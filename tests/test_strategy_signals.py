@@ -1,10 +1,39 @@
 import pytest
+import pandas as pd
 from pydantic import ValidationError
 
 from trading_bot.models.market import MarketBar
 from trading_bot.models.order import FillResult, OrderRequest
 from trading_bot.models.portfolio import PortfolioState, Position
 from trading_bot.models.signal import TradeSignal
+from trading_bot.strategy.daily_filter import is_bullish_daily_regime
+from trading_bot.strategy.setup_rules import detect_intraday_breakout
+
+
+def test_daily_regime_true_when_price_above_trend() -> None:
+    frame = pd.DataFrame(
+        {
+            "close": [100, 102, 104],
+            "ema_20": [99, 100, 101],
+            "sma_50": [98, 99, 100],
+        }
+    )
+
+    assert is_bullish_daily_regime(frame) is True
+
+
+def test_intraday_breakout_detects_range_break() -> None:
+    frame = pd.DataFrame(
+        {
+            "close": [100.0, 100.2, 100.1, 100.3, 101.0],
+            "high": [100.1, 100.3, 100.2, 100.4, 101.1],
+            "volume": [1000, 1100, 950, 1050, 2500],
+            "volume_avg_5": [1000, 1000, 1000, 1000, 1000],
+        }
+    )
+
+    breakout = detect_intraday_breakout(frame)
+    assert breakout is True
 
 
 def test_trade_signal_requires_stop_loss_and_core_fields() -> None:
