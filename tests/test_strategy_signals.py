@@ -143,8 +143,8 @@ def test_generate_signal_returns_none_for_missing_numeric_values() -> None:
             "close": [100.0, 100.2, 100.1, 100.3, 101.0],
             "high": [100.1, 100.3, 100.2, 100.4, 101.1],
             "volume": [1000, 1100, 950, 1050, 2500],
-            "volume_avg_5": [1000, 1000, 1000, 1000, pd.NA],
-            "low": [99.8, 100.0, 99.9, 100.1, float("nan")],
+            "volume_avg_5": [1000, 1000, 1000, 1000, 1000],
+            "low": [pd.NA, pd.NA, pd.NA, pd.NA, float("nan")],
         },
         index=pd.to_datetime(
             [
