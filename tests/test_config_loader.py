@@ -30,7 +30,7 @@ def test_load_settings_reads_yaml(tmp_path: Path) -> None:
 
     assert settings.app.live_trading_enabled is False
     assert settings.app.timezone == "America/New_York"
-    assert settings.app.state_db_path == "state/test.db"
+    assert settings.app.state_db_path == str((tmp_path / "state/test.db").resolve())
     assert settings.market_data.intraday_interval == "5m"
     assert settings.risk.max_daily_risk_pct == 0.03
 
