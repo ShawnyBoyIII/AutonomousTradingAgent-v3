@@ -1,0 +1,120 @@
+import pytest
+from pydantic import ValidationError
+
+from trading_bot.models.market import MarketBar
+from trading_bot.models.order import FillResult, OrderRequest
+from trading_bot.models.portfolio import PortfolioState, Position
+from trading_bot.models.signal import TradeSignal
+
+
+def test_trade_signal_requires_stop_loss_and_core_fields() -> None:
+    signal = TradeSignal(
+        ticker="AAPL",
+        timeframe="intraday",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=99.0,
+        profit_target=102.5,
+        risk_reward_ratio=2.5,
+        confidence=0.75,
+        reasons=["breakout"],
+        strategy_tag="opening-range-breakout",
+        timestamp="2026-06-13T10:00:00-04:00",
+    )
+
+    assert signal.ticker == "AAPL"
+    assert signal.stop_loss == 99.0
+    assert signal.risk_reward_ratio == 2.5
+    assert signal.reasons == ["breakout"]
+
+
+def test_trade_signal_rejects_buy_setups_with_incoherent_prices() -> None:
+    with pytest.raises(ValidationError, match="BUY trade requires"):
+        TradeSignal(
+            ticker="AAPL",
+            timeframe="intraday",
+            action="BUY",
+            entry_price=100.0,
+            stop_loss=101.0,
+            profit_target=102.5,
+            risk_reward_ratio=2.5,
+            confidence=0.75,
+            reasons=["breakout"],
+            strategy_tag="opening-range-breakout",
+            timestamp="2026-06-13T10:00:00-04:00",
+        )
+
+
+def test_order_request_rejects_missing_price_requirements() -> None:
+    with pytest.raises(ValidationError, match="limit_price"):
+        OrderRequest(
+            ticker="AAPL",
+            side="BUY",
+            order_type="limit",
+            quantity=10,
+            submitted_at="2026-06-13T10:00:00-04:00",
+        )
+
+    with pytest.raises(ValidationError, match="stop_price"):
+        OrderRequest(
+            ticker="AAPL",
+            side="BUY",
+            order_type="stop",
+            quantity=10,
+            submitted_at="2026-06-13T10:00:00-04:00",
+        )
+
+    with pytest.raises(ValidationError, match="limit_price.*stop_price"):
+        OrderRequest(
+            ticker="AAPL",
+            side="BUY",
+            order_type="bracket",
+            quantity=10,
+            submitted_at="2026-06-13T10:00:00-04:00",
+        )
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"high": 9.5, "low": 9.0, "open": 10.0, "close": 9.8},
+        {"high": 10.5, "low": 10.1, "open": 10.0, "close": 10.2},
+    ],
+)
+def test_market_bar_rejects_impossible_ohlc_ranges(fields: dict[str, float]) -> None:
+    with pytest.raises(ValidationError, match="OHLC"):
+        MarketBar(
+            ticker="AAPL",
+            timeframe="intraday",
+            timestamp="2026-06-13T10:00:00-04:00",
+            volume=1_000,
+            **fields,
+        )
+
+
+def test_fill_result_requires_positive_quantity() -> None:
+    with pytest.raises(ValidationError, match="quantity"):
+        FillResult(
+            order_id="order-1",
+            ticker="AAPL",
+            quantity=0,
+            fill_price=100.0,
+            fees=1.0,
+            filled_at="2026-06-13T10:00:00-04:00",
+        )
+
+
+def test_portfolio_state_rejects_negative_cash_and_equity() -> None:
+    with pytest.raises(ValidationError, match="cash"):
+        PortfolioState(
+            cash=-1.0,
+            equity=1000.0,
+            positions={"AAPL": Position(ticker="AAPL", quantity=1, average_cost=100.0)},
+        )
+
+    with pytest.raises(ValidationError, match="equity"):
+        PortfolioState(
+            cash=1000.0,
+            equity=-1.0,
+            positions={"AAPL": Position(ticker="AAPL", quantity=1, average_cost=100.0)},
+        )
