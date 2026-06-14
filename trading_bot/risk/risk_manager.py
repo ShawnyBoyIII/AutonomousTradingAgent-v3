@@ -6,6 +6,22 @@ from trading_bot.risk.position_sizer import calculate_position_size
 
 
 def evaluate_signal(signal: TradeSignal, account_equity: float, open_tickers: set[str]) -> RiskDecision:
+    if signal.action != "BUY":
+        return RiskDecision(
+            approved=False,
+            reason="unsupported signal action",
+            position_size=0,
+            dollar_risk=0.0,
+        )
+
+    if account_equity <= 0:
+        return RiskDecision(
+            approved=False,
+            reason="invalid account equity",
+            position_size=0,
+            dollar_risk=0.0,
+        )
+
     if signal.risk_reward_ratio < 2.0:
         return RiskDecision(
             approved=False,

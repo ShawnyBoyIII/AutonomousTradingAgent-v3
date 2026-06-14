@@ -68,3 +68,45 @@ def test_evaluate_signal_approves_valid_signal() -> None:
     assert decision.reason == "approved"
     assert decision.position_size == 100
     assert decision.dollar_risk == 100.0
+
+
+def test_evaluate_signal_rejects_unsupported_action() -> None:
+    signal = TradeSignal(
+        ticker="AAPL",
+        timeframe="intraday",
+        action="SELL",
+        entry_price=100.0,
+        stop_loss=101.0,
+        profit_target=97.0,
+        risk_reward_ratio=3.0,
+        confidence=0.8,
+        reasons=["test"],
+        strategy_tag="test",
+        timestamp=datetime(2026, 6, 13, 10, 0, 0),
+    )
+
+    decision = evaluate_signal(signal=signal, account_equity=10000, open_tickers=set())
+
+    assert decision.approved is False
+    assert decision.reason == "unsupported signal action"
+
+
+def test_evaluate_signal_rejects_non_positive_equity() -> None:
+    signal = TradeSignal(
+        ticker="AAPL",
+        timeframe="intraday",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=99.0,
+        profit_target=103.0,
+        risk_reward_ratio=3.0,
+        confidence=0.8,
+        reasons=["test"],
+        strategy_tag="test",
+        timestamp=datetime(2026, 6, 13, 10, 0, 0),
+    )
+
+    decision = evaluate_signal(signal=signal, account_equity=0, open_tickers=set())
+
+    assert decision.approved is False
+    assert decision.reason == "invalid account equity"

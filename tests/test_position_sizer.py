@@ -12,9 +12,30 @@ def test_calculate_position_size_uses_account_risk() -> None:
     assert shares == 100
 
 
+def test_calculate_position_size_handles_decimal_risk_per_share() -> None:
+    shares = calculate_position_size(
+        account_equity=10000,
+        risk_pct=0.01,
+        entry_price=100,
+        stop_loss=99.9,
+    )
+    assert shares == 1000
+
+
 def test_exceeds_ticker_allocation_flags_over_limit_position() -> None:
     assert exceeds_ticker_allocation(
         account_equity=10000,
         position_value=2500,
         max_allocation_pct=0.2,
+    )
+
+
+def test_exceeds_ticker_allocation_allows_at_limit_position() -> None:
+    assert (
+        exceeds_ticker_allocation(
+            account_equity=10000,
+            position_value=2000,
+            max_allocation_pct=0.2,
+        )
+        is False
     )
