@@ -7,7 +7,8 @@ if TYPE_CHECKING:
 
 
 def detect_intraday_breakout(frame: "pd.DataFrame", lookback: int = 4) -> bool:
-    if lookback <= 0 or len(frame) <= lookback:
+    required_columns = {"close", "high", "volume", "volume_avg_5"}
+    if lookback <= 0 or len(frame) <= lookback or not required_columns.issubset(frame.columns):
         return False
 
     latest = frame.iloc[-1]
