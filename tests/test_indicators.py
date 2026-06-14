@@ -4,6 +4,7 @@ import pytest
 import pandas as pd
 
 from trading_bot.data.indicators import add_ema, add_rsi, add_sma
+from trading_bot.data.market_data import normalize_ohlcv_frame
 
 
 def test_add_ema_creates_expected_column() -> None:
@@ -45,3 +46,27 @@ def test_add_sma_creates_expected_column() -> None:
     assert result["sma_3"].iloc[2] == pytest.approx(11.0)
     assert result["sma_3"].iloc[3] == pytest.approx(12.0)
     assert result["sma_3"].iloc[4] == pytest.approx(13.0)
+
+
+def test_normalize_ohlcv_frame_standardizes_yahoo_columns() -> None:
+    frame = pd.DataFrame(
+        {
+            "Open": [100.0, 101.0],
+            "High": [102.0, 103.0],
+            "Low": [99.0, 100.0],
+            "Close": [101.5, 102.5],
+            "Adj Close": [101.0, 102.0],
+            "Volume": [1_000_000, 1_100_000],
+        },
+        index=pd.to_datetime(["2026-06-13 10:00:00", "2026-06-13 10:01:00"]),
+    )
+
+    result = normalize_ohlcv_frame(frame)
+
+    assert list(result.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+    assert result["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist() == [
+        "2026-06-13 10:00:00",
+        "2026-06-13 10:01:00",
+    ]
+    assert result["open"].tolist() == [100.0, 101.0]
+    assert result["volume"].tolist() == [1_000_000, 1_100_000]
