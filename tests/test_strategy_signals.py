@@ -72,6 +72,19 @@ def test_intraday_breakout_false_for_null_latest_breakout_inputs() -> None:
     assert detect_intraday_breakout(frame) is False
 
 
+def test_intraday_breakout_false_for_incomplete_lookback_range() -> None:
+    frame = pd.DataFrame(
+        {
+            "close": [100.0, 100.2, 100.1, 100.3, 101.0],
+            "high": [100.1, 100.3, pd.NA, 100.4, 101.1],
+            "volume": [1000, 1100, 950, 1050, 2500],
+            "volume_avg_5": [1000, 1000, 1000, 1000, 1000],
+        }
+    )
+
+    assert detect_intraday_breakout(frame) is False
+
+
 def test_generate_signal_returns_buy_candidate_on_bullish_breakout() -> None:
     daily = pd.DataFrame(
         {
