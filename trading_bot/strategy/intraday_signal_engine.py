@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import math
 from typing import TYPE_CHECKING
 
 from trading_bot.models.signal import TradeSignal
@@ -23,11 +24,21 @@ def generate_signal(
         return None
 
     latest = intraday_frame.iloc[-1]
-    entry_price = round(float(latest["close"]), 4)
+    entry_value = _to_finite_float(latest.get("close"))
+    if entry_value is None:
+        return None
+    entry_price = round(entry_value, 4)
 
     if "low" in intraday_frame.columns:
         recent_lows = intraday_frame.tail(min(len(intraday_frame), 5))["low"]
-        stop_loss = round(float(recent_lows.min()), 4)
+        low_values = [
+            numeric
+            for numeric in (_to_finite_float(value) for value in recent_lows.tolist())
+            if numeric is not None
+        ]
+        if not low_values:
+            return None
+        stop_loss = round(min(low_values), 4)
     else:
         stop_loss = round(entry_price * 0.99, 4)
 
@@ -44,7 +55,9 @@ def generate_signal(
         return None
 
     confidence = 0.8
-    if latest.get("volume_avg_5") and latest["volume"] > latest["volume_avg_5"] * 1.5:
+    latest_volume = _to_finite_float(latest.get("volume"))
+    average_volume = _to_finite_float(latest.get("volume_avg_5"))
+    if latest_volume is not None and average_volume is not None and latest_volume > average_volume * 1.5:
         confidence = 0.9
 
     timestamp = intraday_frame.index[-1]
@@ -64,3 +77,15 @@ def generate_signal(
         strategy_tag="intraday-signal-engine",
         timestamp=timestamp,
     )
+
+
+def _to_finite_float(value: object) -> float | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if not math.isfinite(numeric):
+        return None
+
+    return numeric
