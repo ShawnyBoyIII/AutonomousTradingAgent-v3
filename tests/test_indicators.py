@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import pandas as pd
 
-from trading_bot.data.indicators import add_ema, add_rsi
+from trading_bot.data.indicators import add_ema, add_rsi, add_sma
 
 
 def test_add_ema_creates_expected_column() -> None:
@@ -28,5 +28,18 @@ def test_add_rsi_keeps_values_bounded() -> None:
 
     bounded_values = result["rsi_3"].dropna()
 
-    assert bounded_values
+    assert not bounded_values.empty
     assert bounded_values.between(0.0, 100.0).all()
+
+
+def test_add_sma_creates_expected_column() -> None:
+    frame = pd.DataFrame({"close": [10.0, 11.0, 12.0, 13.0, 14.0]})
+
+    result = add_sma(frame, period=3, column_name="sma_3")
+
+    assert "sma_3" not in frame.columns
+    assert "sma_3" in result.columns
+    assert result["sma_3"].iloc[:2].isna().all()
+    assert result["sma_3"].iloc[2] == pytest.approx(11.0)
+    assert result["sma_3"].iloc[3] == pytest.approx(12.0)
+    assert result["sma_3"].iloc[4] == pytest.approx(13.0)
