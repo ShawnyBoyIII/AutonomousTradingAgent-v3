@@ -16,9 +16,9 @@ class MarketDataSettings(BaseModel):
 
 
 class RiskSettings(BaseModel):
-    max_risk_per_trade_pct: float = Field(default=0.01, gt=0.0)
-    max_daily_risk_pct: float = Field(default=0.03, gt=0.0)
-    max_ticker_allocation_pct: float = Field(default=0.20, gt=0.0)
+    max_risk_per_trade_pct: float = Field(default=0.01, gt=0.0, le=1.0)
+    max_daily_risk_pct: float = Field(default=0.03, gt=0.0, le=1.0)
+    max_ticker_allocation_pct: float = Field(default=0.20, gt=0.0, le=1.0)
     min_reward_risk_ratio: float = Field(default=2.0, gt=0.0)
 
 
