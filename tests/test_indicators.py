@@ -30,6 +30,8 @@ def test_add_rsi_keeps_values_bounded() -> None:
 
     assert not bounded_values.empty
     assert bounded_values.between(0.0, 100.0).all()
+    assert bounded_values.iloc[0] == pytest.approx(70.58823529411771)
+    assert bounded_values.iloc[-1] == pytest.approx(60.8927890118277)
 
 
 def test_add_sma_creates_expected_column() -> None:
