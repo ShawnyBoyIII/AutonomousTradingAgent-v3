@@ -1,0 +1,5 @@
+app:
+  live_trading_enabled: false
+  timezone: America/New_York
+  state_db_path: state/trading_bot.db
+  log_dir: logs
