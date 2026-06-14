@@ -7,6 +7,7 @@ from trading_bot.models.order import FillResult, OrderRequest
 from trading_bot.models.portfolio import PortfolioState, Position
 from trading_bot.models.signal import TradeSignal
 from trading_bot.strategy.daily_filter import is_bullish_daily_regime
+from trading_bot.strategy.intraday_signal_engine import generate_signal
 from trading_bot.strategy.setup_rules import detect_intraday_breakout
 
 
@@ -34,6 +35,37 @@ def test_intraday_breakout_detects_range_break() -> None:
 
     breakout = detect_intraday_breakout(frame)
     assert breakout is True
+
+
+def test_generate_signal_returns_buy_candidate_on_bullish_breakout() -> None:
+    daily = pd.DataFrame(
+        {
+            "close": [100.0, 102.0, 104.0],
+            "ema_20": [99.0, 100.0, 101.0],
+            "sma_50": [98.0, 99.0, 100.0],
+        }
+    )
+    intraday = pd.DataFrame(
+        {
+            "close": [100.0, 100.2, 100.1, 100.3, 101.0],
+            "high": [100.1, 100.3, 100.2, 100.4, 101.1],
+            "volume": [1000, 1100, 950, 1050, 2500],
+            "volume_avg_5": [1000, 1000, 1000, 1000, 1000],
+            "low": [99.8, 100.0, 99.9, 100.1, 100.4],
+        }
+    )
+
+    signal = generate_signal("AAPL", daily, intraday)
+
+    assert signal is not None
+    assert isinstance(signal, TradeSignal)
+    assert signal.ticker == "AAPL"
+    assert signal.action == "BUY"
+    assert signal.timeframe == "intraday"
+    assert signal.entry_price > signal.stop_loss
+    assert signal.profit_target > signal.entry_price
+    assert "bullish daily regime" in signal.reasons
+    assert "intraday breakout" in signal.reasons
 
 
 def test_trade_signal_requires_stop_loss_and_core_fields() -> None:
