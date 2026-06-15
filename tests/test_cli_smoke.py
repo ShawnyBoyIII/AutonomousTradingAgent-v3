@@ -26,3 +26,12 @@ def test_scan_command_prints_symbols() -> None:
 
     assert result.exit_code == 0
     assert result.stdout.strip() == "AAPL"
+
+
+def test_portfolio_command_prints_placeholder_summary() -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["portfolio"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "Portfolio summary: paper-only placeholder."

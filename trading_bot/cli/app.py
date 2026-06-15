@@ -53,4 +53,4 @@ def report() -> None:
 @app.command()
 def portfolio() -> None:
     """Inspect the current simulated portfolio."""
-    return None
+    typer.echo("Portfolio summary: paper-only placeholder.")
