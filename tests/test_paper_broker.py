@@ -6,6 +6,7 @@ import pytest
 
 from trading_bot.execution.order_manager import submit_signal_as_order
 from trading_bot.execution.paper_broker import PaperBroker
+from trading_bot.execution.modes import ExecutionMode
 from trading_bot.models.order import OrderRequest
 from trading_bot.models.signal import TradeSignal
 from trading_bot.portfolio.ledger import PortfolioLedger
@@ -145,3 +146,82 @@ def test_submit_signal_as_order_returns_fill_for_approved_trade() -> None:
     assert fill.ticker == "AAPL"
     assert fill.quantity == 100
     assert fill.fill_price == 100.0
+
+
+def test_submit_signal_as_order_returns_none_for_rejected_signal() -> None:
+    broker = PaperBroker(starting_cash=10001, fee_per_order=1.0, slippage_bps=0)
+    signal = TradeSignal(
+        ticker="AAPL",
+        timeframe="intraday",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=99.5,
+        profit_target=100.5,
+        risk_reward_ratio=1.0,
+        confidence=0.8,
+        reasons=["test"],
+        strategy_tag="test",
+        timestamp=datetime.now(),
+    )
+
+    fill = submit_signal_as_order(
+        signal,
+        broker,
+        account_equity=10000,
+        open_tickers=set(),
+    )
+
+    assert fill is None
+
+
+def test_submit_signal_as_order_returns_none_when_broker_cash_is_insufficient() -> None:
+    broker = PaperBroker(starting_cash=5000, fee_per_order=1.0, slippage_bps=0)
+    signal = TradeSignal(
+        ticker="AAPL",
+        timeframe="intraday",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=99.0,
+        profit_target=102.0,
+        risk_reward_ratio=2.0,
+        confidence=0.8,
+        reasons=["test"],
+        strategy_tag="test",
+        timestamp=datetime.now(),
+    )
+
+    fill = submit_signal_as_order(
+        signal,
+        broker,
+        account_equity=10000,
+        open_tickers=set(),
+    )
+
+    assert fill is None
+    assert broker.cash == 5000
+
+
+def test_submit_signal_as_order_enforces_paper_mode() -> None:
+    broker = PaperBroker(starting_cash=10001, fee_per_order=1.0, slippage_bps=0)
+    signal = TradeSignal(
+        ticker="AAPL",
+        timeframe="intraday",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=99.0,
+        profit_target=102.0,
+        risk_reward_ratio=2.0,
+        confidence=0.8,
+        reasons=["test"],
+        strategy_tag="test",
+        timestamp=datetime.now(),
+    )
+
+    with pytest.raises(RuntimeError):
+        submit_signal_as_order(
+            signal,
+            broker,
+            account_equity=10000,
+            open_tickers=set(),
+            mode=ExecutionMode.LIVE,
+        )
