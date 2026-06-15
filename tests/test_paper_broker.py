@@ -119,7 +119,7 @@ def test_compute_unrealized_pnl_returns_expected_gain() -> None:
 
 
 def test_submit_signal_as_order_returns_fill_for_approved_trade() -> None:
-    broker = PaperBroker(starting_cash=10000, fee_per_order=1.0, slippage_bps=0)
+    broker = PaperBroker(starting_cash=10001, fee_per_order=1.0, slippage_bps=0)
     signal = TradeSignal(
         ticker="AAPL",
         timeframe="intraday",
