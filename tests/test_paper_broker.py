@@ -4,9 +4,12 @@ import sqlite3
 
 import pytest
 
+from trading_bot.execution.order_manager import submit_signal_as_order
 from trading_bot.execution.paper_broker import PaperBroker
 from trading_bot.models.order import OrderRequest
+from trading_bot.models.signal import TradeSignal
 from trading_bot.portfolio.ledger import PortfolioLedger
+from trading_bot.portfolio.performance import compute_unrealized_pnl
 
 
 def test_market_buy_updates_cash_and_position() -> None:
@@ -103,11 +106,42 @@ def test_ledger_initializes_sqlite_tables(tmp_path: Path) -> None:
 
     assert db_path.exists()
     with sqlite3.connect(db_path) as conn:
-        tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
-        }
+        columns = [
+            row[1]
+            for row in conn.execute("PRAGMA table_info(orders)")
+        ]
 
-    assert "orders" in tables
+    assert columns == ["id", "ticker", "side", "quantity", "fill_price", "fees", "filled_at"]
+
+
+def test_compute_unrealized_pnl_returns_expected_gain() -> None:
+    assert compute_unrealized_pnl(10, 100.0, 112.5) == 125.0
+
+
+def test_submit_signal_as_order_returns_fill_for_approved_trade() -> None:
+    broker = PaperBroker(starting_cash=10000, fee_per_order=1.0, slippage_bps=0)
+    signal = TradeSignal(
+        ticker="AAPL",
+        timeframe="intraday",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=99.0,
+        profit_target=102.0,
+        risk_reward_ratio=2.0,
+        confidence=0.8,
+        reasons=["test"],
+        strategy_tag="test",
+        timestamp=datetime.now(),
+    )
+
+    fill = submit_signal_as_order(
+        signal,
+        broker,
+        account_equity=10000,
+        open_tickers=set(),
+    )
+
+    assert fill is not None
+    assert fill.ticker == "AAPL"
+    assert fill.quantity == 100
+    assert fill.fill_price == 100.0
