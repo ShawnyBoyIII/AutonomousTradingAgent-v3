@@ -14,16 +14,26 @@ class PaperBroker:
 
     def submit_order(self, order: OrderRequest, market_price: float) -> FillResult:
         fill_price = apply_slippage(market_price, self.slippage_bps, order.side)
+        if fill_price <= 0:
+            raise ValueError("fill price must be positive")
+
         gross = fill_price * order.quantity
+        current_position = self.positions.get(order.ticker, 0)
 
         if order.side == "BUY":
-            self.cash -= gross + self.fee_per_order
-            self.positions[order.ticker] = self.positions.get(order.ticker, 0) + order.quantity
-        else:
-            self.cash += gross - self.fee_per_order
-            self.positions[order.ticker] = self.positions.get(order.ticker, 0) - order.quantity
+            next_cash = self.cash - gross - self.fee_per_order
+            if next_cash < 0:
+                raise ValueError("insufficient cash for paper trade")
 
-        return FillResult(
+            next_position = current_position + order.quantity
+        else:
+            if current_position < order.quantity:
+                raise ValueError("insufficient position for paper sell")
+
+            next_cash = self.cash + gross - self.fee_per_order
+            next_position = current_position - order.quantity
+
+        fill = FillResult(
             order_id=str(uuid4()),
             ticker=order.ticker,
             quantity=order.quantity,
@@ -31,3 +41,8 @@ class PaperBroker:
             fees=self.fee_per_order,
             filled_at=datetime.now(),
         )
+
+        self.cash = next_cash
+        self.positions[order.ticker] = next_position
+
+        return fill
