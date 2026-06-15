@@ -1,5 +1,8 @@
 import sys
 
+from typer.testing import CliRunner
+
+from trading_bot.cli.app import app
 from trading_bot.main import main
 
 
@@ -14,3 +17,12 @@ def test_cli_shows_help(monkeypatch, capsys) -> None:
     captured = capsys.readouterr()
     assert "scan" in captured.out
     assert "paper-trade" in captured.out
+
+
+def test_scan_command_prints_symbols() -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["scan", "--symbols", "AAPL"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "AAPL"

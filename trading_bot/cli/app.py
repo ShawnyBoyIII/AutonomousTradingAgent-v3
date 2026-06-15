@@ -3,6 +3,7 @@ from pathlib import Path
 import typer
 
 from trading_bot.config.loader import load_settings
+from trading_bot.runtime.orchestrator import run_scan
 
 app = typer.Typer(help="Paper-trading CLI for stocks and ETFs.")
 
@@ -20,9 +21,15 @@ def main(
 
 
 @app.command()
-def scan() -> None:
+def scan(
+    symbols: list[str] = typer.Option(
+        ...,
+        "--symbols",
+        help="Symbols to scan for trade candidates.",
+    ),
+) -> None:
     """Scan the configured universe for trade candidates."""
-    return None
+    run_scan(symbols)
 
 
 @app.command(name="paper-trade")
