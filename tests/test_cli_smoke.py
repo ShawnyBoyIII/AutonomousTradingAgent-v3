@@ -22,10 +22,10 @@ def test_cli_shows_help(monkeypatch, capsys) -> None:
 def test_scan_command_prints_symbols() -> None:
     runner = CliRunner()
 
-    result = runner.invoke(app, ["scan", "--symbols", "AAPL"])
+    result = runner.invoke(app, ["scan", "--symbols", "AAPL,MSFT"])
 
     assert result.exit_code == 0
-    assert result.stdout.strip() == "AAPL"
+    assert result.stdout.strip().splitlines() == ["AAPL", "MSFT"]
 
 
 def test_portfolio_command_prints_placeholder_summary() -> None:

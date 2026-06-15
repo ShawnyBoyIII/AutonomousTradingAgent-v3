@@ -1,4 +1,2 @@
 def run_scan(symbols: list[str]) -> list[str]:
-    for symbol in symbols:
-        print(symbol)
-    return symbols
+    return [symbol.strip() for symbol in symbols if symbol.strip()]

@@ -29,7 +29,14 @@ def scan(
     ),
 ) -> None:
     """Scan the configured universe for trade candidates."""
-    run_scan(symbols)
+    parsed_symbols: list[str] = []
+    for raw_value in symbols:
+        parsed_symbols.extend(
+            symbol.strip() for symbol in raw_value.split(",") if symbol.strip()
+        )
+
+    for symbol in run_scan(parsed_symbols):
+        typer.echo(symbol)
 
 
 @app.command(name="paper-trade")
