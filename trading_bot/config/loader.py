@@ -19,6 +19,8 @@ def load_settings(config_path: Path | None = None) -> Settings:
 
     if path.exists():
         loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if loaded is None:
+            loaded = {}
         if not isinstance(loaded, dict):
             raise ValueError("Config YAML top-level must be a mapping")
         raw = loaded
