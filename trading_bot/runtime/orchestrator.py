@@ -179,13 +179,52 @@ def run_paper_trade(symbols: list[str], settings: Settings) -> list[str]:
 
     for symbol in (value.strip() for value in symbols if value.strip()):
         try:
-            signal = _build_signal(symbol, settings)
+            if symbol in open_tickers:
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "paper-trade",
+                        "ticker": symbol,
+                        "status": "REJECTED",
+                        "reason": "duplicate open ticker",
+                    },
+                )
+                results.append(f"{symbol} REJECTED duplicate open ticker")
+                continue
+
+            signal, _, details = _build_signal_result(symbol, settings)
             if signal is None:
                 append_decision_event(
                     log_path,
                     {"command": "paper-trade", "ticker": symbol, "status": "NO_SIGNAL"},
                 )
                 results.append(f"{symbol} NO_SIGNAL")
+                continue
+
+            if _market_data_status(signal.timestamp, settings.market_data.intraday_interval) == "stale":
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "paper-trade",
+                        "ticker": symbol,
+                        "status": "REJECTED",
+                        "reason": "stale market data",
+                    },
+                )
+                results.append(f"{symbol} REJECTED stale market data")
+                continue
+
+            if _scan_quality(details) != "GREEN":
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "paper-trade",
+                        "ticker": symbol,
+                        "status": "REJECTED",
+                        "reason": "yellow signal",
+                    },
+                )
+                results.append(f"{symbol} REJECTED yellow signal")
                 continue
 
             decision = evaluate_signal(
