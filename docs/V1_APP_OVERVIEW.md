@@ -164,9 +164,39 @@ Later:
 Close trade lifecycle loop:
 
 - Add manage-positions loop for open trades.
+- Start with single-shot `manage-positions`; add continuous `run-manager --interval 60s` only after single-shot is stable.
 - Trail stop loss behind moving averages or recent pivot lows.
 - Add hard end-of-day exit for intraday positions around 3:55 PM ET.
 - Avoid overnight gap risk for intraday momentum trades.
+
+Position manager blueprint:
+
+- Read open positions from SQLite.
+- Fetch latest market data only for open tickers.
+- Check end-of-day exit before all price logic.
+- Check hard stop and target after time exit.
+- Update trailing stop only after time, stop, and target checks pass.
+- Dispatch generated sell signals through paper broker.
+- Save updated portfolio state and refresh snapshots.
+
+Exit order:
+
+1. Hydrate open positions and latest data.
+2. Trigger EOD liquidation first.
+3. Trigger hard stop or target.
+4. Ratchet trailing stop up only.
+5. Commit sells and state updates.
+
+Trailing stop methods:
+
+- R-multiple ratchet: at `+1R`, move stop to breakeven; at `+1.5R`, move stop to `+0.5R`.
+- Chandelier exit: track highest high since entry and set stop to `highest_high - (1.5 * ATR)`.
+
+Manager guardrails:
+
+- Freeze manager if market data is older than strict latency limit.
+- Do not execute trailing stops or EOD exits on stale data.
+- Handle SQLite locks cleanly if scanner and manager run near same time.
 
 Harden paper simulation:
 
