@@ -31,4 +31,16 @@ def load_settings(config_path: Path | None = None) -> Settings:
     base_dir = path.resolve().parent
     settings.app.state_db_path = _resolve_relative_value(settings.app.state_db_path, base_dir)
     settings.app.log_dir = _resolve_relative_value(settings.app.log_dir, base_dir)
+    settings.app.dashboard_summary_path = _resolve_relative_value(
+        settings.app.dashboard_summary_path, base_dir
+    )
+    settings.app.scan_results_path = _resolve_relative_value(
+        settings.app.scan_results_path, base_dir
+    )
+    settings.app.portfolio_summary_path = _resolve_relative_value(
+        settings.app.portfolio_summary_path, base_dir
+    )
+    settings.app.backtest_summary_path = _resolve_relative_value(
+        settings.app.backtest_summary_path, base_dir
+    )
     return settings

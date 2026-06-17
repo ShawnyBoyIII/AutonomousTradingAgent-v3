@@ -4,10 +4,13 @@ import sqlite3
 
 import pytest
 
+from trading_bot.config.settings import RiskSettings
 from trading_bot.execution.order_manager import submit_signal_as_order
 from trading_bot.execution.paper_broker import PaperBroker
 from trading_bot.execution.modes import ExecutionMode
+from trading_bot.models.order import FillResult
 from trading_bot.models.order import OrderRequest
+from trading_bot.models.portfolio import PortfolioState, Position
 from trading_bot.models.signal import TradeSignal
 from trading_bot.portfolio.ledger import PortfolioLedger
 from trading_bot.portfolio.performance import compute_unrealized_pnl
@@ -113,6 +116,65 @@ def test_ledger_initializes_sqlite_tables(tmp_path: Path) -> None:
         ]
 
     assert columns == ["id", "ticker", "side", "quantity", "fill_price", "fees", "filled_at"]
+
+
+def test_ledger_round_trips_portfolio_state(tmp_path: Path) -> None:
+    db_path = tmp_path / "ledger.db"
+    ledger = PortfolioLedger(db_path)
+    state = PortfolioState(
+        cash=12_500.0,
+        equity=13_000.0,
+        positions={
+            "AAPL": Position(ticker="AAPL", quantity=5, average_cost=100.0),
+        },
+    )
+
+    ledger.save_portfolio_state(state)
+
+    loaded = ledger.load_portfolio_state()
+
+    assert loaded == state
+
+
+def test_ledger_ensure_portfolio_state_creates_default_snapshot(tmp_path: Path) -> None:
+    db_path = tmp_path / "ledger.db"
+    ledger = PortfolioLedger(db_path)
+
+    state = ledger.ensure_portfolio_state(starting_cash=15_000.0)
+    loaded = ledger.load_portfolio_state()
+
+    assert state.cash == 15_000.0
+    assert state.equity == 15_000.0
+    assert loaded == state
+
+
+def test_ledger_records_fill_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "ledger.db"
+    ledger = PortfolioLedger(db_path)
+    fill = FillResult(
+        order_id="order-123",
+        ticker="AAPL",
+        quantity=10,
+        fill_price=101.25,
+        fees=1.0,
+        filled_at=datetime(2026, 6, 13, 10, 0, 0),
+    )
+
+    ledger.record_fill(fill, side="BUY")
+
+    rows = ledger.list_order_rows()
+
+    assert rows == [
+        {
+            "id": "order-123",
+            "ticker": "AAPL",
+            "side": "BUY",
+            "quantity": 10,
+            "fill_price": 101.25,
+            "fees": 1.0,
+            "filled_at": "2026-06-13T10:00:00",
+        }
+    ]
 
 
 def test_compute_unrealized_pnl_returns_expected_gain() -> None:
@@ -225,3 +287,36 @@ def test_submit_signal_as_order_enforces_paper_mode() -> None:
             open_tickers=set(),
             mode=ExecutionMode.LIVE,
         )
+
+
+def test_submit_signal_as_order_uses_configured_risk_settings() -> None:
+    broker = PaperBroker(starting_cash=20001, fee_per_order=1.0, slippage_bps=0)
+    signal = TradeSignal(
+        ticker="AAPL",
+        timeframe="intraday",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=99.0,
+        profit_target=101.5,
+        risk_reward_ratio=1.5,
+        confidence=0.8,
+        reasons=["test"],
+        strategy_tag="test",
+        timestamp=datetime.now(),
+    )
+
+    fill = submit_signal_as_order(
+        signal,
+        broker,
+        account_equity=10000,
+        open_tickers=set(),
+        risk_settings=RiskSettings(
+            max_risk_per_trade_pct=0.02,
+            max_daily_risk_pct=0.03,
+            max_ticker_allocation_pct=0.20,
+            min_reward_risk_ratio=1.5,
+        ),
+    )
+
+    assert fill is not None
+    assert fill.quantity == 200

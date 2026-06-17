@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from trading_bot.config.settings import RiskSettings
 from trading_bot.execution.broker_base import BrokerAdapter
 from trading_bot.execution.modes import ExecutionMode, require_paper_mode
 from trading_bot.models.order import FillResult, OrderRequest
@@ -14,6 +15,7 @@ def submit_signal_as_order(
     broker: BrokerAdapter,
     account_equity: float,
     open_tickers: set[str],
+    risk_settings: RiskSettings | None = None,
     mode: ExecutionMode = ExecutionMode.PAPER,
 ) -> FillResult | None:
     require_paper_mode(mode)
@@ -22,6 +24,7 @@ def submit_signal_as_order(
         signal=signal,
         account_equity=account_equity,
         open_tickers=open_tickers,
+        risk_settings=risk_settings,
     )
     if not decision.approved:
         return None

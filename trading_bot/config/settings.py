@@ -6,6 +6,10 @@ class AppSettings(BaseModel):
     timezone: str = "America/New_York"
     state_db_path: str = "state/trading_bot.db"
     log_dir: str = "logs"
+    dashboard_summary_path: str = "state/dashboard_summary.json"
+    scan_results_path: str = "state/scan_results.json"
+    portfolio_summary_path: str = "state/portfolio_summary.json"
+    backtest_summary_path: str = "state/backtest_summary.json"
 
 
 class MarketDataSettings(BaseModel):

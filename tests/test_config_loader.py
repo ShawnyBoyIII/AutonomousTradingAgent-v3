@@ -31,6 +31,7 @@ def test_load_settings_reads_yaml(tmp_path: Path) -> None:
     assert settings.app.live_trading_enabled is False
     assert settings.app.timezone == "America/New_York"
     assert settings.app.state_db_path == str((tmp_path / "state/test.db").resolve())
+    assert settings.app.scan_results_path == str((tmp_path / "state/scan_results.json").resolve())
     assert settings.market_data.intraday_interval == "5m"
     assert settings.risk.max_daily_risk_pct == 0.03
 
@@ -121,3 +122,6 @@ def test_load_settings_resolves_relative_paths_from_config_directory(tmp_path: P
 
     assert settings.app.state_db_path == str((config_dir / "state/local.db").resolve())
     assert settings.app.log_dir == str((config_dir / "logs").resolve())
+    assert settings.app.dashboard_summary_path == str(
+        (config_dir / "state/dashboard_summary.json").resolve()
+    )

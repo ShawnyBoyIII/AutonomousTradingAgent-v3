@@ -1,0 +1,12 @@
+/.DS_Store
+/.codegraph/
+/.pytest_cache/
+/.venv/
+/.venv.bad/
+/*.egg-info/
+/agents.md-main/
+/logs/
+/state/
+
+__pycache__/
+*.py[cod]

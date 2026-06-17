@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+from trading_bot.config.settings import RiskSettings
 from trading_bot.models.risk import RiskDecision
 from trading_bot.models.signal import TradeSignal
 from trading_bot.risk.position_sizer import calculate_position_size
 
 
-def evaluate_signal(signal: TradeSignal, account_equity: float, open_tickers: set[str]) -> RiskDecision:
+def evaluate_signal(
+    signal: TradeSignal,
+    account_equity: float,
+    open_tickers: set[str],
+    risk_settings: RiskSettings | None = None,
+) -> RiskDecision:
+    settings = risk_settings or RiskSettings()
+
     if signal.action != "BUY":
         return RiskDecision(
             approved=False,
@@ -22,7 +30,7 @@ def evaluate_signal(signal: TradeSignal, account_equity: float, open_tickers: se
             dollar_risk=0.0,
         )
 
-    if signal.risk_reward_ratio < 2.0:
+    if signal.risk_reward_ratio < settings.min_reward_risk_ratio:
         return RiskDecision(
             approved=False,
             reason="reward/risk below minimum",
@@ -40,7 +48,7 @@ def evaluate_signal(signal: TradeSignal, account_equity: float, open_tickers: se
 
     position_size = calculate_position_size(
         account_equity=account_equity,
-        risk_pct=0.01,
+        risk_pct=settings.max_risk_per_trade_pct,
         entry_price=signal.entry_price,
         stop_loss=signal.stop_loss,
     )

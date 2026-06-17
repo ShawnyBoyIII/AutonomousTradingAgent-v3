@@ -2,7 +2,7 @@
 
 ## Goal
 
-Build a brand-new Python trading system for stocks and ETFs that is safe by default, intraday-first, and fully paper-trading only in v1. The system must support both intraday and daily analysis, but intraday execution is the primary path. It must be auditable, modular, CLI-first, and designed so higher-fidelity data providers or broker adapters can be added later without rewriting core portfolio, risk, or strategy logic.
+Build a brand-new Python trading system for stocks and ETFs that is safe by default, intraday-first, and fully paper-trading only in v1. The system must support both intraday and daily analysis, but intraday execution is the primary path. It must be auditable, modular, CLI-first, and designed so higher-fidelity data providers, research agents, or broker adapters can be added later without rewriting core portfolio, risk, or strategy logic.
 
 ## Scope
 
@@ -35,6 +35,36 @@ Build a brand-new Python trading system for stocks and ETFs that is safe by defa
 
 User runs a CLI app locally. App can scan watchlists, generate signals, simulate paper orders, backtest strategies, and print or export performance summaries. All order creation flows through risk checks first. If a trade fails validation, system records rejection reason and takes no action.
 
+## User Journeys
+
+### 1. Research
+
+- User opens CLI and supplies a symbol list or watchlist file
+- System loads market data through the configured provider
+- System computes daily regime and intraday setup signals
+- System returns ranked candidates with reasons, entry, stop, target, and confidence
+- User can inspect rejected candidates and why they were rejected
+
+### 2. Paper Trade
+
+- User starts paper-trade mode for the same watchlist or a filtered symbol list
+- System reuses the same strategy and risk checks used in research mode
+- Approved signals become simulated orders
+- Paper broker applies slippage and fees and updates portfolio state
+- System writes decision logs, order logs, and portfolio snapshots
+
+### 3. Review
+
+- User requests portfolio or report output
+- System shows open positions, cash, equity, realized P/L, unrealized P/L, and recent trade decisions
+- User can inspect which signals were accepted, rejected, or skipped
+- User can compare live-paper results against backtest summaries once backtest support is complete
+
+Architecture direction borrowed from reference repos:
+
+- From TradingAgents: keep agent-shaped boundaries even when logic is deterministic in v1
+- From AI-Trader: separate user-facing command flow from longer-running runtime work, and keep paper/live execution modes explicit in config and code
+
 ## Architecture
 
 ### Repo layout
@@ -51,6 +81,10 @@ AutonomousTradingAgent/
     cli/
       __init__.py
       app.py
+    runtime/
+      __init__.py
+      orchestrator.py
+      decision_log.py
     config/
       __init__.py
       settings.py
@@ -67,6 +101,10 @@ AutonomousTradingAgent/
       market_data.py
       indicators.py
       cache.py
+      providers/
+        __init__.py
+        base.py
+        yfinance_provider.py
     strategy/
       __init__.py
       intraday_signal_engine.py
@@ -83,7 +121,9 @@ AutonomousTradingAgent/
       performance.py
     execution/
       __init__.py
+      modes.py
       paper_broker.py
+      broker_base.py
       order_manager.py
       fills.py
     backtest/
@@ -111,12 +151,13 @@ AutonomousTradingAgent/
 ### Module responsibilities
 
 - `config`: load YAML and env vars, enforce safety defaults
+- `runtime`: orchestrate scan, decision, execution, logging, and future background jobs
 - `models`: shared typed data contracts
-- `data`: fetch bars, normalize frames, compute indicators, cache results
-- `strategy`: generate candidate setups from intraday bars, filtered by daily regime
+- `data`: fetch bars through provider interface, normalize frames, compute indicators, cache results
+- `strategy`: generate candidate setups from intraday bars, filtered by daily regime, using agent-shaped interfaces that can later wrap LLM or deterministic logic
 - `risk`: reject or approve trades, size positions, cap exposure
 - `portfolio`: maintain account state and realized/unrealized performance
-- `execution`: simulate order lifecycle and fills
+- `execution`: enforce execution mode, simulate order lifecycle and fills, and expose future broker adapter boundary
 - `backtest`: replay historical data and measure performance
 - `reports`: render CLI summaries and export files
 
@@ -130,7 +171,8 @@ AutonomousTradingAgent/
 4. Compute indicators
 5. Apply daily trend filter
 6. Run intraday setup rules
-7. Return ranked candidates with reasons and risk metadata
+7. Append each candidate or rejection to decision log
+8. Return ranked candidates with reasons and risk metadata
 
 ### Paper trading flow
 
@@ -138,9 +180,10 @@ AutonomousTradingAgent/
 2. Run scan flow
 3. Convert strongest setups into candidate orders
 4. Send each candidate through risk manager
-5. Simulate approved orders through paper broker
-6. Update positions, balances, and journal
-7. Persist logs and summary output
+5. Enforce execution mode is `paper`
+6. Simulate approved orders through paper broker
+7. Update positions, balances, and journal
+8. Persist decision log, execution log, and summary output
 
 ### Backtest flow
 
@@ -175,6 +218,7 @@ AutonomousTradingAgent/
 - Mark stale or partial intraday data clearly
 - Normalize timezone handling to US market session assumptions
 - Cache raw fetches so repeated scans do not hammer provider unnecessarily
+- All fetches go through a provider interface so `yfinance` can be swapped later without touching strategy or risk code
 
 ## Strategy design
 
@@ -236,6 +280,7 @@ Each signal must include:
 - estimated dollar risk
 - estimated portfolio exposure after fill
 - order instructions sent to execution layer
+- decision-log payload suitable for later audit or replay
 
 ## Paper execution
 
@@ -246,6 +291,7 @@ Each signal must include:
 - Fills market orders against most recent available bar context
 - Updates cash, buying power, average cost, and realized/unrealized P/L
 - Records every order event: submitted, accepted, partially filled if supported later, filled, cancelled, rejected
+- Requires explicit execution mode check before any order path runs
 
 ### Simplifications in v1
 
@@ -270,6 +316,19 @@ Portfolio state stores:
 
 Persistence can be file-based in v1, using JSON or SQLite-backed storage. Preferred v1 choice: SQLite for transactions plus CSV export for human review.
 
+## Decision log
+
+Every scan and trade cycle writes structured records for:
+
+- candidate created
+- candidate rejected by strategy gate
+- candidate rejected by risk
+- order submitted
+- simulated fill
+- portfolio state change
+
+This log is modeled after the persistent decision-history idea in TradingAgents, but remains deterministic and local in v1.
+
 ## CLI design
 
 ### Commands
@@ -292,6 +351,7 @@ Persistence can be file-based in v1, using JSON or SQLite-backed storage. Prefer
 
 `config.yaml` holds:
 
+- execution mode
 - default watchlist
 - timeframe settings
 - indicator parameters
@@ -299,6 +359,7 @@ Persistence can be file-based in v1, using JSON or SQLite-backed storage. Prefer
 - slippage/fee assumptions
 - market session settings
 - cache settings
+- selected market-data provider
 
 ### Environment variables
 
@@ -308,6 +369,7 @@ Persistence can be file-based in v1, using JSON or SQLite-backed storage. Prefer
 
 Safety defaults:
 
+- `execution.mode=paper`
 - `LIVE_TRADING_ENABLED=false`
 - no live broker credentials required in v1
 - any future live mode path must fail closed unless explicit config and credentials exist
@@ -337,6 +399,7 @@ System logs:
 
 - raw signal generation
 - risk approval/rejection
+- decision log writes
 - simulated order lifecycle
 - portfolio updates
 - errors and warnings
@@ -353,6 +416,7 @@ Artifacts:
 Designed extension points:
 
 - swap `yfinance` with stronger provider later
+- add separate long-running worker or scheduler around runtime orchestrator without changing CLI contract
 - add broker adapter interface and live-safe placeholder
 - add news/sentiment agent
 - add LLM research agent layer on top of deterministic engine
@@ -381,3 +445,6 @@ V1 succeeds when user can:
 - backtest strategy without look-ahead bias
 - inspect portfolio state and logs afterward
 - trust that system never places a live trade in v1
+- trace every decision from input data to rejection or fill
+- see the same candidate universe in research and paper-trade mode
+- understand why a signal was accepted or rejected without reading code

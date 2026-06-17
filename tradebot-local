@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+
+ROOT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
+
+if [ ! -x "$PYTHON_BIN" ]; then
+  echo "Missing local venv at $ROOT_DIR/.venv" >&2
+  echo "Run:" >&2
+  echo "  cd $ROOT_DIR" >&2
+  echo "  python3 -m venv .venv" >&2
+  echo "  .venv/bin/python -m pip install -e .[dev]" >&2
+  exit 1
+fi
+
+if ! "$PYTHON_BIN" -c "import typer" >/dev/null 2>&1; then
+  echo "Local venv exists but project is not installed in it." >&2
+  echo "Run:" >&2
+  echo "  cd $ROOT_DIR" >&2
+  echo "  .venv/bin/python -m pip install -e .[dev]" >&2
+  exit 1
+fi
+
+exec "$PYTHON_BIN" -m trading_bot.main "$@"
