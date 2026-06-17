@@ -79,6 +79,8 @@ Paper trade rejects:
 - Stale market data.
 - `YELLOW` signals.
 - Duplicate open ticker.
+- Daily order limit.
+- Daily loss limit.
 - Risk-manager rejection.
 - Insufficient cash.
 - Broker/order rejection.
@@ -143,11 +145,14 @@ Do not use it for:
 
 ## Next Best Work
 
+Completed from follow-up priority:
+
+- Daily loss limit and daily order limit.
+
 Future work priority:
 
-1. Add daily loss limit and daily order limit.
-2. Add paper-trade dry-run preview before committing state changes.
-3. Build simple dashboard from snapshot JSON files.
+1. Add paper-trade dry-run preview before committing state changes.
+2. Build simple dashboard from snapshot JSON files.
 
 Reason:
 

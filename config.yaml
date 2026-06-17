@@ -7,3 +7,5 @@ app:
   scan_results_path: state/scan_results.json
   portfolio_summary_path: state/portfolio_summary.json
   backtest_summary_path: state/backtest_summary.json
+risk:
+  max_daily_orders: 3

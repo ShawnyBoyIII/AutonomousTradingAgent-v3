@@ -179,6 +179,32 @@ def run_paper_trade(symbols: list[str], settings: Settings) -> list[str]:
 
     for symbol in (value.strip() for value in symbols if value.strip()):
         try:
+            if _daily_loss_limit_hit(state, settings):
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "paper-trade",
+                        "ticker": symbol,
+                        "status": "REJECTED",
+                        "reason": "daily loss limit",
+                    },
+                )
+                results.append(f"{symbol} REJECTED daily loss limit")
+                continue
+
+            if _daily_order_limit_hit(ledger, settings):
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "paper-trade",
+                        "ticker": symbol,
+                        "status": "REJECTED",
+                        "reason": "daily order limit",
+                    },
+                )
+                results.append(f"{symbol} REJECTED daily order limit")
+                continue
+
             if symbol in open_tickers:
                 append_decision_event(
                     log_path,
@@ -445,6 +471,21 @@ def _scan_quality(details: dict[str, float | int]) -> str:
     ):
         return "GREEN"
     return "YELLOW"
+
+
+def _daily_loss_limit_hit(state: PortfolioState, settings: Settings) -> bool:
+    limit = state.equity * settings.risk.max_daily_risk_pct
+    return state.realized_pnl <= -limit
+
+
+def _daily_order_limit_hit(ledger: PortfolioLedger, settings: Settings) -> bool:
+    today = datetime.now().date().isoformat()
+    orders = [
+        row
+        for row in ledger.list_order_rows()
+        if row["side"] == "BUY" and str(row["filled_at"]).startswith(today)
+    ]
+    return len(orders) >= settings.risk.max_daily_orders
 
 
 def _portfolio_state_from_broker(

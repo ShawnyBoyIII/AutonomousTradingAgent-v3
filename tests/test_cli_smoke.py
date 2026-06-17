@@ -909,6 +909,64 @@ def test_paper_trade_rejects_yellow_signal(monkeypatch, tmp_path: Path) -> None:
     assert result.stdout.strip() == "AAPL REJECTED yellow signal"
 
 
+def test_paper_trade_rejects_daily_order_limit(tmp_path: Path) -> None:
+    from datetime import datetime
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        "risk:\n"
+        "  max_daily_orders: 1\n",
+        encoding="utf-8",
+    )
+    ledger = PortfolioLedger(db_path)
+    ledger.save_portfolio_state(PortfolioState(cash=20_000.0, equity=20_000.0))
+    ledger.record_fill(
+        FillResult(
+            order_id="existing-order",
+            ticker="SPY",
+            quantity=1,
+            fill_price=100.0,
+            fees=1.0,
+            filled_at=datetime.now(),
+        ),
+        side="BUY",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "paper-trade", "--symbols", "AAPL"],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "AAPL REJECTED daily order limit"
+
+
+def test_paper_trade_rejects_daily_loss_limit(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        "risk:\n"
+        "  max_daily_risk_pct: 0.01\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(cash=20_000.0, equity=20_000.0, realized_pnl=-250.0)
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "paper-trade", "--symbols", "AAPL"],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "AAPL REJECTED daily loss limit"
+
+
 def test_report_command_prints_summary_and_exports_files(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
 
