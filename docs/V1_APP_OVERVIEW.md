@@ -143,10 +143,18 @@ Do not use it for:
 
 ## Next Best Work
 
-Best next upgrades:
+Future work priority:
 
-- Add daily order limit.
-- Add daily loss limit.
-- Add paper-trade dry-run preview.
+1. Add daily loss limit and daily order limit.
+2. Add paper-trade dry-run preview before committing state changes.
+3. Build simple dashboard from snapshot JSON files.
+
+Reason:
+
+- Daily loss/order limits prevent rogue local loops from creating too many simulated orders.
+- Dry-run preview gives final sanity check before writing fills to SQLite.
+- Dashboard makes paper portfolio debugging easier than terminal-only inspection.
+
+Later:
+
 - Add scan summary table.
-- Build simple dashboard from snapshot JSON files.
