@@ -158,3 +158,34 @@ Reason:
 Later:
 
 - Add scan summary table.
+
+## V2 Keep In Mind
+
+Close trade lifecycle loop:
+
+- Add manage-positions loop for open trades.
+- Trail stop loss behind moving averages or recent pivot lows.
+- Add hard end-of-day exit for intraday positions around 3:55 PM ET.
+- Avoid overnight gap risk for intraday momentum trades.
+
+Harden paper simulation:
+
+- Add strict latency gate between signal data timestamp and local clock.
+- Reject signals older than configured latency limit.
+- Simulate hostile fills with slippage.
+- Deduct fees from portfolio state.
+- Make paper trading prove edge survives friction.
+
+Advanced filters and sizing:
+
+- Add macro/breadth master gate.
+- If SPY or QQQ are bearish daily, block long equity entries.
+- Add ATR-based sizing.
+- Size fewer shares for high-volatility names and more for slow movers.
+
+Observability and developer experience:
+
+- Add push notifications for `GREEN` signals and fills.
+- Prefer Discord or Telegram webhook first.
+- Build local dashboard from existing JSON snapshots.
+- Keep dashboard simple before adding API/service layer.
