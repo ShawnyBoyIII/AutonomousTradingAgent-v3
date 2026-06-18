@@ -21,7 +21,7 @@ V1 is paper-only by default. It does not place live broker orders.
 ## Main Commands
 
 ```bash
-sh ./tradebot-local scan --symbols AAPL,MSFT,SPY,NVDA,QQQ --why
+sh ./tradebot-local scan --symbols AAPL,MSFT,SPY,NVDA,QQQ --why --summary
 sh ./tradebot-local paper-trade --symbols SPY --dry-run
 sh ./tradebot-local paper-trade --symbols SPY
 sh ./tradebot-local backtest --symbols AAPL,MSFT,SPY,NVDA,QQQ --start 2026-05-01 --end 2026-06-17
@@ -57,6 +57,8 @@ Intraday setup:
 - `volume`
 - `volume_avg`
 - `volume_ratio`
+
+`--summary` adds one totals line with symbols, approved, green, yellow, rejected, no-signal, and error counts.
 
 ## Signal Quality
 
@@ -155,10 +157,11 @@ Completed from follow-up priority:
 - Daily loss limit and daily order limit.
 - Paper-trade dry-run preview.
 - Simple static dashboard from snapshot JSON files.
+- Scan summary table.
 
 Future work priority:
 
-1. Add scan summary table.
+1. Keep paper trading stable with real usage feedback.
 
 Reason:
 

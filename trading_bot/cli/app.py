@@ -42,6 +42,11 @@ def scan(
         "--why",
         help="Show the gate values behind each scan decision.",
     ),
+    summary: bool = typer.Option(
+        False,
+        "--summary",
+        help="Print one summary line after scan results.",
+    ),
 ) -> None:
     """Scan the configured universe for trade candidates."""
     from trading_bot.runtime.orchestrator import run_scan
@@ -55,6 +60,8 @@ def scan(
     scan_result = run_scan(parsed_symbols, ctx.obj, include_details=why)
     for result in scan_result["lines"]:
         typer.echo(result)
+    if summary:
+        typer.echo(_format_scan_summary(scan_result["summary"]))
 
 
 @app.command(name="paper-trade")
@@ -310,3 +317,18 @@ def _fetch_latest_prices(symbols: list[str], settings) -> dict[str, float]:
             continue
         prices[symbol] = float(frame.iloc[-1]["close"])
     return prices
+
+
+def _format_scan_summary(summary: dict[str, object]) -> str:
+    return " ".join(
+        [
+            "summary",
+            f"symbols={summary['symbols']}",
+            f"approved={summary['approved']}",
+            f"green={summary['green']}",
+            f"yellow={summary['yellow']}",
+            f"rejected={summary['rejected']}",
+            f"no_signal={summary['no_signal']}",
+            f"errors={summary['errors']}",
+        ]
+    )

@@ -149,21 +149,24 @@ def run_scan(
         reverse=True,
     )
     lines = [value for _, value in approved_results] + other_results
+    summary = {
+        "symbols": len([value for value in symbols if value.strip()]),
+        "approved": sum(1 for row in candidate_rows if row["status"] == "APPROVED"),
+        "green": sum(1 for row in candidate_rows if row.get("quality") == "GREEN"),
+        "yellow": sum(1 for row in candidate_rows if row.get("quality") == "YELLOW"),
+        "rejected": sum(1 for row in candidate_rows if row["status"] == "REJECTED"),
+        "no_signal": sum(1 for row in candidate_rows if row["status"] == "NO_SIGNAL"),
+        "errors": sum(1 for row in candidate_rows if row["status"] == "ERROR"),
+    }
     write_snapshot(
         settings.app.scan_results_path,
         {
             "mode": "scan",
-            "summary": {
-                "symbols": len([value for value in symbols if value.strip()]),
-                "approved": sum(1 for row in candidate_rows if row["status"] == "APPROVED"),
-                "rejected": sum(1 for row in candidate_rows if row["status"] == "REJECTED"),
-                "no_signal": sum(1 for row in candidate_rows if row["status"] == "NO_SIGNAL"),
-                "errors": sum(1 for row in candidate_rows if row["status"] == "ERROR"),
-            },
+            "summary": summary,
             "candidates": candidate_rows,
         },
     )
-    return {"lines": lines, "candidates": candidate_rows}
+    return {"lines": lines, "summary": summary, "candidates": candidate_rows}
 
 
 def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = False) -> list[str]:

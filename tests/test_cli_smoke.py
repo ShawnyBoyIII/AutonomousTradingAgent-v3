@@ -179,13 +179,14 @@ def test_scan_command_sorts_approved_candidates_and_prints_richer_fields(
     runner = CliRunner()
     result = runner.invoke(
         app,
-        ["--config-path", str(config_file), "scan", "--symbols", "MSFT,AAPL"],
+        ["--config-path", str(config_file), "scan", "--symbols", "MSFT,AAPL", "--summary"],
     )
 
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
         "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00 last=101.00 qty=166 rr=2.00 conf=0.90 risk=$199.20 alloc=0.84 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout",
         "MSFT APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00 last=201.00 qty=166 rr=2.00 conf=0.80 risk=$199.20 alloc=1.67 entry=201.00 stop=199.80 target=203.40 reasons=bullish daily regime; intraday breakout",
+        "summary symbols=2 approved=2 green=2 yellow=0 rejected=0 no_signal=0 errors=0",
     ]
     log_text = (tmp_path / "logs" / "decision-log.jsonl").read_text(encoding="utf-8")
     assert '"command": "scan"' in log_text
