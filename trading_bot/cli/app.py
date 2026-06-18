@@ -4,9 +4,10 @@ from pathlib import Path
 import typer
 
 from trading_bot.config.loader import load_settings
+from trading_bot.data.indicators import add_atr
 from trading_bot.execution.paper_broker import PaperBroker
 from trading_bot.models.order import OrderRequest
-from trading_bot.models.portfolio import PortfolioState, Position
+from trading_bot.models.portfolio import PortfolioState
 from trading_bot.portfolio.ledger import PortfolioLedger
 from trading_bot.portfolio.performance import (
     compute_exposure_ratio,
@@ -17,6 +18,7 @@ from trading_bot.reports.exporters import export_csv, export_json
 from trading_bot.reports.summaries import build_daily_summary
 from trading_bot.runtime.decision_log import append_decision_event
 from trading_bot.runtime.snapshots import read_recent_decision_rows, write_snapshot
+from trading_bot.strategy.trailing_stop import next_trailing_stop
 
 app = typer.Typer(help="Paper-trading CLI for stocks and ETFs.")
 
@@ -252,6 +254,37 @@ def manage_positions(ctx: typer.Context) -> None:
                 f"price={fill.fill_price:.2f} cash={state.cash:.2f}"
             )
             continue
+        trail_update = _update_trailing_stop(position, frame, last_price)
+        if trail_update is not None:
+            new_stop, method, new_highest_high, new_initial_risk = trail_update
+            state.positions[ticker] = position.model_copy(
+                update={
+                    "stop_loss": new_stop,
+                    "highest_high": new_highest_high,
+                    "initial_risk": new_initial_risk,
+                }
+            )
+            ledger.save_portfolio_state(state)
+            append_decision_event(
+                log_path,
+                {
+                    "command": "manage-positions",
+                    "ticker": ticker,
+                    "status": "TRAIL",
+                    "method": method,
+                    "old_stop": position.stop_loss,
+                    "new_stop": new_stop,
+                    "last_price": last_price,
+                    "highest_high": new_highest_high,
+                    "initial_risk": new_initial_risk,
+                },
+            )
+            actions += 1
+            lines.append(
+                f"{ticker} TRAIL method={method} stop={new_stop:.2f} "
+                f"last={last_price:.2f} high={new_highest_high:.2f}"
+            )
+            continue
         lines.append(
             f"{ticker} qty={position.quantity} "
             f"avg={position.average_cost:.2f} last={last_price:.2f}"
@@ -436,6 +469,53 @@ def _paper_broker_from_state(state: PortfolioState) -> PaperBroker:
     return broker
 
 
+def _update_trailing_stop(
+    position,
+    frame,
+    last_price: float,
+) -> tuple[float, str, float, float] | None:
+    """Tighten `position.stop_loss` using the latest frame.
+
+    Returns `(new_stop, method, new_highest_high, new_initial_risk)` when
+    the stop ratchets up, otherwise `None` so the caller falls through to
+    the standard open-position line. `new_initial_risk` is locked in on
+    the first call (entry_price - stop_loss) and persisted for future
+    runs so r-multiple math stays stable as the stop moves.
+    """
+    new_highest_high = max(position.highest_high or last_price, last_price)
+
+    new_initial_risk = position.initial_risk
+    if (
+        new_initial_risk is None
+        and position.stop_loss is not None
+        and position.stop_loss < position.average_cost
+    ):
+        new_initial_risk = round(position.average_cost - position.stop_loss, 4)
+
+    atr_value: float | None = None
+    try:
+        atr_frame = add_atr(frame, period=14, column_name="atr_14")
+        atr_series = atr_frame["atr_14"].dropna()
+        if not atr_series.empty:
+            atr_value = float(atr_series.iloc[-1])
+    except (KeyError, ValueError):
+        atr_value = None
+
+    candidate = position.model_copy(
+        update={
+            "highest_high": new_highest_high,
+            "initial_risk": new_initial_risk or position.initial_risk,
+        }
+    )
+    new_stop, method = next_trailing_stop(candidate, last_price, atr_value)
+    if new_stop is None or method is None:
+        return None
+    if position.stop_loss is not None and new_stop <= position.stop_loss:
+        return None
+
+    return new_stop, method, new_highest_high, new_initial_risk or position.initial_risk
+
+
 def _portfolio_state_after_sell(
     previous_state: PortfolioState,
     ticker: str,
@@ -445,13 +525,7 @@ def _portfolio_state_after_sell(
 ) -> PortfolioState:
     exited_position = previous_state.positions[ticker]
     positions = {
-        symbol: Position(
-            ticker=symbol,
-            quantity=quantity,
-            average_cost=previous_state.positions[symbol].average_cost,
-            stop_loss=previous_state.positions[symbol].stop_loss,
-            profit_target=previous_state.positions[symbol].profit_target,
-        )
+        symbol: previous_state.positions[symbol].model_copy(update={"quantity": quantity})
         for symbol, quantity in broker.positions.items()
         if quantity > 0 and symbol in previous_state.positions
     }

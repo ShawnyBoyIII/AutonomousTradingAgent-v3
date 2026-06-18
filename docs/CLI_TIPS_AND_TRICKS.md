@@ -104,7 +104,10 @@ What it does:
 - Checks all open positions.
 - Fills stop-loss exits.
 - Fills profit-target exits.
-- Updates local portfolio state after exits.
+- Ratchets trailing stop up only when price advances (R-multiple and chandelier ATR).
+- Persists `stop_loss`, `highest_high`, and `initial_risk` per position.
+- Logs `TRAIL` events to `logs/decision-log.jsonl`.
+- Updates local portfolio state after exits and trails.
 
 ### 7. View Report
 

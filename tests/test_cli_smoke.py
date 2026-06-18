@@ -1014,6 +1014,212 @@ def test_manage_positions_executes_stop_exit(monkeypatch, tmp_path: Path) -> Non
     assert ledger.list_order_rows()[-1]["side"] == "SELL"
 
 
+def test_manage_positions_trails_stop_up_when_price_advances(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        assert interval == "1d"
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [102.0]})
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=99.0,
+                    profit_target=108.0,
+                )
+            },
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip().splitlines() == [
+        "positions=1 actions=1",
+        "AAPL TRAIL method=r-multiple stop=101.00 last=102.00 high=102.00",
+    ]
+
+    state = PortfolioLedger(db_path).load_portfolio_state()
+    assert state is not None
+    position = state.positions["AAPL"]
+    assert position.stop_loss == 101.0
+    assert position.initial_risk == 1.0
+    assert position.highest_high == 102.0
+
+
+def test_manage_positions_does_not_trail_below_break_even(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        assert interval == "1d"
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [100.5]})
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=99.0,
+                    profit_target=108.0,
+                )
+            },
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip().splitlines() == [
+        "positions=1 actions=0",
+        "AAPL qty=10 avg=100.00 last=100.50",
+    ]
+
+    state = PortfolioLedger(db_path).load_portfolio_state()
+    assert state is not None
+    assert state.positions["AAPL"].stop_loss == 99.0
+    assert state.positions["AAPL"].initial_risk is None
+
+
+def test_manage_positions_trail_is_idempotent_across_runs(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        assert interval == "1d"
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [102.0]})
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=99.0,
+                    profit_target=108.0,
+                )
+            },
+        )
+    )
+    runner = CliRunner()
+
+    first = runner.invoke(app, ["--config-path", str(config_file), "manage-positions"])
+    assert first.exit_code == 0
+    assert "TRAIL method=r-multiple" in first.stdout
+
+    second = runner.invoke(app, ["--config-path", str(config_file), "manage-positions"])
+    assert second.exit_code == 0
+    assert "TRAIL" not in second.stdout
+    assert "AAPL qty=10 avg=100.00 last=102.00" in second.stdout
+
+    state = PortfolioLedger(db_path).load_portfolio_state()
+    assert state is not None
+    assert state.positions["AAPL"].stop_loss == 101.0
+
+
+def test_manage_positions_trails_via_chandelier_atr(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+
+    n_rows = 30
+    rows = []
+    for index in range(n_rows):
+        if index % 2 == 0:
+            close = 101.0
+        else:
+            close = 99.0
+        rows.append({"high": 105.0, "low": 95.0, "close": close, "volume": 1_000_000})
+
+    expected_frame = pd.DataFrame(rows)
+    expected_frame["timestamp"] = pd.to_datetime(
+        [f"2026-06-{day:02d}" for day in range(1, n_rows + 1)]
+    )
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        assert interval == "1d"
+        return expected_frame.copy()
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=80.0,
+                    profit_target=120.0,
+                    highest_high=110.0,
+                )
+            },
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    lines = result.stdout.strip().splitlines()
+    assert lines[0] == "positions=1 actions=1"
+    # ATR is constant 10 across the frame; chandelier = 110 - 1.5 * 10 = 95.
+    assert lines[1] == "AAPL TRAIL method=chandelier-atr stop=95.00 last=99.00 high=110.00"
+
+    state = PortfolioLedger(db_path).load_portfolio_state()
+    assert state is not None
+    position = state.positions["AAPL"]
+    assert position.stop_loss == 95.0
+    assert position.highest_high == 110.0
+    # initial_risk inferred from entry_stop=80 is unchanged on this run since
+    # the ratchet candidate was below breakeven; the value persists for future runs.
+    assert position.initial_risk == 20.0
+
+
 def test_paper_trade_command_prints_rejection_reason(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
 

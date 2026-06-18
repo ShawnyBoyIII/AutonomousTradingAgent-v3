@@ -24,6 +24,18 @@ def add_sma(frame: "pd.DataFrame", period: int = 14, column_name: str | None = N
     return _with_column(frame, column_name or f"sma_{period}", values)
 
 
+def add_atr(frame: "pd.DataFrame", period: int = 14, column_name: str | None = None) -> "pd.DataFrame":
+    required_columns = {"high", "low", "close"}
+    if not required_columns.issubset(frame.columns):
+        raise KeyError("missing required price columns: high, low, close")
+    _validate_period(period)
+    highs = [float(value) for value in frame["high"].tolist()]
+    lows = [float(value) for value in frame["low"].tolist()]
+    closes = [float(value) for value in frame["close"].tolist()]
+    values = _atr_values(highs, lows, closes, period)
+    return _with_column(frame, column_name or f"atr_{period}", values)
+
+
 def _close_prices(frame: "pd.DataFrame") -> list[float]:
     if "close" not in frame.columns:
         raise KeyError("missing required price column: close")
@@ -115,3 +127,33 @@ def _rsi_from_averages(avg_gain: float, avg_loss: float) -> float:
     relative_strength = avg_gain / avg_loss
     value = 100.0 - (100.0 / (1.0 + relative_strength))
     return max(0.0, min(100.0, value))
+
+
+def _atr_values(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    period: int,
+) -> list[float | None]:
+    _validate_period(period)
+    n = len(highs)
+    result: list[float | None] = [None] * n
+    if len(lows) != n or len(closes) != n or n < period + 1:
+        return result
+
+    true_ranges: list[float] = []
+    for index in range(1, n):
+        true_range = max(
+            highs[index] - lows[index],
+            abs(highs[index] - closes[index - 1]),
+            abs(lows[index] - closes[index - 1]),
+        )
+        true_ranges.append(true_range)
+
+    current = sum(true_ranges[:period]) / period
+    result[period] = current
+    for index in range(period, len(true_ranges)):
+        current = (current * (period - 1) + true_ranges[index]) / period
+        result[index + 1] = current
+
+    return result

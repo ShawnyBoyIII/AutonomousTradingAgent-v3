@@ -186,8 +186,9 @@ Close trade lifecycle loop:
 - Single-shot `manage-positions` exists and reports open positions.
 - Single-shot `manage-positions` now executes hard stop and target exits through the paper broker.
 - Each manager run saves updated portfolio state and refreshes `state/portfolio_summary.json`.
+- Single-shot `manage-positions` now ratchets trailing stop up only after stop and target checks pass.
+- Trail stops persist across runs on each `Position` (`stop_loss`, `highest_high`, `initial_risk`).
 - Add continuous `run-manager --interval 60s` only after single-shot exits are stable.
-- Trail stop loss behind moving averages or recent pivot lows.
 - Add hard end-of-day exit for intraday positions around 3:55 PM ET.
 - Avoid overnight gap risk for intraday momentum trades.
 
@@ -206,13 +207,29 @@ Exit order:
 1. Hydrate open positions and latest data.
 2. Trigger EOD liquidation first.
 3. Trigger hard stop or target. Current V2 slice now fills these exits.
-4. Ratchet trailing stop up only.
+4. Ratchet trailing stop up only. Current V2 slice now tightens stops.
 5. Commit sells and state updates.
 
 Trailing stop methods:
 
 - R-multiple ratchet: at `+1R`, move stop to breakeven; at `+1.5R`, move stop to `+0.5R`.
 - Chandelier exit: track highest high since entry and set stop to `highest_high - (1.5 * ATR)`.
+
+Trailing stop implementation:
+
+- `trading_bot/strategy/trailing_stop.py` holds the pure functions:
+  - `ratchet_stop(current_stop, entry_price, last_price, initial_risk)`
+  - `chandelier_stop(highest_high, atr, multiplier=1.5)`
+  - `next_trailing_stop(position, last_price, atr)` returns `(new_stop, method)` where `method` is `r-multiple`, `chandelier-atr`, or `both`; returns `(None, None)` when no tightening is warranted.
+- ATR is Wilder's smoothing via `trading_bot/data/indicators.py:add_atr(period=14)`.
+- `Position` model gained two persisted fields:
+  - `initial_risk` locked in once on the first manage-positions run (`entry_price - stop_loss`) so R-multiple math stays stable as the stop moves up.
+  - `highest_high` tracked monotonically since entry for the chandelier method.
+- `manage-positions` applies trails after stop and target checks:
+  - computes fresh ATR from the daily frame when `high`/`low` are present (skips silently on close-only frames),
+  - picks the tighter of the r-multiple and chandelier candidates,
+  - only writes a new `stop_loss` higher than the current one,
+  - persists the new `Position` and log line `TRAIL method=... stop=... last=... high=...` to `logs/decision-log.jsonl`.
 
 Manager guardrails:
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import pandas as pd
 
-from trading_bot.data.indicators import add_ema, add_rsi, add_sma
+from trading_bot.data.indicators import add_atr, add_ema, add_rsi, add_sma
 from trading_bot.data.market_data import normalize_ohlcv_frame
 
 
@@ -70,3 +70,50 @@ def test_normalize_ohlcv_frame_standardizes_yahoo_columns() -> None:
     ]
     assert result["open"].tolist() == [100.0, 101.0]
     assert result["volume"].tolist() == [1_000_000, 1_100_000]
+
+
+def test_add_atr_creates_expected_column() -> None:
+    frame = pd.DataFrame(
+        {
+            "high":   [105.0, 110.0, 108.0, 115.0, 120.0, 122.0],
+            "low":    [ 95.0, 100.0, 102.0, 108.0, 113.0, 116.0],
+            "close":  [100.0, 105.0, 106.0, 112.0, 118.0, 119.0],
+            "volume": [1e6] * 6,
+        }
+    )
+
+    result = add_atr(frame, period=3, column_name="atr_3")
+
+    assert "atr_3" not in frame.columns
+    assert "atr_3" in result.columns
+    assert result["atr_3"].iloc[:3].isna().all()
+    # First ATR seeds as average of TR[1..3]: max(10,10,0)=10, max(6,3,3)=6, max(7,9,2)=9
+    assert result["atr_3"].iloc[3] == pytest.approx(25.0 / 3.0)
+    # Wilder smoothing on TR[4]=8 and TR[5]=6
+    seed = 25.0 / 3.0
+    expected_4 = (seed * 2 + 8.0) / 3.0
+    expected_5 = (expected_4 * 2 + 6.0) / 3.0
+    assert result["atr_3"].iloc[4] == pytest.approx(expected_4)
+    assert result["atr_3"].iloc[5] == pytest.approx(expected_5)
+
+
+def test_add_atr_returns_all_nan_when_insufficient_history() -> None:
+    frame = pd.DataFrame(
+        {
+            "high":  [105.0, 110.0],
+            "low":   [ 95.0, 100.0],
+            "close": [100.0, 105.0],
+        }
+    )
+
+    result = add_atr(frame, period=3, column_name="atr_3")
+
+    assert "atr_3" in result.columns
+    assert result["atr_3"].isna().all()
+
+
+def test_add_atr_requires_high_low_close() -> None:
+    frame = pd.DataFrame({"close": [100.0, 105.0]})
+
+    with pytest.raises(KeyError):
+        add_atr(frame, period=2)
