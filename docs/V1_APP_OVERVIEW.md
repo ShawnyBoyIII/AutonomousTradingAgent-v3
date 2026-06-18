@@ -188,8 +188,10 @@ Close trade lifecycle loop:
 - Each manager run saves updated portfolio state and refreshes `state/portfolio_summary.json`.
 - Single-shot `manage-positions` now ratchets trailing stop up only after stop and target checks pass.
 - Trail stops persist across runs on each `Position` (`stop_loss`, `highest_high`, `initial_risk`).
+- Single-shot `manage-positions` now liquidates open positions at end-of-day (default 15:55 ET on weekdays).
+- Position entry time persisted on each `Position` as `entry_at` for audit and future lifecycle rules.
+- EOD exit is configurable via the `session:` block (`close_hour`, `close_minute`, `eod_minutes_before_close`, `eod_enabled`).
 - Add continuous `run-manager --interval 60s` only after single-shot exits are stable.
-- Add hard end-of-day exit for intraday positions around 3:55 PM ET.
 - Avoid overnight gap risk for intraday momentum trades.
 
 Position manager blueprint:
@@ -205,10 +207,19 @@ Position manager blueprint:
 Exit order:
 
 1. Hydrate open positions and latest data.
-2. Trigger EOD liquidation first.
+2. Trigger EOD liquidation first. Current V2 slice now fills end-of-day exits.
 3. Trigger hard stop or target. Current V2 slice now fills these exits.
 4. Ratchet trailing stop up only. Current V2 slice now tightens stops.
 5. Commit sells and state updates.
+
+End-of-day liquidation:
+
+- The manager checks `should_eod_exit(now, settings.session)` once per run.
+- Exit fires when current local time (in the configured `app.timezone`) is at or after `close_hour:close_minute - eod_minutes_before_close` on a weekday.
+- Defaults: `close_hour=16`, `close_minute=0`, `eod_minutes_before_close=5` → 15:55 ET, Monday through Friday.
+- Each open position is sold through the `PaperBroker` at the latest daily close, persisted to SQLite, and logged as `FILLED reason=eod` to `logs/decision-log.jsonl`.
+- Set `session.eod_enabled: false` in `config.yaml` to disable; useful for weekend runs or paper-mode debugging.
+- `trading_bot/runtime/session.py` holds the pure `now_in_zone` and `should_eod_exit` helpers so tests can drive the wall clock deterministically.
 
 Trailing stop methods:
 

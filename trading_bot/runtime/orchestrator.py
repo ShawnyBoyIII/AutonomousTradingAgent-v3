@@ -333,6 +333,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 signal,
                 previous_state=state,
                 fill_fees=fill.fees,
+                filled_at=fill.filled_at,
             )
             ledger.save_portfolio_state(updated_state)
             state = updated_state
@@ -514,18 +515,24 @@ def _portfolio_state_from_broker(
     signal,
     previous_state: PortfolioState,
     fill_fees: float,
+    filled_at: datetime | None = None,
 ) -> PortfolioState:
-    positions = {
-        ticker: Position(
+    positions: dict[str, Position] = {}
+    for ticker, quantity in broker.positions.items():
+        if quantity <= 0:
+            continue
+        prior = previous_state.positions.get(ticker)
+        if prior is not None:
+            positions[ticker] = prior.model_copy(update={"quantity": quantity})
+            continue
+        positions[ticker] = Position(
             ticker=ticker,
             quantity=quantity,
             average_cost=signal.entry_price,
             stop_loss=signal.stop_loss,
             profit_target=signal.profit_target,
+            entry_at=filled_at,
         )
-        for ticker, quantity in broker.positions.items()
-        if quantity > 0
-    }
     equity = broker.cash + sum(
         position.quantity * position.average_cost for position in positions.values()
     )

@@ -1220,6 +1220,170 @@ def test_manage_positions_trails_via_chandelier_atr(monkeypatch, tmp_path: Path)
     assert position.initial_risk == 20.0
 
 
+def test_manage_positions_executes_eod_exit(monkeypatch, tmp_path: Path) -> None:
+    import sys
+    import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 15, 56, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(sys.modules["trading_bot.cli.app"], "now_in_zone", fake_now_in_zone)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        assert interval == "1d"
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [105.0]})
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        f"  log_dir: {log_dir}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=90.0,
+                    profit_target=110.0,
+                )
+            },
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip().splitlines() == [
+        "positions=0 actions=1",
+        "AAPL FILLED reason=eod qty=10 price=105.00 cash=10049.00",
+    ]
+
+    ledger = PortfolioLedger(db_path)
+    state = ledger.load_portfolio_state()
+    assert state is not None
+    assert state.cash == 10049.0
+    assert state.realized_pnl == 49.0
+    assert state.positions == {}
+    assert ledger.list_order_rows()[-1]["side"] == "SELL"
+
+    log_text = (log_dir / "decision-log.jsonl").read_text(encoding="utf-8")
+    assert '"reason": "eod"' in log_text
+
+
+def test_manage_positions_eod_check_skips_inside_trading_hours(monkeypatch, tmp_path: Path) -> None:
+    import sys
+    import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 10, 30, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(sys.modules["trading_bot.cli.app"], "now_in_zone", fake_now_in_zone)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        assert interval == "1d"
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [101.0]})
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=80.0,
+                    profit_target=110.0,
+                )
+            },
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    assert "FILLED reason=eod" not in result.stdout
+
+    state = PortfolioLedger(db_path).load_portfolio_state()
+    assert state is not None
+    assert "AAPL" in state.positions
+
+
+def test_manage_positions_eod_can_be_disabled_via_config(monkeypatch, tmp_path: Path) -> None:
+    import sys
+    import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 15, 56, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(sys.modules["trading_bot.cli.app"], "now_in_zone", fake_now_in_zone)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        assert interval == "1d"
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [101.0]})
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        "session:\n"
+        "  eod_enabled: false\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=80.0,
+                    profit_target=110.0,
+                )
+            },
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    assert "FILLED reason=eod" not in result.stdout
+
+    state = PortfolioLedger(db_path).load_portfolio_state()
+    assert state is not None
+    assert "AAPL" in state.positions
+
+
 def test_paper_trade_command_prints_rejection_reason(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
 

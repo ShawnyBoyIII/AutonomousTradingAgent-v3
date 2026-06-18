@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 
@@ -11,6 +13,7 @@ class Position(BaseModel):
     profit_target: float | None = Field(default=None, gt=0.0)
     highest_high: float | None = Field(default=None, gt=0.0)
     initial_risk: float | None = Field(default=None, gt=0.0)
+    entry_at: datetime | None = None
 
 
 class PortfolioState(BaseModel):

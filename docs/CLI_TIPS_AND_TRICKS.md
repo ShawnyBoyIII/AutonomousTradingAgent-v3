@@ -102,11 +102,12 @@ sh ./tradebot-local manage-positions
 What it does:
 
 - Checks all open positions.
+- Liquidates everything at end-of-day (default 15:55 ET weekdays) to avoid overnight gap.
 - Fills stop-loss exits.
 - Fills profit-target exits.
 - Ratchets trailing stop up only when price advances (R-multiple and chandelier ATR).
-- Persists `stop_loss`, `highest_high`, and `initial_risk` per position.
-- Logs `TRAIL` events to `logs/decision-log.jsonl`.
+- Persists `stop_loss`, `highest_high`, `initial_risk`, and `entry_at` per position.
+- Logs `FILLED reason=eod`, `FILLED reason=stop`, `FILLED reason=target`, and `TRAIL` events to `logs/decision-log.jsonl`.
 - Updates local portfolio state after exits and trails.
 
 ### 7. View Report

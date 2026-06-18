@@ -17,6 +17,7 @@ from trading_bot.portfolio.performance import (
 from trading_bot.reports.exporters import export_csv, export_json
 from trading_bot.reports.summaries import build_daily_summary
 from trading_bot.runtime.decision_log import append_decision_event
+from trading_bot.runtime.session import now_in_zone, should_eod_exit
 from trading_bot.runtime.snapshots import read_recent_decision_rows, write_snapshot
 from trading_bot.strategy.trailing_stop import next_trailing_stop
 
@@ -169,6 +170,8 @@ def manage_positions(ctx: typer.Context) -> None:
     state = ledger.ensure_portfolio_state()
     broker = _paper_broker_from_state(state)
     log_path = Path(ctx.obj.app.log_dir) / "decision-log.jsonl"
+    manage_now = now_in_zone(ctx.obj.app.timezone)
+    eod_active = should_eod_exit(manage_now, ctx.obj.session)
     lines: list[str] = []
     actions = 0
     for ticker, position in sorted(state.positions.items()):
@@ -178,6 +181,45 @@ def manage_positions(ctx: typer.Context) -> None:
             "1d",
         )
         last_price = float(frame.iloc[-1]["close"])
+        if eod_active:
+            fill = broker.submit_order(
+                OrderRequest(
+                    ticker=ticker,
+                    side="SELL",
+                    order_type="market",
+                    quantity=position.quantity,
+                    submitted_at=manage_now,
+                ),
+                market_price=last_price,
+            )
+            ledger.record_fill(fill, side="SELL")
+            state = _portfolio_state_after_sell(
+                previous_state=state,
+                ticker=ticker,
+                fill_price=fill.fill_price,
+                fill_fees=fill.fees,
+                broker=broker,
+            )
+            ledger.save_portfolio_state(state)
+            append_decision_event(
+                log_path,
+                {
+                    "command": "manage-positions",
+                    "ticker": ticker,
+                    "status": "FILLED",
+                    "reason": "eod",
+                    "quantity": fill.quantity,
+                    "fill_price": fill.fill_price,
+                    "cash": state.cash,
+                    "managed_at": manage_now.isoformat(),
+                },
+            )
+            actions += 1
+            lines.append(
+                f"{ticker} FILLED reason=eod qty={fill.quantity} "
+                f"price={fill.fill_price:.2f} cash={state.cash:.2f}"
+            )
+            continue
         if position.stop_loss is not None and last_price <= position.stop_loss:
             fill = broker.submit_order(
                 OrderRequest(

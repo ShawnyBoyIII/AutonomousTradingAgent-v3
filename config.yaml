@@ -9,3 +9,8 @@ app:
   backtest_summary_path: state/backtest_summary.json
 risk:
   max_daily_orders: 3
+session:
+  close_hour: 16
+  close_minute: 0
+  eod_minutes_before_close: 5
+  eod_enabled: true

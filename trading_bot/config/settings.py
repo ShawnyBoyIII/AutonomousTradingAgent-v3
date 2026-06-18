@@ -27,7 +27,15 @@ class RiskSettings(BaseModel):
     min_reward_risk_ratio: float = Field(default=2.0, gt=0.0)
 
 
+class SessionSettings(BaseModel):
+    close_hour: int = Field(default=16, ge=0, le=23)
+    close_minute: int = Field(default=0, ge=0, le=59)
+    eod_minutes_before_close: int = Field(default=5, ge=0, le=120)
+    eod_enabled: bool = True
+
+
 class Settings(BaseModel):
     app: AppSettings = Field(default_factory=AppSettings)
     market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)
+    session: SessionSettings = Field(default_factory=SessionSettings)
