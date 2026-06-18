@@ -784,6 +784,63 @@ def test_paper_trade_dry_run_previews_without_persisting(monkeypatch, tmp_path: 
     assert '"status": "DRY_RUN"' in (log_dir / "decision-log.jsonl").read_text(encoding="utf-8")
 
 
+def test_dashboard_command_builds_static_html(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "scan_results.json").write_text(
+        json.dumps(
+            {
+                "mode": "scan",
+                "candidates": [
+                    {
+                        "ticker": "SPY",
+                        "status": "APPROVED",
+                        "quality": "GREEN",
+                        "confidence": 0.8,
+                        "entry": 750.54,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_dir / "portfolio_summary.json").write_text(
+        json.dumps({"summary": {"cash": 10000.0, "equity": 10000.0, "exposure": 0.0}, "positions": []}),
+        encoding="utf-8",
+    )
+    (state_dir / "dashboard_summary.json").write_text(
+        json.dumps({"summary": {"net_pnl": 0.0}, "recent_decisions": []}),
+        encoding="utf-8",
+    )
+    (state_dir / "backtest_summary.json").write_text(
+        json.dumps({"summary": {"trades": 4, "net_pnl": 335.46}}),
+        encoding="utf-8",
+    )
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        "  scan_results_path: state/scan_results.json\n"
+        "  portfolio_summary_path: state/portfolio_summary.json\n"
+        "  dashboard_summary_path: state/dashboard_summary.json\n"
+        "  backtest_summary_path: state/backtest_summary.json\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "dashboard.html"
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "dashboard", "--output", str(output)],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == f"dashboard={output}"
+    html_text = output.read_text(encoding="utf-8")
+    assert "Autonomous Trading Agent" in html_text
+    assert "SPY" in html_text
+    assert "GREEN" in html_text
+    assert "$10,000.00" in html_text
+
+
 def test_paper_trade_command_prints_rejection_reason(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
 

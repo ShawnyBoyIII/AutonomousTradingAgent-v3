@@ -126,6 +126,22 @@ def backtest(
 
 
 @app.command()
+def dashboard(
+    ctx: typer.Context,
+    output: Path = typer.Option(
+        Path("state/dashboard.html"),
+        "--output",
+        help="Path for static HTML dashboard.",
+    ),
+) -> None:
+    """Build a static dashboard from local JSON snapshots."""
+    from trading_bot.runtime.dashboard import build_dashboard
+
+    path = build_dashboard(ctx.obj, output)
+    typer.echo(f"dashboard={path}")
+
+
+@app.command()
 def report(
     ctx: typer.Context,
     json_path: Path | None = typer.Option(

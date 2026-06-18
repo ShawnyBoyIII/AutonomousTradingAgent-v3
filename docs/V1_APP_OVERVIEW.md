@@ -14,6 +14,7 @@ V1 can:
 - Produce local reports.
 - Replay historical data with a simple backtest.
 - Write JSON snapshots for future UI work.
+- Build a static local dashboard from JSON snapshots.
 
 V1 is paper-only by default. It does not place live broker orders.
 
@@ -26,6 +27,7 @@ sh ./tradebot-local paper-trade --symbols SPY
 sh ./tradebot-local backtest --symbols AAPL,MSFT,SPY,NVDA,QQQ --start 2026-05-01 --end 2026-06-17
 sh ./tradebot-local portfolio
 sh ./tradebot-local report
+sh ./tradebot-local dashboard --output state/dashboard.html
 ```
 
 Use `tradebot-local` so the app runs from this repo's `.venv`, not a stale global install.
@@ -152,16 +154,19 @@ Completed from follow-up priority:
 
 - Daily loss limit and daily order limit.
 - Paper-trade dry-run preview.
+- Simple static dashboard from snapshot JSON files.
 
 Future work priority:
 
-1. Build simple dashboard from snapshot JSON files.
+1. Add scan summary table.
 
 Reason:
 
 - Daily loss/order limits prevent rogue local loops from creating too many simulated orders.
 - Dry-run preview gives final sanity check before writing fills to SQLite.
 - Dashboard makes paper portfolio debugging easier than terminal-only inspection.
+
+Open `state/dashboard.html` in a browser after running `dashboard`.
 
 Later:
 
