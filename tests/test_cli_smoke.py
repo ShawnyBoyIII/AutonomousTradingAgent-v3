@@ -26,6 +26,27 @@ def test_cli_shows_help(monkeypatch, capsys) -> None:
     assert "paper-trade" in captured.out
 
 
+def test_doctor_command_reports_local_readiness(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        "  state_db_path: state/trading_bot.db\n"
+        "  log_dir: logs\n"
+        "  scan_results_path: state/scan_results.json\n"
+        "  portfolio_summary_path: state/portfolio_summary.json\n"
+        "  dashboard_summary_path: state/dashboard_summary.json\n"
+        "  backtest_summary_path: state/backtest_summary.json\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "doctor"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == (
+        "doctor live_trading=false state_db=missing log_dir=missing snapshots=0/4"
+    )
+
+
 def test_scan_command_sizes_from_saved_portfolio_state(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
     import trading_bot.runtime.orchestrator as orchestrator

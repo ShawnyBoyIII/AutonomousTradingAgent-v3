@@ -30,6 +30,12 @@ def main(
 
 
 @app.command()
+def doctor(ctx: typer.Context) -> None:
+    """Check local app readiness without fetching market data."""
+    typer.echo(_format_doctor(ctx.obj))
+
+
+@app.command()
 def scan(
     ctx: typer.Context,
     symbols: list[str] = typer.Option(
@@ -332,3 +338,26 @@ def _format_scan_summary(summary: dict[str, object]) -> str:
             f"errors={summary['errors']}",
         ]
     )
+
+
+def _format_doctor(settings) -> str:
+    snapshots = [
+        settings.app.scan_results_path,
+        settings.app.portfolio_summary_path,
+        settings.app.dashboard_summary_path,
+        settings.app.backtest_summary_path,
+    ]
+    ready_snapshots = sum(1 for path in snapshots if Path(path).exists())
+    return " ".join(
+        [
+            "doctor",
+            f"live_trading={str(settings.app.live_trading_enabled).lower()}",
+            f"state_db={_exists_label(settings.app.state_db_path)}",
+            f"log_dir={_exists_label(settings.app.log_dir)}",
+            f"snapshots={ready_snapshots}/{len(snapshots)}",
+        ]
+    )
+
+
+def _exists_label(path: str) -> str:
+    return "ok" if Path(path).exists() else "missing"

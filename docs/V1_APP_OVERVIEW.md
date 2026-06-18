@@ -15,6 +15,7 @@ V1 can:
 - Replay historical data with a simple backtest.
 - Write JSON snapshots for future UI work.
 - Build a static local dashboard from JSON snapshots.
+- Check local readiness without fetching market data.
 
 V1 is paper-only by default. It does not place live broker orders.
 
@@ -28,6 +29,7 @@ sh ./tradebot-local backtest --symbols AAPL,MSFT,SPY,NVDA,QQQ --start 2026-05-01
 sh ./tradebot-local portfolio
 sh ./tradebot-local report
 sh ./tradebot-local dashboard --output state/dashboard.html
+sh ./tradebot-local doctor
 ```
 
 Use `tradebot-local` so the app runs from this repo's `.venv`, not a stale global install.
