@@ -184,7 +184,8 @@ Close trade lifecycle loop:
 
 - Add manage-positions loop for open trades.
 - Single-shot `manage-positions` exists and reports open positions.
-- Single-shot `manage-positions` now detects hard stop and target exits.
+- Single-shot `manage-positions` now executes hard stop and target exits through the paper broker.
+- Each manager run saves updated portfolio state and refreshes `state/portfolio_summary.json`.
 - Add continuous `run-manager --interval 60s` only after single-shot exits are stable.
 - Trail stop loss behind moving averages or recent pivot lows.
 - Add hard end-of-day exit for intraday positions around 3:55 PM ET.
@@ -204,7 +205,7 @@ Exit order:
 
 1. Hydrate open positions and latest data.
 2. Trigger EOD liquidation first.
-3. Trigger hard stop or target. Current V2 slice covers detection only.
+3. Trigger hard stop or target. Current V2 slice now fills these exits.
 4. Ratchet trailing stop up only.
 5. Commit sells and state updates.
 
@@ -240,3 +241,95 @@ Observability and developer experience:
 - Prefer Discord or Telegram webhook first.
 - Build local dashboard from existing JSON snapshots.
 - Keep dashboard simple before adding API/service layer.
+
+## V3 And V4 Roadmap
+
+Robinhood agentic integration fits later, not in V1 or V2.
+
+Why:
+
+- Live execution changes the risk profile of the app.
+- Robinhood Agentic Trading uses a dedicated agentic account and Trading MCP flow.
+- Robinhood exposes useful review, account, portfolio, market data, and order tools, so we can stage this safely.
+
+V3 goal: shadow integration, no live order placement.
+
+V3 checklist:
+
+- Add broker abstraction only where needed for one external broker path.
+- Add Robinhood connector config with credentials stored outside git.
+- Add read-only account sync for accounts, buying power, positions, and recent orders.
+- Add market data parity checks between local feed and broker-visible quotes.
+- Add symbol tradability check before any live-intent workflow.
+- Add order preview path that mirrors broker-side review before submit.
+- Add shadow mode that logs "would place order" without placing it.
+- Add explicit kill switch that blocks any accidental submit path.
+- Add audit log rows for broker sync, preview, and shadow decisions.
+- Add operator command(s) for account sync, broker health, and preview checks.
+- Keep user approval/manual review as the default operating mode.
+
+V4 goal: guarded live execution through broker review plus submit.
+
+V4 checklist:
+
+- Support broker-side order review before every live equity order.
+- Support live equity order placement only after review passes.
+- Support cancel-open-order flow.
+- Require manual approval by default before submit.
+- Add optional supervised auto-submit mode only after manual mode is stable.
+- Reuse daily loss limit, daily order limit, stale-data gate, and duplicate-position blocks for live mode.
+- Add live-only max notional and max position caps.
+- Add emergency stop command that disables further submits immediately.
+- Add order-status reconciliation so local state matches broker state after fills, partial fills, rejects, or cancels.
+- Add startup safety check that refuses live mode if account sync is stale.
+- Keep options out of scope until equities path is proven stable.
+
+Suggested sequence:
+
+1. Finish V2 position management and paper realism.
+2. Build autonomous scouting for a small-cap-first universe.
+3. Add Discord or Telegram alerts on top of scouting and fills.
+4. Build V3 read-only broker sync and shadow mode.
+5. Run shadow mode for a while and compare decisions against paper flow.
+6. Add V4 manual-approval live execution.
+7. Only then consider supervised automation.
+
+## Autonomous Scouting Track
+
+Target behavior:
+
+- The app should scout markets on its own.
+- The first focus should be U.S. small-cap names, not broad mega-cap-only scanning.
+- The app should suggest candidates, not blindly auto-buy them.
+
+Small-cap-first V3 scouting checklist:
+
+- Add a maintained universe file under local state for tradable symbols.
+- Start with U.S. listed common stocks and exclude ETFs, funds, warrants, and OTC names in the first slice.
+- Add a small-cap segment filter using market-cap bounds.
+- Add liquidity filter using average dollar volume so suggestions stay tradable.
+- Add price floor to avoid ultra-low-priced names in the first slice.
+- Refresh the universe on a schedule instead of hardcoding symbol lists.
+- Add a command to rebuild the universe locally.
+- Add a command to scan the saved universe without passing `--symbols`.
+- Rank candidates by signal quality, freshness, relative volume, and risk/reward.
+- Save the top candidates into the existing scan snapshot for dashboard and alerts.
+- Keep the first version long-only and U.S.-only.
+
+Suggested first small-cap profile:
+
+- Market cap roughly `$50M` to `$2B`.
+- Price above `$2`.
+- Minimum average dollar volume threshold so fills are realistic.
+- Exclude OTC in the first version.
+
+Alerts checklist:
+
+- Add outbound webhook notifier with no extra service.
+- Start with Discord webhook support first because it is dead simple.
+- Add Telegram bot support right after Discord.
+- Send alerts for new `GREEN` candidates from autonomous scans.
+- Send alerts for paper fills, stop exits, target exits, and risk-limit blocks.
+- Add a daily market-summary alert with top candidates and portfolio state.
+- Add a test-alert command so operators can validate webhooks quickly.
+- Keep alerts one-way at first; no chat commands or bot control surface yet.

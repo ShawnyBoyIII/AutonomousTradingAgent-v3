@@ -916,7 +916,7 @@ def test_manage_positions_reports_open_position_price(monkeypatch, tmp_path: Pat
     ]
 
 
-def test_manage_positions_reports_target_exit(monkeypatch, tmp_path: Path) -> None:
+def test_manage_positions_executes_target_exit(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
 
     def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
@@ -952,12 +952,20 @@ def test_manage_positions_reports_target_exit(monkeypatch, tmp_path: Path) -> No
 
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
-        "positions=1 actions=1",
-        "AAPL EXIT reason=target last=110.00 target=108.00",
+        "positions=0 actions=1",
+        "AAPL FILLED reason=target qty=10 price=110.00 cash=10099.00",
     ]
 
+    ledger = PortfolioLedger(db_path)
+    state = ledger.load_portfolio_state()
+    assert state is not None
+    assert state.cash == 10099.0
+    assert state.realized_pnl == 99.0
+    assert state.positions == {}
+    assert ledger.list_order_rows()[-1]["side"] == "SELL"
 
-def test_manage_positions_reports_stop_exit(monkeypatch, tmp_path: Path) -> None:
+
+def test_manage_positions_executes_stop_exit(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
 
     def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
@@ -993,9 +1001,17 @@ def test_manage_positions_reports_stop_exit(monkeypatch, tmp_path: Path) -> None
 
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
-        "positions=1 actions=1",
-        "AAPL EXIT reason=stop last=97.50 stop=99.00",
+        "positions=0 actions=1",
+        "AAPL FILLED reason=stop qty=10 price=97.50 cash=9974.00",
     ]
+
+    ledger = PortfolioLedger(db_path)
+    state = ledger.load_portfolio_state()
+    assert state is not None
+    assert state.cash == 9974.0
+    assert state.realized_pnl == -26.0
+    assert state.positions == {}
+    assert ledger.list_order_rows()[-1]["side"] == "SELL"
 
 
 def test_paper_trade_command_prints_rejection_reason(monkeypatch, tmp_path: Path) -> None:
@@ -1411,7 +1427,15 @@ def test_backtest_command_replays_data_and_prints_summary(monkeypatch, tmp_path:
     assert snapshot["rows"][0]["ticker"] == "AAPL"
 
 
-def test_report_command_reflects_paper_trade_fees(tmp_path: Path) -> None:
+def test_report_command_reflects_paper_trade_fees(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        assert interval == "1d"
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [101.0]})
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
     config_file = tmp_path / "config.yaml"
     db_path = tmp_path / "state.db"
     config_file.write_text(

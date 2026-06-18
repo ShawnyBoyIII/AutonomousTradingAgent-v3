@@ -1,9 +1,12 @@
+from datetime import datetime
 from pathlib import Path
 
 import typer
 
 from trading_bot.config.loader import load_settings
-from trading_bot.models.portfolio import PortfolioState
+from trading_bot.execution.paper_broker import PaperBroker
+from trading_bot.models.order import OrderRequest
+from trading_bot.models.portfolio import PortfolioState, Position
 from trading_bot.portfolio.ledger import PortfolioLedger
 from trading_bot.portfolio.performance import (
     compute_exposure_ratio,
@@ -12,6 +15,7 @@ from trading_bot.portfolio.performance import (
 )
 from trading_bot.reports.exporters import export_csv, export_json
 from trading_bot.reports.summaries import build_daily_summary
+from trading_bot.runtime.decision_log import append_decision_event
 from trading_bot.runtime.snapshots import read_recent_decision_rows, write_snapshot
 
 app = typer.Typer(help="Paper-trading CLI for stocks and ETFs.")
@@ -161,6 +165,8 @@ def manage_positions(ctx: typer.Context) -> None:
 
     ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
     state = ledger.ensure_portfolio_state()
+    broker = _paper_broker_from_state(state)
+    log_path = Path(ctx.obj.app.log_dir) / "decision-log.jsonl"
     lines: list[str] = []
     actions = 0
     for ticker, position in sorted(state.positions.items()):
@@ -171,15 +177,79 @@ def manage_positions(ctx: typer.Context) -> None:
         )
         last_price = float(frame.iloc[-1]["close"])
         if position.stop_loss is not None and last_price <= position.stop_loss:
+            fill = broker.submit_order(
+                OrderRequest(
+                    ticker=ticker,
+                    side="SELL",
+                    order_type="market",
+                    quantity=position.quantity,
+                    submitted_at=datetime.now(),
+                ),
+                market_price=last_price,
+            )
+            ledger.record_fill(fill, side="SELL")
+            state = _portfolio_state_after_sell(
+                previous_state=state,
+                ticker=ticker,
+                fill_price=fill.fill_price,
+                fill_fees=fill.fees,
+                broker=broker,
+            )
+            ledger.save_portfolio_state(state)
+            append_decision_event(
+                log_path,
+                {
+                    "command": "manage-positions",
+                    "ticker": ticker,
+                    "status": "FILLED",
+                    "reason": "stop",
+                    "quantity": fill.quantity,
+                    "fill_price": fill.fill_price,
+                    "cash": state.cash,
+                },
+            )
             actions += 1
             lines.append(
-                f"{ticker} EXIT reason=stop last={last_price:.2f} stop={position.stop_loss:.2f}"
+                f"{ticker} FILLED reason=stop qty={fill.quantity} "
+                f"price={fill.fill_price:.2f} cash={state.cash:.2f}"
             )
             continue
         if position.profit_target is not None and last_price >= position.profit_target:
+            fill = broker.submit_order(
+                OrderRequest(
+                    ticker=ticker,
+                    side="SELL",
+                    order_type="market",
+                    quantity=position.quantity,
+                    submitted_at=datetime.now(),
+                ),
+                market_price=last_price,
+            )
+            ledger.record_fill(fill, side="SELL")
+            state = _portfolio_state_after_sell(
+                previous_state=state,
+                ticker=ticker,
+                fill_price=fill.fill_price,
+                fill_fees=fill.fees,
+                broker=broker,
+            )
+            ledger.save_portfolio_state(state)
+            append_decision_event(
+                log_path,
+                {
+                    "command": "manage-positions",
+                    "ticker": ticker,
+                    "status": "FILLED",
+                    "reason": "target",
+                    "quantity": fill.quantity,
+                    "fill_price": fill.fill_price,
+                    "cash": state.cash,
+                },
+            )
             actions += 1
             lines.append(
-                f"{ticker} EXIT reason=target last={last_price:.2f} target={position.profit_target:.2f}"
+                f"{ticker} FILLED reason=target qty={fill.quantity} "
+                f"price={fill.fill_price:.2f} cash={state.cash:.2f}"
             )
             continue
         lines.append(
@@ -189,6 +259,22 @@ def manage_positions(ctx: typer.Context) -> None:
     typer.echo(f"positions={len(state.positions)} actions={actions}")
     for line in lines:
         typer.echo(line)
+    portfolio_view = _build_portfolio_view(state, ctx.obj)
+    write_snapshot(
+        ctx.obj.app.portfolio_summary_path,
+        {
+            "mode": "portfolio",
+            "summary": {
+                "cash": round(state.cash, 2),
+                "equity": portfolio_view["equity"],
+                "realized_pnl": round(state.realized_pnl, 2),
+                "unrealized_pnl": portfolio_view["unrealized_pnl"],
+                "exposure": portfolio_view["exposure"],
+                "positions": len(state.positions),
+            },
+            "positions": portfolio_view["positions"],
+        },
+    )
 
 
 @app.command()
@@ -338,6 +424,50 @@ def _build_portfolio_view(state: PortfolioState, settings) -> dict[str, object]:
         "exposure": round(compute_exposure_ratio(total_market_value, equity), 2),
         "positions": position_rows,
     }
+
+
+def _paper_broker_from_state(state: PortfolioState) -> PaperBroker:
+    broker = PaperBroker(starting_cash=state.cash, fee_per_order=1.0, slippage_bps=0)
+    broker.positions = {
+        ticker: position.quantity
+        for ticker, position in state.positions.items()
+        if position.quantity > 0
+    }
+    return broker
+
+
+def _portfolio_state_after_sell(
+    previous_state: PortfolioState,
+    ticker: str,
+    fill_price: float,
+    fill_fees: float,
+    broker: PaperBroker,
+) -> PortfolioState:
+    exited_position = previous_state.positions[ticker]
+    positions = {
+        symbol: Position(
+            ticker=symbol,
+            quantity=quantity,
+            average_cost=previous_state.positions[symbol].average_cost,
+            stop_loss=previous_state.positions[symbol].stop_loss,
+            profit_target=previous_state.positions[symbol].profit_target,
+        )
+        for symbol, quantity in broker.positions.items()
+        if quantity > 0 and symbol in previous_state.positions
+    }
+    realized_delta = (
+        (fill_price - exited_position.average_cost) * exited_position.quantity
+    ) - fill_fees
+    equity = broker.cash + sum(
+        position.quantity * position.average_cost for position in positions.values()
+    )
+    return PortfolioState(
+        cash=round(broker.cash, 2),
+        equity=round(equity, 2),
+        positions=positions,
+        realized_pnl=round(previous_state.realized_pnl + realized_delta, 2),
+        unrealized_pnl=0.0,
+    )
 
 
 def _fetch_latest_prices(symbols: list[str], settings) -> dict[str, float]:
