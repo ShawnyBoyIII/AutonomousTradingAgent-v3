@@ -725,6 +725,8 @@ def test_paper_trade_command_executes_fill_and_persists_state(monkeypatch, tmp_p
     assert state.equity == 19999.0
     assert state.positions["AAPL"].quantity == 166
     assert state.positions["AAPL"].average_cost == 101.0
+    assert state.positions["AAPL"].stop_loss == 99.8
+    assert state.positions["AAPL"].profit_target == 103.4
 
     rows = ledger.list_order_rows()
     assert len(rows) == 1
@@ -911,6 +913,88 @@ def test_manage_positions_reports_open_position_price(monkeypatch, tmp_path: Pat
     assert result.stdout.strip().splitlines() == [
         "positions=1 actions=0",
         "AAPL qty=10 avg=100.00 last=110.00",
+    ]
+
+
+def test_manage_positions_reports_target_exit(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        assert interval == "1d"
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [110.0]})
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=98.0,
+                    profit_target=108.0,
+                )
+            },
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip().splitlines() == [
+        "positions=1 actions=1",
+        "AAPL EXIT reason=target last=110.00 target=108.00",
+    ]
+
+
+def test_manage_positions_reports_stop_exit(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        assert interval == "1d"
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [97.5]})
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=99.0,
+                    profit_target=108.0,
+                )
+            },
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip().splitlines() == [
+        "positions=1 actions=1",
+        "AAPL EXIT reason=stop last=97.50 stop=99.00",
     ]
 
 

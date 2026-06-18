@@ -184,6 +184,7 @@ Close trade lifecycle loop:
 
 - Add manage-positions loop for open trades.
 - Single-shot `manage-positions` exists and reports open positions.
+- Single-shot `manage-positions` now detects hard stop and target exits.
 - Add continuous `run-manager --interval 60s` only after single-shot exits are stable.
 - Trail stop loss behind moving averages or recent pivot lows.
 - Add hard end-of-day exit for intraday positions around 3:55 PM ET.
@@ -203,7 +204,7 @@ Exit order:
 
 1. Hydrate open positions and latest data.
 2. Trigger EOD liquidation first.
-3. Trigger hard stop or target.
+3. Trigger hard stop or target. Current V2 slice covers detection only.
 4. Ratchet trailing stop up only.
 5. Commit sells and state updates.
 

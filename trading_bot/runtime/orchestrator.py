@@ -520,6 +520,8 @@ def _portfolio_state_from_broker(
             ticker=ticker,
             quantity=quantity,
             average_cost=signal.entry_price,
+            stop_loss=signal.stop_loss,
+            profit_target=signal.profit_target,
         )
         for ticker, quantity in broker.positions.items()
         if quantity > 0

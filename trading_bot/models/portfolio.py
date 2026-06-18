@@ -7,6 +7,8 @@ class Position(BaseModel):
     ticker: str
     quantity: int = Field(ge=0)
     average_cost: float = Field(gt=0.0)
+    stop_loss: float | None = Field(default=None, gt=0.0)
+    profit_target: float | None = Field(default=None, gt=0.0)
 
 
 class PortfolioState(BaseModel):

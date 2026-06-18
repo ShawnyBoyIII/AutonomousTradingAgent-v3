@@ -161,7 +161,8 @@ def manage_positions(ctx: typer.Context) -> None:
 
     ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
     state = ledger.ensure_portfolio_state()
-    typer.echo(f"positions={len(state.positions)} actions=0")
+    lines: list[str] = []
+    actions = 0
     for ticker, position in sorted(state.positions.items()):
         frame = market_data.fetch_bars(
             ticker,
@@ -169,10 +170,25 @@ def manage_positions(ctx: typer.Context) -> None:
             "1d",
         )
         last_price = float(frame.iloc[-1]["close"])
-        typer.echo(
+        if position.stop_loss is not None and last_price <= position.stop_loss:
+            actions += 1
+            lines.append(
+                f"{ticker} EXIT reason=stop last={last_price:.2f} stop={position.stop_loss:.2f}"
+            )
+            continue
+        if position.profit_target is not None and last_price >= position.profit_target:
+            actions += 1
+            lines.append(
+                f"{ticker} EXIT reason=target last={last_price:.2f} target={position.profit_target:.2f}"
+            )
+            continue
+        lines.append(
             f"{ticker} qty={position.quantity} "
             f"avg={position.average_cost:.2f} last={last_price:.2f}"
         )
+    typer.echo(f"positions={len(state.positions)} actions={actions}")
+    for line in lines:
+        typer.echo(line)
 
 
 @app.command()
