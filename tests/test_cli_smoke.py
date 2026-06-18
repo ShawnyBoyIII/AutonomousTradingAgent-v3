@@ -714,6 +714,76 @@ def test_paper_trade_command_executes_fill_and_persists_state(monkeypatch, tmp_p
     assert '"status": "FILLED"' in log_text
 
 
+def test_paper_trade_dry_run_previews_without_persisting(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+    import trading_bot.runtime.orchestrator as orchestrator
+
+    daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=60, freq="D"),
+            "open": [100.0 + index for index in range(60)],
+            "high": [101.0 + index for index in range(60)],
+            "low": [99.0 + index for index in range(60)],
+            "close": [100.0 + index for index in range(60)],
+            "volume": [1_000_000 for _ in range(60)],
+        }
+    )
+    intraday = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2026-06-13 10:00:00",
+                    "2026-06-13 10:05:00",
+                    "2026-06-13 10:10:00",
+                    "2026-06-13 10:15:00",
+                    "2026-06-13 10:20:00",
+                ]
+            ),
+            "open": [99.9, 100.1, 100.0, 100.2, 100.5],
+            "high": [100.1, 100.3, 100.2, 100.4, 101.1],
+            "low": [99.8, 100.0, 99.9, 100.1, 100.4],
+            "close": [100.0, 100.2, 100.1, 100.3, 101.0],
+            "volume": [1000, 1100, 950, 1050, 2500],
+        }
+    )
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    monkeypatch.setattr(
+        orchestrator,
+        "_scan_now",
+        lambda signal_timestamp: datetime(2026, 6, 13, 10, 25, 0, tzinfo=signal_timestamp.tzinfo),
+    )
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        f"  log_dir: {log_dir}\n",
+        encoding="utf-8",
+    )
+    ledger = PortfolioLedger(db_path)
+    ledger.save_portfolio_state(PortfolioState(cash=20_000.0, equity=20_000.0))
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "paper-trade", "--symbols", "AAPL", "--dry-run"],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "AAPL DRY_RUN qty=166 price=101.00 cash_after=3233.00"
+    state = ledger.load_portfolio_state()
+    assert state is not None
+    assert state.cash == 20_000.0
+    assert state.positions == {}
+    assert ledger.list_order_rows() == []
+    assert '"status": "DRY_RUN"' in (log_dir / "decision-log.jsonl").read_text(encoding="utf-8")
+
+
 def test_paper_trade_command_prints_rejection_reason(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
 

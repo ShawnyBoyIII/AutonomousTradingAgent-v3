@@ -65,6 +65,11 @@ def paper_trade(
         "--symbols",
         help="Symbols to trade in paper mode.",
     ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Preview paper trades without writing fills or portfolio state.",
+    ),
 ) -> None:
     """Run the paper-trading loop."""
     from trading_bot.runtime.orchestrator import run_paper_trade
@@ -75,7 +80,7 @@ def paper_trade(
             symbol.strip() for symbol in raw_value.split(",") if symbol.strip()
         )
 
-    for result in run_paper_trade(parsed_symbols, ctx.obj):
+    for result in run_paper_trade(parsed_symbols, ctx.obj, dry_run=dry_run):
         typer.echo(result)
 
 

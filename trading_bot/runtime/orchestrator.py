@@ -166,7 +166,7 @@ def run_scan(
     return {"lines": lines, "candidates": candidate_rows}
 
 
-def run_paper_trade(symbols: list[str], settings: Settings) -> list[str]:
+def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = False) -> list[str]:
     ledger = PortfolioLedger(Path(settings.app.state_db_path))
     state = ledger.ensure_portfolio_state()
     broker = PaperBroker(starting_cash=state.cash, fee_per_order=1.0, slippage_bps=0)
@@ -284,6 +284,24 @@ def run_paper_trade(symbols: list[str], settings: Settings) -> list[str]:
                     },
                 )
                 results.append(f"{symbol} REJECTED insufficient cash")
+                continue
+
+            if dry_run:
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "paper-trade",
+                        "ticker": symbol,
+                        "status": "DRY_RUN",
+                        "quantity": decision.position_size,
+                        "fill_price": signal.entry_price,
+                        "cash_after": broker.cash - estimated_total_cost,
+                    },
+                )
+                results.append(
+                    f"{symbol} DRY_RUN qty={decision.position_size} "
+                    f"price={signal.entry_price:.2f} cash_after={broker.cash - estimated_total_cost:.2f}"
+                )
                 continue
 
             fill = submit_signal_as_order(

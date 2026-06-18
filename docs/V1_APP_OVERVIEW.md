@@ -21,6 +21,7 @@ V1 is paper-only by default. It does not place live broker orders.
 
 ```bash
 sh ./tradebot-local scan --symbols AAPL,MSFT,SPY,NVDA,QQQ --why
+sh ./tradebot-local paper-trade --symbols SPY --dry-run
 sh ./tradebot-local paper-trade --symbols SPY
 sh ./tradebot-local backtest --symbols AAPL,MSFT,SPY,NVDA,QQQ --start 2026-05-01 --end 2026-06-17
 sh ./tradebot-local portfolio
@@ -72,6 +73,8 @@ Approved signals get quality label.
 ## Paper Trading Guardrails
 
 Paper trading is stricter than scan.
+
+Use `--dry-run` to preview a fill without writing orders or portfolio state.
 
 Paper trade rejects:
 
@@ -148,11 +151,11 @@ Do not use it for:
 Completed from follow-up priority:
 
 - Daily loss limit and daily order limit.
+- Paper-trade dry-run preview.
 
 Future work priority:
 
-1. Add paper-trade dry-run preview before committing state changes.
-2. Build simple dashboard from snapshot JSON files.
+1. Build simple dashboard from snapshot JSON files.
 
 Reason:
 
