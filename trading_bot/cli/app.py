@@ -154,6 +154,27 @@ def dashboard(
     typer.echo(f"dashboard={path}")
 
 
+@app.command(name="manage-positions")
+def manage_positions(ctx: typer.Context) -> None:
+    """Run one position-management check."""
+    from trading_bot.data import market_data
+
+    ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
+    state = ledger.ensure_portfolio_state()
+    typer.echo(f"positions={len(state.positions)} actions=0")
+    for ticker, position in sorted(state.positions.items()):
+        frame = market_data.fetch_bars(
+            ticker,
+            ctx.obj.market_data.daily_period,
+            "1d",
+        )
+        last_price = float(frame.iloc[-1]["close"])
+        typer.echo(
+            f"{ticker} qty={position.quantity} "
+            f"avg={position.average_cost:.2f} last={last_price:.2f}"
+        )
+
+
 @app.command()
 def report(
     ctx: typer.Context,

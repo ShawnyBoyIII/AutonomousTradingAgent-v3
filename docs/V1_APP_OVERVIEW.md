@@ -30,6 +30,7 @@ sh ./tradebot-local portfolio
 sh ./tradebot-local report
 sh ./tradebot-local dashboard --output state/dashboard.html
 sh ./tradebot-local doctor
+sh ./tradebot-local manage-positions
 ```
 
 Use `tradebot-local` so the app runs from this repo's `.venv`, not a stale global install.
@@ -182,7 +183,8 @@ Later:
 Close trade lifecycle loop:
 
 - Add manage-positions loop for open trades.
-- Start with single-shot `manage-positions`; add continuous `run-manager --interval 60s` only after single-shot is stable.
+- Single-shot `manage-positions` exists and reports open positions.
+- Add continuous `run-manager --interval 60s` only after single-shot exits are stable.
 - Trail stop loss behind moving averages or recent pivot lows.
 - Add hard end-of-day exit for intraday positions around 3:55 PM ET.
 - Avoid overnight gap risk for intraday momentum trades.
