@@ -501,3 +501,206 @@ def run_walk_forward(
         "net_pnl": round(all_net_pnl, 2),
         "windows": window_results,
     }
+
+
+def run_rl_backtest(
+    symbols: list[str],
+    settings: Settings,
+    start: str | None = None,
+    end: str | None = None,
+    model_path: str | None = None,
+) -> dict[str, float | int | list[dict[str, float | int | str | None]]]:
+    """Run backtest using RL agent inference on pre-loaded market data.
+
+    Requires a trained RL model. The agent predicts actions (buy/sell/hold)
+    for each bar based on technical indicators and portfolio state.
+
+    Args:
+        symbols: List of ticker symbols to backtest
+        settings: Application settings
+        start: Inclusive start date (YYYY-MM-DD)
+        end: Inclusive end date (YYYY-MM-DD)
+        model_path: Path to trained RL model (uses config if None)
+
+    Returns:
+        Summary dict with trades, wins, losses, net_pnl, rows
+    """
+    from trading_bot.rl.backtest import RLBacktestConfig, RLBacktestRunner
+
+    trades = 0
+    wins = 0
+    losses = 0
+    net_pnl = 0.0
+    rows: list[dict[str, float | int | str | None]] = []
+    log_path = Path(settings.app.log_dir) / "decision-log.jsonl"
+
+    rl_config = RLBacktestConfig(
+        model_path=model_path or getattr(settings.rl, "model_path", None) if hasattr(settings, "rl") else None,
+        symbols=symbols,
+        starting_cash=10_000.0,
+        fee_per_order=settings.paper.fee_per_order,
+        slippage_bps=settings.paper.slippage_bps,
+    )
+
+    runner = RLBacktestRunner(config=rl_config)
+
+    if rl_config.model_path:
+        runner.load_model()
+    else:
+        print("Warning: No RL model path specified. Setting to dummy for testing.")
+        runner.set_model(None)
+
+    for symbol in (value.strip() for value in symbols if value.strip()):
+        daily_frame = market_data.fetch_bars(
+            symbol,
+            settings.market_data.daily_period,
+            "1d",
+            start=start,
+            end=end,
+        )
+        try:
+            intraday_frame = market_data.fetch_bars(
+                symbol,
+                settings.market_data.intraday_period,
+                settings.market_data.intraday_interval,
+                start=start,
+                end=end,
+            )
+        except ValueError:
+            try:
+                intraday_frame = market_data.fetch_bars(
+                    symbol, "1y", "1h", start=start, end=end
+                )
+                print(f"Note: Using 1h data for {symbol} (5m unavailable for date range)")
+            except ValueError:
+                intraday_frame = daily_frame.copy()
+                print(f"Note: Using daily bars for {symbol} (intraday unavailable)")
+
+        intraday_frame = _filter_frame_by_date(intraday_frame, start=start, end=end)
+
+        if len(intraday_frame) < 15:
+            continue
+
+        result = runner.run_backtest(symbol, daily_frame, intraday_frame)
+        trades += result["trades"]
+        wins += result["wins"]
+        losses += result["losses"]
+        net_pnl += result["net_pnl"]
+        rows.append({
+            "ticker": symbol,
+            "trades": result["trades"],
+            "wins": result["wins"],
+            "losses": result["losses"],
+            "net_pnl": result["net_pnl"],
+            "start": start,
+            "end": end,
+            "strategy": "rl",
+        })
+        append_decision_event(
+            log_path,
+            {
+                "command": "backtest",
+                "ticker": symbol,
+                "strategy": "rl",
+                "trades": result["trades"],
+                "wins": result["wins"],
+                "losses": result["losses"],
+                "net_pnl": result["net_pnl"],
+                "start": start,
+                "end": end,
+            },
+        )
+
+    summary = {
+        "trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": 0.0 if trades == 0 else wins / trades,
+        "net_pnl": round(net_pnl, 2),
+        "rows": rows,
+        "strategy": "rl",
+    }
+    write_snapshot(
+        settings.app.backtest_summary_path,
+        {
+            "mode": "backtest",
+            "strategy": "rl",
+            "summary": {
+                "trades": summary["trades"],
+                "wins": summary["wins"],
+                "losses": summary["losses"],
+                "win_rate": summary["win_rate"],
+                "net_pnl": summary["net_pnl"],
+            },
+            "rows": rows,
+        },
+    )
+    return summary
+
+
+def run_strategy_comparison(
+    symbols: list[str],
+    settings: Settings,
+    start: str | None = None,
+    end: str | None = None,
+    strategies: list[str] | None = None,
+) -> dict[str, Any]:
+    """Run backtest across multiple strategies and compare results.
+
+    Compares rule-based strategies (v2.5, v3) against RL agent inference.
+
+    Args:
+        symbols: List of ticker symbols to backtest
+        settings: Application settings
+        start: Inclusive start date (YYYY-MM-DD)
+        end: Inclusive end date (YYYY-MM-DD)
+        strategies: List of strategies to compare (default: all available)
+
+    Returns:
+        Dict with per-strategy results and aggregated comparison
+    """
+    if strategies is None:
+        strategies = []
+        if getattr(settings, "strategy", None) is not None and settings.strategy.use_v3_signals:
+            strategies.append("v3")
+        strategies.append("v2.5")
+        if getattr(settings, "rl", None) is not None and settings.rl.enabled:
+            strategies.append("rl")
+        if not strategies:
+            strategies = ["v2.5"]
+
+    results: dict[str, dict[str, Any]] = {}
+
+    for strategy in strategies:
+        print(f"Running {strategy} backtest...")
+        if strategy == "rl":
+            result = run_rl_backtest(symbols, settings, start=start, end=end)
+        else:
+            result = run_backtest(symbols, settings, start=start, end=end)
+            result["strategy"] = strategy
+        results[strategy] = result
+
+    comparison = {
+        "symbols": symbols,
+        "start": start,
+        "end": end,
+        "strategies": strategies,
+        "results": results,
+        "summary": {},
+    }
+
+    for strategy, result in results.items():
+        comparison["summary"][strategy] = {
+            "trades": result.get("trades", 0),
+            "wins": result.get("wins", 0),
+            "losses": result.get("losses", 0),
+            "win_rate": result.get("win_rate", 0.0),
+            "net_pnl": result.get("net_pnl", 0.0),
+        }
+
+    best_pnl = max(comparison["summary"].items(), key=lambda x: x[1]["net_pnl"])
+    best_winrate = max(comparison["summary"].items(), key=lambda x: x[1]["win_rate"])
+    comparison["best_pnl_strategy"] = best_pnl[0]
+    comparison["best_winrate_strategy"] = best_winrate[0]
+
+    return comparison

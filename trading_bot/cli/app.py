@@ -318,18 +318,30 @@ def backtest(
         min=2,
         help="Number of sequential windows for walk-forward.",
     ),
+    strategy: str = typer.Option(
+        None,
+        "--strategy",
+        help="Strategy to use: v2.5, v3, or rl.",
+    ),
+    compare: bool = typer.Option(
+        False,
+        "--compare",
+        help="Compare all available strategies.",
+    ),
 ) -> None:
     """Replay historical data for a strategy.
 
     Use --walk-forward to split the date range into N sequential windows
     and run an independent backtest on each. Consistent performance across
     all windows = robust strategy. High variance = fragile / overfit.
-    """
-    from trading_bot.backtest.runner import run_backtest, run_walk_forward
 
+    Use --strategy to select v2.5, v3, or rl. Use --compare to run all
+    available strategies and show a side-by-side comparison.
+    """
     parsed_symbols = _parse_symbols(symbols)
 
     if walk_forward:
+        from trading_bot.backtest.runner import run_walk_forward
         summary = run_walk_forward(parsed_symbols, ctx.obj, start=start, end=end, windows=windows)
         typer.echo(
             " ".join([
@@ -346,7 +358,36 @@ def backtest(
                 f"trades={w['trades']} wins={w['wins']} "
                 f"win_rate={w['win_rate']:.2f} net_pnl={w['net_pnl']}"
             )
+    elif compare:
+        from trading_bot.backtest.runner import run_strategy_comparison
+        comparison = run_strategy_comparison(parsed_symbols, ctx.obj, start=start, end=end)
+        typer.echo("STRATEGY COMPARISON")
+        typer.echo("=" * 60)
+        for strat, result in comparison["results"].items():
+            typer.echo(f"\n{strat.upper()}:")
+            typer.echo(f"  trades={result['trades']} wins={result['wins']} losses={result['losses']}")
+            typer.echo(f"  win_rate={result['win_rate']:.2f} net_pnl={result['net_pnl']:.2f}")
+        typer.echo(f"\nBest P&L: {comparison['best_pnl_strategy']}")
+        typer.echo(f"Best Win Rate: {comparison['best_winrate_strategy']}")
+    elif strategy:
+        if strategy == "rl":
+            from trading_bot.backtest.runner import run_rl_backtest
+            summary = run_rl_backtest(parsed_symbols, ctx.obj, start=start, end=end)
+        else:
+            from trading_bot.backtest.runner import run_backtest
+            summary = run_backtest(parsed_symbols, ctx.obj, start=start, end=end)
+        typer.echo(
+            " ".join(
+                [
+                    f"trades={summary['trades']}",
+                    f"wins={summary['wins']}",
+                    f"win_rate={summary['win_rate']:.2f}",
+                    f"net_pnl={summary['net_pnl']:.2f}",
+                ]
+            )
+        )
     else:
+        from trading_bot.backtest.runner import run_backtest
         summary = run_backtest(parsed_symbols, ctx.obj, start=start, end=end)
         typer.echo(
             " ".join(
