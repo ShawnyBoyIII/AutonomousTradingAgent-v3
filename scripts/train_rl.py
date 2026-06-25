@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
         "--agent",
         type=str,
         default="PPO",
-        choices=["PPO", "A2C", "SAC", "TD3", "DDPG"],
+        choices=["PPO", "A2C", "DQN"],
         help="DRL agent type (default: PPO)",
     )
     parser.add_argument(
@@ -74,6 +74,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="state/rl_logs",
         help="Output directory for trained models (default: state/rl_logs)",
+    )
+    parser.add_argument(
+        "--train-symbols",
+        type=str,
+        default=None,
+        help="Symbols used during training (required for --evaluate)",
     )
     parser.add_argument(
         "--evaluate",
@@ -210,74 +216,88 @@ def evaluate_agent(args: argparse.Namespace) -> int:
     from trading_bot.rl.env import TradingConfig
     from trading_bot.rl.trainer import TrainingConfig as RLTrainingConfig
 
-    symbols = [s.strip() for s in args.symbols.split(",")]
+    if not args.train_symbols:
+        print(f"\n  ERROR: --train-symbols is required for evaluation.")
+        print(f"  Use the same symbols as training, e.g. --train-symbols AAPL")
+        return 1
+
+    train_symbols = [s.strip() for s in args.train_symbols.split(",")]
+    eval_symbols = [s.strip() for s in args.symbols.split(",")]
+    if eval_symbols != train_symbols:
+        print("\n  ERROR: evaluation must use the same symbol set as training.")
+        print(f"  train symbols: {', '.join(train_symbols)}")
+        print(f"  eval symbols:  {', '.join(eval_symbols)}")
+        return 1
 
     print(f"\n{'='*60}")
     print(f"  RL Agent Evaluation")
     print(f"{'='*60}")
-    print(f"  Symbols:       {', '.join(symbols)}")
+    print(f"  Train symbols: {', '.join(train_symbols)}")
+    print(f"  Eval symbols:  {', '.join(eval_symbols)}")
     print(f"  Eval episodes: {args.eval_episodes}")
     print(f"{'='*60}\n")
 
-    for symbol in symbols:
-        model_path = Path(args.output_dir) / f"PPO_final"
-        if not model_path.exists():
-            model_path = Path(args.output_dir) / f"{symbol}_PPO_final"
+    env_config = TradingConfig(
+        symbols=train_symbols,
+        bar_period="1y",
+        bar_interval="1d",
+        observer_window=10,
+        starting_cash=100_000.0,
+        fee_per_order=1.0,
+        slippage_bps=5,
+        max_positions=10,
+        max_episode_steps=500,
+    )
 
-        if not model_path.exists():
-            print(f"  WARNING: Model not found at {model_path}")
-            continue
+    training_config = RLTrainingConfig(
+        env_config=env_config,
+        model_type=args.agent,
+        total_timesteps=50000,
+        verbose=0,
+    )
 
-        print(f"\n  Evaluating {symbol} from {model_path}...")
+    model_path = Path(args.output_dir) / f"{args.agent}_final"
+    if not model_path.exists():
+        model_path_zip = model_path.with_suffix(".zip")
+        if model_path_zip.exists():
+            model_path = model_path_zip
 
+    if not model_path.exists():
+        print(f"  ERROR: Model not found at {model_path} or {model_path.with_suffix('.zip')}")
+        return 1
+
+    for symbol in eval_symbols:
         try:
-            daily_frame = fetch_training_data(symbol, args.start_date, args.end_date)
+            fetch_training_data(symbol, args.start_date, args.end_date)
         except Exception as e:
             print(f"  ERROR: Failed to fetch data for {symbol}: {e}")
-            continue
+            return 1
 
-        env_config = TradingConfig(
-            symbols=[symbol],
-            bar_period="1y",
-            bar_interval="1d",
-            observer_window=10,
-            starting_cash=100_000.0,
-            fee_per_order=1.0,
-            slippage_bps=5,
-            max_positions=10,
-            max_episode_steps=500,
-        )
+    print(f"\n  Evaluating {', '.join(eval_symbols)} from {model_path}...")
 
-        training_config = RLTrainingConfig(
-            env_config=env_config,
-            model_type="PPO",
-            total_timesteps=50000,
-            verbose=0,
-        )
+    agent_config = RLAgentConfig(
+        enabled=True,
+        env_config=env_config,
+        training=training_config,
+    )
 
-        agent_config = RLAgentConfig(
-            enabled=True,
-            env_config=env_config,
-            training=training_config,
-        )
+    agent = RLAgent(config=agent_config)
+    agent.load(model_path)
 
-        agent = RLAgent(config=agent_config)
-        agent.load(model_path)
+    results = agent.evaluate(n_episodes=args.eval_episodes)
 
-        results = agent.evaluate(n_episodes=args.eval_episodes)
+    print(f"\n  Evaluation results:")
+    print(f"    Mean reward:     {results.get('mean_reward', 0):.4f}")
+    print(f"    Std reward:      {results.get('std_reward', 0):.4f}")
+    print(f"    Mean final eq:   ${results.get('mean_final_equity', 0):,.2f}")
+    print(f"    Min final eq:    ${results.get('min_final_equity', 0):,.2f}")
+    print(f"    Max final eq:    ${results.get('max_final_equity', 0):,.2f}")
 
-        print(f"\n  Evaluation results for {symbol}:")
-        print(f"    Mean reward:     {results.get('mean_reward', 0):.4f}")
-        print(f"    Std reward:      {results.get('std_reward', 0):.4f}")
-        print(f"    Mean final eq:   ${results.get('mean_final_equity', 0):,.2f}")
-        print(f"    Min final eq:    ${results.get('min_final_equity', 0):,.2f}")
-        print(f"    Max final eq:    ${results.get('max_final_equity', 0):,.2f}")
-
-        initial = env_config.starting_cash
-        final = results.get("mean_final_equity", 0)
-        if initial > 0:
-            ret = (final / initial - 1) * 100
-            print(f"    Return:          {ret:+.2f}%")
+    initial = env_config.starting_cash
+    final = results.get("mean_final_equity", 0)
+    if initial > 0:
+        ret = (final / initial - 1) * 100
+        print(f"    Return:          {ret:+.2f}%")
 
     print(f"\n{'='*60}")
     print(f"  Evaluation complete!")

@@ -76,6 +76,59 @@ class RLBacktestRunner:
             self._data_cache[symbol] = daily_frame.copy()
             self._data_indices[symbol] = 0
 
+    def _compute_features_for_symbol(self, symbol: str) -> list[float]:
+        df = self._data_cache.get(symbol)
+        if df is None or df.empty:
+            return [0.0] * len(self.FEATURE_COLS)
+
+        idx = self._data_indices.get(symbol, 0)
+        if idx >= len(df):
+            return [0.0] * len(self.FEATURE_COLS)
+
+        window = df.iloc[:idx + 1].copy()
+        n_features = len(self.FEATURE_COLS)
+
+        window = add_ema(window, 12, "ema_12")
+        window = add_ema(window, 26, "ema_26")
+        window = add_rsi(window, 14)
+        window = add_sma(window, 20, "sma_20")
+        window = add_macd(window, 12, 26, 9)
+        window = add_bollinger_bands(window, 20, 2.0)
+        window = add_atr_percent(window, 14)
+
+        close_col = float(window["close"].iloc[-1]) if "close" in window.columns else 0.0
+        returns = 0.0
+        if len(window) >= 2:
+            prev_close = float(window["close"].iloc[-2])
+            if prev_close > 0:
+                returns = (close_col - prev_close) / prev_close
+
+        rsi = float(window["rsi_14"].iloc[-1]) if "rsi_14" in window.columns and pd.notna(window["rsi_14"].iloc[-1]) else 50.0
+        ema_12 = float(window["ema_12"].iloc[-1]) if "ema_12" in window.columns and pd.notna(window["ema_12"].iloc[-1]) else close_col
+        ema_26 = float(window["ema_26"].iloc[-1]) if "ema_26" in window.columns and pd.notna(window["ema_26"].iloc[-1]) else close_col
+        sma_20 = float(window["sma_20"].iloc[-1]) if "sma_20" in window.columns and pd.notna(window["sma_20"].iloc[-1]) else close_col
+
+        macd_line = float(window["macd_line"].iloc[-1]) if "macd_line" in window.columns and pd.notna(window["macd_line"].iloc[-1]) else 0.0
+        macd_signal = float(window["macd_signal"].iloc[-1]) if "macd_signal" in window.columns and pd.notna(window["macd_signal"].iloc[-1]) else 0.0
+        macd_hist = float(window["macd_histogram"].iloc[-1]) if "macd_histogram" in window.columns and pd.notna(window["macd_histogram"].iloc[-1]) else 0.0
+
+        bb_pct = float(window["bb_percent_b"].iloc[-1]) if "bb_percent_b" in window.columns and pd.notna(window["bb_percent_b"].iloc[-1]) else 50.0
+        bb_w = float(window["bb_width"].iloc[-1]) if "bb_width" in window.columns and pd.notna(window["bb_width"].iloc[-1]) else 0.0
+        atr_pct = float(window["atr_pct"].iloc[-1]) if "atr_pct" in window.columns and pd.notna(window["atr_pct"].iloc[-1]) else 0.0
+
+        volume = float(window["volume"].iloc[-1]) if "volume" in window.columns else 0.0
+        volume_ratio = 1.0
+        if len(window) >= 2 and "volume" in window.columns:
+            prev_vol = float(window["volume"].iloc[-2])
+            if prev_vol > 0:
+                volume_ratio = volume / prev_vol
+
+        return [
+            close_col, returns, rsi, ema_12, ema_26,
+            sma_20, macd_line, macd_signal, macd_hist,
+            bb_pct, bb_w, atr_pct, volume_ratio,
+        ]
+
     def _build_observation(self, symbol: str, window: pd.DataFrame,
                            portfolio_state: PortfolioState) -> np.ndarray:
         df = window.copy()
@@ -157,12 +210,12 @@ class RLBacktestRunner:
         return int(action)
 
     def _action_to_trade(self, action: int, symbol: str, prices: dict[str, float],
-                         broker: PaperBroker) -> tuple[str | None, float | None]:
+                          broker: PaperBroker) -> tuple[str | None, float | None]:
         if action == 0:
             return None, None
 
         symbols = self.config.symbols
-        if symbol not in symbols:
+        if not symbols:
             return None, None
 
         action_idx = action - 1
@@ -170,6 +223,9 @@ class RLBacktestRunner:
         direction = action_idx % 3
 
         if symbol_idx >= len(symbols):
+            return None, None
+
+        if direction == 0:
             return None, None
 
         target_symbol = symbols[symbol_idx]
@@ -222,14 +278,23 @@ class RLBacktestRunner:
         entry_blocked_until = -1
         rl_actions = []
 
-        self._load_symbols(self.config.symbols, daily_frame, intraday_frame)
+        all_symbols = self.config.symbols
+        if not all_symbols:
+            all_symbols = [symbol]
+
+        for sym in all_symbols:
+            self._data_cache[sym] = daily_frame.copy()
+            self._data_indices[sym] = 0
 
         for end_index in range(self.config.observer_window, len(intraday_frame)):
             if end_index <= entry_blocked_until:
                 continue
 
-            window = intraday_frame.iloc[:end_index + 1]
-            prices = {symbol: float(intraday_frame.iloc[end_index]["close"])}
+            prices = {}
+            for sym in all_symbols:
+                df = self._data_cache.get(sym)
+                if df is not None and end_index < len(df):
+                    prices[sym] = float(df.iloc[end_index]["close"])
 
             portfolio_state = PortfolioState(
                 cash=broker.cash,
@@ -243,7 +308,37 @@ class RLBacktestRunner:
                 },
             )
 
-            observation = self._build_observation(symbol, window, portfolio_state)
+            market_features = []
+            for sym in all_symbols:
+                features = self._compute_features_for_symbol(sym)
+                market_features.extend(features)
+
+            equity = max(portfolio_state.equity, 1e-8)
+            cash_ratio = portfolio_state.cash / equity
+            num_positions = len(portfolio_state.positions)
+            position_weight_sum = sum(
+                p.quantity * p.average_cost / equity
+                for p in portfolio_state.positions.values()
+            )
+            unrealized_pnl_pct = portfolio_state.unrealized_pnl / equity
+            realized_pnl_pct = portfolio_state.realized_pnl / equity
+
+            portfolio_features = [
+                cash_ratio, num_positions, position_weight_sum,
+                unrealized_pnl_pct, realized_pnl_pct,
+            ]
+
+            all_features = market_features + portfolio_features
+            n_features = len(all_features)
+
+            history_list = [all_features]
+            padding_rows = self.config.observer_window - len(history_list)
+            zero_row = [0.0] * n_features
+            for _ in range(padding_rows):
+                history_list.insert(0, zero_row)
+
+            observation = np.array(history_list[:self.config.observer_window], dtype=np.float32)
+
             action = self._predict_action(observation)
             rl_actions.append({"step": end_index, "action": action})
 
@@ -295,6 +390,10 @@ class RLBacktestRunner:
                     broker.cash += exit_value - self.config.fee_per_order
                     broker.positions.pop(symbol, None)
                     entry_blocked_until = end_index
+
+            for sym in all_symbols:
+                if sym in self._data_indices:
+                    self._data_indices[sym] = end_index + 1
 
         return {
             "trades": trades,

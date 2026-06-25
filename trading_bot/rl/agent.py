@@ -54,7 +54,9 @@ class RLAgent:
             raise ValueError("No model path specified. Provide model_path or set config.model_path")
 
         if self._trainer is None:
-            self._trainer = RLTrainer()
+            self._trainer = RLTrainer(
+                training_config=self.config.training
+            )
 
         self._model = self._trainer.load(path)
         logger.info(f"RL agent loaded from {path}")

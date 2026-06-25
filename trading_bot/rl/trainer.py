@@ -37,7 +37,7 @@ class TrainingConfig:
 class RLTrainer:
     """Trains RL agents on TradingEnv using stable-baselines3.
 
-    Supports PPO, A2C, DQN, SAC, TD3, and DDPG agents.
+    Supports PPO, A2C, and DQN agents.
     """
 
     def __init__(self, training_config: TrainingConfig | None = None) -> None:
@@ -54,63 +54,61 @@ class RLTrainer:
 
     def train(self) -> Any:
         try:
-            from stable_baselines3 import A2C, DDPG, DQN, PPO, SAC, TD3
+            from stable_baselines3 import A2C, DQN, PPO
         except ImportError:
             raise ImportError(
                 "stable-baselines3 is required for RL training. "
                 "Install with: pip install stable-baselines3"
             )
 
-        model_class = {
+        model_map = {
             "PPO": PPO,
             "A2C": A2C,
             "DQN": DQN,
-            "SAC": SAC,
-            "TD3": TD3,
-            "DDPG": DDPG,
         }.get(self.config.model_type)
 
-        if model_class is None:
+        if model_map is None:
             raise ValueError(
                 f"Unknown model type: {self.config.model_type}. "
-                f"Supported: {list(model_class.keys())}"
+                "Supported: ['PPO', 'A2C', 'DQN']."
             )
 
         env = self._make_env()
 
-        kwargs: dict[str, Any] = {
+        common_kwargs: dict[str, Any] = {
             "learning_rate": self.config.learning_rate,
-            "n_steps": self.config.n_steps,
-            "batch_size": self.config.batch_size,
-            "n_epochs": self.config.n_epochs,
             "gamma": self.config.gamma,
-            "gae_lambda": self.config.gae_lambda,
-            "clip_range": self.config.clip_range,
-            "ent_coef": self.config.ent_coef,
-            "vf_coef": self.config.vf_coef,
-            "max_grad_norm": self.config.max_grad_norm,
             "verbose": self.config.verbose,
         }
 
         if self.config.model_type == "PPO":
-            kwargs["n_steps"] = 128
-            model = model_class("MultiInputPolicy", env, **kwargs)
+            model_kwargs = {
+                **common_kwargs,
+                "n_steps": self.config.n_steps,
+                "batch_size": self.config.batch_size,
+                "n_epochs": self.config.n_epochs,
+                "gae_lambda": self.config.gae_lambda,
+                "clip_range": self.config.clip_range,
+                "ent_coef": self.config.ent_coef,
+                "vf_coef": self.config.vf_coef,
+                "max_grad_norm": self.config.max_grad_norm,
+            }
         elif self.config.model_type == "A2C":
-            model = model_class("MultiInputPolicy", env, **kwargs)
-        elif self.config.model_type == "DQN":
-            model = model_class("MultiInputPolicy", env, **kwargs)
-        elif self.config.model_type == "SAC":
-            kwargs["learning_starts"] = 1000
-            kwargs["reward_scale"] = 1.0
-            model = model_class("MultiInputPolicy", env, **kwargs)
-        elif self.config.model_type == "TD3":
-            kwargs["learning_starts"] = 1000
-            kwargs["reward_scale"] = 1.0
-            model = model_class("MultiInputPolicy", env, **kwargs)
-        elif self.config.model_type == "DDPG":
-            kwargs["learning_starts"] = 1000
-            kwargs["reward_scale"] = 1.0
-            model = model_class("MultiInputPolicy", env, **kwargs)
+            model_kwargs = {
+                **common_kwargs,
+                "n_steps": self.config.n_steps,
+                "gae_lambda": self.config.gae_lambda,
+                "ent_coef": self.config.ent_coef,
+                "vf_coef": self.config.vf_coef,
+                "max_grad_norm": self.config.max_grad_norm,
+            }
+        else:
+            model_kwargs = {
+                **common_kwargs,
+                "batch_size": self.config.batch_size,
+            }
+
+        model = model_map("MlpPolicy", env, **model_kwargs)
 
         logger.info(
             f"Training {self.config.model_type} on TradingEnv "
@@ -180,10 +178,22 @@ class RLTrainer:
 
     def load(self, path: str | Path) -> Any:
         try:
-            from stable_baselines3 import PPO
+            from stable_baselines3 import A2C, DQN, PPO
         except ImportError:
             raise ImportError("stable-baselines3 required for model loading")
 
-        self._model = PPO.load(path)
+        model_map = {
+            "PPO": PPO,
+            "A2C": A2C,
+            "DQN": DQN,
+        }
+        model_class = model_map.get(self.config.model_type)
+        if model_class is None:
+            raise ValueError(
+                f"Unknown model type: {self.config.model_type}. "
+                f"Supported: {list(model_map.keys())}"
+            )
+
+        self._model = model_class.load(path)
         logger.info(f"Model loaded from {path}")
         return self._model

@@ -4,6 +4,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 from trading_bot.config.settings import Settings
 from trading_bot.data import market_data
 from trading_bot.data.indicators import add_atr, add_bollinger_bands, add_ema, add_rsi, add_sma
@@ -379,20 +381,24 @@ def _filter_frame_by_date(frame: Any, start: str | None, end: str | None):
     if frame.empty or "timestamp" not in frame.columns:
         return frame
 
-    filtered = frame
-    timestamp_series = filtered["timestamp"]
-    timestamp_tz = getattr(timestamp_series.dt, "tz", None)
+    timestamp_series = pd.to_datetime(frame["timestamp"])
+    if timestamp_series.isna().all():
+        return frame
+
+    filtered = frame.copy()
+    filtered["_ts"] = timestamp_series
+    timestamp_tz = getattr(filtered["_ts"].dt, "tz", None)
     if start is not None:
         start_dt = datetime.combine(date.fromisoformat(start), datetime.min.time())
         if timestamp_tz is not None:
             start_dt = start_dt.replace(tzinfo=timestamp_tz)
-        filtered = filtered[filtered["timestamp"] >= start_dt]
+        filtered = filtered[filtered["_ts"] >= start_dt]
     if end is not None:
         end_dt = datetime.combine(date.fromisoformat(end), datetime.min.time()) + timedelta(days=1)
         if timestamp_tz is not None:
             end_dt = end_dt.replace(tzinfo=timestamp_tz)
-        filtered = filtered[filtered["timestamp"] < end_dt]
-    return filtered.reset_index(drop=True)
+        filtered = filtered[filtered["_ts"] < end_dt]
+    return filtered.drop(columns=["_ts"]).reset_index(drop=True)
 
 
 def _resolve_exit(signal, intraday_frame: Any, entry_index: int) -> tuple[float, int]:
@@ -545,7 +551,18 @@ def run_rl_backtest(
     runner = RLBacktestRunner(config=rl_config)
 
     if rl_config.model_path:
-        runner.load_model()
+        try:
+            runner.load_model()
+            expected_features = runner._model.observation_space.shape[1]
+            n_market_features = len(RLBacktestRunner.FEATURE_COLS)
+            n_portfolio_features = 5
+            actual_features = len(rl_config.symbols) * n_market_features + n_portfolio_features
+            if expected_features != actual_features:
+                print(f"Warning: RL model expects {expected_features} features ({expected_features - n_portfolio_features} symbols) but backtest uses {actual_features} features ({len(rl_config.symbols)} symbols). Skipping RL backtest.")
+                return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0, "win_rate": 0.0, "rows": rows, "rl_actions": []}
+        except Exception as e:
+            print(f"Warning: Failed to load RL model: {e}. Skipping RL backtest.")
+            return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0, "win_rate": 0.0, "rows": rows, "rl_actions": []}
     else:
         print("Warning: No RL model path specified. Setting to dummy for testing.")
         runner.set_model(None)
@@ -644,6 +661,7 @@ def run_strategy_comparison(
     start: str | None = None,
     end: str | None = None,
     strategies: list[str] | None = None,
+    model_path: str | None = None,
 ) -> dict[str, Any]:
     """Run backtest across multiple strategies and compare results.
 
@@ -674,7 +692,7 @@ def run_strategy_comparison(
     for strategy in strategies:
         print(f"Running {strategy} backtest...")
         if strategy == "rl":
-            result = run_rl_backtest(symbols, settings, start=start, end=end)
+            result = run_rl_backtest(symbols, settings, start=start, end=end, model_path=model_path)
         else:
             result = run_backtest(symbols, settings, start=start, end=end)
             result["strategy"] = strategy

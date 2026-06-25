@@ -360,7 +360,13 @@ def backtest(
             )
     elif compare:
         from trading_bot.backtest.runner import run_strategy_comparison
-        comparison = run_strategy_comparison(parsed_symbols, ctx.obj, start=start, end=end)
+        default_model = "state/rl_logs/PPO_final.zip"
+        strategies = ["v2.5", "v3"]
+        model_path = None
+        if ctx.obj.rl.enabled and Path(default_model).exists():
+            strategies.append("rl")
+            model_path = default_model
+        comparison = run_strategy_comparison(parsed_symbols, ctx.obj, start=start, end=end, strategies=strategies, model_path=model_path)
         typer.echo("STRATEGY COMPARISON")
         typer.echo("=" * 60)
         for strat, result in comparison["results"].items():
@@ -2279,7 +2285,8 @@ def screen_market(
 def rl_train(
     ctx: typer.Context,
     symbols: str = typer.Option("AAPL", "--symbols", help="Comma-separated symbols to train on"),
-    agent: str = typer.Option("PPO", "--agent", help="DRL agent type (PPO, A2C, SAC, TD3, DDPG)"),
+    train_symbols: str = typer.Option(None, "--train-symbols", help="Symbols used during training (required for --evaluate)"),
+    agent: str = typer.Option("PPO", "--agent", help="DRL agent type (PPO, A2C, DQN)"),
     timesteps: int = typer.Option(50000, "--timesteps", help="Total training timesteps"),
     learning_rate: float = typer.Option(3e-4, "--learning-rate", help="Learning rate"),
     output_dir: str = typer.Option("state/rl_logs", "--output-dir", help="Output directory for model"),
@@ -2307,6 +2314,9 @@ def rl_train(
         "--verbose", str(verbose),
     ]
 
+    if train_symbols:
+        argv.extend(["--train-symbols", train_symbols])
+
     if evaluate:
         argv.append("--evaluate")
         argv.extend(["--eval-episodes", str(eval_episodes)])
@@ -2320,18 +2330,24 @@ def rl_train(
 
 @app.command(name="rl-eval")
 def rl_eval(
-    ctx: typer.Context,
     symbols: str = typer.Option("AAPL", "--symbols", help="Comma-separated symbols to evaluate"),
+    train_symbols: str = typer.Option(None, "--train-symbols", help="Symbols used during training"),
+    agent: str = typer.Option("PPO", "--agent", help="DRL agent type (PPO, A2C, DQN)"),
     episodes: int = typer.Option(10, "--episodes", help="Number of evaluation episodes"),
 ) -> None:
     """Evaluate a trained DRL trading agent."""
     import sys
-    sys.argv = [
+    argv = [
         "train_rl.py",
         "--evaluate",
         "--symbols", symbols,
+        "--agent", agent,
         "--eval-episodes", str(episodes),
     ]
+    if train_symbols:
+        argv.extend(["--train-symbols", train_symbols])
+
+    sys.argv = argv
 
     from scripts.train_rl import main as train_main
     exit_code = train_main()
