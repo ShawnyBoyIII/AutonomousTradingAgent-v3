@@ -5,6 +5,7 @@ import logging
 import pandas as pd
 
 from trading_bot.config.settings import MarketDataSettings
+from trading_bot.data.cache import MarketDataCache
 from trading_bot.data.validation import ValidationResult, validate_market_data
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,41 @@ def fetch_bars(
     end: str | None = None,
     settings: MarketDataSettings | None = None,
 ) -> pd.DataFrame:
-    return _fallback_fetch(symbol, period, interval, start=start, end=end, primary_settings=settings)
+    cache = _get_cache()
+    cached = cache.get(symbol, period, interval, start, end)
+    if cached is not None:
+        return cached
+
+    result = _fallback_fetch(symbol, period, interval, start=start, end=end, primary_settings=settings)
+    if result is not None and not result.empty:
+        cache.put(symbol, period, interval, result, start=start, end=end)
+    return result
+
+
+_cache_instance: MarketDataCache | None = None
+
+
+def _get_cache() -> MarketDataCache:
+    global _cache_instance
+    if _cache_instance is None:
+        _cache_instance = MarketDataCache()
+    return _cache_instance
+
+
+def reset_cache() -> None:
+    global _cache_instance
+    _cache_instance = None
+
+
+def clear_cache(symbol: str | None = None) -> dict:
+    cache = _get_cache()
+    if symbol:
+        count = cache.invalidate(symbol=symbol.upper().strip())
+        logger.info(f"Cleared {count} cache entries for {symbol}")
+    else:
+        cache.clear_expired()
+        count = 0
+    return cache.status()
 
 
 def fetch_small_cap_candidates(
