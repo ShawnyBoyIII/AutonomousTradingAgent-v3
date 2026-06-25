@@ -153,6 +153,44 @@ def alert_signals(ctx: typer.Context) -> None:
     typer.echo(f"alerts={len(candidates)}")
 
 
+@app.command(name="burn-in-report")
+def burn_in_report(
+    ctx: typer.Context,
+    log_dir: Path = typer.Option(
+        None,
+        "--log-dir",
+        help="Path to burn-in log directory. Defaults to config log_dir.",
+    ),
+    db_path: Path = typer.Option(
+        None,
+        "--db-path",
+        help="Path to burn-in SQLite database. Defaults to config state_db_path.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output report as JSON instead of formatted text.",
+    ),
+) -> None:
+    """Generate a comprehensive burn-in analytics report.
+
+    Parses decision-log.jsonl and the SQLite portfolio database to produce
+    a full analysis including trade performance, signal quality, risk metrics,
+    counter-thesis effectiveness, and actionable recommendations.
+    """
+    from trading_bot.reports.burn_in_analytics import compute_burn_in_report, format_report
+
+    log_path = log_dir or (Path(ctx.obj.app.log_dir) / "decision-log.jsonl")
+    db = db_path or Path(ctx.obj.app.state_db_path)
+
+    report = compute_burn_in_report(log_path, db, settings=ctx.obj)
+
+    if json_output:
+        typer.echo(json.dumps(report, default=str, indent=2))
+    else:
+        typer.echo(format_report(report))
+
+
 @app.command(name="run-ops")
 def run_ops(
     ctx: typer.Context,
@@ -422,6 +460,75 @@ def run_manager(
                 time.sleep(0.1)
     except KeyboardInterrupt:
         typer.echo("run-manager stopped")
+
+
+@app.command(name="continuous")
+def continuous(
+    ctx: typer.Context,
+    interval: int = typer.Option(
+        300,
+        "--interval",
+        help="Seconds between full loop cycles (scan + trade + manage).",
+    ),
+    cycles: int = typer.Option(
+        0,
+        "--cycles",
+        min=0,
+        help="Maximum cycles to run. Use 0 for infinite.",
+    ),
+    build_universe: bool = typer.Option(
+        True,
+        "--build-universe/--no-build-universe",
+        help="Refresh the universe before each scan cycle.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Preview trades without executing fills.",
+    ),
+    max_failures: int = typer.Option(
+        10,
+        "--max-failures",
+        help="Consecutive failures before circuit breaker opens.",
+    ),
+    event_system: bool = typer.Option(
+        False,
+        "--event-system",
+        help="Wire loop events through the event bus.",
+    ),
+) -> None:
+    """Run the full paper-trading loop continuously.
+
+    Each cycle performs:
+    1. Build universe (optional)
+    2. Scan watchlist for signals
+    3. Execute paper trades on approved signals
+    4. Manage existing positions (exits, stops, targets)
+    5. Sleep for interval
+
+    Press Ctrl-C (SIGINT) to stop gracefully. The loop tracks statistics
+    and exits after --max-failures consecutive errors to prevent crash loops.
+    """
+    from trading_bot.runtime.continuous_loop import run_continuous_loop
+
+    typer.echo(
+        f"continuous_loop_start interval={interval}s cycles={'inf' if cycles == 0 else cycles} "
+        f"build_universe={'yes' if build_universe else 'no'} dry_run={'yes' if dry_run else 'no'}"
+    )
+
+    try:
+        stats = run_continuous_loop(
+            settings=ctx.obj,
+            interval_seconds=interval,
+            max_cycles=cycles if cycles > 0 else None,
+            build_universe=build_universe,
+            dry_run=dry_run,
+            max_failures=max_failures,
+            use_event_system=event_system,
+        )
+        typer.echo(f"loop_stopped stats={json.dumps(stats.summary(), default=str)}")
+    except KeyboardInterrupt:
+        typer.echo("continuous_loop_stopped_by_user")
 
 
 def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:

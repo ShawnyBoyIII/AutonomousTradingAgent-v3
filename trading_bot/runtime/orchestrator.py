@@ -128,7 +128,8 @@ def run_scan(
 
             open_tickers.add(symbol)
             market_status = _market_data_status(
-                signal.timestamp, settings.market_data.intraday_interval
+                signal.timestamp, settings.market_data.intraday_interval,
+                max_age_minutes=settings.market_data.max_data_age_minutes,
             )
             market_age = _market_data_age(signal.timestamp)
             quality = _scan_quality(details)
@@ -313,7 +314,8 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
 
             counter_result = _evaluate_counter_thesis_for_signal(symbol, signal, settings)
 
-            if _market_data_status(signal.timestamp, settings.market_data.intraday_interval) == "stale":
+            if _market_data_status(signal.timestamp, settings.market_data.intraday_interval,
+                                  max_age_minutes=settings.market_data.max_data_age_minutes) == "stale":
                 append_decision_event(
                     log_path,
                     {
@@ -898,9 +900,9 @@ def _portfolio_state_from_broker(
     )
 
 
-def _market_data_status(signal_timestamp: datetime, interval: str) -> str:
+def _market_data_status(signal_timestamp: datetime, interval: str, max_age_minutes: int = 30) -> str:
     age = _scan_now(signal_timestamp) - signal_timestamp
-    return "stale" if age > _stale_after(interval) else "fresh"
+    return "stale" if age > timedelta(minutes=max_age_minutes) else "fresh"
 
 
 def _market_data_age(signal_timestamp: datetime) -> str:
