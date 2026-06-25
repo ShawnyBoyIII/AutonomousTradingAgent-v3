@@ -1128,8 +1128,8 @@ def _render_performance_section(
   <div class="chart-container">
     <div class="chart-row">
       <div class="chart-box">
-        <div class="label">Trade Distribution</div>
-        <div class="bar-container">
+        <div class="label" id="trade-dist-label">Trade Distribution</div>
+        <div class="bar-container" role="img" aria-label="Trade Distribution: {wins} wins and {losses} losses">
           <div class="bar-win" style="width: {win_pct:.1f}%" title="{wins} wins ({win_pct:.1f}%)"></div>
           <div class="bar-loss" style="width: {loss_pct:.1f}%" title="{losses} losses ({loss_pct:.1f}%)"></div>
         </div>
@@ -1140,9 +1140,9 @@ def _render_performance_section(
       </div>
 
       <div class="chart-box">
-        <div class="label">Win Rate Gauge</div>
-        <div class="gauge-container">
-          <svg viewBox="0 0 150 80">
+        <div class="label" id="win-rate-label">Win Rate Gauge</div>
+        <div class="gauge-container" role="img" aria-label="Win Rate Gauge: {win_rate:.1%}">
+          <svg viewBox="0 0 150 80" aria-hidden="true">
             <defs>
               <linearGradient id="gaugeGradient" x1="0%" y1="0%" x2="100%" y2="0%">
                 <stop offset="0%" style="stop-color:#f85149"/>
@@ -1160,13 +1160,13 @@ def _render_performance_section(
       </div>
 
       <div class="chart-box">
-        <div class="label">Average Trade P&L</div>
-        <div class="pnl-distribution">
+        <div class="label" id="avg-pnl-label">Average Trade P&L</div>
+        <div class="pnl-distribution" role="img" aria-label="Average Trade P&L: win is {_money(avg_win)}, loss is {_money(avg_loss)}">
           <div class="pnl-bar positive" style="height: {min(abs(avg_win) * 5, 100):.0f}px">
-            <div class="pnl-label">Win</div>
+            <div class="pnl-label" aria-hidden="true">Win</div>
           </div>
           <div class="pnl-bar negative" style="height: {min(abs(avg_loss) * 5, 100):.0f}px">
-            <div class="pnl-label">Loss</div>
+            <div class="pnl-label" aria-hidden="true">Loss</div>
           </div>
         </div>
         <div style="text-align: center; margin-top: 25px; font-size: 12px;">
