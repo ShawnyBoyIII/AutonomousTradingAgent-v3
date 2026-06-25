@@ -16,8 +16,11 @@ def generate_signal(
     symbol: str,
     daily_frame: "pd.DataFrame",
     intraday_frame: "pd.DataFrame",
+    atr_stop_multiplier: float = 1.5,
 ) -> TradeSignal | None:
-    signal, _ = generate_signal_with_reason(symbol, daily_frame, intraday_frame)
+    signal, _ = generate_signal_with_reason(
+        symbol, daily_frame, intraday_frame, atr_stop_multiplier=atr_stop_multiplier
+    )
     return signal
 
 
@@ -25,6 +28,7 @@ def generate_signal_with_reason(
     symbol: str,
     daily_frame: "pd.DataFrame",
     intraday_frame: "pd.DataFrame",
+    atr_stop_multiplier: float = 1.5,
 ) -> tuple[TradeSignal | None, str]:
     if not is_bullish_daily_regime(daily_frame):
         return None, "daily regime not bullish"
@@ -48,11 +52,20 @@ def generate_signal_with_reason(
         ]
         if not low_values:
             return None, "invalid stop price"
-        stop_loss = round(min(low_values), 4)
+        low_stop = round(min(low_values), 4)
     else:
-        stop_loss = round(entry_price * 0.99, 4)
+        low_stop = round(entry_price * 0.99, 4)
 
-    if stop_loss >= entry_price:
+    # ATR floor: ensure stop is at least atr × multiplier below entry
+    atr_value = _to_finite_float(latest.get("atr_14"))
+    if atr_value is not None and atr_value > 0:
+        atr_floor = round(entry_price - (atr_value * atr_stop_multiplier), 4)
+        stop_loss = min(low_stop, atr_floor)
+    else:
+        stop_loss = low_stop
+    stop_loss = round(stop_loss, 4)
+
+    if stop_loss >= entry_price or stop_loss <= 0:
         stop_loss = round(entry_price * 0.99, 4)
 
     risk = entry_price - stop_loss
@@ -109,9 +122,12 @@ def generate_recent_signal_with_reason(
     daily_frame: "pd.DataFrame",
     intraday_frame: "pd.DataFrame",
     lookback_bars: int = 6,
+    atr_stop_multiplier: float = 1.5,
 ) -> tuple[TradeSignal | None, str]:
     if lookback_bars <= 0:
-        return generate_signal_with_reason(symbol, daily_frame, intraday_frame)
+        return generate_signal_with_reason(
+            symbol, daily_frame, intraday_frame, atr_stop_multiplier=atr_stop_multiplier
+        )
 
     reason = "no intraday setup"
     start_index = max(5, len(intraday_frame) - lookback_bars + 1)
@@ -120,6 +136,7 @@ def generate_recent_signal_with_reason(
             symbol,
             daily_frame,
             intraday_frame.iloc[:end_index].copy(),
+            atr_stop_multiplier=atr_stop_multiplier,
         )
         if signal is not None:
             return signal, "approved"
