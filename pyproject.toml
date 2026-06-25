@@ -9,10 +9,12 @@ description = "CLI-first paper trading system for stocks and ETFs"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "alpaca-py>=0.43",
   "numpy<2",
   "pandas>=2.2",
   "pydantic>=2.7",
   "PyYAML>=6.0",
+  "python-dotenv>=1.2",
   "typer>=0.12",
   "yfinance>=0.2.40",
 ]
@@ -20,6 +22,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8.2",
+]
+rl = [
+  "gymnasium>=0.29",
+  "stable-baselines3>=2.0",
+  "torch>=2.0",
 ]
 
 [project.scripts]

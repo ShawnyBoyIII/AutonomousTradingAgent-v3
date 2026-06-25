@@ -178,97 +178,137 @@ Later:
 
 - Add scan summary table.
 
+## V2 Completion Summary
+
+V2 is now complete and production-ready for paper trading with full position lifecycle management.
+
+### Position Management Lifecycle
+
+**Commands:**
+```bash
+# Single-shot position check
+sh ./tradebot-local manage-positions
+
+# Continuous daemon with 60s interval
+sh ./tradebot-local run-manager --interval 60
+
+# Tight loop (no sleep between iterations)
+sh ./tradebot-local run-manager --interval 0
+```
+
+**Exit Priority Order:** EOD → Stop → Target → Trail
+
+1. **EOD Exit** — Liquidates all positions at configured end-of-session time (default 15:55 ET) to avoid overnight risk
+2. **Stop Loss** — Hard stop to limit downside
+3. **Profit Target** — Take profit at predetermined level
+4. **Trailing Stop** — Dynamic stop that ratchets up only, never down
+
+See `docs/adr/001-exit-priority-order.md` for full rationale.
+
+### New V2 Features
+
+**Latency Gate (Chunk A):**
+- Configurable `max_data_age_hours` (default 72 hours)
+- `manage-positions` skips all actions if market data is stale
+- Reports `skipped=N` in summary line for observability
+- Pure helper functions in `trading_bot/runtime/latency.py`
+
+**Slippage & Fees (Chunk B):**
+- `PaperSettings` in config: `fee_per_order` (default $1.00), `slippage_bps` (default 0)
+- Applied on every paper broker fill
+- Makes simulation realistic — strategy must prove edge survives friction
+
+**SQLite Resilience (Chunk C):**
+- `busy_timeout` pragma (default 5000ms)
+- Bounded retry on lock errors (3 attempts, exponential backoff)
+- Clean handling when scanner and manager run concurrently
+- Full test coverage in `tests/test_ledger_locks.py`
+
+**Continuous Manager (Chunk D):**
+- `run-manager --interval N` runs forever with Ctrl-C graceful stop
+- Circuit breaker: `--max-failures 5` (configurable) with exponential backoff
+- Exits code 1 if too many consecutive failures
+- Production-ready for daemon deployment
+
+**Trailing Stop Implementation:**
+- R-multiple ratchet: at +1R move to breakeven, at +1.5R move to +0.5R
+- Chandelier ATR: `highest_high - (1.5 * ATR)`
+- Wilder's smoothing ATR(14) from `trading_bot/data/indicators.py`
+- Persists `initial_risk` and `highest_high` on each `Position`
+- Only tightens, never loosens
+
+**End-of-Day Exit:**
+- Configurable: `close_hour`, `close_minute`, `eod_minutes_before_close`, `eod_enabled`
+- Runs first in priority order — no other exits evaluated during EOD window
+- Logs as `FILLED reason=eod` to decision log
+
+### V2 Configuration
+
+Add to `config.yaml`:
+
+```yaml
+app:
+  timezone: "America/New_York"
+  
+market_data:
+  max_data_age_hours: 72  # Skip actions if data older than this
+
+session:
+  close_hour: 16
+  close_minute: 0
+  eod_minutes_before_close: 5  # Exit at 15:55 ET
+  eod_enabled: true
+
+paper:
+  fee_per_order: 1.0  # Dollars per fill
+  slippage_bps: 0     # Basis points of slippage
+```
+
+### V2 Safety Features
+
+- Stale data freeze: Won't trade on old data
+- Lock handling: Retries on SQLite contention
+- Circuit breaker: Daemon exits if consistently failing
+- Deterministic exits: Clear priority order, no ambiguity
+- Audit trail: Every decision logged to `logs/decision-log.jsonl`
+
+### V2 Test Coverage
+
+161 tests covering:
+- Latency detection and staleness handling
+- Slippage and fee application
+- SQLite lock retry logic
+- Circuit breaker behavior
+- All four exit types (EOD, stop, target, trail)
+- Trailing stop ratcheting logic
+- run-manager loop and interrupt handling
+
 ## V2 Keep In Mind
+
+*The following section is historical context for the V2 design. V2 is now complete.*
 
 Close trade lifecycle loop:
 
-- Add manage-positions loop for open trades.
-- Single-shot `manage-positions` exists and reports open positions.
-- Single-shot `manage-positions` now executes hard stop and target exits through the paper broker.
-- Each manager run saves updated portfolio state and refreshes `state/portfolio_summary.json`.
-- Single-shot `manage-positions` now ratchets trailing stop up only after stop and target checks pass.
-- Trail stops persist across runs on each `Position` (`stop_loss`, `highest_high`, `initial_risk`).
-- Single-shot `manage-positions` now liquidates open positions at end-of-day (default 15:55 ET on weekdays).
-- Position entry time persisted on each `Position` as `entry_at` for audit and future lifecycle rules.
-- EOD exit is configurable via the `session:` block (`close_hour`, `close_minute`, `eod_minutes_before_close`, `eod_enabled`).
-- Add continuous `run-manager --interval 60s` only after single-shot exits are stable.
-- Avoid overnight gap risk for intraday momentum trades.
+- ~~Add manage-positions loop for open trades.~~ ✅
+- ~~Single-shot `manage-positions` exists and reports open positions.~~ ✅
+- ~~Single-shot `manage-positions` now executes hard stop and target exits through the paper broker.~~ ✅
+- ~~Each manager run saves updated portfolio state and refreshes `state/portfolio_summary.json`.~~ ✅
+- ~~Single-shot `manage-positions` now ratchets trailing stop up only after stop and target checks pass.~~ ✅
+- ~~Trail stops persist across runs on each `Position` (`stop_loss`, `highest_high`, `initial_risk`).~~ ✅
+- ~~Single-shot `manage-positions` now liquidates open positions at end-of-day (default 15:55 ET on weekdays).~~ ✅
+- ~~Position entry time persisted on each `Position` as `entry_at` for audit and future lifecycle rules.~~ ✅
+- ~~EOD exit is configurable via the `session:` block (`close_hour`, `close_minute`, `eod_minutes_before_close`, `eod_enabled`).~~ ✅
+- ~~Add latency gate to freeze manager on stale data.~~ ✅
+- ~~Handle SQLite locks cleanly if scanner and manager run near same time.~~ ✅
+- ~~Add strict latency gate between signal data timestamp and local clock.~~ ✅
+- ~~Simulate hostile fills with slippage.~~ ✅
+- ~~Deduct fees from portfolio state.~~ ✅
+- ~~Add continuous `run-manager --interval` with circuit breaker.~~ ✅
+- Add macro/breadth master gate. *(Future: V2.1 or V3)*
+- Add ATR-based sizing. *(Future)*
+- Add push notifications for `GREEN` signals and fills. *(Future)*
 
-Position manager blueprint:
-
-- Read open positions from SQLite.
-- Fetch latest market data only for open tickers.
-- Check end-of-day exit before all price logic.
-- Check hard stop and target after time exit.
-- Update trailing stop only after time, stop, and target checks pass.
-- Dispatch generated sell signals through paper broker.
-- Save updated portfolio state and refresh snapshots.
-
-Exit order:
-
-1. Hydrate open positions and latest data.
-2. Trigger EOD liquidation first. Current V2 slice now fills end-of-day exits.
-3. Trigger hard stop or target. Current V2 slice now fills these exits.
-4. Ratchet trailing stop up only. Current V2 slice now tightens stops.
-5. Commit sells and state updates.
-
-End-of-day liquidation:
-
-- The manager checks `should_eod_exit(now, settings.session)` once per run.
-- Exit fires when current local time (in the configured `app.timezone`) is at or after `close_hour:close_minute - eod_minutes_before_close` on a weekday.
-- Defaults: `close_hour=16`, `close_minute=0`, `eod_minutes_before_close=5` → 15:55 ET, Monday through Friday.
-- Each open position is sold through the `PaperBroker` at the latest daily close, persisted to SQLite, and logged as `FILLED reason=eod` to `logs/decision-log.jsonl`.
-- Set `session.eod_enabled: false` in `config.yaml` to disable; useful for weekend runs or paper-mode debugging.
-- `trading_bot/runtime/session.py` holds the pure `now_in_zone` and `should_eod_exit` helpers so tests can drive the wall clock deterministically.
-
-Trailing stop methods:
-
-- R-multiple ratchet: at `+1R`, move stop to breakeven; at `+1.5R`, move stop to `+0.5R`.
-- Chandelier exit: track highest high since entry and set stop to `highest_high - (1.5 * ATR)`.
-
-Trailing stop implementation:
-
-- `trading_bot/strategy/trailing_stop.py` holds the pure functions:
-  - `ratchet_stop(current_stop, entry_price, last_price, initial_risk)`
-  - `chandelier_stop(highest_high, atr, multiplier=1.5)`
-  - `next_trailing_stop(position, last_price, atr)` returns `(new_stop, method)` where `method` is `r-multiple`, `chandelier-atr`, or `both`; returns `(None, None)` when no tightening is warranted.
-- ATR is Wilder's smoothing via `trading_bot/data/indicators.py:add_atr(period=14)`.
-- `Position` model gained two persisted fields:
-  - `initial_risk` locked in once on the first manage-positions run (`entry_price - stop_loss`) so R-multiple math stays stable as the stop moves up.
-  - `highest_high` tracked monotonically since entry for the chandelier method.
-- `manage-positions` applies trails after stop and target checks:
-  - computes fresh ATR from the daily frame when `high`/`low` are present (skips silently on close-only frames),
-  - picks the tighter of the r-multiple and chandelier candidates,
-  - only writes a new `stop_loss` higher than the current one,
-  - persists the new `Position` and log line `TRAIL method=... stop=... last=... high=...` to `logs/decision-log.jsonl`.
-
-Manager guardrails:
-
-- Freeze manager if market data is older than strict latency limit.
-- Do not execute trailing stops or EOD exits on stale data.
-- Handle SQLite locks cleanly if scanner and manager run near same time.
-
-Harden paper simulation:
-
-- Add strict latency gate between signal data timestamp and local clock.
-- Reject signals older than configured latency limit.
-- Simulate hostile fills with slippage.
-- Deduct fees from portfolio state.
-- Make paper trading prove edge survives friction.
-
-Advanced filters and sizing:
-
-- Add macro/breadth master gate.
-- If SPY or QQQ are bearish daily, block long equity entries.
-- Add ATR-based sizing.
-- Size fewer shares for high-volatility names and more for slow movers.
-
-Observability and developer experience:
-
-- Add push notifications for `GREEN` signals and fills.
-- Prefer Discord or Telegram webhook first.
-- Build local dashboard from existing JSON snapshots.
-- Keep dashboard simple before adding API/service layer.
+Exit order remains: **EOD → Stop → Target → Trail**
 
 ## V3 And V4 Roadmap
 

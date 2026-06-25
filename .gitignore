@@ -7,6 +7,15 @@
 /agents.md-main/
 /logs/
 /state/
+/trained_models/
+/ui/
+/.opencode/
 
 __pycache__/
 *.py[cod]
+.env
+.env.local
+.env.*.local
+*.db
+dynamic_watchlist.json
+.last_discover_date

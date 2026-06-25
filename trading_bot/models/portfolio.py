@@ -14,6 +14,7 @@ class Position(BaseModel):
     highest_high: float | None = Field(default=None, gt=0.0)
     initial_risk: float | None = Field(default=None, gt=0.0)
     entry_at: datetime | None = None
+    strategy_tag: str = ""
 
 
 class PortfolioState(BaseModel):

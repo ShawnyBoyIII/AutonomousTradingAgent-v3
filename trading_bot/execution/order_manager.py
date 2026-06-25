@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 from trading_bot.config.settings import RiskSettings
 from trading_bot.execution.broker_base import BrokerAdapter
+from trading_bot.execution.fills import apply_slippage
 from trading_bot.execution.modes import ExecutionMode, require_paper_mode
 from trading_bot.models.order import FillResult, OrderRequest
 from trading_bot.models.signal import TradeSignal
 from trading_bot.risk.risk_manager import evaluate_signal
+
+if TYPE_CHECKING:
+    from trading_bot.strategy.counter_thesis import CounterThesisResult
 
 
 def submit_signal_as_order(
@@ -15,7 +20,10 @@ def submit_signal_as_order(
     broker: BrokerAdapter,
     account_equity: float,
     open_tickers: set[str],
+    portfolio_heat_pct: float = 0.0,
+    atr: float | None = None,
     risk_settings: RiskSettings | None = None,
+    counter_thesis: "CounterThesisResult | None" = None,
     mode: ExecutionMode = ExecutionMode.PAPER,
 ) -> FillResult | None:
     require_paper_mode(mode)
@@ -24,7 +32,10 @@ def submit_signal_as_order(
         signal=signal,
         account_equity=account_equity,
         open_tickers=open_tickers,
+        portfolio_heat_pct=portfolio_heat_pct,
+        atr=atr,
         risk_settings=risk_settings,
+        counter_thesis=counter_thesis,
     )
     if not decision.approved:
         return None
@@ -38,7 +49,12 @@ def submit_signal_as_order(
     )
 
     broker_cash = _extract_broker_cash(broker)
-    estimated_total_cost = (signal.entry_price * decision.position_size) + getattr(
+    estimated_fill_price = apply_slippage(
+        signal.entry_price,
+        getattr(broker, "slippage_bps", 0),
+        "BUY",
+    )
+    estimated_total_cost = (estimated_fill_price * decision.position_size) + getattr(
         broker, "fee_per_order", 0.0
     )
     if broker_cash is not None and broker_cash < estimated_total_cost:

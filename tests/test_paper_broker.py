@@ -115,7 +115,7 @@ def test_ledger_initializes_sqlite_tables(tmp_path: Path) -> None:
             for row in conn.execute("PRAGMA table_info(orders)")
         ]
 
-    assert columns == ["id", "ticker", "side", "quantity", "fill_price", "fees", "filled_at"]
+    assert columns == ["id", "ticker", "side", "quantity", "fill_price", "fees", "filled_at", "pnl"]
 
 
 def test_ledger_round_trips_portfolio_state(tmp_path: Path) -> None:
@@ -173,6 +173,7 @@ def test_ledger_records_fill_rows(tmp_path: Path) -> None:
             "fill_price": 101.25,
             "fees": 1.0,
             "filled_at": "2026-06-13T10:00:00",
+            "pnl": 0.0,
         }
     ]
 
@@ -202,11 +203,14 @@ def test_submit_signal_as_order_returns_fill_for_approved_trade() -> None:
         broker,
         account_equity=10000,
         open_tickers=set(),
+        portfolio_heat_pct=0.0,
+        atr=None,
     )
 
     assert fill is not None
     assert fill.ticker == "AAPL"
-    assert fill.quantity == 100
+    # With max_position_pct=0.20 (default), max position = $2k / $100 = 20 shares
+    assert fill.quantity == 20
     assert fill.fill_price == 100.0
 
 
@@ -231,13 +235,17 @@ def test_submit_signal_as_order_returns_none_for_rejected_signal() -> None:
         broker,
         account_equity=10000,
         open_tickers=set(),
+        portfolio_heat_pct=0.0,
+        atr=None,
     )
 
     assert fill is None
 
 
 def test_submit_signal_as_order_returns_none_when_broker_cash_is_insufficient() -> None:
-    broker = PaperBroker(starting_cash=5000, fee_per_order=1.0, slippage_bps=0)
+    # With max_position_pct=0.20, position is capped at 20 shares = $2000
+    # Set cash below $2001 (position + fee)
+    broker = PaperBroker(starting_cash=1000, fee_per_order=1.0, slippage_bps=0)
     signal = TradeSignal(
         ticker="AAPL",
         timeframe="intraday",
@@ -257,10 +265,12 @@ def test_submit_signal_as_order_returns_none_when_broker_cash_is_insufficient() 
         broker,
         account_equity=10000,
         open_tickers=set(),
+        portfolio_heat_pct=0.0,
+        atr=None,
     )
 
     assert fill is None
-    assert broker.cash == 5000
+    assert broker.cash == 1000
 
 
 def test_submit_signal_as_order_enforces_paper_mode() -> None:
@@ -310,6 +320,8 @@ def test_submit_signal_as_order_uses_configured_risk_settings() -> None:
         broker,
         account_equity=10000,
         open_tickers=set(),
+        portfolio_heat_pct=0.0,
+        atr=None,
         risk_settings=RiskSettings(
             max_risk_per_trade_pct=0.02,
             max_daily_risk_pct=0.03,
@@ -319,4 +331,6 @@ def test_submit_signal_as_order_uses_configured_risk_settings() -> None:
     )
 
     assert fill is not None
-    assert fill.quantity == 200
+    # With 2% risk on $10k = $200 risk, $1 stop distance = 200 shares desired
+    # But max_position_pct=0.20 caps position at $2k / $100 = 20 shares
+    assert fill.quantity == 20

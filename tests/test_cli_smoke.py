@@ -43,8 +43,401 @@ def test_doctor_command_reports_local_readiness(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert result.stdout.strip() == (
-        "doctor live_trading=false state_db=missing log_dir=missing snapshots=0/4"
+        "doctor live_trading=false state_db=missing log_dir=missing snapshots=0/4 "
+        "provider=yfinance provider_auth=ok"
     )
+
+
+def test_read_only_analysis_commands_render_cleanly_with_empty_state(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        "  state_db_path: state/trading_bot.db\n"
+        "  log_dir: logs\n",
+        encoding="utf-8",
+    )
+    runner = CliRunner()
+
+    checks = [
+        (["--config-path", str(config_file), "performance"], 0, "No trades found"),
+        (["--config-path", str(config_file), "health"], 0, "Health Check Report"),
+        (["--config-path", str(config_file), "alerts"], 0, "No active alerts. System operating normally."),
+        (["--config-path", str(config_file), "strategy-health"], 0, "No strategy results tracked yet."),
+        (["--config-path", str(config_file), "drawdown"], 0, "No equity history"),
+        (["--config-path", str(config_file), "correlation"], 0, "Need 2+ open positions to compute correlation."),
+        (["--config-path", str(config_file), "var"], 0, "No open positions for VaR calculation."),
+        (["--config-path", str(config_file), "risk-report"], 0, "No open positions — skipping VaR, correlation, stress tests."),
+    ]
+
+    for argv, exit_code, text in checks:
+        result = runner.invoke(app, argv)
+        assert result.exit_code == exit_code
+        assert text in result.stdout
+
+
+def test_build_universe_writes_ranked_symbols_and_snapshot(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+
+    monkeypatch.setattr(
+        market_data,
+        "fetch_small_cap_candidates",
+        lambda limit=200, screeners=None: [
+            {
+                "symbol": "FAST",
+                "quoteType": "EQUITY",
+                "exchange": "NYQ",
+                "marketCap": 300_000_000,
+                "regularMarketPrice": 6.0,
+                "averageDailyVolume3Month": 300_000,
+                "dayVolume": 800_000,
+                "source": "aggressive_small_caps",
+            },
+            {
+                "symbol": "SLOW",
+                "quoteType": "EQUITY",
+                "exchange": "NYQ",
+                "marketCap": 1_500_000_000,
+                "regularMarketPrice": 8.0,
+                "averageDailyVolume3Month": 150_000,
+                "dayVolume": 120_000,
+                "source": "small_cap_gainers",
+            },
+        ],
+    )
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        f"  universe_path: {tmp_path / 'state' / 'universe.txt'}\n"
+        f"  universe_candidates_path: {tmp_path / 'state' / 'universe_candidates.json'}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "build-universe"])
+
+    assert result.exit_code == 0
+    assert "FAST" in result.stdout
+    assert "summary candidates=2 included=2" in result.stdout
+    assert (tmp_path / "state" / "universe.txt").read_text(encoding="utf-8") == "FAST\nSLOW\n"
+    snapshot = json.loads((tmp_path / "state" / "universe_candidates.json").read_text(encoding="utf-8"))
+    assert snapshot["mode"] == "universe"
+    assert snapshot["summary"]["included"] == 2
+
+
+def test_build_universe_keeps_multi_screener_hits(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+
+    monkeypatch.setattr(
+        market_data,
+        "fetch_small_cap_candidates",
+        lambda limit=200, screeners=None: [
+            {
+                "symbol": "DUPE",
+                "quoteType": "EQUITY",
+                "exchange": "NYQ",
+                "marketCap": 500_000_000,
+                "regularMarketPrice": 10.0,
+                "averageDailyVolume3Month": 200_000,
+                "dayVolume": 500_000,
+                "source": "aggressive_small_caps",
+            },
+            {
+                "symbol": "DUPE",
+                "quoteType": "EQUITY",
+                "exchange": "NYQ",
+                "marketCap": 500_000_000,
+                "regularMarketPrice": 10.0,
+                "averageDailyVolume3Month": 200_000,
+                "dayVolume": 400_000,
+                "source": "small_cap_gainers",
+            },
+        ],
+    )
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        f"  universe_path: {tmp_path / 'state' / 'universe.txt'}\n"
+        f"  universe_candidates_path: {tmp_path / 'state' / 'universe_candidates.json'}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "build-universe"])
+
+    assert result.exit_code == 0
+    assert "source_hits=2" in result.stdout
+    snapshot = json.loads((tmp_path / "state" / "universe_candidates.json").read_text(encoding="utf-8"))
+    assert snapshot["candidates"][0]["source_hits"] == 2
+
+
+def test_scan_universe_reads_saved_symbols_file(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+    import trading_bot.runtime.orchestrator as orchestrator
+
+    daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=60, freq="D"),
+            "open": [100.0 + index for index in range(60)],
+            "high": [101.0 + index for index in range(60)],
+            "low": [99.0 + index for index in range(60)],
+            "close": [100.0 + index for index in range(60)],
+            "volume": [1_000_000 for _ in range(60)],
+        }
+    )
+    intraday = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2026-06-13 10:00:00",
+                    "2026-06-13 10:05:00",
+                    "2026-06-13 10:10:00",
+                    "2026-06-13 10:15:00",
+                    "2026-06-13 10:20:00",
+                ]
+            ),
+            "open": [99.9, 100.1, 100.0, 100.2, 100.5],
+            "high": [100.1, 100.3, 100.2, 100.4, 101.1],
+            "low": [99.8, 100.0, 99.9, 100.1, 100.4],
+            "close": [100.0, 100.2, 100.1, 100.3, 101.0],
+            "volume": [1000, 1100, 950, 1050, 2500],
+        }
+    )
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    monkeypatch.setattr(
+        orchestrator,
+        "_scan_now",
+        lambda signal_timestamp: datetime(2026, 6, 13, 10, 25, 0, tzinfo=signal_timestamp.tzinfo),
+    )
+    universe_path = tmp_path / "state" / "universe.txt"
+    universe_path.parent.mkdir(parents=True, exist_ok=True)
+    universe_path.write_text("AAPL\n", encoding="utf-8")
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        f"  universe_path: {universe_path}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(PortfolioState(cash=20_000.0, equity=20_000.0))
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "scan-universe", "--summary"])
+
+    assert result.exit_code == 0
+    assert "AAPL APPROVED quality=GREEN" in result.stdout
+    assert "summary symbols=1 approved=1 green=1 yellow=0 rejected=0 no_signal=0 errors=0" in result.stdout
+
+
+def test_alert_signals_sends_from_scan_snapshot(monkeypatch, tmp_path: Path) -> None:
+    from trading_bot.monitoring.notifiers import DiscordNotifier
+
+    sent: list[str] = []
+
+    def fake_send(self, event) -> bool:
+        sent.append(f"{event.title}: {event.message}")
+        return True
+
+    monkeypatch.setattr(DiscordNotifier, "send", fake_send)
+    scan_path = tmp_path / "state" / "scan_results.json"
+    scan_path.parent.mkdir(parents=True, exist_ok=True)
+    scan_path.write_text(
+        json.dumps(
+            {
+                "mode": "scan",
+                "summary": {"approved": 1},
+                "candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "APPROVED",
+                        "quality": "GREEN",
+                        "freshness": "fresh",
+                        "entry": 101.0,
+                        "stop": 99.8,
+                        "target": 103.4,
+                        "confidence": 0.9,
+                        "reasons": ["bullish daily regime", "intraday breakout"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  scan_results_path: {scan_path}\n"
+        "alerts:\n"
+        "  discord_webhook_url: https://discord.test/webhook\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "alert-signals"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "alerts=1"
+    assert len(sent) == 1
+    assert "BUY CANDIDATE" in sent[0]
+    assert "AAPL" in sent[0]
+
+
+def test_alert_signals_no_webhook_is_noop(tmp_path: Path) -> None:
+    scan_path = tmp_path / "state" / "scan_results.json"
+    scan_path.parent.mkdir(parents=True, exist_ok=True)
+    scan_path.write_text(
+        json.dumps(
+            {
+                "mode": "scan",
+                "summary": {"approved": 1},
+                "candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "APPROVED",
+                        "quality": "GREEN",
+                        "freshness": "fresh",
+                        "entry": 101.0,
+                        "stop": 99.8,
+                        "target": 103.4,
+                        "confidence": 0.9,
+                        "reasons": ["bullish daily regime"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  scan_results_path: {scan_path}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "alert-signals"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "alerts=1"
+
+
+def test_robinhood_status_reports_mcp_snapshot_state(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    state_dir = tmp_path / "state"
+    synced_at = datetime(2026, 6, 19, 10, 0, 0)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {state_dir / 'trading_bot.db'}\n"
+        "robinhood:\n"
+        "  enabled: true\n",
+        encoding="utf-8",
+    )
+    (state_dir / "robinhood_sync_meta.json").write_text(
+        json.dumps(
+                {
+                    "source": "mcp",
+                    "account_number": "ACC123",
+                    "synced_at": synced_at.isoformat(),
+                    "fresh_until": datetime(2099, 6, 19, 10, 15, 0).isoformat(),
+                    "capabilities": {
+                        "read_only": True,
+                        "shadow_preview": True,
+                        "live_submit": False,
+                        "live_cancel": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_dir / "robinhood_account.json").write_text(
+        json.dumps(
+            {
+                "account_number": "ACC123",
+                "cash": 1200.5,
+                "equity": 2500.0,
+                "buying_power": 1800.0,
+                "updated_at": synced_at.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_dir / "robinhood_positions.json").write_text("[]", encoding="utf-8")
+    (state_dir / "robinhood_orders.json").write_text("[]", encoding="utf-8")
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "robinhood-status"])
+
+    assert result.exit_code == 0
+    assert "Source: MCP" in result.stdout
+    assert "Connection: connected" in result.stdout
+    assert "Account: ACC123" in result.stdout
+    assert "Freshness: fresh" in result.stdout
+
+
+def test_sync_account_requires_operator_managed_snapshot_when_missing(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "robinhood:\n"
+        "  enabled: true\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "sync-account"])
+
+    assert result.exit_code == 1
+    assert "Codex/operator using Robinhood MCP" in result.stdout
+
+
+def test_sync_positions_apply_is_rejected_for_local_cli(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {state_dir / 'trading_bot.db'}\n"
+        "robinhood:\n"
+        "  enabled: true\n",
+        encoding="utf-8",
+    )
+    (state_dir / "robinhood_sync_meta.json").write_text(
+        json.dumps(
+                {
+                    "source": "mcp",
+                    "account_number": "ACC123",
+                    "synced_at": datetime(2026, 6, 19, 10, 0, 0).isoformat(),
+                    "fresh_until": datetime(2099, 6, 19, 10, 15, 0).isoformat(),
+                    "capabilities": {
+                        "read_only": True,
+                        "shadow_preview": True,
+                        "live_submit": False,
+                        "live_cancel": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_dir / "robinhood_account.json").write_text(
+        json.dumps(
+            {
+                "account_number": "ACC123",
+                "cash": 1200.5,
+                "equity": 2500.0,
+                "buying_power": 1800.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_dir / "robinhood_positions.json").write_text("[]", encoding="utf-8")
+    (state_dir / "robinhood_orders.json").write_text("[]", encoding="utf-8")
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "sync-positions", "--apply"])
+
+    assert result.exit_code == 1
+    assert "Local apply is not supported" in result.stdout
 
 
 def test_scan_command_sizes_from_saved_portfolio_state(monkeypatch, tmp_path: Path) -> None:
@@ -80,7 +473,7 @@ def test_scan_command_sizes_from_saved_portfolio_state(monkeypatch, tmp_path: Pa
         }
     )
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
 
@@ -108,7 +501,7 @@ def test_scan_command_sizes_from_saved_portfolio_state(monkeypatch, tmp_path: Pa
     assert result.exit_code == 0
     assert (
         result.stdout.strip()
-        == "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00 last=101.00 qty=166 rr=2.00 conf=0.90 risk=$199.20 alloc=0.84 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout"
+        == "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout"
     )
     snapshot = json.loads((tmp_path / "state" / "scan_results.json").read_text(encoding="utf-8"))
     assert snapshot["mode"] == "scan"
@@ -175,7 +568,7 @@ def test_scan_command_sorts_approved_candidates_and_prints_richer_fields(
         ),
     }
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         if interval == "5m":
             return intraday_map[symbol].copy(deep=True)
         return daily.copy(deep=True)
@@ -205,8 +598,8 @@ def test_scan_command_sorts_approved_candidates_and_prints_richer_fields(
 
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
-        "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00 last=101.00 qty=166 rr=2.00 conf=0.90 risk=$199.20 alloc=0.84 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout",
-        "MSFT APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00 last=201.00 qty=166 rr=2.00 conf=0.80 risk=$199.20 alloc=1.67 entry=201.00 stop=199.80 target=203.40 reasons=bullish daily regime; intraday breakout",
+        "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout",
+        "MSFT APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00 last=201.00 qty=19 rr=2.00 conf=0.80 risk=$76.00 alloc=0.19 entry=201.00 stop=199.80 target=203.40 reasons=bullish daily regime; intraday breakout",
         "summary symbols=2 approved=2 green=2 yellow=0 rejected=0 no_signal=0 errors=0",
     ]
     log_text = (tmp_path / "logs" / "decision-log.jsonl").read_text(encoding="utf-8")
@@ -260,7 +653,7 @@ def test_scan_command_marks_stale_market_data(monkeypatch, tmp_path: Path) -> No
         }
     )
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
 
@@ -298,8 +691,8 @@ def test_scan_command_writes_empty_snapshot_for_no_signal(monkeypatch, tmp_path:
             "timestamp": pd.date_range("2026-06-01", periods=60, freq="D"),
             "open": [100.0 for _ in range(60)],
             "high": [101.0 for _ in range(60)],
-            "low": [99.0 for _ in range(60)],
-            "close": [100.0 for _ in range(60)],
+            "low": [99.0 for _ in range(59)] + [98.0],
+            "close": [100.0 for _ in range(59)] + [98.0],  # Last day bearish
             "volume": [1_000_000 for _ in range(60)],
         }
     )
@@ -322,7 +715,7 @@ def test_scan_command_writes_empty_snapshot_for_no_signal(monkeypatch, tmp_path:
         }
     )
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
 
@@ -360,8 +753,8 @@ def test_scan_command_prints_no_signal_reason(monkeypatch, tmp_path: Path) -> No
             "timestamp": pd.date_range("2026-06-01", periods=60, freq="D"),
             "open": [100.0 for _ in range(60)],
             "high": [101.0 for _ in range(60)],
-            "low": [99.0 for _ in range(60)],
-            "close": [98.0 for _ in range(60)],
+            "low": [99.0 for _ in range(59)] + [98.0],
+            "close": [100.0 for _ in range(59)] + [98.0],  # Last day bearish,
             "volume": [1_000_000 for _ in range(60)],
         }
     )
@@ -384,7 +777,7 @@ def test_scan_command_prints_no_signal_reason(monkeypatch, tmp_path: Path) -> No
         }
     )
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
 
@@ -412,8 +805,8 @@ def test_scan_command_can_print_gate_details(monkeypatch, tmp_path: Path) -> Non
             "timestamp": pd.date_range("2026-06-01", periods=60, freq="D"),
             "open": [100.0 for _ in range(60)],
             "high": [101.0 for _ in range(60)],
-            "low": [99.0 for _ in range(60)],
-            "close": [98.0 for _ in range(60)],
+            "low": [99.0 for _ in range(59)] + [98.0],
+            "close": [100.0 for _ in range(59)] + [98.0],  # Last day bearish,
             "volume": [1_000_000 for _ in range(60)],
         }
     )
@@ -436,7 +829,7 @@ def test_scan_command_can_print_gate_details(monkeypatch, tmp_path: Path) -> Non
         }
     )
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
 
@@ -458,14 +851,14 @@ def test_scan_command_can_print_gate_details(monkeypatch, tmp_path: Path) -> Non
     assert result.exit_code == 0
     assert result.stdout.strip() == (
         "AAPL NO_SIGNAL reason=daily regime not bullish "
-        "daily_close=98.00 ema_20=98.00 sma_50=98.00 "
+        "daily_close=98.00 ema_20=99.81 sma_50=99.96 "
         "intraday_close=101.00 range_high=100.40 volume=2500 volume_avg=1320.00 volume_ratio=1.89"
     )
     snapshot = json.loads((tmp_path / "state" / "scan_results.json").read_text(encoding="utf-8"))
     assert snapshot["candidates"][0]["details"] == {
         "daily_close": 98.0,
-        "ema_20": 98.0,
-        "sma_50": 98.0,
+        "ema_20": 99.81,
+        "sma_50": 99.96,
         "intraday_close": 101.0,
         "range_high": 100.4,
         "volume": 2500,
@@ -508,7 +901,7 @@ def test_scan_details_ignore_trailing_zero_volume_bar(monkeypatch, tmp_path: Pat
         }
     )
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
 
@@ -576,7 +969,7 @@ def test_scan_details_explain_signal_bar_when_later_bar_exists(monkeypatch, tmp_
         }
     )
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
 
@@ -611,14 +1004,23 @@ def test_scan_details_explain_signal_bar_when_later_bar_exists(monkeypatch, tmp_
 
 
 def test_portfolio_command_prints_saved_summary(monkeypatch, tmp_path: Path) -> None:
+    import sys
     import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 13, 10, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(app_module, "now_in_zone", fake_now_in_zone)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
-        assert interval == "1d"
+        assert interval == "5m"
         return pd.DataFrame(
             {
-                "timestamp": pd.to_datetime(["2026-06-13"]),
+                "timestamp": pd.to_datetime(["2026-06-13T09:55:00"]),
                 "close": [110.0],
             }
         )
@@ -651,6 +1053,136 @@ def test_portfolio_command_prints_saved_summary(monkeypatch, tmp_path: Path) -> 
     assert snapshot["mode"] == "portfolio"
     assert snapshot["summary"]["equity"] == 13050.0
     assert snapshot["positions"][0]["ticker"] == "AAPL"
+
+
+def test_portfolio_command_falls_back_to_average_cost_when_latest_price_is_nan(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import trading_bot.data.market_data as market_data
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        assert interval == "5m"
+        return pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-06-13T09:55:00"]),
+                "close": [float("nan")],
+            }
+        )
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=12_500.0,
+            equity=13_000.0,
+            positions={"AAPL": Position(ticker="AAPL", quantity=5, average_cost=100.0)},
+        )
+    )
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "portfolio"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip().splitlines() == [
+        "cash=12500.00 equity=13000.00 realized_pnl=0.00 unrealized_pnl=0.00 exposure=0.04 positions=1",
+        "AAPL qty=5 avg=100.00 last=100.00 mv=500.00 upl=0.00 alloc=0.04",
+    ]
+
+
+def test_paper_audit_passes_for_matching_local_state(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    ledger = PortfolioLedger(db_path)
+    state = PortfolioState(
+        cash=12_500.0,
+        equity=13_000.0,
+        realized_pnl=150.0,
+        unrealized_pnl=350.0,
+        positions={"AAPL": Position(ticker="AAPL", quantity=5, average_cost=100.0)},
+    )
+    ledger.save_portfolio_state(state)
+    ledger.record_equity_snapshot(state, timestamp=datetime(2026, 6, 22, 10, 0, 0))
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "portfolio_summary.json").write_text(
+        json.dumps(
+            {
+                "mode": "portfolio",
+                "summary": {
+                    "cash": 12500.0,
+                    "equity": 13050.0,
+                    "realized_pnl": 150.0,
+                    "unrealized_pnl": 50.0,
+                    "exposure": 0.04,
+                    "positions": 1,
+                },
+                "positions": [
+                    {
+                        "ticker": "AAPL",
+                        "quantity": 5,
+                        "average_cost": 100.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "paper-audit"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "paper_audit=PASS orders=0 positions=1 equity_snapshots=1 snapshot=yes"
+
+
+def test_paper_audit_fails_when_snapshot_drifts_from_ledger(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    ledger = PortfolioLedger(db_path)
+    state = PortfolioState(
+        cash=12_500.0,
+        equity=13_000.0,
+        positions={"AAPL": Position(ticker="AAPL", quantity=5, average_cost=100.0)},
+    )
+    ledger.save_portfolio_state(state)
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "portfolio_summary.json").write_text(
+        json.dumps(
+            {
+                "mode": "portfolio",
+                "summary": {"cash": 12000.0, "positions": 1},
+                "positions": [
+                    {
+                        "ticker": "AAPL",
+                        "quantity": 7,
+                        "average_cost": 100.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "paper-audit"])
+
+    assert result.exit_code == 1
+    assert "paper_audit=FAIL" in result.stdout
+    assert "- portfolio snapshot cash does not match ledger state" in result.stdout
+    assert "- portfolio snapshot quantity mismatch for AAPL" in result.stdout
 
 
 def test_paper_trade_command_executes_fill_and_persists_state(monkeypatch, tmp_path: Path) -> None:
@@ -686,7 +1218,7 @@ def test_paper_trade_command_executes_fill_and_persists_state(monkeypatch, tmp_p
         }
     )
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
 
@@ -717,13 +1249,13 @@ def test_paper_trade_command_executes_fill_and_persists_state(monkeypatch, tmp_p
     )
 
     assert result.exit_code == 0
-    assert result.stdout.strip() == "AAPL FILLED qty=166 price=101.00 cash=3233.00"
+    assert result.stdout.strip() == "AAPL FILLED qty=39 price=101.00 cash=16060.00"
 
     state = ledger.load_portfolio_state()
     assert state is not None
-    assert state.cash == 3233.0
+    assert state.cash == 16060.0  # $20k - ($39 × $101) - $1 fee
     assert state.equity == 19999.0
-    assert state.positions["AAPL"].quantity == 166
+    assert state.positions["AAPL"].quantity == 39
     assert state.positions["AAPL"].average_cost == 101.0
     assert state.positions["AAPL"].stop_loss == 99.8
     assert state.positions["AAPL"].profit_target == 103.4
@@ -736,6 +1268,306 @@ def test_paper_trade_command_executes_fill_and_persists_state(monkeypatch, tmp_p
     log_text = (log_dir / "decision-log.jsonl").read_text(encoding="utf-8")
     assert '"command": "paper-trade"' in log_text
     assert '"status": "FILLED"' in log_text
+
+
+def test_paper_trade_command_applies_configured_fees_and_slippage(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+    import trading_bot.runtime.orchestrator as orchestrator
+
+    daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=60, freq="D"),
+            "open": [100.0 + index for index in range(60)],
+            "high": [101.0 + index for index in range(60)],
+            "low": [99.0 + index for index in range(60)],
+            "close": [100.0 + index for index in range(60)],
+            "volume": [1_000_000 for _ in range(60)],
+        }
+    )
+    intraday = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2026-06-13 10:00:00",
+                    "2026-06-13 10:05:00",
+                    "2026-06-13 10:10:00",
+                    "2026-06-13 10:15:00",
+                    "2026-06-13 10:20:00",
+                ]
+            ),
+            "open": [99.9, 100.1, 100.0, 100.2, 100.5],
+            "high": [100.1, 100.3, 100.2, 100.4, 101.1],
+            "low": [99.8, 100.0, 99.9, 100.1, 100.4],
+            "close": [100.0, 100.2, 100.1, 100.3, 101.0],
+            "volume": [1000, 1100, 950, 1050, 2500],
+        }
+    )
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    monkeypatch.setattr(
+        orchestrator,
+        "_scan_now",
+        lambda signal_timestamp: datetime(2026, 6, 13, 10, 25, 0, tzinfo=signal_timestamp.tzinfo),
+    )
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        "paper:\n"
+        "  fee_per_order: 1.0\n"
+        "  slippage_bps: 5\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(cash=20_000.0, equity=20_000.0)
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "paper-trade", "--symbols", "AAPL"],
+    )
+
+    assert result.exit_code == 0
+
+    # Entry=101.00; slippage=5bps on BUY → 101 * 1.0005 = 101.0505
+    # qty=39 → gross=3940.97; +fee=1 → cost=3941.97
+    # cash = 20000 - 3941.97 = 16058.03
+    assert result.stdout.strip() == "AAPL FILLED qty=39 price=101.05 cash=16058.03"
+
+    state = PortfolioLedger(db_path).load_portfolio_state()
+    assert state is not None
+    assert state.cash == 16058.03
+    assert state.realized_pnl == -1.0
+    assert state.positions["AAPL"].quantity == 39
+
+
+def test_paper_trade_dry_run_uses_slippage_adjusted_cash_after(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+    import trading_bot.runtime.orchestrator as orchestrator
+
+    daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=60, freq="D"),
+            "open": [100.0 + index for index in range(60)],
+            "high": [101.0 + index for index in range(60)],
+            "low": [99.0 + index for index in range(60)],
+            "close": [100.0 + index for index in range(60)],
+            "volume": [1_000_000 for _ in range(60)],
+        }
+    )
+    intraday = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2026-06-13 10:00:00",
+                    "2026-06-13 10:05:00",
+                    "2026-06-13 10:10:00",
+                    "2026-06-13 10:15:00",
+                    "2026-06-13 10:20:00",
+                ]
+            ),
+            "open": [99.9, 100.1, 100.0, 100.2, 100.5],
+            "high": [100.1, 100.3, 100.2, 100.4, 101.1],
+            "low": [99.8, 100.0, 99.9, 100.1, 100.4],
+            "close": [100.0, 100.2, 100.1, 100.3, 101.0],
+            "volume": [1000, 1100, 950, 1050, 2500],
+        }
+    )
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    monkeypatch.setattr(
+        orchestrator,
+        "_scan_now",
+        lambda signal_timestamp: datetime(2026, 6, 13, 10, 25, 0, tzinfo=signal_timestamp.tzinfo),
+    )
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        "paper:\n"
+        "  fee_per_order: 1.0\n"
+        "  slippage_bps: 5\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(cash=20_000.0, equity=20_000.0)
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "paper-trade", "--symbols", "AAPL", "--dry-run"],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "AAPL DRY_RUN qty=39 price=101.05 cash_after=16058.03"
+
+
+def test_paper_trade_rejects_when_slippage_pushes_cost_over_cash(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+    import trading_bot.runtime.orchestrator as orchestrator
+
+    daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=60, freq="D"),
+            "open": [100.0 + index for index in range(60)],
+            "high": [101.0 + index for index in range(60)],
+            "low": [99.0 + index for index in range(60)],
+            "close": [100.0 + index for index in range(60)],
+            "volume": [1_000_000 for _ in range(60)],
+        }
+    )
+    intraday = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2026-06-13 10:00:00",
+                    "2026-06-13 10:05:00",
+                    "2026-06-13 10:10:00",
+                    "2026-06-13 10:15:00",
+                    "2026-06-13 10:20:00",
+                ]
+            ),
+            "open": [99.9, 100.1, 100.0, 100.2, 100.5],
+            "high": [100.1, 100.3, 100.2, 100.4, 101.1],
+            "low": [99.8, 100.0, 99.9, 100.1, 100.4],
+            "close": [100.0, 100.2, 100.1, 100.3, 101.0],
+            "volume": [1000, 1100, 950, 1050, 2500],
+        }
+    )
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    monkeypatch.setattr(
+        orchestrator,
+        "_scan_now",
+        lambda signal_timestamp: datetime(2026, 6, 13, 10, 25, 0, tzinfo=signal_timestamp.tzinfo),
+    )
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        "paper:\n"
+        "  fee_per_order: 1.0\n"
+        "  slippage_bps: 5\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(cash=3941.50, equity=20_000.0)
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "paper-trade", "--symbols", "AAPL"],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "AAPL REJECTED insufficient cash"
+
+    state = PortfolioLedger(db_path).load_portfolio_state()
+    assert state is not None
+    assert state.cash == 3941.50
+    assert state.positions == {}
+
+
+def test_paper_trade_ignores_invalid_held_position_data_for_portfolio_heat(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import trading_bot.data.market_data as market_data
+    import trading_bot.runtime.orchestrator as orchestrator
+
+    valid_daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=60, freq="D"),
+            "open": [100.0 + index for index in range(60)],
+            "high": [101.0 + index for index in range(60)],
+            "low": [99.0 + index for index in range(60)],
+            "close": [100.0 + index for index in range(60)],
+            "volume": [1_000_000 for _ in range(60)],
+        }
+    )
+    valid_intraday = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2026-06-13 10:00:00",
+                    "2026-06-13 10:05:00",
+                    "2026-06-13 10:10:00",
+                    "2026-06-13 10:15:00",
+                    "2026-06-13 10:20:00",
+                ]
+            ),
+            "open": [99.9, 100.1, 100.0, 100.2, 100.5],
+            "high": [100.1, 100.3, 100.2, 100.4, 101.1],
+            "low": [99.8, 100.0, 99.9, 100.1, 100.4],
+            "close": [100.0, 100.2, 100.1, 100.3, 101.0],
+            "volume": [1000, 1100, 950, 1050, 2500],
+        }
+    )
+    invalid_held_intraday = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2026-06-13 10:20:00"]),
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [0.0],
+            "volume": [1000],
+        }
+    )
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        if symbol == "AAPL":
+            return valid_intraday.copy(deep=True) if interval == "5m" else valid_daily.copy(deep=True)
+        if symbol == "TSLA":
+            assert interval == "5m"
+            return invalid_held_intraday.copy(deep=True)
+        raise AssertionError(symbol)
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    monkeypatch.setattr(
+        orchestrator,
+        "_scan_now",
+        lambda signal_timestamp: datetime(2026, 6, 13, 10, 25, 0, tzinfo=signal_timestamp.tzinfo),
+    )
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=20_000.0,
+            equity=20_000.0,
+            positions={"TSLA": Position(ticker="TSLA", quantity=10, average_cost=100.0)},
+        )
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "paper-trade", "--symbols", "AAPL"],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "AAPL FILLED qty=39 price=101.00 cash=16060.00"
 
 
 def test_paper_trade_dry_run_previews_without_persisting(monkeypatch, tmp_path: Path) -> None:
@@ -771,7 +1603,7 @@ def test_paper_trade_dry_run_previews_without_persisting(monkeypatch, tmp_path: 
         }
     )
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
 
@@ -799,7 +1631,8 @@ def test_paper_trade_dry_run_previews_without_persisting(monkeypatch, tmp_path: 
     )
 
     assert result.exit_code == 0
-    assert result.stdout.strip() == "AAPL DRY_RUN qty=166 price=101.00 cash_after=3233.00"
+    # With max_position_pct=0.20 (20%), max position = $4k / $101 = ~39 shares
+    assert result.stdout.strip() == "AAPL DRY_RUN qty=39 price=101.00 cash_after=16060.00"
     state = ledger.load_portfolio_state()
     assert state is not None
     assert state.cash == 20_000.0
@@ -880,16 +1713,33 @@ def test_manage_positions_reports_empty_portfolio(tmp_path: Path) -> None:
     result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
 
     assert result.exit_code == 0
-    assert result.stdout.strip() == "positions=0 actions=0"
+    assert result.stdout.strip() == "positions=0 actions=0 skipped=0"
 
 
 def test_manage_positions_reports_open_position_price(monkeypatch, tmp_path: Path) -> None:
+    import sys
     import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 10, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(app_module, "now_in_zone", fake_now_in_zone)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
-        assert interval == "1d"
-        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [110.0]})
+        if interval == "5m":
+            return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18T09:55:00"]), "close": [110.0]})
+        elif interval == "1d":
+            # Daily bars for ATR (not used in this test but needed for consistency)
+            return pd.DataFrame({
+                "timestamp": pd.to_datetime(["2026-06-18"]),
+                "high": [110.0], "low": [100.0], "close": [110.0], "volume": [1_000_000]
+            })
+        else:
+            raise ValueError(f"Unexpected interval: {interval}")
 
     monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
     config_file = tmp_path / "config.yaml"
@@ -911,18 +1761,27 @@ def test_manage_positions_reports_open_position_price(monkeypatch, tmp_path: Pat
 
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
-        "positions=1 actions=0",
+        "positions=1 actions=0 skipped=0",
         "AAPL qty=10 avg=100.00 last=110.00",
     ]
 
 
 def test_manage_positions_executes_target_exit(monkeypatch, tmp_path: Path) -> None:
+    import sys
     import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 10, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(app_module, "now_in_zone", fake_now_in_zone)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
-        assert interval == "1d"
-        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [110.0]})
+        assert interval == "5m"
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18T09:55:00"]), "close": [110.0]})
 
     monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
     config_file = tmp_path / "config.yaml"
@@ -952,7 +1811,7 @@ def test_manage_positions_executes_target_exit(monkeypatch, tmp_path: Path) -> N
 
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
-        "positions=0 actions=1",
+        "positions=0 actions=1 skipped=0",
         "AAPL FILLED reason=target qty=10 price=110.00 cash=10099.00",
     ]
 
@@ -966,12 +1825,21 @@ def test_manage_positions_executes_target_exit(monkeypatch, tmp_path: Path) -> N
 
 
 def test_manage_positions_executes_stop_exit(monkeypatch, tmp_path: Path) -> None:
+    import sys
     import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 10, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(app_module, "now_in_zone", fake_now_in_zone)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
-        assert interval == "1d"
-        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [97.5]})
+        assert interval == "5m"
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18T09:55:00"]), "close": [97.5]})
 
     monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
     config_file = tmp_path / "config.yaml"
@@ -1001,7 +1869,7 @@ def test_manage_positions_executes_stop_exit(monkeypatch, tmp_path: Path) -> Non
 
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
-        "positions=0 actions=1",
+        "positions=0 actions=1 skipped=0",
         "AAPL FILLED reason=stop qty=10 price=97.50 cash=9974.00",
     ]
 
@@ -1015,12 +1883,30 @@ def test_manage_positions_executes_stop_exit(monkeypatch, tmp_path: Path) -> Non
 
 
 def test_manage_positions_trails_stop_up_when_price_advances(monkeypatch, tmp_path: Path) -> None:
+    import sys
     import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 10, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(app_module, "now_in_zone", fake_now_in_zone)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
-        assert interval == "1d"
-        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [102.0]})
+        if interval == "5m":
+            # Intraday timestamp 5 mins before "now" (10:00 ET)
+            return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18T09:55:00"]), "close": [102.0]})
+        elif interval == "1d":
+            # Daily bars for ATR
+            return pd.DataFrame({
+                "timestamp": pd.to_datetime(["2026-06-18"]),
+                "high": [102.0], "low": [99.0], "close": [102.0], "volume": [1_000_000]
+            })
+        else:
+            raise ValueError(f"Unexpected interval: {interval}")
 
     monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
     config_file = tmp_path / "config.yaml"
@@ -1050,7 +1936,7 @@ def test_manage_positions_trails_stop_up_when_price_advances(monkeypatch, tmp_pa
 
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
-        "positions=1 actions=1",
+        "positions=1 actions=1 skipped=0",
         "AAPL TRAIL method=r-multiple stop=101.00 last=102.00 high=102.00",
     ]
 
@@ -1063,12 +1949,28 @@ def test_manage_positions_trails_stop_up_when_price_advances(monkeypatch, tmp_pa
 
 
 def test_manage_positions_does_not_trail_below_break_even(monkeypatch, tmp_path: Path) -> None:
+    import sys
     import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 10, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(app_module, "now_in_zone", fake_now_in_zone)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
-        assert interval == "1d"
-        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [100.5]})
+        if interval == "5m":
+            return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18T09:55:00"]), "close": [100.5]})
+        elif interval == "1d":
+            return pd.DataFrame({
+                "timestamp": pd.to_datetime(["2026-06-18"]),
+                "high": [102.0], "low": [99.0], "close": [100.5], "volume": [1_000_000]
+            })
+        else:
+            raise ValueError(f"Unexpected interval: {interval}")
 
     monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
     config_file = tmp_path / "config.yaml"
@@ -1098,7 +2000,7 @@ def test_manage_positions_does_not_trail_below_break_even(monkeypatch, tmp_path:
 
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
-        "positions=1 actions=0",
+        "positions=1 actions=0 skipped=0",
         "AAPL qty=10 avg=100.00 last=100.50",
     ]
 
@@ -1109,12 +2011,28 @@ def test_manage_positions_does_not_trail_below_break_even(monkeypatch, tmp_path:
 
 
 def test_manage_positions_trail_is_idempotent_across_runs(monkeypatch, tmp_path: Path) -> None:
+    import sys
     import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 10, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(app_module, "now_in_zone", fake_now_in_zone)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
-        assert interval == "1d"
-        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [102.0]})
+        if interval == "5m":
+            return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18T09:55:00"]), "close": [102.0]})
+        elif interval == "1d":
+            return pd.DataFrame({
+                "timestamp": pd.to_datetime(["2026-06-18"]),
+                "high": [102.0], "low": [99.0], "close": [102.0], "volume": [1_000_000]
+            })
+        else:
+            raise ValueError(f"Unexpected interval: {interval}")
 
     monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
     config_file = tmp_path / "config.yaml"
@@ -1156,7 +2074,16 @@ def test_manage_positions_trail_is_idempotent_across_runs(monkeypatch, tmp_path:
 
 
 def test_manage_positions_trails_via_chandelier_atr(monkeypatch, tmp_path: Path) -> None:
+    import sys
     import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
+
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 10, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(app_module, "now_in_zone", fake_now_in_zone)
 
     n_rows = 30
     rows = []
@@ -1172,10 +2099,21 @@ def test_manage_positions_trails_via_chandelier_atr(monkeypatch, tmp_path: Path)
         [f"2026-06-{day:02d}" for day in range(1, n_rows + 1)]
     )
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
-        assert interval == "1d"
-        return expected_frame.copy()
+        if interval == "5m":
+            # Return last row as intraday bar
+            return pd.DataFrame({
+                "timestamp": pd.to_datetime(["2026-06-18T09:55:00"]),
+                "high": [105.0],
+                "low": [95.0],
+                "close": [99.0],
+                "volume": [1_000_000],
+            })
+        elif interval == "1d":
+            return expected_frame.copy()
+        else:
+            raise ValueError(f"Unexpected interval: {interval}")
 
     monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
     config_file = tmp_path / "config.yaml"
@@ -1206,7 +2144,7 @@ def test_manage_positions_trails_via_chandelier_atr(monkeypatch, tmp_path: Path)
 
     assert result.exit_code == 0
     lines = result.stdout.strip().splitlines()
-    assert lines[0] == "positions=1 actions=1"
+    assert lines[0] == "positions=1 actions=1 skipped=0"
     # ATR is constant 10 across the frame; chandelier = 110 - 1.5 * 10 = 95.
     assert lines[1] == "AAPL TRAIL method=chandelier-atr stop=95.00 last=99.00 high=110.00"
 
@@ -1220,6 +2158,100 @@ def test_manage_positions_trails_via_chandelier_atr(monkeypatch, tmp_path: Path)
     assert position.initial_risk == 20.0
 
 
+def test_manage_positions_chandelier_uses_bar_high_not_close(monkeypatch, tmp_path: Path) -> None:
+    """Chandelier stop should track the bar's true high (including wicks), not just closes.
+
+    If a bar spikes to 110 but closes at 102, highest_high should be 110, not 102.
+    This ensures we don't tighten the stop prematurely based on a lower close.
+    """
+    import sys
+    import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
+
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 10, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(app_module, "now_in_zone", fake_now_in_zone)
+
+    # Need at least 15 bars for ATR(14) calculation (for daily data)
+    n_rows = 20
+    rows = []
+    for index in range(n_rows - 1):
+        # Historical bars with consistent range
+        rows.append({"high": 105.0, "low": 95.0, "close": 100.0, "volume": 1_000_000})
+    # Last bar: spikes to 110, closes at 102
+    rows.append({"high": 110.0, "low": 100.0, "close": 102.0, "volume": 1_000_000})
+
+    expected_frame = pd.DataFrame(rows)
+    expected_frame["timestamp"] = pd.to_datetime(
+        [f"2026-06-{day:02d}" for day in range(1, n_rows + 1)]
+    )
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        if interval == "5m":
+            # Intraday bar: spikes to 110, closes at 102
+            return pd.DataFrame({
+                "timestamp": pd.to_datetime(["2026-06-18T09:55:00"]),
+                "high": [110.0],
+                "low": [100.0],
+                "close": [102.0],
+                "volume": [1_000_000],
+            })
+        elif interval == "1d":
+            # Daily bars for ATR calculation
+            return expected_frame.copy()
+        else:
+            raise ValueError(f"Unexpected interval: {interval}")
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    # Start with no highest_high tracked and a loose stop
+    # ATR ~10, chandelier = 110 - 1.5 * 10 = 95
+    # So current stop of 90 should tighten to 95
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=90.0,  # Loose stop - chandelier will tighten to 95
+                    profit_target=120.0,
+                    # highest_high not set - will be initialized from bar high (110)
+                )
+            },
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    lines = result.stdout.strip().splitlines()
+    assert lines[0] == "positions=1 actions=1 skipped=0"
+    # highest_high should be 110.0 (the bar high), NOT 102.0 (the close)
+    # Most importantly: high=110.00 in the log line, not 102.00
+    assert "high=110.00" in lines[1]
+
+    state = PortfolioLedger(db_path).load_portfolio_state()
+    assert state is not None
+    position = state.positions["AAPL"]
+    # highest_high must be 110 (the bar high), not 102 (the close)
+    assert position.highest_high == 110.0, f"expected 110.0 (bar high), got {position.highest_high} (close)"
+    # Stop should tighten to chandelier level
+    assert position.stop_loss == 95.0
+
+
 def test_manage_positions_executes_eod_exit(monkeypatch, tmp_path: Path) -> None:
     import sys
     import trading_bot.data.market_data as market_data
@@ -1230,10 +2262,11 @@ def test_manage_positions_executes_eod_exit(monkeypatch, tmp_path: Path) -> None
 
     monkeypatch.setattr(sys.modules["trading_bot.cli.app"], "now_in_zone", fake_now_in_zone)
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
-        assert interval == "1d"
-        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [105.0]})
+        assert interval == "5m"
+        # Use intraday timestamp close to EOD time (15:56)
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18T15:55:00"]), "close": [105.0]})
 
     monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
 
@@ -1266,7 +2299,7 @@ def test_manage_positions_executes_eod_exit(monkeypatch, tmp_path: Path) -> None
 
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
-        "positions=0 actions=1",
+        "positions=0 actions=1 skipped=0",
         "AAPL FILLED reason=eod qty=10 price=105.00 cash=10049.00",
     ]
 
@@ -1292,9 +2325,9 @@ def test_manage_positions_eod_check_skips_inside_trading_hours(monkeypatch, tmp_
 
     monkeypatch.setattr(sys.modules["trading_bot.cli.app"], "now_in_zone", fake_now_in_zone)
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
-        assert interval == "1d"
+        assert interval == "5m"
         return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [101.0]})
 
     monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
@@ -1332,6 +2365,124 @@ def test_manage_positions_eod_check_skips_inside_trading_hours(monkeypatch, tmp_
     assert "AAPL" in state.positions
 
 
+def test_manage_positions_freezes_on_stale_market_data(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
+    import trading_bot.cli.app as cli_app_mod
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 12, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(
+        sys.modules["trading_bot.cli.app"], "now_in_zone", fake_now_in_zone
+    )
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        assert interval == "5m"  # Now uses intraday interval
+        return pd.DataFrame(
+            {"timestamp": pd.to_datetime(["2026-06-18 10:00:00"]), "close": [80.0]}
+        )
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        "market_data:\n"
+        "  max_data_age_minutes: 30\n",  # Use minutes for intraday staleness
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=99.0,
+                    profit_target=108.0,
+                )
+            },
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip().splitlines() == [
+        "positions=1 actions=0 skipped=1",
+        "AAPL SKIP reason=stale-data last=80.00",
+    ]
+
+    state = PortfolioLedger(db_path).load_portfolio_state()
+    assert state is not None
+    # Position should be untouched despite last_price=80 < stop=99.
+    assert state.positions["AAPL"].quantity == 10
+    assert state.cash == 9_000.0
+
+
+def test_manage_positions_skips_empty_intraday_frame(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 12, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(
+        sys.modules["trading_bot.cli.app"], "now_in_zone", fake_now_in_zone
+    )
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        assert interval == "5m"
+        return pd.DataFrame(columns=["timestamp", "close"])
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        "market_data:\n"
+        "  max_data_age_minutes: 30\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=99.0,
+                    profit_target=108.0,
+                )
+            },
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip().splitlines() == [
+        "positions=1 actions=0 skipped=1",
+        "AAPL SKIP reason=stale-data last=unknown",
+    ]
+
+    state = PortfolioLedger(db_path).load_portfolio_state()
+    assert state is not None
+    assert state.positions["AAPL"].quantity == 10
+    assert state.cash == 9_000.0
+
+
 def test_manage_positions_eod_can_be_disabled_via_config(monkeypatch, tmp_path: Path) -> None:
     import sys
     import trading_bot.data.market_data as market_data
@@ -1342,9 +2493,9 @@ def test_manage_positions_eod_can_be_disabled_via_config(monkeypatch, tmp_path: 
 
     monkeypatch.setattr(sys.modules["trading_bot.cli.app"], "now_in_zone", fake_now_in_zone)
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
-        assert interval == "1d"
+        assert interval == "5m"
         return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [101.0]})
 
     monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
@@ -1384,6 +2535,256 @@ def test_manage_positions_eod_can_be_disabled_via_config(monkeypatch, tmp_path: 
     assert "AAPL" in state.positions
 
 
+def test_manage_positions_executes_target_exit_with_fees(monkeypatch, tmp_path: Path) -> None:
+    import sys
+    import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
+
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 10, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(app_module, "now_in_zone", fake_now_in_zone)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        assert interval == "5m"
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18T09:55:00"]), "close": [110.0]})
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        "paper:\n"
+        "  fee_per_order: 1.0\n"
+        "  slippage_bps: 5\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=98.0,
+                    profit_target=108.0,
+                )
+            },
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    # SELL at market=110 → slippage is *against* the seller so fill = 110 * (1 - 5/10000) = 109.945
+    # cash_after = 9000 + (109.945 * 10) - 1 = 9000 + 1099.45 - 1 = 10098.45
+    assert result.stdout.strip().splitlines() == [
+        "positions=0 actions=1 skipped=0",
+        "AAPL FILLED reason=target qty=10 price=109.95 cash=10098.45",
+    ]
+
+    state = PortfolioLedger(db_path).load_portfolio_state()
+    assert state is not None
+    assert state.cash == 10098.45
+    assert state.realized_pnl == 98.45
+    assert state.positions == {}
+
+
+def test_run_manager_loops_until_keyboard_interrupt(monkeypatch, tmp_path: Path) -> None:
+    import sys
+    import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
+
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 10, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(app_module, "now_in_zone", fake_now_in_zone)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [101.0]})
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    iteration = {"n": 0}
+
+    def fake_sleep(seconds: float) -> None:
+        iteration["n"] += 1
+        if iteration["n"] >= 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(app_module.time, "sleep", fake_sleep)
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(cash=9_000.0, equity=10_000.0)
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "run-manager", "--interval", "1"],
+    )
+
+    assert result.exit_code == 0
+    assert "run-manager started interval=1s" in result.stdout
+    assert "run-manager stopped" in result.stdout
+    # At least two iterations of the manage-positions summary line.
+    assert result.stdout.count("positions=0 actions=0 skipped=0") >= 2
+
+
+def test_run_manager_runs_one_iteration_with_interval_zero(monkeypatch, tmp_path: Path) -> None:
+    """With interval=0, the loop runs continuously without sleeping."""
+    import sys
+    import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
+
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 10, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(app_module, "now_in_zone", fake_now_in_zone)
+
+    iteration_count = {"n": 0}
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [101.0]})
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    # Track iterations and stop after a few
+    original_run_once = app_module._run_manage_positions_once
+
+    def counting_run_once(ctx):
+        iteration_count["n"] += 1
+        if iteration_count["n"] >= 3:
+            raise KeyboardInterrupt
+        return original_run_once(ctx)
+
+    monkeypatch.setattr(app_module, "_run_manage_positions_once", counting_run_once)
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(cash=9_000.0, equity=10_000.0)
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "run-manager", "--interval", "0"],
+    )
+
+    assert result.exit_code == 0
+    assert "run-manager started interval=0s" in result.stdout
+    assert "run-manager stopped" in result.stdout
+    # Should run at least 2 iterations before KeyboardInterrupt
+    assert result.stdout.count("positions=0 actions=0 skipped=0") >= 2
+
+
+def test_run_manager_circuit_breaker_opens_after_max_failures(monkeypatch, tmp_path: Path) -> None:
+    """Circuit breaker exits after consecutive failures exceed threshold."""
+    import sys
+    from trading_bot.portfolio.ledger import PortfolioLedger
+
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(cash=9_000.0, equity=10_000.0)
+    )
+
+    # Prevent any actual sleeping during backoff (patch app's import of time)
+    monkeypatch.setattr(app_module.time, "sleep", lambda x: None)
+
+    # Inject a failure into every iteration
+    monkeypatch.setattr(
+        app_module,
+        "_run_manage_positions_once",
+        lambda ctx: (_ for _ in ()).throw(RuntimeError("simulated failure")),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "run-manager", "--interval", "1", "--max-failures", "3"],
+    )
+
+    assert result.exit_code == 1
+    assert "circuit breaker open after 3 failures" in result.stdout
+
+
+def test_run_manager_circuit_breaker_resets_on_success(monkeypatch, tmp_path: Path) -> None:
+    """Circuit breaker resets failure count on successful iteration."""
+    import sys
+    import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
+
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 10, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(app_module, "now_in_zone", fake_now_in_zone)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [101.0]})
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(cash=9_000.0, equity=10_000.0)
+    )
+
+    iteration = {"n": 0}
+
+    def fake_sleep(seconds: float) -> None:
+        iteration["n"] += 1
+        if iteration["n"] >= 5:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(app_module.time, "sleep", fake_sleep)
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "run-manager", "--interval", "1", "--max-failures", "10"],
+    )
+
+    assert result.exit_code == 0
+    assert "run-manager stopped" in result.stdout
+    # Should complete 5 iterations without hitting circuit breaker
+    assert result.stdout.count("positions=0 actions=0 skipped=0") >= 5
+
+
 def test_paper_trade_command_prints_rejection_reason(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
 
@@ -1416,7 +2817,7 @@ def test_paper_trade_command_prints_rejection_reason(monkeypatch, tmp_path: Path
         }
     )
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
 
@@ -1486,7 +2887,7 @@ def test_paper_trade_rejects_stale_signal(monkeypatch, tmp_path: Path) -> None:
         }
     )
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
 
@@ -1549,7 +2950,7 @@ def test_paper_trade_rejects_yellow_signal(monkeypatch, tmp_path: Path) -> None:
         }
     )
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
 
@@ -1640,9 +3041,9 @@ def test_paper_trade_rejects_daily_loss_limit(tmp_path: Path) -> None:
 def test_report_command_prints_summary_and_exports_files(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
-        assert interval == "1d"
+        assert interval == "5m"
         return pd.DataFrame(
             {
                 "timestamp": pd.to_datetime(["2026-06-13"]),
@@ -1710,8 +3111,8 @@ def test_report_command_prints_summary_and_exports_files(monkeypatch, tmp_path: 
         "orders": 1,
     }
     assert csv_path.read_text(encoding="utf-8").splitlines() == [
-        "id,ticker,side,quantity,fill_price,fees,filled_at",
-        "order-1,AAPL,BUY,5,100.0,1.0,2026-06-13T10:00:00",
+        "id,ticker,side,quantity,fill_price,fees,filled_at,pnl",
+        "order-1,AAPL,BUY,5,100.0,1.0,2026-06-13T10:00:00,0.0",
     ]
     dashboard_snapshot = json.loads(
         (tmp_path / "state" / "dashboard_summary.json").read_text(encoding="utf-8")
@@ -1754,7 +3155,7 @@ def test_backtest_command_replays_data_and_prints_summary(monkeypatch, tmp_path:
         }
     )
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
 
@@ -1784,7 +3185,7 @@ def test_backtest_command_replays_data_and_prints_summary(monkeypatch, tmp_path:
     )
 
     assert result.exit_code == 0
-    assert result.stdout.strip() == "trades=1 wins=1 win_rate=1.00 net_pnl=164.00"
+    assert result.stdout.strip() == "trades=1 wins=1 win_rate=1.00 net_pnl=36.00"
     log_text = (log_dir / "decision-log.jsonl").read_text(encoding="utf-8")
     assert '"command": "backtest"' in log_text
     assert '"ticker": "AAPL"' in log_text
@@ -1793,16 +3194,16 @@ def test_backtest_command_replays_data_and_prints_summary(monkeypatch, tmp_path:
     assert snapshot["mode"] == "backtest"
     assert snapshot["summary"]["trades"] == 1
     assert snapshot["summary"]["wins"] == 1
-    assert snapshot["summary"]["net_pnl"] == 164.0
+    assert snapshot["summary"]["net_pnl"] == 36.0
     assert snapshot["rows"][0]["ticker"] == "AAPL"
 
 
 def test_report_command_reflects_paper_trade_fees(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
 
-    def fake_fetch_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
-        assert interval == "1d"
+        assert interval == "5m"
         return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18"]), "close": [101.0]})
 
     monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
@@ -1832,3 +3233,112 @@ def test_report_command_reflects_paper_trade_fees(monkeypatch, tmp_path: Path) -
         result.stdout.strip()
         == "net_pnl=-1.00 realized_pnl=-1.00 unrealized_pnl=0.00 open_positions=1 exposure=0.84 orders=0"
     )
+
+
+def test_paper_trade_v3_lifecycle_creates_position_and_tracks_pnl(monkeypatch, tmp_path: Path) -> None:
+    """V3 signal path creates order, fills, tracks position with stop/target."""
+    import trading_bot.data.market_data as market_data
+    import trading_bot.runtime.orchestrator as orchestrator
+    from trading_bot.data.indicators import add_atr, add_bollinger_bands, add_ema, add_rsi, add_sma
+
+    # Daily: gentle uptrend with narrowing ranges -> WEAK_UPTREND regime
+    closes = [100.0 + i * 0.5 for i in range(60)]
+    ranges = [3.5 * (1 - i / 80) for i in range(60)]
+    daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=60, freq="D"),
+            "open": [c - 0.2 for c in closes],
+            "high": [c + r / 2 for c, r in zip(closes, ranges)],
+            "low": [c - r / 2 for c, r in zip(closes, ranges)],
+            "close": closes,
+            "volume": [1_000_000] * 60,
+        }
+    )
+    daily = add_ema(daily, 20, "ema_20")
+    daily = add_sma(daily, 50, "sma_50")
+    daily = add_atr(daily, 14, "atr_14")
+    daily = add_bollinger_bands(daily, 20)
+
+    # Intraday: 20 bars, breakout at bar 5 with volume surge, RSI present
+    base = 129.0
+    n = 20
+    intraday_ts = pd.date_range("2026-06-13 10:00:00", periods=n, freq="5min")
+    oclv = []
+    for i in range(n):
+        if i == 5:
+            oclv.append((base, base + 3.0, base - 0.2, base + 2.0, 6000))
+        elif i == 6:
+            oclv.append((base + 2.0, base + 4.0, base + 1.5, base + 3.0, 2000))
+        elif i % 2 == 0:
+            c = base + 0.1 * (i % 5)
+            oclv.append((c - 0.1, c + 0.3, c - 0.3, c, 1000 + (i % 5) * 100))
+        else:
+            c = base + 0.2 * (i % 5)
+            oclv.append((c - 0.1, c + 0.3, c - 0.3, c, 1100 + (i % 5) * 100))
+    intraday = pd.DataFrame(
+        {
+            "timestamp": intraday_ts,
+            "open": [x[0] for x in oclv],
+            "high": [x[1] for x in oclv],
+            "low": [x[2] for x in oclv],
+            "close": [x[3] for x in oclv],
+            "volume": [x[4] for x in oclv],
+        }
+    )
+    intraday["volume_avg_5"] = intraday["volume"].rolling(5).mean()
+    intraday = add_rsi(intraday, 14)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        return intraday.copy(deep=True) if interval == "5m" else daily.copy(deep=True)
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    monkeypatch.setattr(
+        orchestrator,
+        "_scan_now",
+        lambda signal_timestamp: datetime(2026, 6, 13, 10, 25, 0, tzinfo=signal_timestamp.tzinfo),
+    )
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        f"  log_dir: {log_dir}\n"
+        "strategy:\n"
+        "  use_v3_signals: true\n"
+        "  risk_tolerance: high\n"
+        "  min_confidence: medium\n",
+        encoding="utf-8",
+    )
+
+    ledger = PortfolioLedger(db_path)
+    ledger.save_portfolio_state(PortfolioState(cash=20_000.0, equity=20_000.0))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["--config-path", str(config_file), "paper-trade", "--symbols", "AAPL"],
+    )
+
+    assert result.exit_code == 0
+    # Verify fill output present (format matches legacy test expectation)
+    assert "FILLED" in result.stdout
+
+    # Verify position tracked in ledger
+    state = ledger.load_portfolio_state()
+    assert state is not None
+    assert "AAPL" in state.positions
+    pos = state.positions["AAPL"]
+    assert pos.quantity > 0
+    assert pos.average_cost > 0
+    assert pos.stop_loss is not None and pos.stop_loss < pos.average_cost
+    assert pos.profit_target is not None and pos.profit_target > pos.average_cost
+
+    # Verify order recorded with PnL tracking
+    rows = ledger.list_order_rows()
+    buy_rows = [r for r in rows if r["ticker"] == "AAPL" and r["side"] == "BUY"]
+    assert len(buy_rows) == 1
+    # PnL column exists and is None for BUY (realized PnL on sells only)
+    assert "pnl" in buy_rows[0]

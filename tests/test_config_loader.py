@@ -31,6 +31,10 @@ def test_load_settings_reads_yaml(tmp_path: Path) -> None:
     assert settings.app.live_trading_enabled is False
     assert settings.app.timezone == "America/New_York"
     assert settings.app.state_db_path == str((tmp_path / "state/test.db").resolve())
+    assert settings.app.universe_path == str((tmp_path / "state/universe.txt").resolve())
+    assert settings.app.universe_candidates_path == str(
+        (tmp_path / "state/universe_candidates.json").resolve()
+    )
     assert settings.app.scan_results_path == str((tmp_path / "state/scan_results.json").resolve())
     assert settings.market_data.intraday_interval == "5m"
     assert settings.risk.max_daily_risk_pct == 0.03
@@ -50,6 +54,33 @@ def test_load_settings_forces_live_trading_off(tmp_path: Path) -> None:
         "  min_reward_risk_ratio: 2.0\n",
         encoding="utf-8",
     )
+
+    settings = load_settings(config_file)
+
+    assert settings.app.live_trading_enabled is False
+
+
+def test_load_settings_clamps_robinhood_mode_to_local_supported_values(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("app:\n  state_db_path: state/test.db\n", encoding="utf-8")
+
+    monkeypatch.setenv("ROBINHOOD_MODE", "live")
+
+    settings = load_settings(config_file)
+
+    assert settings.robinhood.mode == "shadow"
+
+
+def test_load_settings_ignores_live_enable_flags_without_local_executor(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("app:\n  state_db_path: state/test.db\n", encoding="utf-8")
+
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "true")
+    monkeypatch.setenv("LIVE_TRADING_CONFIRMED", "i_understand_the_risks")
 
     settings = load_settings(config_file)
 
@@ -107,6 +138,8 @@ def test_load_settings_resolves_relative_paths_from_config_directory(tmp_path: P
     config_file.write_text(
         "app:\n"
         "  state_db_path: state/local.db\n"
+        "  universe_path: state/universe.txt\n"
+        "  universe_candidates_path: state/universe_candidates.json\n"
         "  log_dir: logs\n"
         "market_data:\n"
         "  provider: yfinance\n"
@@ -121,6 +154,10 @@ def test_load_settings_resolves_relative_paths_from_config_directory(tmp_path: P
     settings = load_settings(config_file)
 
     assert settings.app.state_db_path == str((config_dir / "state/local.db").resolve())
+    assert settings.app.universe_path == str((config_dir / "state/universe.txt").resolve())
+    assert settings.app.universe_candidates_path == str(
+        (config_dir / "state/universe_candidates.json").resolve()
+    )
     assert settings.app.log_dir == str((config_dir / "logs").resolve())
     assert settings.app.dashboard_summary_path == str(
         (config_dir / "state/dashboard_summary.json").resolve()
