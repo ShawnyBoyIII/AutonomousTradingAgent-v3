@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -427,7 +427,7 @@ def selection_to_signal(
         if isinstance(candidate, datetime):
             timestamp = candidate
     if timestamp is None and not intraday_frame.empty:
-        timestamp = datetime.now()
+        timestamp = datetime.now(timezone.utc)
 
     if timestamp is None:
         return None

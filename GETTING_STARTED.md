@@ -43,7 +43,7 @@ source .venv/bin/activate  # macOS/Linux
 .venv/bin/python -m pytest -q
 ```
 
-Expected output: `530 passed` (or similar number)
+Expected output: `823 tests collected` (or similar number)
 
 ---
 
@@ -246,7 +246,10 @@ open state/dashboard.html  # macOS
 
 ```bash
 # Run backtest on date range
-./tradebot-local backtest --start-date 2025-01-01 --end-date 2025-06-01
+./tradebot-local backtest --symbols AAPL --start 2025-01-01 --end 2025-06-01
+
+# Apples-to-apples single-symbol RL comparison
+./tradebot-local rl-benchmark --symbol AAPL --start 2025-01-01 --end 2025-06-01
 ```
 
 ---

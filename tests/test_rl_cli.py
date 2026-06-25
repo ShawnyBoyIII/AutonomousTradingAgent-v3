@@ -55,6 +55,49 @@ def test_backtest_compare_only_adds_rl_when_enabled_and_model_exists(
     assert captured["model_path"] is None
 
 
+def test_backtest_compare_uses_configured_rl_model_path(monkeypatch, tmp_path: Path) -> None:
+    model_path = tmp_path / "custom" / "model.zip"
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    model_path.write_bytes(b"")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "market_data:\n"
+        "  provider: yfinance\n"
+        "rl:\n"
+        "  enabled: true\n"
+        f"  model_path: {model_path}\n",
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_compare(symbols, settings, start=None, end=None, strategies=None, model_path=None):
+        captured["strategies"] = strategies
+        captured["model_path"] = model_path
+        return {
+            "results": {
+                "v2.5": {"trades": 1, "wins": 1, "losses": 0, "win_rate": 1.0, "net_pnl": 10.0},
+                "v3": {"trades": 1, "wins": 1, "losses": 0, "win_rate": 1.0, "net_pnl": 12.0},
+                "rl": {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "net_pnl": 0.0},
+            },
+            "best_pnl_strategy": "v3",
+            "best_winrate_strategy": "v3",
+        }
+
+    monkeypatch.setattr("trading_bot.backtest.runner.run_strategy_comparison", fake_compare)
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "backtest", "--symbols", "AAPL", "--compare"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["strategies"] == ["v2.5", "v3", "rl"]
+    assert captured["model_path"] == str(model_path)
+
+
 def test_rl_eval_forwards_agent_and_train_symbols(monkeypatch) -> None:
     captured: dict[str, list[str]] = {}
 
@@ -84,6 +127,73 @@ def test_rl_eval_forwards_agent_and_train_symbols(monkeypatch) -> None:
         "--train-symbols",
         "AAPL,MSFT",
     ]
+
+
+def test_rl_benchmark_requires_existing_model_path(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "market_data:\n"
+        "  provider: yfinance\n"
+        "rl:\n"
+        "  enabled: true\n"
+        "  model_path: missing/model.zip\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "rl-benchmark", "--symbol", "AAPL"],
+    )
+
+    assert result.exit_code == 1
+    assert "requires an existing model path" in result.stdout
+
+
+def test_rl_benchmark_runs_compare_with_single_symbol(monkeypatch, tmp_path: Path) -> None:
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "market_data:\n"
+        "  provider: yfinance\n"
+        "rl:\n"
+        "  enabled: true\n"
+        f"  model_path: {model_path}\n",
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_compare(symbols, settings, start=None, end=None, strategies=None, model_path=None):
+        captured["symbols"] = symbols
+        captured["strategies"] = strategies
+        captured["model_path"] = model_path
+        return {
+            "results": {
+                "v2.5": {"trades": 1, "wins": 1, "losses": 0, "win_rate": 1.0, "net_pnl": 10.0},
+                "v3": {"trades": 1, "wins": 1, "losses": 0, "win_rate": 1.0, "net_pnl": 12.0},
+                "rl": {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "net_pnl": 0.0},
+            },
+            "best_pnl_strategy": "v3",
+            "best_winrate_strategy": "v3",
+        }
+
+    monkeypatch.setattr("trading_bot.backtest.runner.run_strategy_comparison", fake_compare)
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "rl-benchmark", "--symbol", "AAPL"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["symbols"] == ["AAPL"]
+    assert captured["strategies"] == ["v2.5", "v3", "rl"]
+    assert captured["model_path"] == str(model_path)
+    assert "RL BENCHMARK" in result.stdout
 
 
 def test_evaluate_agent_rejects_symbol_mismatch(capsys) -> None:

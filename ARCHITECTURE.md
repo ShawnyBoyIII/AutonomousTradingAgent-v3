@@ -3,13 +3,13 @@
 ## Data Flow
 
 ```
-Market Data (yfinance)
+Market Data (Alpaca / yfinance)
     ↓
 Data Validation (OHLC, Price, Volume)
     ↓
 Indicators (EMA/SMA/RSI/ATR/MACD/Bollinger/VWAP)
     ↓
-Strategy Engine (Trend Following + Mean Reversion)
+Strategy Engine (V2.5 / V3 / RL research lane)
     ↓
 Signal Generation (GREEN/YELLOW/NO SIGNAL)
     ↓
@@ -29,6 +29,7 @@ trading_bot/
 ├── cli/app.py              # CLI commands
 ├── config/                 # Settings & loader
 ├── data/                   # Market data & indicators
+├── brokers/                # Robinhood MCP boundary + broker abstractions
 ├── strategy/               # Signal generation
 │   ├── mean_reversion.py   # NEW
 │   └── setup_rules.py
@@ -46,8 +47,9 @@ trading_bot/
 ## Key Features
 
 ### Trading Strategies
-- **Trend Following**: Breakout, Momentum continuation
-- **Mean Reversion**: NEW - Oversold bounce, VWAP reversion, Range reversal
+- **V2.5**: Rule-based breakout, momentum continuation, mean reversion
+- **V3**: Regime detection, confluence scoring, counter-thesis
+- **RL**: Train, eval, and benchmark commands for research
 
 ### Risk Controls
 - Position cap: 20% per ticker
@@ -63,7 +65,7 @@ trading_bot/
 
 ## Testing
 
-285 tests covering:
+823 tests collected covering:
 - Unit tests for all modules
 - Integration tests
 - Network-free (monkeypatched)

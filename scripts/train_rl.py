@@ -93,6 +93,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of evaluation episodes (default: 10)",
     )
     parser.add_argument(
+        "--max-symbols",
+        type=int,
+        default=None,
+        help="Fixed observation symbol capacity (default: number of training symbols)",
+    )
+    parser.add_argument(
         "--verbose",
         type=int,
         default=1,
@@ -163,6 +169,7 @@ def train_agent(args: argparse.Namespace) -> int:
         slippage_bps=5,
         max_positions=10,
         max_episode_steps=500,
+        max_symbols=args.max_symbols,
     )
 
     training_config = RLTrainingConfig(
@@ -176,7 +183,7 @@ def train_agent(args: argparse.Namespace) -> int:
         gamma=0.995,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.01,
+        ent_coef=0.05,
         vf_coef=0.5,
         max_grad_norm=0.5,
         verbose=args.verbose,
@@ -201,7 +208,17 @@ def train_agent(args: argparse.Namespace) -> int:
 
     model_path = output_dir / f"{args.agent}_final"
     agent.save(model_path)
+    # Save training metadata so inference can reconstruct the symbol order
+    import json
+    meta_path = output_dir / f"{args.agent}_final_meta.json"
+    meta = {
+        "symbols": symbols,
+        "agent": args.agent,
+        "max_symbols": args.max_symbols,
+    }
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
     print(f"\n  Model saved to: {model_path}")
+    print(f"  Metadata saved to: {meta_path}")
 
     print(f"\n{'='*60}")
     print(f"  Training complete!")

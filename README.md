@@ -15,6 +15,7 @@ A CLI-first paper-trading system with risk controls, scout/universe building, an
 - **Real-Time Dashboard**: Visual charts for trade distribution and performance
 - **Webhook Alerts**: Slack/Discord notifications for critical events
 - **Live P&L Tracking**: Real-time portfolio monitoring with alerts
+- **RL Research Lane**: Train, evaluate, and benchmark RL agents against rule-based paths
 
 ## Quick Start
 
@@ -28,7 +29,7 @@ pip install -e .[dev]
 ./tradebot-local doctor
 
 # Run tests
-.venv/bin/python -m pytest -q  # 344 tests
+.venv/bin/python -m pytest -q  # 823 tests collected
 ```
 
 **Always use `./tradebot-local`** instead of bare `tradebot` to ensure you're using the local virtual environment.
@@ -59,7 +60,10 @@ pip install -e .[dev]
 ./tradebot-local kill-switch --resume
 
 # Backtest strategy
-./tradebot-local backtest --start-date 2025-01-01 --end-date 2025-06-01
+./tradebot-local backtest --symbols AAPL --start 2025-01-01 --end 2025-06-01
+
+# RL benchmark on one symbol
+./tradebot-local rl-benchmark --symbol AAPL --start 2025-01-01 --end 2025-06-01
 
 # Alerts and ops loop
 ./tradebot-local alert-signals
@@ -199,6 +203,7 @@ trading_bot/
 - `AGENTS.md` - Essential context for AI assistants
 - `docs/V2_5_PHASE_D_BURN_IN_GUIDE.md` - Burn-in operational guide
 - `docs/V3_ROADMAP.md` - Historical V3 notes plus current MCP boundary direction
+- `docs/RL_TRADING_GUIDE.md` - Current RL train/eval/benchmark commands
 - `docs/SECURITY_HARDENING.md` - Security improvements
 - `docs/CLI_TIPS_AND_TRICKS.md` - Advanced CLI usage
 

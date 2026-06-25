@@ -335,3 +335,28 @@ class TestStrategyComparison:
             assert "best_pnl_strategy" in comparison
             assert "best_winrate_strategy" in comparison
             assert "AAPL" in str(comparison) or "MSFT" in str(comparison)
+
+    def test_run_strategy_comparison_toggles_v3_flag(self, mock_settings):
+        from trading_bot.backtest.runner import run_strategy_comparison
+
+        seen_flags = []
+
+        def fake_backtest(symbols, settings, start=None, end=None):
+            seen_flags.append(settings.strategy.use_v3_signals)
+            return {
+                "trades": 1, "wins": 1, "losses": 0,
+                "net_pnl": 1.0, "win_rate": 1.0, "rows": [],
+            }
+
+        with patch("trading_bot.backtest.runner.run_backtest", side_effect=fake_backtest), \
+             patch("trading_bot.backtest.runner.run_rl_backtest") as mock_rl:
+            mock_rl.return_value = {
+                "trades": 0, "wins": 0, "losses": 0,
+                "net_pnl": 0.0, "win_rate": 0.0, "rows": [],
+            }
+
+            run_strategy_comparison(
+                ["AAPL"], mock_settings, start="2024-01-01", end="2024-12-31", strategies=["v2.5", "v3", "rl"]
+            )
+
+        assert seen_flags == [False, True]

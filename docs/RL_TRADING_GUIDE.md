@@ -1,249 +1,163 @@
-# RL Trading Agent Guide
+# RL Trading Guide
 
-## Overview
+Small truth-first guide for the current RL path.
 
-The Autonomous Trading Agent now supports **Deep Reinforcement Learning (DRL)** for signal generation. This integration allows you to train agents that learn optimal trading policies from historical data.
+## What exists now
 
-## Architecture
+- Training CLI: `rl-train`
+- Evaluation CLI: `rl-eval`
+- Strategy benchmark: `rl-benchmark`
+- Generic compare path: `backtest --compare`
+- Supported agents today: `PPO`, `A2C`, `DQN`
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  RL Integration Layers                                  │
-├─────────────────────────────────────────────────────────┤
-│  CLI Commands      │  rl-train, rl-eval                │
-│  Orchestrator      │  RL signal path in orchestrator   │
-│  Agent Wrapper     │  RLAgent (stable-baselines3)      │
-│  Environment       │  TradingEnv (Gymnasium)           │
-│  Features          │  FeatureEngineer + GroupByScaler  │
-└─────────────────────────────────────────────────────────┘
-```
+Not current anymore:
 
-## Quick Start
+- `SAC`, `TD3`, `DDPG`
+- `--feature-set` on the RL CLI
 
-### 1. Install RL Dependencies
+## Install
 
 ```bash
-./tradebot-local doctor  # Verify base installation
+./tradebot-local doctor
 .venv/bin/pip install -e ".[rl]"
 ```
 
-### 2. Train an Agent
+## Train a model
+
+Single symbol:
 
 ```bash
-# Train PPO agent on AAPL
-./tradebot-local rl-train --symbols AAPL --agent PPO --episodes 100 --timesteps 100000
-
-# Train with custom learning rate
-./tradebot-local rl-train --symbols AAPL --agent PPO --learning-rate 0.001
-
-# Train extended feature set
-./tradebot-local rl-train --symbols AAPL --feature-set extended
+./tradebot-local rl-train --symbols AAPL --agent PPO --timesteps 50000
 ```
 
-### 3. Evaluate Agent
+Two symbols:
 
 ```bash
-./tradebot-local rl-eval --symbols AAPL --episodes 10
+./tradebot-local rl-train --symbols AAPL,MSFT --agent PPO --timesteps 50000
 ```
 
-### 4. Enable RL for Trading
+Notes:
 
-Add to your config.yaml:
+- Models save into `state/rl_logs/`
+- Final model names look like `state/rl_logs/PPO_final.zip`
+- The model shape depends on the training symbol set, so keep track of it
+
+## Evaluate a trained model
+
+Evaluation must use the same symbol set used during training.
+
+```bash
+./tradebot-local rl-eval \
+  --symbols AAPL,MSFT \
+  --train-symbols AAPL,MSFT \
+  --agent PPO \
+  --episodes 1
+```
+
+What `--train-symbols` means:
+
+- it is not optional bookkeeping
+- it tells the evaluator what environment shape the model was trained on
+- if it does not match `--symbols`, evaluation fails closed
+
+## Run the benchmark against V2.5 and V3
+
+Use a config with RL enabled and a real model path:
 
 ```yaml
+strategy:
+  use_v3_signals: true
+
 rl:
   enabled: true
-  agent_type: "PPO"
-  feature_set: "standard"
-  model_path: "trained_models/rl_agent_AAPL_PPO.zip"
-  action_confidence_threshold: 0.5
+  agent_type: PPO
+  model_path: state/rl_logs/PPO_final.zip
 ```
 
 Then run:
 
 ```bash
-./tradebot-local scan --symbols AAPL
-./tradebot-local paper-trade --symbols AAPL
+./tradebot-local rl-benchmark \
+  --symbol AAPL \
+  --start 2025-06-25 \
+  --end 2026-06-25
 ```
 
-## Components
+Important:
 
-### FeatureEngineer (`trading_bot/data/feature_engineering.py`)
+- `rl-benchmark` is the apples-to-apples single-symbol path
+- it always runs `v2.5`, `v3`, and `rl` on the same symbol and same date window
+- the RL side now uses the same `TradingEnv` family as training for the single-symbol benchmark path
+- it uses the configured `rl.model_path`, or `--model-path` if you override it
 
-Extracts and normalizes features for RL input:
+Reward scheme notes:
 
-- **Standard (19 features):** log returns, price vs MAs, BB%, RSI, MACD, Stochastic, CCI, Williams %R, ATR%, ADX, volume ratio, OBV change, VWAP distance + 3 portfolio state
-- **Extended (24 features):** Standard + RSI7, Stoch D, +DI/-DI, BB width
+- supported env reward schemes today: `simple_profit`, `risk_adjusted`, `compound_daily`, `shannon_entropy`
+- `risk_adjusted` is still the safest default for local training
+- benchmark and eval now expose more honest episode stats internally, including trade count
 
-Uses **GroupByScaler** for per-ticker z-score normalization.
-
-### TradingEnv (`trading_bot/env/trading_env.py`)
-
-Gymnasium environment wrapping PaperBroker:
-
-- **Action Space:** `Discrete(3)` - HOLD(0), BUY(1), SELL(2)
-- **Observation Space:** `Box(19)` or `Box(24)` depending on feature set
-- **Reward:** Portfolio return change, penalized for transaction costs and drawdown
-
-### RLAgent (`trading_bot/rl/agent.py`)
-
-Wrapper for stable-baselines3 agents:
-
-- Supported agents: PPO, A2C, SAC, TD3, DDPG
-- Methods: `train()`, `predict()`, `save()`, `load()`, `evaluate()`
-
-## Training Best Practices
-
-### Data Quality
-- Use at least 1 year of daily data
-- Ensure indicators are computed on training data
-- Avoid look-ahead bias (features use only past data)
-
-### Hyperparameters
-
-| Agent | Learning Rate | Timesteps | Notes |
-|-------|--------------|-----------|-------|
-| PPO   | 3e-4         | 100k-500k | Default, stable |
-| A2C   | 7e-4         | 100k-300k | Faster training |
-| SAC   | 3e-4         | 200k-500k | Continuous actions |
-| TD3   | 1e-3         | 200k-500k | Good for noisy envs |
-
-### Reward Functions
-
-- **`pnl`:** Raw PnL change (simple, but volatile)
-- **`sharpe`:** Risk-adjusted returns (recommended)
-- **`sortino`:** Downside risk adjustment
-
-### Evaluation Metrics
-
-- **Win Rate:** % of episodes with positive returns
-- **Avg Reward:** Mean episode reward
-- **Final Equity:** Portfolio value at episode end
-- **Sharpe Ratio:** Risk-adjusted performance
-
-## Integration with Existing System
-
-### Signal Flow (RL Enabled)
-
-```
-1. orchestrator._build_rl_signal_result()
-   └── Fetch daily + intraday bars
-   └── Add indicators
-   └── Load trained RL model
-   └── agent.predict() → action, confidence
-   └── If BUY: create TradeSignal with stop/target
-   └── If HOLD/SELL: return None
-
-2. evaluate_signal() (risk manager)
-   └── Check portfolio heat
-   └── Check counter-thesis (if enabled)
-   └── Calculate position size (ATR-based)
-   └── Return approval decision
-
-3. submit_signal_as_order()
-   └── Create OrderRequest
-   └── PaperBroker fills order
-   └── Update ledger
-```
-
-### Safety Constraints
-
-RL agents operate within existing safety limits:
-
-- **Kill switch:** Blocks all trading if enabled
-- **Circuit breaker:** Halts on consecutive losses
-- **Portfolio heat:** Max 3% unrealized loss
-- **Position sizing:** Max 20% per ticker, ATR-adjusted
-- **Confidence threshold:** Actions below threshold rejected
-
-## Example Configurations
-
-### Conservative RL Trading
-
-```yaml
-rl:
-  enabled: true
-  agent_type: "PPO"
-  feature_set: "standard"
-  model_path: "trained_models/rl_agent_conservative.zip"
-  action_confidence_threshold: 0.7  # High confidence required
-  max_position_pct: 0.10  # 10% max per position
-
-risk:
-  max_risk_per_trade_pct: 0.005  # 0.5% risk per trade
-  max_portfolio_heat_pct: 0.02  # 2% max heat
-```
-
-### Aggressive RL Trading
-
-```yaml
-rl:
-  enabled: true
-  agent_type: "SAC"
-  feature_set: "extended"
-  model_path: "trained_models/rl_agent_aggressive.zip"
-  action_confidence_threshold: 0.4  # Lower threshold
-  max_position_pct: 0.20  # 20% max per position
-
-risk:
-  max_risk_per_trade_pct: 0.02  # 2% risk per trade
-  atr_multiplier: 1.5  # Tighter stops
-```
-
-### Multi-Agent Ensemble
-
-Train separate agents on different symbols:
+If you still want the generic compare command:
 
 ```bash
-./tradebot-local rl-train --symbols AAPL --agent PPO
-./tradebot-local rl-train --symbols SPY --agent A2C
-./tradebot-local rl-train --symbols QQQ --agent SAC
+./tradebot-local backtest \
+  --symbols AAPL \
+  --start 2025-06-25 \
+  --end 2026-06-25 \
+  --compare
 ```
 
-Then use symbol-specific model paths in config.
+## What to trust
 
-## Troubleshooting
+- trust the command wiring and the benchmark path more than the current saved PPO quality
+- trust single-symbol `rl-benchmark` over generic `backtest --compare` when you are checking RL against V2.5 and V3
+- do not over-read one lucky RL equity number without checking trade count and a few date windows
 
-### "Model not found"
-- Ensure `model_path` is relative to project root
-- Check file exists: `ls trained_models/rl_agent_*.zip`
+## Should you train on more stocks?
 
-### "stable-baselines3 not installed"
+Not first.
+
+What to do first:
+
+- get one-symbol training and one-symbol benchmarking trustworthy
+- make RL at least competitive on `AAPL` alone
+- repeat across a few date windows
+
+Why not jump to more stocks yet:
+
+- the model shape depends on the training symbol set
+- adding symbols changes both observation size and action space
+- if the single-symbol benchmark is still weak, multi-symbol training just makes debugging harder
+
+When to add more stocks:
+
+- after a single-symbol model is stable
+- after you can show it is not just overfitting one lucky window
+- start small: `AAPL,MSFT`, not a big basket
+
+## Yahoo / date-range gotcha
+
+If you use `yfinance`, long old ranges can miss 5-minute bars. The backtest path falls back when it can, but for the easiest smoke run use a recent window first.
+
+If you want older ranges regularly, use a provider/config that can supply the intraday history you need.
+
+## Quick troubleshooting
+
+Model not found:
+
 ```bash
-.venv/bin/pip install gymnasium stable-baselines3 torch
+ls state/rl_logs
 ```
 
-### Poor Performance
-- Increase training timesteps (200k-500k)
-- Try different agent (A2C trains faster, PPO more stable)
-- Adjust learning rate (lower = more stable, higher = faster)
-- Use extended feature set for more information
+RL not showing up in compare:
 
-### NaN in Observations
-- Ensure all indicators computed on training data
-- Check for insufficient history (< 50 bars)
-- Verify volume data exists (required for VWAP, volume_ratio)
+- check `rl.enabled: true`
+- check `rl.model_path` points to a real file
 
-## Performance Benchmarks
+Evaluation rejected:
 
-Typical training times (M3 Mac, 1 year daily data):
+- make `--symbols` and `--train-symbols` match exactly
 
-| Agent | Timesteps | Time | Memory |
-|-------|-----------|------|--------|
-| PPO   | 100k      | 2-5 min | 200 MB |
-| A2C   | 100k      | 1-3 min | 150 MB |
-| SAC   | 200k      | 5-10 min | 400 MB |
+Training or benchmark fails on data fetch:
 
-## Next Steps
-
-1. **Train baseline agent:** Start with PPO on AAPL
-2. **Evaluate:** Compare vs rule-based signals
-3. **Tune:** Adjust hyperparameters based on evaluation
-4. **Deploy:** Enable in config with confidence threshold
-5. **Monitor:** Track RL vs non-RL performance in burn-in logs
-
-## References
-
-- FinRL: https://github.com/AI4Finance-Foundation/FinRL
-- Stable Baselines3: https://stable-baselines3.readthedocs.io/
-- Gymnasium: https://gymnasium.farama.org/
+- check the market-data provider in your config
+- for quick local smoke tests, `yfinance` is the easiest path

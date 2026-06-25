@@ -30,6 +30,7 @@ class RLBacktestConfig:
     prediction_mode: str = "deterministic"
     bar_period: str = "1y"
     bar_interval: str = "1d"
+    max_symbols: int | None = None
 
 
 class RLBacktestRunner:
@@ -312,6 +313,10 @@ class RLBacktestRunner:
             for sym in all_symbols:
                 features = self._compute_features_for_symbol(sym)
                 market_features.extend(features)
+
+            max_symbols = self.config.max_symbols or len(all_symbols)
+            if max_symbols > len(all_symbols):
+                market_features.extend([0.0] * ((max_symbols - len(all_symbols)) * len(self.FEATURE_COLS)))
 
             equity = max(portfolio_state.equity, 1e-8)
             cash_ratio = portfolio_state.cash / equity

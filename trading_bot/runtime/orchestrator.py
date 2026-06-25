@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import math
 from pathlib import Path
 
@@ -328,7 +328,10 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 results.append(f"{symbol} REJECTED stale market data")
                 continue
 
-            if _scan_quality(details) != "GREEN":
+            # RL signals bypass the rule-based quality filter; the model itself
+            # encodes entry criteria. Rule-based signals still require GREEN.
+            is_rl_signal = getattr(signal, "strategy_tag", "").startswith("rl_")
+            if not is_rl_signal and _scan_quality(details) != "GREEN":
                 append_decision_event(
                     log_path,
                     {
@@ -593,15 +596,13 @@ def _build_rl_signal_result(symbol: str, settings: Settings):
 
     try:
         agent = RLAgent.load(
-            path=model_path,
-            feature_set=settings.rl.feature_set,
-            verbose=0,
+            model_path=model_path,
         )
     except Exception as e:
         return None, f"RL model load failed: {e}", {}
 
     current_price = float(intraday_frame["close"].iloc[-1])
-    action, confidence = agent.predict(
+    action, confidence = agent.predict_signal(
         daily_frame=intraday_frame,
         ticker=symbol,
         portfolio_weight=0.0,
@@ -640,7 +641,7 @@ def _build_rl_signal_result(symbol: str, settings: Settings):
         confidence=confidence,
         reasons=[f"RL {settings.rl.agent_type} signal", f"confidence={confidence:.2f}"],
         strategy_tag=f"rl_{settings.rl.agent_type}",
-        timestamp=datetime.now(),
+        timestamp=datetime.now(timezone.utc),
     )
 
     return signal, f"RL {settings.rl.agent_type} approved", details
@@ -725,7 +726,13 @@ def _drop_trailing_zero_volume_bars(frame):
 def _frame_through_timestamp(frame, timestamp: datetime):
     if frame.empty or "timestamp" not in frame.columns:
         return frame
-    matches = frame.index[frame["timestamp"] == timestamp].tolist()
+    ts = timestamp
+    if ts.tzinfo is not None:
+        ts = ts.replace(tzinfo=None)
+    frame_ts = frame["timestamp"]
+    if hasattr(frame_ts, "dt") and frame_ts.dt.tz is not None:
+        frame_ts = frame_ts.dt.tz_localize(None)
+    matches = frame.index[frame_ts == ts].tolist()
     if not matches:
         return frame
     return frame.iloc[: matches[-1] + 1]
@@ -900,12 +907,20 @@ def _portfolio_state_from_broker(
     )
 
 
+def _ensure_aware(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def _market_data_status(signal_timestamp: datetime, interval: str, max_age_minutes: int = 30) -> str:
+    signal_timestamp = _ensure_aware(signal_timestamp)
     age = _scan_now(signal_timestamp) - signal_timestamp
     return "stale" if age > timedelta(minutes=max_age_minutes) else "fresh"
 
 
 def _market_data_age(signal_timestamp: datetime) -> str:
+    signal_timestamp = _ensure_aware(signal_timestamp)
     age = max(_scan_now(signal_timestamp) - signal_timestamp, timedelta())
     minutes = int(age.total_seconds() // 60)
     return f"{minutes}m"

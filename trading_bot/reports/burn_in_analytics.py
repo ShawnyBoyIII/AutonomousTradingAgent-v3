@@ -120,7 +120,7 @@ def compute_trade_summary(events: list[dict], ledger: PortfolioLedger) -> dict[s
         "total_pnl": round(total_pnl, 2),
         "total_fees": round(total_fees, 2),
         "pnl_by_ticker": {
-            ticker: [round(p, 2) for p in pnls]
+            ticker: [round(p, 2) if p is not None else None for p in pnls]
             for ticker, pnls in pnl_by_ticker.items()
         },
     }

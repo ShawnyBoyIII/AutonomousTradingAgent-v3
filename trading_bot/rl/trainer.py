@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class TrainingConfig:
     env_config: TradingConfig = field(default_factory=TradingConfig)
     model_type: str = "PPO"
-    total_timesteps: int = 50000
+    total_timesteps: int = 200000
     learning_rate: float = 3e-4
     n_steps: int = 128
     batch_size: int = 64
@@ -24,7 +24,7 @@ class TrainingConfig:
     gamma: float = 0.995
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.01
+    ent_coef: float = 0.05
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     verbose: int = 1
@@ -127,10 +127,12 @@ class RLTrainer:
         if self._model is None:
             raise RuntimeError("No model loaded. Call train() or load() first.")
 
-        env = self._make_env()
         rewards = []
+        final_equities = []
+        trade_counts = []
 
         for _ in range(n_episodes):
+            env = self._make_env()
             obs, _ = env.reset()
             done = False
             truncated = False
@@ -142,13 +144,12 @@ class RLTrainer:
                 total_reward += reward
 
             rewards.append(total_reward)
+            summary = env.get_episode_summary()
+            final_equities.append(summary.ending_equity)
+            trade_counts.append(summary.trade_count)
 
         mean_reward = np.mean(rewards)
         std_reward = np.std(rewards)
-        final_equities = [
-            env.get_portfolio_state().equity if env.get_portfolio_state() else 0.0
-            for _ in range(n_episodes)
-        ]
 
         result = {
             "mean_reward": float(mean_reward),
@@ -156,6 +157,7 @@ class RLTrainer:
             "mean_final_equity": float(np.mean(final_equities)),
             "min_final_equity": float(np.min(final_equities)),
             "max_final_equity": float(np.max(final_equities)),
+            "mean_trade_count": float(np.mean(trade_counts)) if trade_counts else 0.0,
         }
 
         logger.info(

@@ -25,16 +25,20 @@ class SimpleProfitReward(RewardScheme):
 class RiskAdjustedReward(RewardScheme):
     """Risk-adjusted return reward: proportional change in net worth.
 
-    reward = (net_worth(t) - net_worth(t-1)) / net_worth(t-1)
+    reward = ((net_worth(t) - net_worth(t-1)) / net_worth(t-1)) * REWARD_SCALE
 
-    Normalized by previous net worth, making it comparable across
-    different account sizes.
+    Normalized by previous net worth, scaled for better learning signals.
     """
+
+    REWARD_SCALE = 1.0
+
+    def __init__(self, reward_scale: float | None = None) -> None:
+        self.reward_scale = reward_scale if reward_scale is not None else self.REWARD_SCALE
 
     def compute_reward(self, current_net_worth: float, previous_net_worth: float) -> float:
         if previous_net_worth < EPSILON:
             return 0.0
-        return (current_net_worth - previous_net_worth) / (previous_net_worth + EPSILON)
+        return ((current_net_worth - previous_net_worth) / (previous_net_worth + EPSILON)) * self.reward_scale
 
 
 class CompoundDailyReward(RewardScheme):

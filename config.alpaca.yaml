@@ -11,7 +11,7 @@ app:
   backtest_summary_path: state/backtest_summary.json
 
 market_data:
-  provider: alpaca  # "yfinance" or "alpaca"
+  provider: alpaca
   validate_data: true
   max_price_jump_pct: 1000.0
   max_volume_jump_pct: 1000.0
@@ -101,9 +101,8 @@ counter_thesis:
 
 # RL-based trading (disabled by default)
 rl:
-  enabled: true
+  enabled: false
   agent_type: PPO
   feature_set: standard
   reward_function: sharpe
-  model_path: state/rl_logs/max4/PPO_final.zip
-  action_confidence_threshold: 0.4
+  model_path: state/rl_logs/PPO_final.zip

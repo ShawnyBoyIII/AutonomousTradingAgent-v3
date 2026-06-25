@@ -501,7 +501,7 @@ def test_scan_command_sizes_from_saved_portfolio_state(monkeypatch, tmp_path: Pa
     assert result.exit_code == 0
     assert (
         result.stdout.strip()
-        == "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout"
+        == "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout"
     )
     snapshot = json.loads((tmp_path / "state" / "scan_results.json").read_text(encoding="utf-8"))
     assert snapshot["mode"] == "scan"
@@ -598,8 +598,8 @@ def test_scan_command_sorts_approved_candidates_and_prints_richer_fields(
 
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
-        "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout",
-        "MSFT APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00 last=201.00 qty=19 rr=2.00 conf=0.80 risk=$76.00 alloc=0.19 entry=201.00 stop=199.80 target=203.40 reasons=bullish daily regime; intraday breakout",
+        "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout",
+        "MSFT APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=201.00 qty=19 rr=2.00 conf=0.80 risk=$76.00 alloc=0.19 entry=201.00 stop=199.80 target=203.40 reasons=bullish daily regime; intraday breakout",
         "summary symbols=2 approved=2 green=2 yellow=0 rejected=0 no_signal=0 errors=0",
     ]
     log_text = (tmp_path / "logs" / "decision-log.jsonl").read_text(encoding="utf-8")
@@ -929,7 +929,7 @@ def test_scan_details_ignore_trailing_zero_volume_bar(monkeypatch, tmp_path: Pat
     )
 
     assert result.exit_code == 0
-    assert "ts=2026-06-13T10:20:00" in result.stdout
+    assert "ts=2026-06-13T10:20:00+00:00" in result.stdout
     assert "intraday_close=101.00" in result.stdout
     assert "volume=2500" in result.stdout
     assert "volume=0" not in result.stdout
@@ -997,7 +997,7 @@ def test_scan_details_explain_signal_bar_when_later_bar_exists(monkeypatch, tmp_
     )
 
     assert result.exit_code == 0
-    assert "ts=2026-06-13T10:20:00" in result.stdout
+    assert "ts=2026-06-13T10:20:00+00:00" in result.stdout
     assert "intraday_close=101.00" in result.stdout
     assert "volume=2500" in result.stdout
     assert "intraday_close=100.70" not in result.stdout

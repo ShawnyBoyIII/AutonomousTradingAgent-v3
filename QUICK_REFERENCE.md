@@ -57,11 +57,14 @@ tail -f logs/burn_in/decision-log.jsonl # Live decision feed
 | `scan --symbols SPY,AAPL --why` | Scan for signals |
 | `paper-trade --symbols AAPL` | Execute paper trades |
 | `manage-positions` | Check stops/targets/EOD |
+| `backtest --symbols AAPL --start YYYY-MM-DD --end YYYY-MM-DD` | Replay one strategy |
+| `rl-benchmark --symbol AAPL --start YYYY-MM-DD --end YYYY-MM-DD` | Compare V2.5 vs V3 vs RL |
 | `portfolio` | View holdings + P&L |
 | `performance --daily` | Performance metrics |
 | `health` | System status |
 | `alerts` | Active warnings |
 | `kill-switch --status` | Check kill switch |
+| `robinhood-status` | Show MCP snapshot state |
 | `serve` | Live web dashboard |
 
 ---

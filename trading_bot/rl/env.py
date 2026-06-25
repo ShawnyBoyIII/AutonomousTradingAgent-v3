@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import gymnasium as gym
@@ -13,7 +13,13 @@ from trading_bot.models.order import OrderRequest
 from trading_bot.models.portfolio import PortfolioState, Position
 from trading_bot.rl.actions import ActionScheme
 from trading_bot.rl.observer import Observer
-from trading_bot.rl.rewards import RewardScheme
+from trading_bot.rl.rewards import (
+    CompoundDailyReward,
+    RewardScheme,
+    RiskAdjustedReward,
+    ShannonEntropyReward,
+    SimpleProfitReward,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +33,10 @@ class TradingConfig:
     min_order_size: int = 1
     max_order_size: int = 1000
     action_scheme: str = "bsh"
-    reward_scheme: str = "simple_profit"
+    reward_scheme: str = "risk_adjusted"
+    reward_scale: float = 100.0
     observer_window: int = 10
+    max_symbols: int | None = None
     symbols: list[str] = field(default_factory=lambda: ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"])
     bar_period: str = "1y"
     bar_interval: str = "1d"
@@ -40,6 +48,19 @@ class TradingConfig:
             self.action_scheme = self.action_scheme.lower()
         if isinstance(self.reward_scheme, str):
             self.reward_scheme = self.reward_scheme.lower()
+
+
+@dataclass(frozen=True)
+class EpisodeSummary:
+    steps: int
+    starting_equity: float
+    ending_equity: float
+    total_reward: float
+    total_return_pct: float
+    trade_count: int
+    buy_count: int
+    sell_count: int
+    open_positions: int
 
 
 class TradingEnv(gym.Env):
@@ -72,13 +93,16 @@ class TradingEnv(gym.Env):
         self._reward_scheme: RewardScheme | None = None
         self._action_space: gym.spaces.Space | None = None
         self._observation_space: gym.spaces.Space | None = None
+        self._episode_reward: float = 0.0
+        self._trade_count: int = 0
+        self._buy_count: int = 0
+        self._sell_count: int = 0
         self._initialized = False
 
     def _ensure_initialized(self) -> None:
         if self._initialized:
             return
         from trading_bot.rl.actions import BSHActionScheme, ProportionActionScheme
-        from trading_bot.rl.rewards import SimpleProfitReward, RiskAdjustedReward
         from trading_bot.rl.observer import TensorTradeObserver
 
         if self.config.action_scheme == "proportion":
@@ -88,16 +112,23 @@ class TradingEnv(gym.Env):
 
         self._action_space = self._action_scheme.action_space
 
-        if self.config.reward_scheme == "risk_adjusted":
-            self._reward_scheme = RiskAdjustedReward()
-        else:
-            self._reward_scheme = SimpleProfitReward()
+        reward_schemes: dict[str, RewardScheme] = {
+            "simple_profit": SimpleProfitReward(),
+            "risk_adjusted": RiskAdjustedReward(reward_scale=self.config.reward_scale),
+            "compound_daily": CompoundDailyReward(),
+            "shannon_entropy": ShannonEntropyReward(),
+        }
+        self._reward_scheme = reward_schemes.get(
+            self.config.reward_scheme,
+            reward_schemes["risk_adjusted"],
+        )
 
         self._observer = TensorTradeObserver(
             symbols=self.config.symbols,
             window_size=self.config.observer_window,
             period=self.config.bar_period,
             interval=self.config.bar_interval,
+            max_symbols=self.config.max_symbols,
         )
         self._observation_space = self._observer.observation_space
 
@@ -214,6 +245,10 @@ class TradingEnv(gym.Env):
         self._portfolio_state = self._update_portfolio_state(prices)
         self._previous_net_worth = self._portfolio_state.equity
         self._current_step = 0
+        self._episode_reward = 0.0
+        self._trade_count = 0
+        self._buy_count = 0
+        self._sell_count = 0
 
         obs = self._observer.observe(
             self._portfolio_state, prices, self._current_step
@@ -237,11 +272,24 @@ class TradingEnv(gym.Env):
         self._action_scheme.reset_portfolio(self._broker)
 
         prices = self._get_current_prices()
+        positions_before = dict(self._broker.positions) if self._broker else {}
 
         try:
             self._action_scheme.perform(action, prices)
         except ValueError as e:
             logger.debug(f"Action rejected: {e}")
+
+        positions_after = dict(self._broker.positions) if self._broker else {}
+        if positions_before != positions_after:
+            self._trade_count += 1
+            net_delta = sum(
+                positions_after.get(symbol, 0) - positions_before.get(symbol, 0)
+                for symbol in self.config.symbols
+            )
+            if net_delta > 0:
+                self._buy_count += 1
+            elif net_delta < 0:
+                self._sell_count += 1
 
         self._portfolio_state = self._update_portfolio_state(prices)
         current_net_worth = self._portfolio_state.equity
@@ -249,6 +297,7 @@ class TradingEnv(gym.Env):
         reward = self._reward_scheme.compute_reward(
             current_net_worth, self._previous_net_worth
         )
+        self._episode_reward += reward
 
         self._previous_net_worth = current_net_worth
         self._current_step += 1
@@ -271,11 +320,14 @@ class TradingEnv(gym.Env):
             "num_positions": len(self._portfolio_state.positions),
             "positions": dict(self._broker.positions) if self._broker else {},
             "reward": reward,
+            "trade_count": self._trade_count,
         }
 
         if self._current_step > 0:
             total_return = (current_net_worth - self.config.starting_cash) / max(self.config.starting_cash, 1e-8)
             info["total_return_pct"] = total_return
+        if terminated or truncated:
+            info["episode_summary"] = asdict(self.get_episode_summary())
 
         return obs, reward, terminated, truncated, info
 
@@ -294,6 +346,29 @@ class TradingEnv(gym.Env):
 
     def get_broker(self) -> PaperBroker | None:
         return self._broker
+
+    def get_episode_summary(self) -> EpisodeSummary:
+        ending_equity = (
+            self._portfolio_state.equity
+            if self._portfolio_state is not None
+            else self.config.starting_cash
+        )
+        total_return_pct = (
+            (ending_equity - self.config.starting_cash)
+            / max(self.config.starting_cash, 1e-8)
+        )
+        open_positions = len(self._portfolio_state.positions) if self._portfolio_state else 0
+        return EpisodeSummary(
+            steps=self._current_step,
+            starting_equity=self.config.starting_cash,
+            ending_equity=ending_equity,
+            total_reward=self._episode_reward,
+            total_return_pct=total_return_pct,
+            trade_count=self._trade_count,
+            buy_count=self._buy_count,
+            sell_count=self._sell_count,
+            open_positions=open_positions,
+        )
 
     def render(self, mode: str = None) -> None:
         if self._portfolio_state is None:

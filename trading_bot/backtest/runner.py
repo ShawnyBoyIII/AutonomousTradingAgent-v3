@@ -17,6 +17,15 @@ from trading_bot.strategy.daily_signal_engine import generate_daily_signal
 from trading_bot.strategy.intraday_signal_engine import generate_signal
 
 
+def _fetch_bars_compat(fetch_fn, symbol: str, period: str, interval: str, **kwargs):
+    """Call fetch_bars, falling back to no-settings signature for test mocks."""
+    try:
+        return fetch_fn(symbol, period, interval, **kwargs)
+    except TypeError:
+        kwargs.pop("settings", None)
+        return fetch_fn(symbol, period, interval, **kwargs)
+
+
 def run_backtest(
     symbols: list[str],
     settings: Settings,
@@ -31,26 +40,31 @@ def run_backtest(
     log_path = Path(settings.app.log_dir) / "decision-log.jsonl"
 
     for symbol in (value.strip() for value in symbols if value.strip()):
-        daily_frame = market_data.fetch_bars(
+        daily_frame = _fetch_bars_compat(
+            market_data.fetch_bars,
             symbol,
             settings.market_data.daily_period,
             "1d",
             start=start,
             end=end,
+            settings=settings.market_data,
         )
         try:
-            intraday_frame = market_data.fetch_bars(
+            intraday_frame = _fetch_bars_compat(
+                market_data.fetch_bars,
                 symbol,
                 settings.market_data.intraday_period,
                 settings.market_data.intraday_interval,
                 start=start,
                 end=end,
+                settings=settings.market_data,
             )
         except ValueError:
             # Try 1h data (730 days available)
             try:
-                intraday_frame = market_data.fetch_bars(
-                    symbol, "1y", "1h", start=start, end=end
+                intraday_frame = _fetch_bars_compat(
+                    market_data.fetch_bars,
+                    symbol, "1y", "1h", start=start, end=end, settings=settings.market_data
                 )
                 print(f"Note: Using 1h data for {symbol} (5m unavailable for date range)")
             except ValueError:
@@ -381,7 +395,7 @@ def _filter_frame_by_date(frame: Any, start: str | None, end: str | None):
     if frame.empty or "timestamp" not in frame.columns:
         return frame
 
-    timestamp_series = pd.to_datetime(frame["timestamp"])
+    timestamp_series = pd.to_datetime(frame["timestamp"], utc=True)
     if timestamp_series.isna().all():
         return frame
 
@@ -540,12 +554,31 @@ def run_rl_backtest(
     rows: list[dict[str, float | int | str | None]] = []
     log_path = Path(settings.app.log_dir) / "decision-log.jsonl"
 
+    # Load model metadata to determine training symbol order and max_symbols
+    resolved_model_path = model_path or (getattr(settings.rl, "model_path", None) if hasattr(settings, "rl") else None)
+    meta_symbols = list(symbols)
+    meta_max_symbols: int | None = None
+    if resolved_model_path:
+        import json
+        meta_path = Path(resolved_model_path).with_suffix(".zip")
+        if meta_path.suffix != ".zip":
+            meta_path = Path(resolved_model_path)
+        meta_path = meta_path.parent / (meta_path.stem + "_meta.json")
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                meta_symbols = [s.strip().upper() for s in meta.get("symbols", symbols)]
+                meta_max_symbols = meta.get("max_symbols")
+            except Exception:
+                pass
+
     rl_config = RLBacktestConfig(
-        model_path=model_path or getattr(settings.rl, "model_path", None) if hasattr(settings, "rl") else None,
-        symbols=symbols,
+        model_path=resolved_model_path,
+        symbols=meta_symbols,
         starting_cash=10_000.0,
         fee_per_order=settings.paper.fee_per_order,
         slippage_bps=settings.paper.slippage_bps,
+        max_symbols=meta_max_symbols,
     )
 
     runner = RLBacktestRunner(config=rl_config)
@@ -553,13 +586,16 @@ def run_rl_backtest(
     if rl_config.model_path:
         try:
             runner.load_model()
-            expected_features = runner._model.observation_space.shape[1]
-            n_market_features = len(RLBacktestRunner.FEATURE_COLS)
-            n_portfolio_features = 5
-            actual_features = len(rl_config.symbols) * n_market_features + n_portfolio_features
-            if expected_features != actual_features:
-                print(f"Warning: RL model expects {expected_features} features ({expected_features - n_portfolio_features} symbols) but backtest uses {actual_features} features ({len(rl_config.symbols)} symbols). Skipping RL backtest.")
-                return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0, "win_rate": 0.0, "rows": rows, "rl_actions": []}
+            model_obs_space = getattr(runner._model, "observation_space", None)
+            if model_obs_space is not None and hasattr(model_obs_space, "shape") and len(model_obs_space.shape) >= 2:
+                expected_features = model_obs_space.shape[1]
+                n_market_features = len(RLBacktestRunner.FEATURE_COLS)
+                n_portfolio_features = 5
+                expected_max = (expected_features - n_portfolio_features) // n_market_features
+                actual_max = rl_config.max_symbols or len(rl_config.symbols)
+                if expected_features != actual_max * n_market_features + n_portfolio_features:
+                    print(f"Warning: RL model expects {expected_features} features ({expected_max} max symbols) but backtest uses {actual_max} max symbols. Skipping RL backtest.")
+                    return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0, "win_rate": 0.0, "rows": rows, "rl_actions": []}
         except Exception as e:
             print(f"Warning: Failed to load RL model: {e}. Skipping RL backtest.")
             return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0, "win_rate": 0.0, "rows": rows, "rl_actions": []}
@@ -567,26 +603,135 @@ def run_rl_backtest(
         print("Warning: No RL model path specified. Setting to dummy for testing.")
         runner.set_model(None)
 
-    for symbol in (value.strip() for value in symbols if value.strip()):
-        daily_frame = market_data.fetch_bars(
+    # ponytail: single-symbol benchmark should use the same env family as RL training.
+    if len(meta_symbols) == 1 and rl_config.model_path:
+        symbol = meta_symbols[0].strip()
+        if symbol:
+            daily_frame = _fetch_bars_compat(
+                market_data.fetch_bars,
+                symbol,
+                settings.market_data.daily_period,
+                "1d",
+                start=start,
+                end=end,
+                settings=settings.market_data,
+            )
+            daily_frame = _filter_frame_by_date(daily_frame, start=start, end=end)
+            if len(daily_frame) >= 2:
+                try:
+                    import stable_baselines3 as sb3
+                    import trading_bot.rl.env as rl_env_module
+
+                    model_class = getattr(sb3, settings.rl.agent_type, None)
+                    if model_class is not None:
+                        env = rl_env_module.TradingEnv(
+                            config=rl_env_module.TradingConfig(
+                                starting_cash=100_000.0,
+                                fee_per_order=settings.paper.fee_per_order,
+                                slippage_bps=settings.paper.slippage_bps,
+                                symbols=[symbol],
+                                bar_period=settings.market_data.daily_period,
+                                bar_interval="1d",
+                                max_episode_steps=max(1, len(daily_frame) - 1),
+                            )
+                        )
+                        env._data_cache[symbol] = daily_frame.copy(deep=True)
+                        env._data_indices[symbol] = 0
+                        model = model_class.load(rl_config.model_path)
+                        obs, _ = env.reset()
+                        done = False
+                        truncated = False
+                        while not (done or truncated):
+                            action, _ = model.predict(obs, deterministic=True)
+                            obs, _, done, truncated, _ = env.step(action)
+
+                        if hasattr(env, "get_episode_summary"):
+                            episode_summary = env.get_episode_summary()
+                            result = {
+                                "trades": episode_summary.trade_count,
+                                "wins": 1 if episode_summary.total_reward > 0 and episode_summary.trade_count > 0 else 0,
+                                "losses": 1 if episode_summary.total_reward <= 0 and episode_summary.trade_count > 0 else 0,
+                                "net_pnl": round(episode_summary.ending_equity - episode_summary.starting_equity, 2),
+                            }
+                        else:
+                            broker = env.get_broker()
+                            state = env.get_portfolio_state()
+                            ending_equity = state.equity if state is not None else 100_000.0
+                            open_positions = broker.positions if broker is not None else {}
+                            trade_count = 1 if open_positions or ending_equity != 100_000.0 else 0
+                            net_pnl_single = ending_equity - 100_000.0
+                            result = {
+                                "trades": trade_count,
+                                "wins": 1 if net_pnl_single > 0 and trade_count > 0 else 0,
+                                "losses": 1 if net_pnl_single <= 0 and trade_count > 0 else 0,
+                                "net_pnl": round(net_pnl_single, 2),
+                            }
+                        env.close()
+                        rows.append(
+                            {
+                                "ticker": symbol,
+                                "trades": result["trades"],
+                                "wins": result["wins"],
+                                "losses": result["losses"],
+                                "net_pnl": result["net_pnl"],
+                                "start": start,
+                                "end": end,
+                                "strategy": "rl",
+                            }
+                        )
+                        summary = {
+                            "trades": result["trades"],
+                            "wins": result["wins"],
+                            "losses": result["losses"],
+                            "win_rate": 0.0 if result["trades"] == 0 else result["wins"] / result["trades"],
+                            "net_pnl": result["net_pnl"],
+                            "rows": rows,
+                            "strategy": "rl",
+                        }
+                        write_snapshot(
+                            settings.app.backtest_summary_path,
+                            {
+                                "mode": "backtest",
+                                "strategy": "rl",
+                                "summary": {
+                                    "trades": summary["trades"],
+                                    "wins": summary["wins"],
+                                    "losses": summary["losses"],
+                                    "win_rate": summary["win_rate"],
+                                    "net_pnl": summary["net_pnl"],
+                                },
+                                "rows": rows,
+                            },
+                        )
+                        return summary
+                except Exception as exc:
+                    print(f"Warning: Single-symbol RL benchmark fallback failed: {exc}")
+
+    for symbol in (value.strip() for value in meta_symbols if value.strip()):
+        daily_frame = _fetch_bars_compat(
+            market_data.fetch_bars,
             symbol,
             settings.market_data.daily_period,
             "1d",
             start=start,
             end=end,
+            settings=settings.market_data,
         )
         try:
-            intraday_frame = market_data.fetch_bars(
+            intraday_frame = _fetch_bars_compat(
+                market_data.fetch_bars,
                 symbol,
                 settings.market_data.intraday_period,
                 settings.market_data.intraday_interval,
                 start=start,
                 end=end,
+                settings=settings.market_data,
             )
         except ValueError:
             try:
-                intraday_frame = market_data.fetch_bars(
-                    symbol, "1y", "1h", start=start, end=end
+                intraday_frame = _fetch_bars_compat(
+                    market_data.fetch_bars,
+                    symbol, "1y", "1h", start=start, end=end, settings=settings.market_data
                 )
                 print(f"Note: Using 1h data for {symbol} (5m unavailable for date range)")
             except ValueError:
@@ -694,7 +839,11 @@ def run_strategy_comparison(
         if strategy == "rl":
             result = run_rl_backtest(symbols, settings, start=start, end=end, model_path=model_path)
         else:
-            result = run_backtest(symbols, settings, start=start, end=end)
+            import copy
+            strategy_settings = copy.deepcopy(settings)
+            if getattr(strategy_settings, "strategy", None) is not None:
+                strategy_settings.strategy.use_v3_signals = strategy == "v3"
+            result = run_backtest(symbols, strategy_settings, start=start, end=end)
             result["strategy"] = strategy
         results[strategy] = result
 

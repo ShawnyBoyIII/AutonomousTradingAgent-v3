@@ -1,9 +1,11 @@
 import pandas as pd
 import pytest
+import sys
+import types
 
 from trading_bot.config.settings import Settings, StrategySettings
 from trading_bot.backtest.metrics import compute_win_rate
-from trading_bot.backtest.runner import _filter_frame_by_date, _run_symbol_backtest, iterate_bars, run_walk_forward
+from trading_bot.backtest.runner import _filter_frame_by_date, _run_symbol_backtest, iterate_bars, run_backtest, run_rl_backtest, run_walk_forward
 
 
 def test_iterate_bars_yields_chronological_slices() -> None:
@@ -44,6 +46,170 @@ def test_filter_frame_by_date_handles_tz_aware_timestamps() -> None:
     filtered = _filter_frame_by_date(frame, start="2026-06-05", end="2026-06-17")
 
     assert list(filtered["close"]) == [2.0]
+
+
+def test_filter_frame_by_date_handles_mixed_offset_timestamps() -> None:
+    frame = pd.DataFrame(
+        {
+            "timestamp": [
+                "2026-11-01 09:30:00-04:00",
+                "2026-11-03 09:30:00-05:00",
+                "2026-11-10 09:30:00-05:00",
+            ],
+            "close": [1.0, 2.0, 3.0],
+        }
+    )
+
+    filtered = _filter_frame_by_date(frame, start="2026-11-02", end="2026-11-05")
+
+    assert list(filtered["close"]) == [2.0]
+
+
+def test_run_rl_backtest_single_symbol_uses_training_env_path(monkeypatch, tmp_path) -> None:
+    import trading_bot.data.market_data as market_data
+    import trading_bot.rl.env as rl_env_module
+
+    daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=20, freq="D"),
+            "open": [100.0] * 20,
+            "high": [101.0] * 20,
+            "low": [99.0] * 20,
+            "close": [100.0 + i for i in range(20)],
+            "volume": [1000] * 20,
+        }
+    )
+
+    monkeypatch.setattr(
+        market_data,
+        "fetch_bars",
+        lambda symbol, period, interval, **kwargs: daily.copy(deep=True),
+    )
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self._actions = iter([1, 2])
+
+        def predict(self, obs, deterministic=True):
+            return next(self._actions, 0), None
+
+    class FakeEnv:
+        def __init__(self, config) -> None:
+            self.config = config
+            self._broker = types.SimpleNamespace(cash=100_000.0, positions={})
+            self._done = False
+            self._data_cache = {}
+            self._data_indices = {}
+
+        def reset(self):
+            self._broker.cash = 100_000.0
+            self._broker.positions = {}
+            self._done = False
+            return [0.0], {}
+
+        def step(self, action):
+            if action == 1:
+                self._broker.cash = 90_000.0
+                self._broker.positions = {"AAPL": 100}
+            elif action == 2:
+                self._broker.cash = 101_500.0
+                self._broker.positions = {}
+                self._done = True
+            return [0.0], 0.0, False, self._done, {}
+
+        def get_broker(self):
+            return self._broker
+
+        def get_portfolio_state(self):
+            return types.SimpleNamespace(equity=self._broker.cash)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(rl_env_module, "TradingEnv", FakeEnv)
+    monkeypatch.setitem(sys.modules, "stable_baselines3", types.SimpleNamespace(PPO=types.SimpleNamespace(load=lambda path: FakeModel())))
+
+    settings = Settings()
+    settings.rl.agent_type = "PPO"
+    model_path = tmp_path / "ppo.zip"
+    model_path.write_bytes(b"")
+
+    result = run_rl_backtest(["AAPL"], settings, model_path=str(model_path))
+
+    assert result["trades"] == 1
+    assert result["wins"] == 1
+    assert result["losses"] == 0
+    assert result["net_pnl"] == 1500.0
+
+
+def test_run_rl_backtest_single_symbol_closes_open_position_at_end(monkeypatch, tmp_path) -> None:
+    import trading_bot.data.market_data as market_data
+    import trading_bot.rl.env as rl_env_module
+
+    daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=20, freq="D"),
+            "open": [100.0] * 20,
+            "high": [101.0] * 20,
+            "low": [99.0] * 20,
+            "close": [100.0 + i for i in range(20)],
+            "volume": [1000] * 20,
+        }
+    )
+
+    monkeypatch.setattr(
+        market_data,
+        "fetch_bars",
+        lambda symbol, period, interval, **kwargs: daily.copy(deep=True),
+    )
+
+    class FakeModel:
+        def predict(self, obs, deterministic=True):
+            return 1, None
+
+    class FakeEnv:
+        def __init__(self, config) -> None:
+            self.config = config
+            self._broker = types.SimpleNamespace(cash=100_000.0, positions={})
+            self._portfolio_state = types.SimpleNamespace(equity=100_000.0)
+            self._data_cache = {}
+            self._data_indices = {}
+
+        def reset(self):
+            self._broker.cash = 100_000.0
+            self._broker.positions = {}
+            self._portfolio_state.equity = 100_000.0
+            return [0.0], {}
+
+        def step(self, action):
+            self._broker.cash = 90_000.0
+            self._broker.positions = {"AAPL": 100}
+            self._portfolio_state.equity = 104_000.0
+            return [0.0], 0.0, False, True, {}
+
+        def get_broker(self):
+            return self._broker
+
+        def get_portfolio_state(self):
+            return self._portfolio_state
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(rl_env_module, "TradingEnv", FakeEnv)
+    monkeypatch.setitem(sys.modules, "stable_baselines3", types.SimpleNamespace(PPO=types.SimpleNamespace(load=lambda path: FakeModel())))
+
+    settings = Settings()
+    settings.rl.agent_type = "PPO"
+    model_path = tmp_path / "ppo.zip"
+    model_path.write_bytes(b"")
+
+    result = run_rl_backtest(["AAPL"], settings, model_path=str(model_path))
+
+    assert result["trades"] == 1
+    assert result["wins"] == 1
+    assert result["losses"] == 0
+    assert result["net_pnl"] == 4000.0
 
 
 def test_run_symbol_backtest_counts_stop_hit_as_loss_even_if_final_close_recovers() -> None:
@@ -543,3 +709,47 @@ def test_run_walk_forward_aggregates_across_windows(monkeypatch) -> None:
     assert result["windows"][0]["window"] == 1
     assert result["windows"][1]["window"] == 2
     assert result["windows"][2]["window"] == 3
+
+
+def test_run_backtest_passes_market_data_settings_to_fetches(monkeypatch) -> None:
+    import trading_bot.data.market_data as market_data
+
+    seen_providers = []
+    daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=60, freq="D"),
+            "open": [100.0] * 60,
+            "high": [101.0] * 60,
+            "low": [99.0] * 60,
+            "close": [100.0] * 60,
+            "volume": [1000] * 60,
+        }
+    )
+    intraday = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-13", periods=20, freq="5min"),
+            "open": [99.9] * 20,
+            "high": [100.1] * 20,
+            "low": [99.8] * 20,
+            "close": [100.0] * 20,
+            "volume": [1000] * 20,
+        }
+    )
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        settings = kwargs.get("settings")
+        seen_providers.append(getattr(settings, "provider", None))
+        if interval == "1d":
+            return daily.copy(deep=True)
+        return intraday.copy(deep=True)
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    settings = Settings()
+    settings.market_data.provider = "alpaca"
+
+    result = run_backtest(["AAPL"], settings, start="2026-01-01", end="2026-03-31")
+
+    assert result["trades"] >= 0
+    assert seen_providers
+    assert all(provider == "alpaca" for provider in seen_providers)

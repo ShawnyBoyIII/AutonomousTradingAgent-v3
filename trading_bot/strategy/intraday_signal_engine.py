@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import math
 from typing import TYPE_CHECKING
 
@@ -166,6 +166,8 @@ def _resolve_signal_timestamp(intraday_frame: "pd.DataFrame") -> datetime | None
         candidate = intraday_frame.index[-1]
 
     if isinstance(candidate, datetime):
+        if candidate.tzinfo is None:
+            return candidate.replace(tzinfo=timezone.utc)
         return candidate
 
     return None

@@ -16,6 +16,7 @@ from trading_bot.rl.rewards import (
 )
 from trading_bot.rl.observer import TensorTradeObserver
 from trading_bot.models.portfolio import PortfolioState
+from trading_bot.rl.trainer import RLTrainer, TrainingConfig
 
 
 @pytest.fixture
@@ -137,6 +138,26 @@ class TestTradingEnv:
         assert "Step" in captured.out
         assert "Equity" in captured.out
 
+    def test_episode_summary_in_terminal_info(self, mock_market_data):
+        env = TradingEnv(
+            config=TradingConfig(
+                symbols=["AAPL"],
+                observer_window=5,
+                max_episode_steps=2,
+                reward_scheme="compound_daily",
+            )
+        )
+        env.reset()
+        _, _, _, truncated, info = env.step(2)  # BUY AAPL
+        assert not truncated
+        _, _, _, truncated, info = env.step(3)  # SELL AAPL
+        assert truncated
+        summary = info["episode_summary"]
+        assert summary["trade_count"] == 2
+        assert summary["buy_count"] == 1
+        assert summary["sell_count"] == 1
+        assert summary["steps"] == 2
+
 
 class TestActionSchemes:
     def test_bsh_action_space(self, mock_market_data):
@@ -196,6 +217,41 @@ class TestRewardSchemes:
         import math
         expected = math.log(110_000 / 100_000)
         assert abs(r - expected) < 0.001
+
+    def test_env_accepts_shannon_reward_scheme(self, mock_market_data):
+        env = TradingEnv(
+            config=TradingConfig(
+                symbols=["AAPL"],
+                observer_window=5,
+                reward_scheme="shannon_entropy",
+            )
+        )
+        env.reset()
+        _, reward, _, _, _ = env.step(0)
+        assert isinstance(reward, float)
+
+
+class TestRLTrainer:
+    def test_evaluate_reports_per_episode_final_equity(self, mock_market_data):
+        trainer = RLTrainer(
+            TrainingConfig(
+                env_config=TradingConfig(
+                    symbols=["AAPL"],
+                    observer_window=5,
+                    max_episode_steps=2,
+                )
+            )
+        )
+
+        class FakeModel:
+            def predict(self, obs, deterministic=True):
+                return 0, None
+
+        trainer._model = FakeModel()
+        result = trainer.evaluate(n_episodes=2)
+        assert "mean_final_equity" in result
+        assert "mean_trade_count" in result
+        assert result["min_final_equity"] <= result["max_final_equity"]
 
 
 class TestObserver:

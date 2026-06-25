@@ -360,12 +360,12 @@ def backtest(
             )
     elif compare:
         from trading_bot.backtest.runner import run_strategy_comparison
-        default_model = "state/rl_logs/PPO_final.zip"
         strategies = ["v2.5", "v3"]
         model_path = None
-        if ctx.obj.rl.enabled and Path(default_model).exists():
+        configured_model = getattr(ctx.obj.rl, "model_path", None)
+        if ctx.obj.rl.enabled and configured_model and Path(configured_model).exists():
             strategies.append("rl")
-            model_path = default_model
+            model_path = configured_model
         comparison = run_strategy_comparison(parsed_symbols, ctx.obj, start=start, end=end, strategies=strategies, model_path=model_path)
         typer.echo("STRATEGY COMPARISON")
         typer.echo("=" * 60)
@@ -2352,3 +2352,39 @@ def rl_eval(
     from scripts.train_rl import main as train_main
     exit_code = train_main()
     raise typer.Exit(code=exit_code)
+
+
+@app.command(name="rl-benchmark")
+def rl_benchmark(
+    ctx: typer.Context,
+    symbol: str = typer.Option("AAPL", "--symbol", help="Single symbol to benchmark"),
+    start: str | None = typer.Option(None, "--start", help="Inclusive start date in YYYY-MM-DD format."),
+    end: str | None = typer.Option(None, "--end", help="Inclusive end date in YYYY-MM-DD format."),
+    model_path: str | None = typer.Option(None, "--model-path", help="Override RL model path"),
+) -> None:
+    """Run apples-to-apples V2.5 vs V3 vs RL benchmark for one symbol."""
+    from trading_bot.backtest.runner import run_strategy_comparison
+
+    resolved_model_path = model_path or getattr(ctx.obj.rl, "model_path", None)
+    if not resolved_model_path or not Path(resolved_model_path).exists():
+        typer.echo("RL benchmark requires an existing model path. Set rl.model_path or pass --model-path.")
+        raise typer.Exit(code=1)
+
+    comparison = run_strategy_comparison(
+        [symbol],
+        ctx.obj,
+        start=start,
+        end=end,
+        strategies=["v2.5", "v3", "rl"],
+        model_path=resolved_model_path,
+    )
+
+    typer.echo("RL BENCHMARK")
+    typer.echo("=" * 60)
+    typer.echo(f"symbol={symbol} model_path={resolved_model_path}")
+    for strat, result in comparison["results"].items():
+        typer.echo(f"\n{strat.upper()}:")
+        typer.echo(f"  trades={result['trades']} wins={result['wins']} losses={result['losses']}")
+        typer.echo(f"  win_rate={result['win_rate']:.2f} net_pnl={result['net_pnl']:.2f}")
+    typer.echo(f"\nBest P&L: {comparison['best_pnl_strategy']}")
+    typer.echo(f"Best Win Rate: {comparison['best_winrate_strategy']}")
