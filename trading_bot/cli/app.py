@@ -2280,26 +2280,38 @@ def rl_train(
     ctx: typer.Context,
     symbols: str = typer.Option("AAPL", "--symbols", help="Comma-separated symbols to train on"),
     agent: str = typer.Option("PPO", "--agent", help="DRL agent type (PPO, A2C, SAC, TD3, DDPG)"),
-    episodes: int = typer.Option(100, "--episodes", help="Number of training episodes"),
-    timesteps: int = typer.Option(100000, "--timesteps", help="Total timesteps"),
+    timesteps: int = typer.Option(50000, "--timesteps", help="Total training timesteps"),
     learning_rate: float = typer.Option(3e-4, "--learning-rate", help="Learning rate"),
-    feature_set: str = typer.Option("standard", "--feature-set", help="Feature set (standard, extended)"),
-    output_dir: str = typer.Option("trained_models", "--output-dir", help="Output directory"),
-    verbose: int = typer.Option(1, "--verbose", help="Verbosity level"),
+    output_dir: str = typer.Option("state/rl_logs", "--output-dir", help="Output directory for model"),
+    evaluate: bool = typer.Option(False, "--evaluate", help="Evaluate trained model instead of training"),
+    eval_episodes: int = typer.Option(10, "--eval-episodes", help="Number of evaluation episodes"),
+    verbose: int = typer.Option(1, "--verbose", help="Verbosity level (0=quiet, 1=normal, 2=debug)"),
 ) -> None:
-    """Train a DRL trading agent."""
+    """Train or evaluate a DRL trading agent.
+
+    Training trains a new agent on historical market data.
+    Use --evaluate to test a trained model instead.
+
+    After training, compare strategies with:
+      ./tradebot-local backtest --symbols AAPL,MSFT --compare
+    """
     import sys
-    sys.argv = [
+
+    argv = [
         "train_rl.py",
         "--symbols", symbols,
         "--agent", agent,
-        "--episodes", str(episodes),
         "--timesteps", str(timesteps),
         "--learning-rate", str(learning_rate),
-        "--feature-set", feature_set,
         "--output-dir", output_dir,
         "--verbose", str(verbose),
     ]
+
+    if evaluate:
+        argv.append("--evaluate")
+        argv.extend(["--eval-episodes", str(eval_episodes)])
+
+    sys.argv = argv
 
     from scripts.train_rl import main as train_main
     exit_code = train_main()
