@@ -373,6 +373,7 @@ def backtest(
             typer.echo(f"\n{strat.upper()}:")
             typer.echo(f"  trades={result['trades']} wins={result['wins']} losses={result['losses']}")
             typer.echo(f"  win_rate={result['win_rate']:.2f} net_pnl={result['net_pnl']:.2f}")
+            typer.echo(f"  {_format_backtest_diagnostics(result)}")
         typer.echo(f"\nBest P&L: {comparison['best_pnl_strategy']}")
         typer.echo(f"Best Win Rate: {comparison['best_winrate_strategy']}")
     elif strategy:
@@ -1019,6 +1020,16 @@ def _parse_symbols(values: list[str]) -> list[str]:
     for raw_value in values:
         parsed_symbols.extend(symbol.strip() for symbol in raw_value.split(",") if symbol.strip())
     return parsed_symbols
+
+
+def _format_backtest_diagnostics(result: dict) -> str:
+    return (
+        f"avg_win={result.get('avg_win', 0.0):.2f} "
+        f"avg_loss={result.get('avg_loss', 0.0):.2f} "
+        f"expectancy={result.get('expectancy', 0.0):.2f} "
+        f"profit_factor={result.get('profit_factor', 0.0):.2f} "
+        f"pnl_per_trade={result.get('pnl_per_trade', 0.0):.2f}"
+    )
 
 
 def _build_universe_file(settings) -> dict[str, object]:
@@ -2386,5 +2397,55 @@ def rl_benchmark(
         typer.echo(f"\n{strat.upper()}:")
         typer.echo(f"  trades={result['trades']} wins={result['wins']} losses={result['losses']}")
         typer.echo(f"  win_rate={result['win_rate']:.2f} net_pnl={result['net_pnl']:.2f}")
+        typer.echo(f"  {_format_backtest_diagnostics(result)}")
     typer.echo(f"\nBest P&L: {comparison['best_pnl_strategy']}")
     typer.echo(f"Best Win Rate: {comparison['best_winrate_strategy']}")
+
+
+@app.command(name="rl-walkforward")
+def rl_walkforward(
+    ctx: typer.Context,
+    symbol: str = typer.Option("AAPL", "--symbol", help="Single symbol to benchmark"),
+    start: str | None = typer.Option(None, "--start", help="Inclusive start date in YYYY-MM-DD format."),
+    end: str | None = typer.Option(None, "--end", help="Inclusive end date in YYYY-MM-DD format."),
+    windows: int = typer.Option(5, "--windows", help="Number of sequential windows"),
+    model_path: str | None = typer.Option(None, "--model-path", help="Override RL model path"),
+) -> None:
+    """Run fixed-model sequential V2.5 vs V3 vs RL windows for one symbol."""
+    from trading_bot.backtest.runner import run_rl_walk_forward
+
+    resolved_model_path = model_path or getattr(ctx.obj.rl, "model_path", None)
+    if not resolved_model_path or not Path(resolved_model_path).exists():
+        typer.echo("RL walk-forward requires an existing model path. Set rl.model_path or pass --model-path.")
+        raise typer.Exit(code=1)
+
+    result = run_rl_walk_forward(
+        [symbol],
+        ctx.obj,
+        start=start,
+        end=end,
+        windows=windows,
+        model_path=resolved_model_path,
+    )
+    typer.echo("RL FIXED-MODEL WALK-FORWARD")
+    typer.echo("=" * 60)
+    typer.echo(f"symbol={symbol} model_path={resolved_model_path} windows={windows}")
+    for window in result["windows"]:
+        typer.echo(f"\nWINDOW {window['window']}: {window['start']} -> {window['end']}")
+        for strategy_name, strategy_result in window["results"].items():
+            typer.echo(
+                f"  {strategy_name.upper()}: trades={strategy_result['trades']} "
+                f"wins={strategy_result['wins']} losses={strategy_result['losses']} "
+                f"win_rate={strategy_result['win_rate']:.2f} net_pnl={strategy_result['net_pnl']:.2f}"
+            )
+            typer.echo(f"    {_format_backtest_diagnostics(strategy_result)}")
+        typer.echo(f"  best_pnl={window['best_pnl_strategy']} best_win_rate={window['best_winrate_strategy']}")
+
+    typer.echo("\nTOTALS:")
+    for strategy_name, strategy_result in result["results"].items():
+        typer.echo(
+            f"  {strategy_name.upper()}: trades={strategy_result['trades']} "
+            f"wins={strategy_result['wins']} losses={strategy_result['losses']} "
+            f"win_rate={strategy_result['win_rate']:.2f} net_pnl={strategy_result['net_pnl']:.2f}"
+        )
+        typer.echo(f"    {_format_backtest_diagnostics(strategy_result)}")

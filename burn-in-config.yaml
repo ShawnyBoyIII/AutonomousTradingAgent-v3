@@ -6,12 +6,14 @@ app:
   scan_results_path: "state/burn_in/scan_results.json"
 
 market_data:
-  provider: "alpaca"
+  providers:
+    - alpaca
+    - polygon
   daily_period: "1y"
   intraday_period: "5d"
   intraday_interval: "5m"
   max_data_age_hours: 72
-  max_data_age_minutes: 30
+  max_data_age_minutes: 75
   validate_data: true
 
 risk:
@@ -29,15 +31,15 @@ risk:
   enable_drawdown_circuit_breaker: true
 
 strategy:
-  use_v3_signals: true
+  use_v3_signals: false
   risk_tolerance: "medium"
   min_confidence: "medium"
 
 counter_thesis:
-  enabled: true
+  enabled: false
   block_on_severity: "high"
   aggregate_block_threshold: 0.6
-  exit_on_block: true
+  exit_on_block: false
 
 session:
   eod_enabled: true

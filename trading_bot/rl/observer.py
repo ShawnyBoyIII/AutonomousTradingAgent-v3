@@ -12,7 +12,6 @@ from trading_bot.rl.features import (
     FEATURE_COLS,
     PORTFOLIO_FEATURES,
     build_market_feature_row,
-    build_observation,
     build_portfolio_feature_row,
     pad_market_rows,
 )
@@ -118,11 +117,13 @@ class TensorTradeObserver(Observer):
         market_rows = [self._load_and_compute_features(symbol) for symbol in self.symbols]
         market_rows = pad_market_rows(market_rows, self.max_symbols)
         portfolio_features = self._compute_portfolio_features(portfolio_state)
-        obs = build_observation(
-            market_rows,
-            portfolio_features,
-            observer_window=self.window_size,
-        )
-        self._history.clear()
-        self._history.extend(obs.tolist())
-        return obs
+        row = [float(value) for row_values in market_rows for value in row_values]
+        row.extend(float(value) for value in portfolio_features)
+        self._history.append(row)
+
+        history_list = list(self._history)
+        if len(history_list) < self.window_size:
+            zero_row = [0.0] * self.n_features
+            while len(history_list) < self.window_size:
+                history_list.insert(0, zero_row)
+        return np.array(history_list[:self.window_size], dtype=np.float32)

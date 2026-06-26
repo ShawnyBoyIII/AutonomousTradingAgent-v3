@@ -24,20 +24,27 @@ def normalize_ohlcv_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return renamed[["timestamp", "open", "high", "low", "close", "volume"]]
 
 
-def _resolve_provider(settings: MarketDataSettings | None = None):
-    """Return the appropriate provider instance based on *settings*.
+def _resolve_provider_stack(settings: MarketDataSettings | None = None) -> list:
+    """Return an ordered list of provider instances from *settings*.provider_stack."""
+    names = settings.provider_stack if settings is not None else ["yfinance"]
+    providers: list = []
+    for name in names:
+        providers.append(_resolve_provider_by_name(name))
+    return providers
 
-    * ``"yfinance"``  → ``YFinanceProvider``
-    * ``"alpaca"``    → ``AlpacaProvider``
-    * omitted / other → ``YFinanceProvider`` (safe default)
-    """
-    provider_name = settings.provider if settings is not None else ""
-    if provider_name == "alpaca":
+
+def _resolve_provider_by_name(name: str):
+    """Return a single provider instance for the given *name* string."""
+    if name == "alpaca":
         from trading_bot.data.providers.alpaca_provider import AlpacaProvider
-
         return AlpacaProvider()
+    if name == "finnhub":
+        from trading_bot.data.providers.finnhub_provider import FinnhubProvider
+        return FinnhubProvider()
+    if name == "polygon":
+        from trading_bot.data.providers.polygon_provider import PolygonProvider
+        return PolygonProvider()
     from trading_bot.data.providers.yfinance_provider import YFinanceProvider
-
     return YFinanceProvider()
 
 
@@ -49,18 +56,20 @@ def _fallback_fetch(
     end: str | None = None,
     primary_settings: MarketDataSettings | None = None,
 ) -> pd.DataFrame:
-    """Try the configured provider first; fall back to yfinance on failure."""
-    primary = _resolve_provider(primary_settings)
-    try:
-        return primary.fetch_bars(symbol, period, interval, start=start, end=end)
-    except (ValueError, ConnectionError, OSError, TimeoutError) as exc:
-        logger.warning(
-            f"fetch_failed symbol={symbol} provider={getattr(primary_settings, 'provider', 'yfinance')} error={exc} "
-            f"falling back to yfinance"
-        )
-    from trading_bot.data.providers.yfinance_provider import YFinanceProvider
-
-    return YFinanceProvider().fetch_bars(symbol, period, interval, start=start, end=end)
+    """Try each provider in the configured stack; first success wins."""
+    stack = _resolve_provider_stack(primary_settings)
+    last_error: Exception | None = None
+    for provider in stack:
+        try:
+            return provider.fetch_bars(symbol, period, interval, start=start, end=end)
+        except (ValueError, ConnectionError, OSError, TimeoutError) as exc:
+            last_error = exc
+            logger.warning(
+                f"fetch_failed symbol={symbol} provider={type(provider).__name__} error={exc}"
+            )
+    raise ValueError(
+        f"All providers failed for {symbol} ({period}/{interval}): {last_error}"
+    )
 
 
 def fetch_bars(

@@ -11,7 +11,9 @@ app:
   backtest_summary_path: state/backtest_summary.json
 
 market_data:
-  provider: alpaca  # "yfinance" or "alpaca"
+  providers:
+    - alpaca
+    - polygon
   validate_data: true
   max_price_jump_pct: 1000.0
   max_volume_jump_pct: 1000.0

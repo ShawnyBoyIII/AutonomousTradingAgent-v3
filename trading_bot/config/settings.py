@@ -16,6 +16,14 @@ class AppSettings(BaseModel):
 
 class MarketDataSettings(BaseModel):
     provider: str = "yfinance"
+    providers: list[str] = Field(default_factory=list)
+
+    @property
+    def provider_stack(self) -> list[str]:
+        """Ordered list of provider names to try.  Falls back to *provider*
+        when *providers* is empty for backward compatibility."""
+        return self.providers if self.providers else [self.provider]
+
     daily_period: str = "1y"
     intraday_period: str = "5d"
     intraday_interval: str = "5m"

@@ -7,6 +7,7 @@ Small truth-first guide for the current RL path.
 - Training CLI: `rl-train`
 - Evaluation CLI: `rl-eval`
 - Strategy benchmark: `rl-benchmark`
+- Sequential benchmark: `rl-walkforward`
 - Generic compare path: `backtest --compare`
 - Supported agents today: `PPO`, `A2C`, `DQN`
 
@@ -83,9 +84,21 @@ Then run:
   --end 2026-06-25
 ```
 
+Or run sequential windows:
+
+```bash
+./tradebot-local rl-walkforward \
+  --symbol AAPL \
+  --start 2025-06-25 \
+  --end 2026-06-25 \
+  --windows 5
+```
+
 Important:
 
 - `rl-benchmark` is the apples-to-apples single-symbol path
+- `rl-walkforward` repeats that comparison across sequential windows
+- `rl-walkforward` does not retrain between windows yet; same saved model used in every window
 - it always runs `v2.5`, `v3`, and `rl` on the same symbol and same date window
 - the RL side now uses the same `TradingEnv` family as training for the single-symbol benchmark path
 - it uses the configured `rl.model_path`, or `--model-path` if you override it
@@ -95,6 +108,14 @@ Reward scheme notes:
 - supported env reward schemes today: `simple_profit`, `risk_adjusted`, `compound_daily`, `shannon_entropy`
 - `risk_adjusted` is still the safest default for local training
 - benchmark and eval now expose more honest episode stats internally, including trade count
+
+Benchmark diagnostics:
+
+- `avg_win`: average dollars gained on winning trades
+- `avg_loss`: average dollars lost on losing trades
+- `expectancy`: average dollars gained or lost per trade
+- `profit_factor`: gross profit divided by absolute gross loss
+- `pnl_per_trade`: same as expectancy, shown for scanability
 
 If you still want the generic compare command:
 

@@ -194,6 +194,87 @@ def test_rl_benchmark_runs_compare_with_single_symbol(monkeypatch, tmp_path: Pat
     assert captured["strategies"] == ["v2.5", "v3", "rl"]
     assert captured["model_path"] == str(model_path)
     assert "RL BENCHMARK" in result.stdout
+    assert "expectancy=" in result.stdout
+
+
+def test_rl_walkforward_requires_existing_model_path(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "market_data:\n"
+        "  provider: yfinance\n"
+        "rl:\n"
+        "  enabled: true\n"
+        "  model_path: missing/model.zip\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "rl-walkforward", "--symbol", "AAPL"],
+    )
+
+    assert result.exit_code == 1
+    assert "requires an existing model path" in result.stdout
+
+
+def test_rl_walkforward_runs_sequential_windows(monkeypatch, tmp_path: Path) -> None:
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "market_data:\n"
+        "  provider: yfinance\n"
+        "rl:\n"
+        "  enabled: true\n"
+        f"  model_path: {model_path}\n",
+        encoding="utf-8",
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_walkforward(symbols, settings, start=None, end=None, windows=5, model_path=None):
+        captured["symbols"] = symbols
+        captured["windows"] = windows
+        captured["model_path"] = model_path
+        return {
+            "windows": [
+                {
+                    "window": 1,
+                    "start": "2025-01-01",
+                    "end": "2025-02-01",
+                    "results": {
+                        "v2.5": {"trades": 1, "wins": 1, "losses": 0, "win_rate": 1.0, "net_pnl": 10.0},
+                        "v3": {"trades": 1, "wins": 1, "losses": 0, "win_rate": 1.0, "net_pnl": 12.0},
+                        "rl": {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "net_pnl": 0.0},
+                    },
+                    "best_pnl_strategy": "v3",
+                    "best_winrate_strategy": "v3",
+                }
+            ],
+            "results": {
+                "v2.5": {"trades": 1, "wins": 1, "losses": 0, "win_rate": 1.0, "net_pnl": 10.0},
+                "v3": {"trades": 1, "wins": 1, "losses": 0, "win_rate": 1.0, "net_pnl": 12.0},
+                "rl": {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "net_pnl": 0.0},
+            },
+        }
+
+    monkeypatch.setattr("trading_bot.backtest.runner.run_rl_walk_forward", fake_walkforward)
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "rl-walkforward", "--symbol", "AAPL", "--windows", "3"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["symbols"] == ["AAPL"]
+    assert captured["windows"] == 3
+    assert captured["model_path"] == str(model_path)
+    assert "RL FIXED-MODEL WALK-FORWARD" in result.stdout
+    assert "profit_factor=" in result.stdout
 
 
 def test_evaluate_agent_rejects_symbol_mismatch(capsys) -> None:
