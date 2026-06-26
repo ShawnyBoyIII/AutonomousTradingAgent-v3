@@ -1,0 +1,3 @@
+## 2025-02-12 - Added Loading Feedback and Accessibility to Kill Switch
+**Learning:** The dashboard UI is currently implemented via server-side rendered HTML strings within Python files (e.g., `trading_bot/runtime/dashboard.py`). It does not use a separate frontend framework (like React or Next.js) or a Node.js package manager (like npm or pnpm). Inline JavaScript is used for interactivity. Be careful with f-string formatting when writing inline JS.
+**Action:** When working on UX improvements for this dashboard, modify the Python strings directly and use standard HTML/CSS/JS. Ensure proper f-string escaping (`{{` and `}}`) for JavaScript code. Do not attempt to run npm/pnpm commands.
