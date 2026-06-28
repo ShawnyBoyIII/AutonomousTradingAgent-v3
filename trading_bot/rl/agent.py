@@ -150,6 +150,7 @@ class RLAgent:
         unrealized_pnl_pct: float = 0.0,
         cash_ratio: float = 1.0,
         symbols: list[str] | None = None,
+        market_frames: dict[str, Any] | None = None,
     ) -> tuple[int, float]:
         """Predict trading signal from market data.
         
@@ -165,9 +166,20 @@ class RLAgent:
         n_market_features = 13  # len(FEATURE_COLS)
         n_portfolio_features = 5
         n_symbols = (obs_shape[1] - n_portfolio_features) // n_market_features
-        market_rows = [build_market_feature_row(daily_frame.copy())]
-        while len(market_rows) < n_symbols:
-            market_rows.append([0.0] * n_market_features)
+        symbol_list = [s.upper().strip() for s in (symbols or self.config.env_config.symbols or [ticker])]
+        if market_frames is None:
+            market_rows = [build_market_feature_row(daily_frame.copy())]
+            while len(market_rows) < n_symbols:
+                market_rows.append([0.0] * n_market_features)
+        else:
+            market_rows = []
+            for frame_symbol in symbol_list[:n_symbols]:
+                frame = market_frames.get(frame_symbol)
+                market_rows.append(
+                    build_market_feature_row(frame.copy())
+                    if frame is not None
+                    else [0.0] * n_market_features
+                )
 
         position_weight_sum = portfolio_weight
         realized_pnl_pct = unrealized_pnl_pct
@@ -191,7 +203,6 @@ class RLAgent:
         #   symbol_idx*3 + 1 = HOLD for symbol
         #   symbol_idx*3 + 2 = BUY for symbol
         #   symbol_idx*3 + 3 = SELL for symbol
-        symbol_list = [s.upper().strip() for s in (symbols or self.config.env_config.symbols or [ticker])]
         try:
             symbol_idx = symbol_list.index(ticker.upper().strip())
         except ValueError:

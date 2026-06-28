@@ -6,11 +6,12 @@ from pathlib import Path
 import pandas as pd
 from typer.testing import CliRunner
 
-from trading_bot.cli.app import app
+from trading_bot.cli.app import app, _format_scan_summary
 from trading_bot.main import main
 from trading_bot.models.order import FillResult
 from trading_bot.models.portfolio import PortfolioState, Position
 from trading_bot.portfolio.ledger import PortfolioLedger
+from trading_bot.runtime.watchlist import add_symbol, read_watchlist, remove_symbol
 
 
 def test_cli_shows_help(monkeypatch, capsys) -> None:
@@ -46,6 +47,140 @@ def test_doctor_command_reports_local_readiness(tmp_path: Path) -> None:
         "doctor live_trading=false state_db=missing log_dir=missing snapshots=0/4 "
         "provider=yfinance provider_auth=ok"
     )
+
+
+def test_scan_summary_includes_rl_counts_when_present() -> None:
+    assert _format_scan_summary(
+        {
+            "symbols": 3,
+            "approved": 1,
+            "green": 1,
+            "yellow": 0,
+            "rejected": 0,
+            "no_signal": 2,
+            "errors": 0,
+            "rl_buy": 1,
+            "rl_hold": 1,
+            "rl_sell": 1,
+            "rl_unsupported": 2,
+            "rl_avg_confidence": 0.62,
+        }
+    ).endswith("rl_buy=1 rl_hold=1 rl_sell=1 rl_unsupported=2 rl_avg_conf=0.62")
+
+
+def test_watchlist_file_adds_and_removes_symbols(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "watchlist.txt"
+
+    assert add_symbol(path, " msft ") == ["MSFT"]
+    assert add_symbol(path, "MSFT") == ["MSFT"]
+    assert add_symbol(path, "brk.b") == ["MSFT", "BRK.B"]
+    assert read_watchlist(path) == ["MSFT", "BRK.B"]
+    assert remove_symbol(path, "msft") == ["BRK.B"]
+
+
+def test_rl_signal_rejects_symbols_outside_model_metadata(monkeypatch, tmp_path: Path) -> None:
+    import types
+
+    import trading_bot.runtime.orchestrator as orchestrator
+    from trading_bot.config.settings import Settings
+
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
+    settings = Settings()
+    settings.app.log_dir = str(tmp_path / "logs")
+    settings.rl.enabled = True
+    settings.rl.model_path = "model.zip"
+
+    fake_agent = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            env_config=types.SimpleNamespace(symbols=["AAPL"]),
+        ),
+    )
+    monkeypatch.setattr("trading_bot.rl.agent.RLAgent.load", lambda model_path: fake_agent)
+
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("unsupported RL symbols should fail before market data fetch")
+
+    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fail_fetch)
+
+    signal, reason, details = orchestrator._build_rl_signal_result("MSFT", settings)
+
+    assert signal is None
+    assert "RL model not trained for MSFT" in reason
+    assert details["rl_trained_symbols"] == ["AAPL"]
+
+
+def test_rl_signal_rejects_missing_model_metadata_before_fetch(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.runtime.orchestrator as orchestrator
+    from trading_bot.config.settings import Settings
+
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    settings = Settings()
+    settings.app.log_dir = str(tmp_path / "logs")
+    settings.rl.enabled = True
+    settings.rl.model_path = "model.zip"
+
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("missing RL metadata should fail before market data fetch")
+
+    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fail_fetch)
+
+    signal, reason, details = orchestrator._build_rl_signal_result("AAPL", settings)
+
+    assert signal is None
+    assert "RL model metadata missing or empty:" in reason
+    assert details == {}
+
+
+def test_rl_signal_passes_all_trained_symbol_frames(monkeypatch, tmp_path: Path) -> None:
+    import types
+
+    import trading_bot.runtime.orchestrator as orchestrator
+    from trading_bot.config.settings import Settings
+
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL", "MSFT"]}', encoding="utf-8")
+    settings = Settings()
+    settings.app.log_dir = str(tmp_path / "logs")
+    settings.rl.enabled = True
+    settings.rl.model_path = "model.zip"
+
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def predict_signal(self, **kwargs):
+            captured["symbols"] = kwargs["symbols"]
+            captured["market_frames"] = sorted(kwargs["market_frames"])
+            return 0, 0.75
+
+    monkeypatch.setattr("trading_bot.rl.agent.RLAgent.load", lambda model_path: FakeAgent())
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=30, freq="D"),
+            "open": [100.0 + index for index in range(30)],
+            "high": [101.0 + index for index in range(30)],
+            "low": [99.0 + index for index in range(30)],
+            "close": [100.0 + index for index in range(30)],
+            "volume": [1_000_000 + index for index in range(30)],
+        }
+    )
+
+    def fake_fetch(symbol, period, interval, settings):
+        return frame.copy(deep=True), types.SimpleNamespace(valid=True, reason="")
+
+    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fake_fetch)
+
+    signal, reason, details = orchestrator._build_rl_signal_result("AAPL", settings)
+
+    assert signal is None
+    assert "RL agent predicts HOLD" in reason
+    assert captured["symbols"] == ["AAPL", "MSFT"]
+    assert captured["market_frames"] == ["AAPL", "MSFT"]
+    assert details["rl_action"] == 0
 
 
 def test_read_only_analysis_commands_render_cleanly_with_empty_state(tmp_path: Path) -> None:
@@ -283,6 +418,48 @@ def test_alert_signals_sends_from_scan_snapshot(monkeypatch, tmp_path: Path) -> 
     assert len(sent) == 1
     assert "BUY CANDIDATE" in sent[0]
     assert "AAPL" in sent[0]
+
+
+def test_scan_universe_includes_watchlist_symbols(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.runtime.orchestrator as orchestrator
+
+    captured: dict[str, object] = {}
+
+    def fake_run_scan(symbols, settings, include_details=False):
+        captured["symbols"] = symbols
+        return {
+            "lines": [],
+            "summary": {
+                "symbols": len(symbols),
+                "approved": 0,
+                "green": 0,
+                "yellow": 0,
+                "rejected": 0,
+                "no_signal": len(symbols),
+                "errors": 0,
+            },
+            "candidates": [],
+        }
+
+    monkeypatch.setattr(orchestrator, "run_scan", fake_run_scan)
+    universe_path = tmp_path / "state" / "universe.txt"
+    watchlist_path = tmp_path / "state" / "watchlist.txt"
+    universe_path.parent.mkdir(parents=True, exist_ok=True)
+    universe_path.write_text("AAPL\nMSFT\n", encoding="utf-8")
+    watchlist_path.write_text("msft\nnvda\n", encoding="utf-8")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state.db'}\n"
+        f"  universe_path: {universe_path}\n"
+        f"  watchlist_path: {watchlist_path}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "scan-universe", "--summary"])
+
+    assert result.exit_code == 0
+    assert captured["symbols"] == ["AAPL", "MSFT", "NVDA"]
 
 
 def test_alert_signals_no_webhook_is_noop(tmp_path: Path) -> None:

@@ -6,6 +6,7 @@ from trading_bot.models.portfolio import PortfolioState
 from trading_bot.rl.features import (
     FEATURE_COLS,
     PORTFOLIO_FEATURES,
+    build_market_feature_frame,
     build_market_feature_row,
     build_observation,
     build_portfolio_feature_row,
@@ -27,6 +28,18 @@ def _frame() -> pd.DataFrame:
 
 def test_build_market_feature_row_returns_shared_shape() -> None:
     row = build_market_feature_row(_frame())
+    assert len(row) == len(FEATURE_COLS)
+
+
+def test_build_market_feature_row_uses_defaults_for_missing_indicators() -> None:
+    row = build_market_feature_row(_frame().head(2))
+
+    assert row[FEATURE_COLS.index("rsi_14")] == 50.0
+
+
+def test_precomputed_market_feature_frame_keeps_same_row_shape() -> None:
+    row = build_market_feature_row(build_market_feature_frame(_frame()))
+
     assert len(row) == len(FEATURE_COLS)
 
 

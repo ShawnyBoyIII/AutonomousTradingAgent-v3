@@ -13,6 +13,8 @@ from trading_bot.rl.rewards import (
     RiskAdjustedReward,
     CompoundDailyReward,
     ShannonEntropyReward,
+    SharpeReward,
+    DrawdownPenaltyReward,
 )
 from trading_bot.rl.observer import TensorTradeObserver
 from trading_bot.models.portfolio import PortfolioState
@@ -230,8 +232,60 @@ class TestRewardSchemes:
         _, reward, _, _, _ = env.step(0)
         assert isinstance(reward, float)
 
+    def test_new_stateful_rewards_reset(self):
+        sharpe = SharpeReward()
+        sharpe.compute_reward(101_000, 100_000)
+        sharpe.reset()
+        assert sharpe.compute_reward(101_000, 100_000) == pytest.approx(1.0)
+
+        drawdown = DrawdownPenaltyReward()
+        assert drawdown.compute_reward(101_000, 100_000) > 0
+        assert drawdown.compute_reward(100_000, 101_000) < 0
+        drawdown.reset()
+        assert drawdown.compute_reward(100_000, 100_000) == 0.0
+
 
 class TestRLTrainer:
+    def test_train_passes_seed_to_model_constructor(self, monkeypatch, tmp_path, mock_market_data):
+        captured: dict[str, object] = {}
+
+        class FakePPO:
+            def __init__(self, policy, env, **kwargs):
+                captured["policy"] = policy
+                captured["kwargs"] = kwargs
+
+            def learn(self, total_timesteps):
+                captured["total_timesteps"] = total_timesteps
+
+            def save(self, path):
+                captured["save_path"] = path
+
+        import sys
+        import types
+
+        monkeypatch.setitem(
+            sys.modules,
+            "stable_baselines3",
+            types.SimpleNamespace(PPO=FakePPO, A2C=FakePPO, DQN=FakePPO),
+        )
+
+        trainer = RLTrainer(
+            TrainingConfig(
+                env_config=TradingConfig(symbols=["AAPL"], observer_window=5),
+                model_type="PPO",
+                total_timesteps=7,
+                seed=789,
+                log_dir=str(tmp_path),
+                verbose=0,
+            )
+        )
+
+        trainer.train()
+
+        assert captured["policy"] == "MlpPolicy"
+        assert captured["kwargs"]["seed"] == 789
+        assert captured["total_timesteps"] == 7
+
     def test_evaluate_reports_per_episode_final_equity(self, mock_market_data):
         trainer = RLTrainer(
             TrainingConfig(

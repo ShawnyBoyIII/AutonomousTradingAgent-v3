@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 import math
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from trading_bot.runtime.decision_log import append_decision_event
 from trading_bot.runtime.snapshots import write_snapshot
 from trading_bot.risk.risk_manager import evaluate_signal
 from trading_bot.strategy.intraday_signal_engine import generate_recent_signal_with_reason
+from trading_bot.rl.utils import rl_model_meta_path, rl_model_symbols
 def run_scan(
     symbols: list[str],
     settings: Settings,
@@ -30,6 +32,10 @@ def run_scan(
     candidate_rows: list[dict[str, object]] = []
     open_tickers = set(state.positions)
     log_path = Path(settings.app.log_dir) / "decision-log.jsonl"
+    rl_action_counts = {"hold": 0, "buy": 0, "sell": 0}
+    rl_confidence_total = 0.0
+    rl_confidence_count = 0
+    rl_unsupported = 0
 
     # V2.5: Calculate portfolio heat before scanning
     portfolio_heat = _calculate_portfolio_heat(state, settings)
@@ -77,6 +83,15 @@ def run_scan(
     for symbol in (value.strip() for value in symbols if value.strip()):
         try:
             signal, no_signal_reason, details = _build_signal_result(symbol, settings)
+            rl_action = details.get("rl_action")
+            if rl_action in (0, 1, 2):
+                rl_action_counts[{0: "hold", 1: "buy", 2: "sell"}[int(rl_action)]] += 1
+                confidence = _finite_float(details.get("rl_confidence"))
+                if confidence is not None:
+                    rl_confidence_total += confidence
+                    rl_confidence_count += 1
+            elif "rl_trained_symbols" in details:
+                rl_unsupported += 1
             counter_result = _evaluate_counter_thesis_for_signal(symbol, signal, settings)
             if counter_result is not None:
                 _augment_details_with_counter_thesis(details, counter_result)
@@ -217,6 +232,21 @@ def run_scan(
         "no_signal": sum(1 for row in candidate_rows if row["status"] == "NO_SIGNAL"),
         "errors": sum(1 for row in candidate_rows if row["status"] == "ERROR"),
     }
+    if getattr(settings, "rl", None) is not None and settings.rl.enabled:
+        summary.update(
+            {
+                "rl_buy": rl_action_counts["buy"],
+                "rl_hold": rl_action_counts["hold"],
+                "rl_sell": rl_action_counts["sell"],
+                "rl_unsupported": rl_unsupported,
+                "rl_avg_confidence": round(
+                    rl_confidence_total / rl_confidence_count,
+                    2,
+                )
+                if rl_confidence_count
+                else 0.0,
+            }
+        )
     write_snapshot(
         settings.app.scan_results_path,
         {
@@ -561,23 +591,52 @@ def _build_rl_signal_result(symbol: str, settings: Settings):
     """
     from trading_bot.rl.agent import RLAgent
 
-    daily_frame, daily_valid = market_data.fetch_and_validate_bars(
-        symbol,
-        settings.market_data.daily_period,
-        "1d",
-        settings.market_data,
-    )
-    if not daily_valid.valid:
-        return None, f"daily data validation failed: {daily_valid.reason}", {}
+    model_path = Path(settings.app.log_dir).parent / settings.rl.model_path
+    if not model_path.exists():
+        return None, f"RL model not found: {model_path}", {}
+    trained_symbols = rl_model_symbols(model_path)
+    if not trained_symbols:
+        return None, f"RL model metadata missing or empty: {rl_model_meta_path(model_path)}", {}
 
-    intraday_frame, intraday_valid = market_data.fetch_and_validate_bars(
-        symbol,
-        settings.market_data.intraday_period,
-        settings.market_data.intraday_interval,
-        settings.market_data,
-    )
-    if not intraday_valid.valid:
-        return None, f"intraday data validation failed: {intraday_valid.reason}", {}
+    try:
+        agent = RLAgent.load(
+            model_path=model_path,
+        )
+    except Exception as e:
+        return None, f"RL model load failed: {e}", {}
+
+    if symbol.upper().strip() not in trained_symbols:
+        return (
+            None,
+            f"RL model not trained for {symbol} (trained_symbols={','.join(trained_symbols)})",
+            {"rl_trained_symbols": trained_symbols},
+        )
+
+    daily_frames = {}
+    intraday_frames = {}
+    for trained_symbol in trained_symbols:
+        daily_frame, daily_valid = market_data.fetch_and_validate_bars(
+            trained_symbol,
+            settings.market_data.daily_period,
+            "1d",
+            settings.market_data,
+        )
+        if not daily_valid.valid:
+            return None, f"{trained_symbol} daily data validation failed: {daily_valid.reason}", {}
+
+        intraday_frame, intraday_valid = market_data.fetch_and_validate_bars(
+            trained_symbol,
+            settings.market_data.intraday_period,
+            settings.market_data.intraday_interval,
+            settings.market_data,
+        )
+        if not intraday_valid.valid:
+            return None, f"{trained_symbol} intraday data validation failed: {intraday_valid.reason}", {}
+        daily_frames[trained_symbol] = daily_frame
+        intraday_frames[trained_symbol] = intraday_frame
+
+    daily_frame = daily_frames[symbol.upper().strip()]
+    intraday_frame = intraday_frames[symbol.upper().strip()]
 
     daily_frame = daily_frame.copy()
     daily_frame = add_ema(daily_frame, period=20, column_name="ema_20")
@@ -590,17 +649,6 @@ def _build_rl_signal_result(symbol: str, settings: Settings):
     intraday_frame = add_rsi(intraday_frame, period=14)
     intraday_frame = add_atr(intraday_frame, period=settings.risk.atr_period)
 
-    model_path = Path(settings.app.log_dir).parent / settings.rl.model_path
-    if not model_path.exists():
-        return None, f"RL model not found: {model_path}", {}
-
-    try:
-        agent = RLAgent.load(
-            model_path=model_path,
-        )
-    except Exception as e:
-        return None, f"RL model load failed: {e}", {}
-
     current_price = float(intraday_frame["close"].iloc[-1])
     action, confidence = agent.predict_signal(
         daily_frame=intraday_frame,
@@ -608,6 +656,8 @@ def _build_rl_signal_result(symbol: str, settings: Settings):
         portfolio_weight=0.0,
         unrealized_pnl_pct=0.0,
         cash_ratio=1.0,
+        symbols=trained_symbols,
+        market_frames=intraday_frames,
     )
 
     details = _scan_details(daily_frame, intraday_frame)

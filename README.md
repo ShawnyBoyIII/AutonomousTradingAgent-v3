@@ -29,7 +29,7 @@ pip install -e .[dev]
 ./tradebot-local doctor
 
 # Run tests
-.venv/bin/python -m pytest -q  # 823 tests collected
+.venv/bin/python -m pytest -q
 ```
 
 **Always use `./tradebot-local`** instead of bare `tradebot` to ensure you're using the local virtual environment.
@@ -62,8 +62,13 @@ pip install -e .[dev]
 # Backtest strategy
 ./tradebot-local backtest --symbols AAPL --start 2025-01-01 --end 2025-06-01
 
-# RL benchmark on one symbol
+# RL model coverage and safe scan plan
+./tradebot-local rl-model-info
+./tradebot-local rl-scan-plan
+
+# RL benchmark against V2.5/V3
 ./tradebot-local rl-benchmark --symbol AAPL --start 2025-01-01 --end 2025-06-01
+./tradebot-local rl-benchmark --symbols AAPL,MSFT --start 2025-01-01 --end 2025-06-01
 
 # Alerts and ops loop
 ./tradebot-local alert-signals

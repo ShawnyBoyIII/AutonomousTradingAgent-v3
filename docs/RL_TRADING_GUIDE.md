@@ -8,6 +8,8 @@ Small truth-first guide for the current RL path.
 - Evaluation CLI: `rl-eval`
 - Strategy benchmark: `rl-benchmark`
 - Sequential benchmark: `rl-walkforward`
+- Model coverage: `rl-model-info`
+- Safe scan plan: `rl-scan-plan`
 - Generic compare path: `backtest --compare`
 - Supported agents today: `PPO`, `A2C`, `DQN`
 
@@ -78,6 +80,9 @@ rl:
 Then run:
 
 ```bash
+./tradebot-local rl-model-info
+./tradebot-local rl-scan-plan
+
 ./tradebot-local rl-benchmark \
   --symbol AAPL \
   --start 2025-06-25 \
@@ -94,18 +99,34 @@ Or run sequential windows:
   --windows 5
 ```
 
+For a model trained on multiple symbols, validate all trained symbols together:
+
+```bash
+./tradebot-local rl-benchmark \
+  --symbols AAPL,MSFT \
+  --start 2025-06-25 \
+  --end 2026-06-25
+
+./tradebot-local rl-walkforward \
+  --symbols AAPL,MSFT \
+  --start 2025-06-25 \
+  --end 2026-06-25 \
+  --windows 5
+```
+
 Important:
 
-- `rl-benchmark` is the apples-to-apples single-symbol path
+- `rl-benchmark` is the apples-to-apples strategy comparison path
 - `rl-walkforward` repeats that comparison across sequential windows
 - `rl-walkforward` does not retrain between windows yet; same saved model used in every window
-- it always runs `v2.5`, `v3`, and `rl` on the same symbol and same date window
-- the RL side now uses the same `TradingEnv` family as training for the single-symbol benchmark path
+- it always runs `v2.5`, `v3`, and `rl` on the same requested symbols and same date window
+- the RL side validates requested symbols against model metadata before fetching data
+- RL scan inference now builds observations with frames for every trained symbol in model metadata
 - it uses the configured `rl.model_path`, or `--model-path` if you override it
 
 Reward scheme notes:
 
-- supported env reward schemes today: `simple_profit`, `risk_adjusted`, `compound_daily`, `shannon_entropy`
+- supported env reward schemes today: `simple_profit`, `risk_adjusted`, `compound_daily`, `shannon_entropy`, `sharpe`, `drawdown_penalty`
 - `risk_adjusted` is still the safest default for local training
 - benchmark and eval now expose more honest episode stats internally, including trade count
 
@@ -130,12 +151,13 @@ If you still want the generic compare command:
 ## What to trust
 
 - trust the command wiring and the benchmark path more than the current saved PPO quality
-- trust single-symbol `rl-benchmark` over generic `backtest --compare` when you are checking RL against V2.5 and V3
+- trust `rl-benchmark` / `rl-walkforward` over generic `backtest --compare` when you are checking RL against V2.5 and V3
 - do not over-read one lucky RL equity number without checking trade count and a few date windows
+- do not scan symbols outside model metadata; commands now fail closed when coverage is unknown
 
 ## Should you train on more stocks?
 
-Not first.
+Yes, but only after single-symbol behavior is stable.
 
 What to do first:
 
@@ -143,7 +165,7 @@ What to do first:
 - make RL at least competitive on `AAPL` alone
 - repeat across a few date windows
 
-Why not jump to more stocks yet:
+Why not jump to too many stocks yet:
 
 - the model shape depends on the training symbol set
 - adding symbols changes both observation size and action space
@@ -154,6 +176,7 @@ When to add more stocks:
 - after a single-symbol model is stable
 - after you can show it is not just overfitting one lucky window
 - start small: `AAPL,MSFT`, not a big basket
+- require `rl-walkforward` to print a paper-confidence `PASS` before promotion
 
 ## Yahoo / date-range gotcha
 

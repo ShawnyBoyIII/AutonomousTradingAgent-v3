@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from trading_bot.config.settings import Settings
+from trading_bot.runtime.watchlist import add_symbol, read_watchlist, remove_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +153,7 @@ class DashboardServer:
         backtest = _read_json(self.settings.app.backtest_summary_path)
         decisions = _read_jsonl_tail(self._decision_log_path, limit=50)
         strategy_results = _read_jsonl_tail(self._strategy_log_path, limit=50)
+        watchlist = read_watchlist(self.settings.app.watchlist_path)
 
         deps = self._resolve_optional_deps()
 
@@ -221,6 +223,7 @@ class DashboardServer:
             "backtest": backtest,
             "decisions": decisions,
             "strategy_results": strategy_results,
+            "watchlist": watchlist,
             "kill_switch": {
                 "checked": ledger is not None,
                 "active": bool(kill_active),
@@ -314,6 +317,8 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
             try:
                 if self.path == "/api/kill-switch":
                     self._handle_kill_switch_toggle()
+                elif self.path == "/api/watchlist":
+                    self._handle_watchlist()
                 else:
                     self._respond(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
             except Exception as exc:
@@ -335,6 +340,25 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
                 self._respond(HTTPStatus.OK, json.dumps(result).encode("utf-8"), "application/json")
             else:
                 self._respond(HTTPStatus.BAD_REQUEST, json.dumps(result).encode("utf-8"), "application/json")
+
+        def _handle_watchlist(self) -> None:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+            try:
+                payload = json.loads(body)
+                action = payload.get("action", "")
+                symbol = payload.get("symbol", "")
+                if action == "add":
+                    symbols = add_symbol(server.settings.app.watchlist_path, str(symbol))
+                elif action == "remove":
+                    symbols = remove_symbol(server.settings.app.watchlist_path, str(symbol))
+                else:
+                    self._respond(HTTPStatus.BAD_REQUEST, b"unknown action", "text/plain")
+                    return
+            except (json.JSONDecodeError, ValueError) as exc:
+                self._respond(HTTPStatus.BAD_REQUEST, str(exc).encode("utf-8"), "text/plain")
+                return
+            self._respond(HTTPStatus.OK, json.dumps({"success": True, "symbols": symbols}).encode("utf-8"), "application/json")
 
         def _serve_html(self) -> None:
             snapshot = server.snapshot()
@@ -372,6 +396,7 @@ def _render_live_dashboard(snapshot: dict[str, Any]) -> str:
     backtest = snapshot.get("backtest", {})
     decisions = snapshot.get("decisions", [])
     strategy_results = snapshot.get("strategy_results", [])
+    watchlist = snapshot.get("watchlist", [])
     kill = snapshot.get("kill_switch", {})
     generated_at = snapshot.get("generated_at", "")
 
@@ -517,6 +542,7 @@ def _render_live_dashboard(snapshot: dict[str, Any]) -> str:
 
   {_market_regime_widget(snapshot.get("market_regime"))}
   {_strategy_attribution_widget(snapshot.get("strategy_attribution"))}
+  {_watchlist_widget(watchlist)}
 
   <div class="two-col">
     <div>
@@ -557,9 +583,47 @@ def _render_live_dashboard(snapshot: dict[str, Any]) -> str:
       if (btn) btn.disabled = false;
     }}
   }}
+
+  async function updateWatchlist(action, symbol) {{
+    const value = (symbol || document.querySelector('#watch-symbol')?.value || '').trim();
+    if (!value) return;
+    try {{
+      const resp = await fetch('/api/watchlist', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{action: action, symbol: value}})
+      }});
+      if (resp.ok) {{
+        location.reload();
+      }} else {{
+        alert(await resp.text());
+      }}
+    }} catch (e) {{
+      alert('Network error: ' + e.message);
+    }}
+  }}
   </script>
 </body>
 </html>
+"""
+
+
+def _watchlist_widget(symbols: list[str]) -> str:
+    items = "".join(
+        f'<span class="badge">{html.escape(symbol)} '
+        f"<button class=\"btn\" onclick=\"updateWatchlist('remove', '{html.escape(symbol)}')\">Remove</button></span> "
+        for symbol in symbols
+    )
+    if not items:
+        items = '<span class="label">No watched symbols.</span>'
+    return f"""
+  <section class="card">
+    <h2>Watcher</h2>
+    <p class="label">Watched symbols are added to the default daily scan universe; normal scanner and risk gates still apply.</p>
+    <input id="watch-symbol" placeholder="AAPL" style="padding:7px;border-radius:6px;border:1px solid #2f3b48;background:#0d1117;color:#e6edf3;">
+    <button class="btn" onclick="updateWatchlist('add')">Add to Watcher</button>
+    <div style="margin-top:12px;">{items}</div>
+  </section>
 """
 
 

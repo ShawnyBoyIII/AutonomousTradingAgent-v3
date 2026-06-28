@@ -15,9 +15,11 @@ from trading_bot.rl.actions import ActionScheme
 from trading_bot.rl.observer import Observer
 from trading_bot.rl.rewards import (
     CompoundDailyReward,
+    DrawdownPenaltyReward,
     RewardScheme,
     RiskAdjustedReward,
     ShannonEntropyReward,
+    SharpeReward,
     SimpleProfitReward,
 )
 
@@ -40,6 +42,7 @@ class TradingConfig:
     symbols: list[str] = field(default_factory=lambda: ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"])
     bar_period: str = "1y"
     bar_interval: str = "1d"
+    data_end_date: str | None = None
     random_start_pct: float = 0.0
     max_episode_steps: int = 500
 
@@ -117,6 +120,8 @@ class TradingEnv(gym.Env):
             "risk_adjusted": RiskAdjustedReward(reward_scale=self.config.reward_scale),
             "compound_daily": CompoundDailyReward(),
             "shannon_entropy": ShannonEntropyReward(),
+            "sharpe": SharpeReward(reward_scale=self.config.reward_scale),
+            "drawdown_penalty": DrawdownPenaltyReward(reward_scale=self.config.reward_scale),
         }
         self._reward_scheme = reward_schemes.get(
             self.config.reward_scheme,
@@ -139,11 +144,15 @@ class TradingEnv(gym.Env):
             return self._data_cache[symbol]
 
         from trading_bot.data.market_data import fetch_bars
+        from trading_bot.rl.features import build_market_feature_frame
 
         try:
-            df = fetch_bars(symbol, self.config.bar_period, self.config.bar_interval)
+            df = fetch_bars(
+                symbol, self.config.bar_period, self.config.bar_interval,
+                end=self.config.data_end_date,
+            )
             if df is not None and not df.empty and "close" in df.columns:
-                self._data_cache[symbol] = df
+                self._data_cache[symbol] = build_market_feature_frame(df)
                 self._data_indices[symbol] = 0
                 return df
         except Exception as e:
@@ -189,15 +198,11 @@ class TradingEnv(gym.Env):
         positions: dict[str, Position] = {}
         for ticker, qty in self._broker.positions.items():
             if qty > 0:
-                avg_cost = 0.0
-                if ticker in self._data_cache:
-                    df = self._data_cache[ticker]
-                    if len(df) > 0:
-                        avg_cost = float(df["close"].iloc[0]) if "close" in df.columns else 0.0
+                avg_cost = self._broker.position_costs.get(ticker, prices.get(ticker, 0.0))
                 positions[ticker] = Position(
                     ticker=ticker,
                     quantity=qty,
-                    average_cost=avg_cost or prices.get(ticker, 0.0),
+                    average_cost=avg_cost,
                 )
 
         market_value = sum(
@@ -249,9 +254,12 @@ class TradingEnv(gym.Env):
         self._trade_count = 0
         self._buy_count = 0
         self._sell_count = 0
+        if hasattr(self._reward_scheme, "reset"):
+            self._reward_scheme.reset()
 
         obs = self._observer.observe(
-            self._portfolio_state, prices, self._current_step
+            self._portfolio_state, prices, self._current_step,
+            data_frames=self._data_cache, data_indices=self._data_indices,
         )
         self._episode_length += 1
 
@@ -310,7 +318,8 @@ class TradingEnv(gym.Env):
         terminated = False
 
         obs = self._observer.observe(
-            self._portfolio_state, prices, self._current_step
+            self._portfolio_state, prices, self._current_step,
+            data_frames=self._data_cache, data_indices=self._data_indices,
         )
 
         info: dict[str, Any] = {

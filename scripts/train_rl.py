@@ -58,6 +58,12 @@ def parse_args() -> argparse.Namespace:
         help="Learning rate (default: 3e-4)",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducible training",
+    )
+    parser.add_argument(
         "--start-date",
         type=str,
         default=None,
@@ -156,6 +162,7 @@ def train_agent(args: argparse.Namespace) -> int:
     print(f"  Episodes:    {args.episodes}")
     print(f"  Timesteps:   {args.timesteps:,}")
     print(f"  Learning rate: {args.learning_rate}")
+    print(f"  Seed:        {args.seed if args.seed is not None else 'default'}")
     print(f"  Output dir:  {output_dir}")
     print(f"{'='*60}\n")
 
@@ -187,6 +194,7 @@ def train_agent(args: argparse.Namespace) -> int:
         vf_coef=0.5,
         max_grad_norm=0.5,
         verbose=args.verbose,
+        seed=args.seed,
         log_dir=str(output_dir),
         eval_freq=5000,
         checkpoint_freq=10000,
@@ -215,6 +223,8 @@ def train_agent(args: argparse.Namespace) -> int:
         "symbols": symbols,
         "agent": args.agent,
         "max_symbols": args.max_symbols,
+        "seed": args.seed,
+        "reward_scheme": env_config.reward_scheme,
     }
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
     print(f"\n  Model saved to: {model_path}")

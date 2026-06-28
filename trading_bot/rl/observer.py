@@ -6,6 +6,7 @@ from typing import Any
 
 import gymnasium as gym
 import numpy as np
+import pandas as pd
 
 from trading_bot.models.portfolio import PortfolioState
 from trading_bot.rl.features import (
@@ -113,8 +114,21 @@ class TensorTradeObserver(Observer):
         portfolio_state: PortfolioState,
         prices: dict[str, float],
         step: int,
+        data_frames: dict[str, pd.DataFrame] | None = None,
+        data_indices: dict[str, int] | None = None,
     ) -> np.ndarray:
-        market_rows = [self._load_and_compute_features(symbol) for symbol in self.symbols]
+        if data_frames is not None and data_indices is not None:
+            market_rows = []
+            for symbol in self.symbols:
+                df = data_frames.get(symbol)
+                idx = data_indices.get(symbol, 0)
+                if df is not None and not df.empty and idx < len(df):
+                    sliced = df.iloc[:idx + 1]
+                    market_rows.append(build_market_feature_row(sliced))
+                else:
+                    market_rows.append([0.0] * self.n_market_features)
+        else:
+            market_rows = [self._load_and_compute_features(symbol) for symbol in self.symbols]
         market_rows = pad_market_rows(market_rows, self.max_symbols)
         portfolio_features = self._compute_portfolio_features(portfolio_state)
         row = [float(value) for row_values in market_rows for value in row_values]

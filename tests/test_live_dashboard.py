@@ -19,6 +19,7 @@ from trading_bot.runtime.dashboard import (
     _positions_table,
     _read_jsonl_tail,
     _render_live_dashboard,
+    _watchlist_widget,
     serve_dashboard,
 )
 
@@ -33,6 +34,7 @@ def _settings_in(tmp_path: Path) -> Settings:
             scan_results_path=str(tmp_path / "scan.json"),
             portfolio_summary_path=str(tmp_path / "portfolio.json"),
             backtest_summary_path=str(tmp_path / "backtest.json"),
+            watchlist_path=str(tmp_path / "watchlist.txt"),
         )
     )
 
@@ -121,6 +123,15 @@ class TestDashboardServerSnapshot:
         assert snap["decisions"][-1]["status"] == "FILLED"
         assert len(snap["strategy_results"]) == 2
 
+    def test_snapshot_reads_watchlist(self, tmp_path: Path) -> None:
+        settings = _settings_in(tmp_path)
+        Path(settings.app.watchlist_path).write_text("aapl\nmsft\n", encoding="utf-8")
+        server = DashboardServer(settings)
+
+        snap = server.snapshot()
+
+        assert snap["watchlist"] == ["AAPL", "MSFT"]
+
     def test_snapshot_with_missing_files_yields_empty(self, tmp_path: Path) -> None:
         settings = _settings_in(tmp_path)
         decision_path = tmp_path / "burn_in" / "decision-log.jsonl"
@@ -202,6 +213,15 @@ class TestRenderLiveDashboard:
         html_out = _render_live_dashboard({"kill_switch": {"active": False}})
         assert "<!doctype html>" in html_out
         assert "No rows." in html_out or "No decisions" in html_out
+
+    def test_includes_watcher_panel(self) -> None:
+        html_out = _render_live_dashboard({"kill_switch": {"active": False}, "watchlist": ["AAPL"]})
+        assert "Watcher" in html_out
+        assert "AAPL" in html_out
+        assert "Add to Watcher" in html_out
+
+    def test_watchlist_widget_empty_state(self) -> None:
+        assert "No watched symbols" in _watchlist_widget([])
 
     def test_realized_pnl_rollup_from_exits(self) -> None:
         snap = {

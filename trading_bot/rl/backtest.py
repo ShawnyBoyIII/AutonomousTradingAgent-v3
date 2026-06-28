@@ -37,6 +37,7 @@ class RLBacktestConfig:
     use_intraday_exit: bool = False
     stop_loss_pct: float = 0.03
     profit_target_pct: float = 0.03
+    action_scheme: str = "bsh"
 
 
 class RLBacktestRunner:
@@ -176,47 +177,81 @@ class RLBacktestRunner:
         return int(action)
 
     # ------------------------------------------------------------------ #
-    #  Action decoding (BSH: 1 + 3 × N symbols)                           #
-    #  0 = global HOLD                                                    #
-    #  1 + sym_idx*3 + 0 = HOLD,  1 = BUY,  2 = SELL                     #
+    #  Action decoding                                                    #
+    #  BSH: 1 + 3 × N symbols                                           #
+    #    0 = global HOLD                                                #
+    #    1 + sym_idx*3 + 0 = HOLD,  1 = BUY,  2 = SELL                 #
+    #  Proportion: 1 + 20 × N symbols                                   #
+    #    0 = global HOLD                                                #
+    #    1 + sym_idx*20 + dir*10 + prop_idx                             #
+    #    dir: 0=BUY, 1=SELL; prop_idx: 0-9 for 10%-100%                #
     # ------------------------------------------------------------------ #
 
-    def _decode_action(self, action: int) -> tuple[str | None, int]:
-        """Return (target_symbol, direction) where direction is 0=HOLD, 1=BUY, 2=SELL."""
+    def _decode_action(self, action: int) -> tuple[str | None, int, float]:
+        """Return (target_symbol, direction, proportion).
+        
+        direction: 0=HOLD, 1=BUY, 2=SELL
+        proportion: fraction of cash/position to trade (1.0 for BSH)
+        """
         if action == 0:
-            return None, 0
+            return None, 0, 1.0
         symbols = self.config.symbols
         if not symbols:
-            return None, 0
+            return None, 0, 1.0
+
+        if self.config.action_scheme == "proportion":
+            return self._decode_proportion_action(action, symbols)
+        else:
+            return self._decode_bsh_action(action, symbols)
+
+    def _decode_bsh_action(self, action: int, symbols: list[str]) -> tuple[str | None, int, float]:
+        """Decode BSH action: 1 + sym_idx*3 + direction."""
         action_idx = action - 1
         symbol_idx = action_idx // 3
         direction = action_idx % 3
         if symbol_idx >= len(symbols):
-            return None, 0
-        return symbols[symbol_idx], direction
+            return None, 0, 1.0
+        return symbols[symbol_idx], direction, 1.0
+
+    def _decode_proportion_action(self, action: int, symbols: list[str]) -> tuple[str | None, int, float]:
+        """Decode Proportion action: 1 + sym_idx*20 + dir*10 + prop_idx."""
+        PROPORTIONS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        action_idx = action - 1
+        symbol_idx = action_idx // 20
+        direction_raw = (action_idx // 10) % 2
+        prop_idx = action_idx % 10
+        
+        if symbol_idx >= len(symbols):
+            return None, 0, 1.0
+        
+        # Map: 0=BUY->1, 1=SELL->2
+        direction = 1 if direction_raw == 0 else 2
+        proportion = PROPORTIONS[prop_idx]
+        
+        return symbols[symbol_idx], direction, proportion
 
     def _action_to_target_symbol(self, action: int, symbols: list[str]) -> str | None:
-        target, direction = self._decode_action(action)
+        target, direction, _ = self._decode_action(action)
         return target if direction != 0 else None
 
     def _action_to_trade(self, action: int, symbol: str, prices: dict[str, float],
                           broker: PaperBroker,
-                          trade_symbols: set[str] | None = None) -> tuple[str | None, float | None]:
-        target_symbol, direction = self._decode_action(action)
+                          trade_symbols: set[str] | None = None) -> tuple[str | None, float | None, float]:
+        target_symbol, direction, proportion = self._decode_action(action)
         if target_symbol is None or direction == 0:
-            return None, None
+            return None, None, 1.0
         if trade_symbols is not None and target_symbol not in trade_symbols:
-            return None, None
+            return None, None, 1.0
 
         price = prices.get(target_symbol)
         if price is None or price <= 0:
-            return None, None
+            return None, None, 1.0
 
         if direction == 1:
-            return "BUY", price
+            return "BUY", price, proportion
         if direction == 2:
-            return ("SELL", price) if broker.positions.get(target_symbol, 0) > 0 else (None, None)
-        return None, None
+            return ("SELL", price, proportion) if broker.positions.get(target_symbol, 0) > 0 else (None, None, 1.0)
+        return None, None, 1.0
 
     # ------------------------------------------------------------------ #
     #  Exit resolution                                                    #
@@ -252,9 +287,10 @@ class RLBacktestRunner:
         frames: dict[str, pd.DataFrame],
         master_frame: pd.DataFrame,
         entry_index: int,
+        proportion: float = 1.0,
     ) -> tuple[float, int, int] | None:
         """Execute a BUY and resolve exit. Returns (pnl, exit_index, shares) or None."""
-        affordable = int(broker.cash * 0.95 / entry_price)
+        affordable = int(broker.cash * proportion * 0.95 / entry_price)
         shares = min(affordable, self.config.max_shares)
         if shares < 1:
             return None
@@ -291,20 +327,29 @@ class RLBacktestRunner:
         broker: PaperBroker,
         entry_cost_basis: dict[str, float],
         prices: dict[str, float],
+        proportion: float = 1.0,
     ) -> float | None:
         """Execute a SELL and return the PnL, or None if no position."""
         current_pos = broker.positions.get(target_symbol, 0)
         if current_pos <= 0:
             return None
 
+        sell_qty = max(1, int(current_pos * proportion))
+        if sell_qty > current_pos:
+            sell_qty = current_pos
+
         price = prices.get(target_symbol, sell_price)
         cost_basis = entry_cost_basis.get(target_symbol, price)
-        exit_value = price * current_pos
-        trade_pnl = exit_value - (current_pos * cost_basis) - self.config.fee_per_order
+        exit_value = price * sell_qty
+        trade_pnl = exit_value - (sell_qty * cost_basis) - self.config.fee_per_order
 
         broker.cash += exit_value - self.config.fee_per_order
-        broker.positions.pop(target_symbol, None)
-        entry_cost_basis.pop(target_symbol, None)
+        remaining = current_pos - sell_qty
+        if remaining <= 0:
+            broker.positions.pop(target_symbol, None)
+            entry_cost_basis.pop(target_symbol, None)
+        else:
+            broker.positions[target_symbol] = remaining
         return trade_pnl
 
     def _build_portfolio_state(
@@ -387,7 +432,7 @@ class RLBacktestRunner:
             action = self._predict_action(observation)
             rl_actions.append({"step": end_index, "action": action})
 
-            trade_type, trade_price = self._action_to_trade(
+            trade_type, trade_price, proportion = self._action_to_trade(
                 action, primary, prices, broker, trade_symbols=allowed_symbols,
             )
 
@@ -400,7 +445,7 @@ class RLBacktestRunner:
                     continue
                 result = self._execute_buy(
                     target_symbol, price, broker, entry_cost_basis,
-                    intra_frames, frames, master_frame, end_index,
+                    intra_frames, frames, master_frame, end_index, proportion,
                 )
                 if result is not None:
                     trade_pnl, exit_index, _shares = result
@@ -419,7 +464,7 @@ class RLBacktestRunner:
                 if target_symbol is None:
                     continue
                 trade_pnl = self._execute_sell(
-                    target_symbol, trade_price, broker, entry_cost_basis, prices,
+                    target_symbol, trade_price, broker, entry_cost_basis, prices, proportion,
                 )
                 if trade_pnl is not None:
                     net_pnl += trade_pnl

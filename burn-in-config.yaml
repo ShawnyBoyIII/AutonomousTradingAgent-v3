@@ -1,7 +1,7 @@
 app:
   timezone: "America/New_York"
   state_db_path: "state/burn_in.db"
-  log_dir: "logs/burn_in"
+  log_dir: "logs"
   portfolio_summary_path: "state/burn_in/portfolio_summary.json"
   scan_results_path: "state/burn_in/scan_results.json"
 
@@ -40,6 +40,14 @@ counter_thesis:
   block_on_severity: "high"
   aggregate_block_threshold: 0.6
   exit_on_block: false
+
+rl:
+  enabled: true
+  agent_type: "PPO"
+  feature_set: "standard"
+  reward_function: "risk_adjusted"
+  model_path: "state/rl_logs/aapl_production/PPO_final.zip"
+  action_confidence_threshold: 0.4
 
 session:
   eod_enabled: true

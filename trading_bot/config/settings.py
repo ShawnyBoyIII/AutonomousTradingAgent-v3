@@ -6,6 +6,7 @@ class AppSettings(BaseModel):
     timezone: str = "America/New_York"
     state_db_path: str = "state/trading_bot.db"
     universe_path: str = "state/universe.txt"
+    watchlist_path: str = "state/watchlist.txt"
     universe_candidates_path: str = "state/universe_candidates.json"
     log_dir: str = "logs"
     dashboard_summary_path: str = "state/dashboard_summary.json"
@@ -186,13 +187,13 @@ class RLSettings(BaseModel):
 
     Agent types: "PPO", "A2C", "SAC", "TD3", "DDPG"
     Feature sets: "standard" (19 features), "extended" (24 features)
-    Reward functions: "pnl" (raw PnL), "sharpe" (risk-adjusted), "sortino" (downside risk)
+    Reward functions: "risk_adjusted", "simple_profit", "compound_daily", "sharpe", "drawdown_penalty"
     """
 
     enabled: bool = Field(default=False)
     agent_type: str = Field(default="PPO")  # PPO, A2C, SAC, TD3, DDPG
     feature_set: str = Field(default="standard")  # standard, extended
-    reward_function: str = Field(default="sharpe")  # pnl, sharpe, sortino
+    reward_function: str = Field(default="risk_adjusted")
     model_path: str = Field(default="trained_models/rl_agent.zip")
     training_episodes: int = Field(default=100, ge=1)
     training_timesteps: int = Field(default=100000, ge=1000)

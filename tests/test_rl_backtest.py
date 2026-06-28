@@ -166,9 +166,10 @@ class TestRLBacktestRunner:
         broker = PaperBroker(starting_cash=10000.0, fee_per_order=1.0, slippage_bps=0)
         prices = {"AAPL": 100.0}
 
-        trade_type, trade_price = runner._action_to_trade(0, "AAPL", prices, broker)
+        trade_type, trade_price, proportion = runner._action_to_trade(0, "AAPL", prices, broker)
         assert trade_type is None
         assert trade_price is None
+        assert proportion == 1.0
 
     def test_action_to_trade_buy(self):
         config = RLBacktestConfig(symbols=["AAPL"])
@@ -179,9 +180,10 @@ class TestRLBacktestRunner:
         prices = {"AAPL": 100.0}
 
         action = 2  # BUY for AAPL (action=1 is HOLD for AAPL)
-        trade_type, trade_price = runner._action_to_trade(action, "AAPL", prices, broker)
+        trade_type, trade_price, proportion = runner._action_to_trade(action, "AAPL", prices, broker)
         assert trade_type == "BUY"
         assert trade_price == 100.0
+        assert proportion == 1.0
 
     def test_action_to_trade_sell_no_position(self):
         config = RLBacktestConfig(symbols=["AAPL"])
@@ -192,9 +194,10 @@ class TestRLBacktestRunner:
         prices = {"AAPL": 100.0}
 
         action = 3  # SELL for AAPL (action=2 is BUY, action=3 is SELL)
-        trade_type, trade_price = runner._action_to_trade(action, "AAPL", prices, broker)
+        trade_type, trade_price, proportion = runner._action_to_trade(action, "AAPL", prices, broker)
         assert trade_type is None
         assert trade_price is None
+        assert proportion == 1.0
 
     def test_action_to_trade_sell_with_position(self):
         config = RLBacktestConfig(symbols=["AAPL"])
@@ -206,9 +209,10 @@ class TestRLBacktestRunner:
         prices = {"AAPL": 100.0}
 
         action = 3  # SELL for AAPL
-        trade_type, trade_price = runner._action_to_trade(action, "AAPL", prices, broker)
+        trade_type, trade_price, proportion = runner._action_to_trade(action, "AAPL", prices, broker)
         assert trade_type == "SELL"
         assert trade_price == 100.0
+        assert proportion == 1.0
 
     def test_action_to_trade_invalid_symbol(self):
         config = RLBacktestConfig(symbols=["AAPL"])
@@ -218,9 +222,10 @@ class TestRLBacktestRunner:
         broker = PaperBroker(starting_cash=10000.0, fee_per_order=1.0, slippage_bps=0)
         prices = {"SPY": 100.0}
 
-        trade_type, trade_price = runner._action_to_trade(1, "SPY", prices, broker)
+        trade_type, trade_price, proportion = runner._action_to_trade(1, "SPY", prices, broker)
         assert trade_type is None
         assert trade_price is None
+        assert proportion == 1.0
 
     def test_resolve_exit_stop_loss_hit(self):
         config = RLBacktestConfig()

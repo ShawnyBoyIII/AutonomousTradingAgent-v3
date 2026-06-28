@@ -43,7 +43,7 @@ source .venv/bin/activate  # macOS/Linux
 .venv/bin/python -m pytest -q
 ```
 
-Expected output: `823 tests collected` (or similar number)
+Expected output: hundreds of passing tests. The exact count changes as features are added.
 
 ---
 
@@ -248,8 +248,13 @@ open state/dashboard.html  # macOS
 # Run backtest on date range
 ./tradebot-local backtest --symbols AAPL --start 2025-01-01 --end 2025-06-01
 
-# Apples-to-apples single-symbol RL comparison
+# Check active RL model coverage
+./tradebot-local rl-model-info
+./tradebot-local rl-scan-plan
+
+# Apples-to-apples RL comparison
 ./tradebot-local rl-benchmark --symbol AAPL --start 2025-01-01 --end 2025-06-01
+./tradebot-local rl-benchmark --symbols AAPL,MSFT --start 2025-01-01 --end 2025-06-01
 ```
 
 ---

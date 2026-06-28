@@ -106,6 +106,6 @@ rl:
   enabled: true
   agent_type: PPO
   feature_set: standard
-  reward_function: sharpe
-  model_path: state/rl_logs/max4/PPO_final.zip
+  reward_function: risk_adjusted
+  model_path: state/rl_logs/aapl_production/PPO_final.zip
   action_confidence_threshold: 0.4

@@ -28,6 +28,7 @@ from trading_bot.runtime.decision_log import append_decision_event
 from trading_bot.runtime.latency import frame_last_timestamp, is_stale
 from trading_bot.runtime.snapshots import read_recent_decision_rows, write_snapshot
 from trading_bot.scout import build_scout_candidates
+from trading_bot.rl.utils import rl_model_meta_path, rl_model_symbols
 from trading_bot.strategy.trailing_stop import next_trailing_stop
 
 app = typer.Typer(help="Paper-trading CLI for stocks and ETFs.")
@@ -126,6 +127,8 @@ def scan_universe(
         if universe_path is None
         else _read_universe_symbols(path)
     )
+    if universe_path is None:
+        symbols = _merge_symbols(symbols, _read_universe_symbols(Path(ctx.obj.app.watchlist_path)))
     if not symbols:
         typer.echo(f"universe=empty path={path}")
         typer.echo("alerts=0")
@@ -1022,6 +1025,18 @@ def _parse_symbols(values: list[str]) -> list[str]:
     return parsed_symbols
 
 
+def _merge_symbols(*groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for raw_symbol in group:
+            symbol = raw_symbol.upper().strip()
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                merged.append(symbol)
+    return merged
+
+
 def _format_backtest_diagnostics(result: dict) -> str:
     return (
         f"avg_win={result.get('avg_win', 0.0):.2f} "
@@ -1030,6 +1045,65 @@ def _format_backtest_diagnostics(result: dict) -> str:
         f"profit_factor={result.get('profit_factor', 0.0):.2f} "
         f"pnl_per_trade={result.get('pnl_per_trade', 0.0):.2f}"
     )
+
+
+def _format_paper_confidence_gate(result: dict) -> str:
+    rl = result.get("results", {}).get("rl", {})
+    windows = result.get("windows", [])
+    window_count = len(windows)
+    positive_windows = sum(
+        1
+        for window in windows
+        if window.get("results", {}).get("rl", {}).get("net_pnl", 0.0) > 0
+    )
+    required_positive = max(1, math.ceil(window_count * 0.6)) if window_count else 1
+    checks = {
+        "trades>=10": int(rl.get("trades", 0)) >= 10,
+        "net_pnl>=500": float(rl.get("net_pnl", 0.0)) >= 500.0,
+        "profit_factor>=1.20": float(rl.get("profit_factor", 0.0)) >= 1.20,
+        "positive_windows>=60pct": positive_windows >= required_positive,
+    }
+    verdict = "PASS" if all(checks.values()) else "FAIL"
+    failed = [name for name, passed in checks.items() if not passed]
+    suffix = "" if not failed else f" failed={','.join(failed)}"
+    return (
+        f"PAPER CONFIDENCE: {verdict} "
+        f"rl_trades={int(rl.get('trades', 0))} "
+        f"rl_net_pnl=${float(rl.get('net_pnl', 0.0)):.2f} "
+        f"rl_profit_factor={float(rl.get('profit_factor', 0.0)):.2f} "
+        f"positive_windows={positive_windows}/{window_count}{suffix}"
+    )
+
+
+def _load_rl_model_meta(path: Path) -> tuple[Path, dict[str, object], list[str]]:
+    meta_path = rl_model_meta_path(path)
+    meta: dict[str, object] = {}
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    symbols = [str(value).upper() for value in meta.get("symbols", [])]
+    return meta_path, meta, symbols
+
+
+def _resolve_rl_symbols(raw_symbols: str | None, fallback_symbol: str) -> list[str]:
+    parsed = _parse_symbols([raw_symbols or fallback_symbol])
+    if not parsed:
+        return [fallback_symbol.upper().strip()]
+    return [symbol.upper().strip() for symbol in parsed]
+
+
+def _validate_rl_model_symbols(path: Path, requested_symbols: list[str]) -> list[str]:
+    model_symbols = rl_model_symbols(path)
+    if not model_symbols:
+        typer.echo(f"RL model metadata missing or empty: {rl_model_meta_path(path)}")
+        raise typer.Exit(code=1)
+    missing = [symbol for symbol in requested_symbols if symbol not in model_symbols]
+    if missing:
+        typer.echo(
+            f"RL model not trained for {','.join(missing)} "
+            f"(trained_symbols={','.join(model_symbols)})"
+        )
+        raise typer.Exit(code=1)
+    return model_symbols
 
 
 def _build_universe_file(settings) -> dict[str, object]:
@@ -1450,18 +1524,27 @@ def _try_fetch_bars(symbol: str, settings, market_data) -> "pd.DataFrame | None"
 
 
 def _format_scan_summary(summary: dict[str, object]) -> str:
-    return " ".join(
-        [
-            "summary",
-            f"symbols={summary['symbols']}",
-            f"approved={summary['approved']}",
-            f"green={summary['green']}",
-            f"yellow={summary['yellow']}",
-            f"rejected={summary['rejected']}",
-            f"no_signal={summary['no_signal']}",
-            f"errors={summary['errors']}",
-        ]
-    )
+    parts = [
+        "summary",
+        f"symbols={summary['symbols']}",
+        f"approved={summary['approved']}",
+        f"green={summary['green']}",
+        f"yellow={summary['yellow']}",
+        f"rejected={summary['rejected']}",
+        f"no_signal={summary['no_signal']}",
+        f"errors={summary['errors']}",
+    ]
+    if "rl_buy" in summary:
+        parts.extend(
+            [
+                f"rl_buy={summary['rl_buy']}",
+                f"rl_hold={summary['rl_hold']}",
+                f"rl_sell={summary['rl_sell']}",
+                f"rl_unsupported={summary.get('rl_unsupported', 0)}",
+                f"rl_avg_conf={summary.get('rl_avg_confidence', 0.0)}",
+            ]
+        )
+    return " ".join(parts)
 
 
 def _format_doctor(settings) -> str:
@@ -2300,6 +2383,7 @@ def rl_train(
     agent: str = typer.Option("PPO", "--agent", help="DRL agent type (PPO, A2C, DQN)"),
     timesteps: int = typer.Option(50000, "--timesteps", help="Total training timesteps"),
     learning_rate: float = typer.Option(3e-4, "--learning-rate", help="Learning rate"),
+    seed: int | None = typer.Option(None, "--seed", help="Random seed for reproducible training"),
     output_dir: str = typer.Option("state/rl_logs", "--output-dir", help="Output directory for model"),
     evaluate: bool = typer.Option(False, "--evaluate", help="Evaluate trained model instead of training"),
     eval_episodes: int = typer.Option(10, "--eval-episodes", help="Number of evaluation episodes"),
@@ -2324,6 +2408,8 @@ def rl_train(
         "--output-dir", output_dir,
         "--verbose", str(verbose),
     ]
+    if seed is not None:
+        argv.extend(["--seed", str(seed)])
 
     if train_symbols:
         argv.extend(["--train-symbols", train_symbols])
@@ -2369,30 +2455,34 @@ def rl_eval(
 def rl_benchmark(
     ctx: typer.Context,
     symbol: str = typer.Option("AAPL", "--symbol", help="Single symbol to benchmark"),
+    symbols: str | None = typer.Option(None, "--symbols", help="Comma-separated symbols to benchmark"),
     start: str | None = typer.Option(None, "--start", help="Inclusive start date in YYYY-MM-DD format."),
     end: str | None = typer.Option(None, "--end", help="Inclusive end date in YYYY-MM-DD format."),
     model_path: str | None = typer.Option(None, "--model-path", help="Override RL model path"),
 ) -> None:
-    """Run apples-to-apples V2.5 vs V3 vs RL benchmark for one symbol."""
+    """Run apples-to-apples V2.5 vs V3 vs RL benchmark."""
     from trading_bot.backtest.runner import run_strategy_comparison
 
+    requested_symbols = _resolve_rl_symbols(symbols, symbol)
     resolved_model_path = model_path or getattr(ctx.obj.rl, "model_path", None)
-    if not resolved_model_path or not Path(resolved_model_path).exists():
+    path = Path(resolved_model_path) if resolved_model_path else None
+    if path is None or not path.exists():
         typer.echo("RL benchmark requires an existing model path. Set rl.model_path or pass --model-path.")
         raise typer.Exit(code=1)
+    _validate_rl_model_symbols(path, requested_symbols)
 
     comparison = run_strategy_comparison(
-        [symbol],
+        requested_symbols,
         ctx.obj,
         start=start,
         end=end,
         strategies=["v2.5", "v3", "rl"],
-        model_path=resolved_model_path,
+        model_path=str(path),
     )
 
     typer.echo("RL BENCHMARK")
     typer.echo("=" * 60)
-    typer.echo(f"symbol={symbol} model_path={resolved_model_path}")
+    typer.echo(f"symbols={','.join(requested_symbols)} model_path={path}")
     for strat, result in comparison["results"].items():
         typer.echo(f"\n{strat.upper()}:")
         typer.echo(f"  trades={result['trades']} wins={result['wins']} losses={result['losses']}")
@@ -2402,34 +2492,95 @@ def rl_benchmark(
     typer.echo(f"Best Win Rate: {comparison['best_winrate_strategy']}")
 
 
+@app.command(name="rl-model-info")
+def rl_model_info(
+    ctx: typer.Context,
+    model_path: str | None = typer.Option(None, "--model-path", help="Override RL model path"),
+) -> None:
+    """Show active RL model coverage without fetching market data."""
+    resolved_model_path = model_path or getattr(ctx.obj.rl, "model_path", None)
+    if not resolved_model_path:
+        typer.echo("RL model path is not configured.")
+        raise typer.Exit(code=1)
+
+    path = Path(resolved_model_path)
+    if not path.exists():
+        typer.echo(f"RL model missing: {path}")
+        raise typer.Exit(code=1)
+
+    meta_path, meta, symbols = _load_rl_model_meta(path)
+    typer.echo(f"model_path={path}")
+    typer.echo(f"metadata_path={meta_path if meta_path.exists() else 'missing'}")
+    typer.echo(f"agent={meta.get('agent', getattr(ctx.obj.rl, 'agent_type', 'unknown'))}")
+    typer.echo(f"symbols={','.join(symbols) if symbols else 'unknown'}")
+    typer.echo(f"max_symbols={meta.get('max_symbols', 'unknown')}")
+    typer.echo(f"seed={meta.get('seed', 'unknown')}")
+    typer.echo(f"reward_scheme={meta.get('reward_scheme', getattr(ctx.obj.rl, 'reward_function', 'unknown'))}")
+    if symbols:
+        typer.echo(f"supported_scan=./tradebot-local scan --symbols {','.join(symbols)} --summary --why")
+
+
+@app.command(name="rl-scan-plan")
+def rl_scan_plan(
+    ctx: typer.Context,
+    model_path: str | None = typer.Option(None, "--model-path", help="Override RL model path"),
+) -> None:
+    """Show the safe scan plan for the active RL model."""
+    resolved_model_path = model_path or getattr(ctx.obj.rl, "model_path", None)
+    if not resolved_model_path:
+        typer.echo("RL model path is not configured.")
+        raise typer.Exit(code=1)
+
+    path = Path(resolved_model_path)
+    if not path.exists():
+        typer.echo(f"RL model missing: {path}")
+        raise typer.Exit(code=1)
+
+    meta_path, _meta, symbols = _load_rl_model_meta(path)
+    typer.echo("RL SCAN PLAN")
+    typer.echo(f"model_path={path}")
+    typer.echo(f"metadata_path={meta_path if meta_path.exists() else 'missing'}")
+    typer.echo(f"symbols={','.join(symbols) if symbols else 'unknown'}")
+    if not symbols:
+        typer.echo("status=blocked_missing_metadata")
+        typer.echo("next=write model metadata with trained symbols before scanning")
+    else:
+        typer.echo("status=ready")
+        typer.echo(f"command=./tradebot-local scan --symbols {','.join(symbols)} --summary --why")
+
+
 @app.command(name="rl-walkforward")
 def rl_walkforward(
     ctx: typer.Context,
     symbol: str = typer.Option("AAPL", "--symbol", help="Single symbol to benchmark"),
+    symbols: str | None = typer.Option(None, "--symbols", help="Comma-separated symbols to benchmark"),
     start: str | None = typer.Option(None, "--start", help="Inclusive start date in YYYY-MM-DD format."),
     end: str | None = typer.Option(None, "--end", help="Inclusive end date in YYYY-MM-DD format."),
     windows: int = typer.Option(5, "--windows", help="Number of sequential windows"),
     model_path: str | None = typer.Option(None, "--model-path", help="Override RL model path"),
 ) -> None:
-    """Run fixed-model sequential V2.5 vs V3 vs RL windows for one symbol."""
+    """Run fixed-model sequential V2.5 vs V3 vs RL windows."""
     from trading_bot.backtest.runner import run_rl_walk_forward
 
+    requested_symbols = _resolve_rl_symbols(symbols, symbol)
     resolved_model_path = model_path or getattr(ctx.obj.rl, "model_path", None)
-    if not resolved_model_path or not Path(resolved_model_path).exists():
+    path = Path(resolved_model_path) if resolved_model_path else None
+    if path is None or not path.exists():
         typer.echo("RL walk-forward requires an existing model path. Set rl.model_path or pass --model-path.")
         raise typer.Exit(code=1)
+    _validate_rl_model_symbols(path, requested_symbols)
 
     result = run_rl_walk_forward(
-        [symbol],
+        requested_symbols,
         ctx.obj,
         start=start,
         end=end,
         windows=windows,
-        model_path=resolved_model_path,
+        model_path=str(path),
     )
     typer.echo("RL FIXED-MODEL WALK-FORWARD")
     typer.echo("=" * 60)
-    typer.echo(f"symbol={symbol} model_path={resolved_model_path} windows={windows}")
+    typer.echo(f"symbols={','.join(requested_symbols)} model_path={path} windows={windows}")
     for window in result["windows"]:
         typer.echo(f"\nWINDOW {window['window']}: {window['start']} -> {window['end']}")
         for strategy_name, strategy_result in window["results"].items():
@@ -2449,3 +2600,4 @@ def rl_walkforward(
             f"win_rate={strategy_result['win_rate']:.2f} net_pnl={strategy_result['net_pnl']:.2f}"
         )
         typer.echo(f"    {_format_backtest_diagnostics(strategy_result)}")
+    typer.echo(f"\n{_format_paper_confidence_gate(result)}")

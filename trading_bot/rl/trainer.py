@@ -28,6 +28,7 @@ class TrainingConfig:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     verbose: int = 1
+    seed: int | None = None
     log_dir: str = "state/rl_logs"
     eval_envs: int = 3
     eval_freq: int = 5000
@@ -80,6 +81,8 @@ class RLTrainer:
             "gamma": self.config.gamma,
             "verbose": self.config.verbose,
         }
+        if self.config.seed is not None:
+            common_kwargs["seed"] = self.config.seed
 
         if self.config.model_type == "PPO":
             model_kwargs = {

@@ -129,6 +129,120 @@ def test_rl_eval_forwards_agent_and_train_symbols(monkeypatch) -> None:
     ]
 
 
+def test_rl_model_info_reports_metadata(tmp_path: Path) -> None:
+    model_path = tmp_path / "PPO_final.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "PPO_final_meta.json").write_text(
+        '{"symbols": ["AAPL"], "agent": "PPO", "seed": 789, "reward_scheme": "risk_adjusted"}',
+        encoding="utf-8",
+    )
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "rl:\n"
+        "  enabled: true\n"
+        f"  model_path: {model_path}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "rl-model-info"])
+
+    assert result.exit_code == 0
+    assert f"model_path={model_path}" in result.stdout
+    assert "symbols=AAPL" in result.stdout
+    assert "seed=789" in result.stdout
+    assert "reward_scheme=risk_adjusted" in result.stdout
+    assert "supported_scan=./tradebot-local scan --symbols AAPL --summary --why" in result.stdout
+
+
+def test_rl_model_info_suggests_multi_symbol_scan(tmp_path: Path) -> None:
+    model_path = tmp_path / "PPO_final.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "PPO_final_meta.json").write_text(
+        '{"symbols": ["AAPL", "MSFT"], "agent": "PPO"}',
+        encoding="utf-8",
+    )
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "rl:\n"
+        "  enabled: true\n"
+        f"  model_path: {model_path}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "rl-model-info"])
+
+    assert result.exit_code == 0
+    assert "symbols=AAPL,MSFT" in result.stdout
+    assert "supported_scan=./tradebot-local scan --symbols AAPL,MSFT --summary --why" in result.stdout
+
+
+def test_rl_scan_plan_reports_single_symbol_command(tmp_path: Path) -> None:
+    model_path = tmp_path / "PPO_final.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "PPO_final_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "rl:\n"
+        "  enabled: true\n"
+        f"  model_path: {model_path}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "rl-scan-plan"])
+
+    assert result.exit_code == 0
+    assert "status=ready" in result.stdout
+    assert "command=./tradebot-local scan --symbols AAPL --summary --why" in result.stdout
+
+
+def test_rl_scan_plan_reports_multi_symbol_command(tmp_path: Path) -> None:
+    model_path = tmp_path / "PPO_final.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "PPO_final_meta.json").write_text('{"symbols": ["AAPL", "MSFT"]}', encoding="utf-8")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "rl:\n"
+        "  enabled: true\n"
+        f"  model_path: {model_path}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "rl-scan-plan"])
+
+    assert result.exit_code == 0
+    assert "status=ready" in result.stdout
+    assert "command=./tradebot-local scan --symbols AAPL,MSFT --summary --why" in result.stdout
+
+
+def test_rl_train_forwards_seed(monkeypatch) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fake_main() -> int:
+        import sys
+
+        captured["argv"] = list(sys.argv)
+        return 0
+
+    monkeypatch.setattr("scripts.train_rl.main", fake_main)
+
+    result = CliRunner().invoke(
+        app,
+        ["rl-train", "--symbols", "AAPL", "--agent", "PPO", "--timesteps", "7", "--seed", "789"],
+    )
+
+    assert result.exit_code == 0
+    assert "--seed" in captured["argv"]
+    assert captured["argv"][captured["argv"].index("--seed") + 1] == "789"
+
+
 def test_rl_benchmark_requires_existing_model_path(tmp_path: Path) -> None:
     config_file = tmp_path / "config.yaml"
     config_file.write_text(
@@ -151,9 +265,10 @@ def test_rl_benchmark_requires_existing_model_path(tmp_path: Path) -> None:
     assert "requires an existing model path" in result.stdout
 
 
-def test_rl_benchmark_runs_compare_with_single_symbol(monkeypatch, tmp_path: Path) -> None:
+def test_rl_benchmark_runs_compare_with_symbols(monkeypatch, tmp_path: Path) -> None:
     model_path = tmp_path / "model.zip"
     model_path.write_bytes(b"")
+    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL", "MSFT"]}', encoding="utf-8")
     config_file = tmp_path / "config.yaml"
     config_file.write_text(
         "app:\n"
@@ -186,15 +301,61 @@ def test_rl_benchmark_runs_compare_with_single_symbol(monkeypatch, tmp_path: Pat
 
     result = CliRunner().invoke(
         app,
-        ["--config-path", str(config_file), "rl-benchmark", "--symbol", "AAPL"],
+        ["--config-path", str(config_file), "rl-benchmark", "--symbols", "AAPL,MSFT"],
     )
 
     assert result.exit_code == 0
-    assert captured["symbols"] == ["AAPL"]
+    assert captured["symbols"] == ["AAPL", "MSFT"]
     assert captured["strategies"] == ["v2.5", "v3", "rl"]
     assert captured["model_path"] == str(model_path)
     assert "RL BENCHMARK" in result.stdout
+    assert "symbols=AAPL,MSFT" in result.stdout
     assert "expectancy=" in result.stdout
+
+
+def test_rl_benchmark_rejects_symbol_outside_model_metadata(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "rl:\n"
+        "  enabled: true\n"
+        f"  model_path: {model_path}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "rl-benchmark", "--symbol", "MSFT"],
+    )
+
+    assert result.exit_code == 1
+    assert "RL model not trained for MSFT (trained_symbols=AAPL)" in result.stdout
+
+
+def test_rl_benchmark_rejects_missing_model_metadata(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "rl:\n"
+        "  enabled: true\n"
+        f"  model_path: {model_path}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "rl-benchmark", "--symbol", "AAPL"],
+    )
+
+    assert result.exit_code == 1
+    assert "RL model metadata missing or empty:" in result.stdout
 
 
 def test_rl_walkforward_requires_existing_model_path(tmp_path: Path) -> None:
@@ -219,9 +380,10 @@ def test_rl_walkforward_requires_existing_model_path(tmp_path: Path) -> None:
     assert "requires an existing model path" in result.stdout
 
 
-def test_rl_walkforward_runs_sequential_windows(monkeypatch, tmp_path: Path) -> None:
+def test_rl_walkforward_runs_sequential_windows_for_symbols(monkeypatch, tmp_path: Path) -> None:
     model_path = tmp_path / "model.zip"
     model_path.write_bytes(b"")
+    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL", "MSFT"]}', encoding="utf-8")
     config_file = tmp_path / "config.yaml"
     config_file.write_text(
         "app:\n"
@@ -266,15 +428,62 @@ def test_rl_walkforward_runs_sequential_windows(monkeypatch, tmp_path: Path) -> 
 
     result = CliRunner().invoke(
         app,
-        ["--config-path", str(config_file), "rl-walkforward", "--symbol", "AAPL", "--windows", "3"],
+        ["--config-path", str(config_file), "rl-walkforward", "--symbols", "AAPL,MSFT", "--windows", "3"],
     )
 
     assert result.exit_code == 0
-    assert captured["symbols"] == ["AAPL"]
+    assert captured["symbols"] == ["AAPL", "MSFT"]
     assert captured["windows"] == 3
     assert captured["model_path"] == str(model_path)
     assert "RL FIXED-MODEL WALK-FORWARD" in result.stdout
+    assert "symbols=AAPL,MSFT" in result.stdout
     assert "profit_factor=" in result.stdout
+    assert "PAPER CONFIDENCE: FAIL" in result.stdout
+
+
+def test_rl_walkforward_rejects_symbol_outside_model_metadata(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "rl:\n"
+        "  enabled: true\n"
+        f"  model_path: {model_path}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "rl-walkforward", "--symbol", "MSFT"],
+    )
+
+    assert result.exit_code == 1
+    assert "RL model not trained for MSFT (trained_symbols=AAPL)" in result.stdout
+
+
+def test_rl_walkforward_rejects_missing_model_metadata(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "rl:\n"
+        "  enabled: true\n"
+        f"  model_path: {model_path}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "rl-walkforward", "--symbol", "AAPL"],
+    )
+
+    assert result.exit_code == 1
+    assert "RL model metadata missing or empty:" in result.stdout
 
 
 def test_evaluate_agent_rejects_symbol_mismatch(capsys) -> None:

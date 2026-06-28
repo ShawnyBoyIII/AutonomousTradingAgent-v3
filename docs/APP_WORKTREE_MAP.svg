@@ -1,0 +1,277 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1180" viewBox="0 0 1800 1180">
+  <defs>
+    <style>
+      .title { font: 700 34px Arial, sans-serif; fill: #111; }
+      .subtitle { font: 400 18px Arial, sans-serif; fill: #333; }
+      .lane-title { font: 700 20px Arial, sans-serif; fill: #111; }
+      .box-title { font: 700 17px Arial, sans-serif; fill: #111; }
+      .box-text { font: 400 14px Arial, sans-serif; fill: #222; }
+      .note-title { font: 700 17px Arial, sans-serif; fill: #111; }
+      .note-text { font: 400 15px Arial, sans-serif; fill: #222; }
+      .lane { fill: #fff; stroke: #111; stroke-width: 2; }
+      .box { fill: #fff; stroke: #111; stroke-width: 2; rx: 12; }
+      .note { fill: #f7f7f7; stroke: #111; stroke-width: 2; rx: 12; }
+      .line { stroke: #111; stroke-width: 2.4; fill: none; marker-end: url(#arrow); }
+      .thin-line { stroke: #111; stroke-width: 1.8; fill: none; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#111"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1800" height="1180" fill="#fff"/>
+  <text x="60" y="62" class="title">AutonomousTradingAgent Worktree Map</text>
+  <text x="60" y="94" class="subtitle">High-level CLI, runtime, data, strategy, execution, broker, and research flow</text>
+
+  <!-- Lanes -->
+  <rect x="50" y="125" width="1700" height="105" class="lane"/>
+  <rect x="50" y="250" width="1700" height="105" class="lane"/>
+  <rect x="50" y="375" width="1700" height="105" class="lane"/>
+  <rect x="50" y="500" width="1700" height="105" class="lane"/>
+  <rect x="50" y="625" width="1700" height="105" class="lane"/>
+  <rect x="50" y="750" width="1700" height="105" class="lane"/>
+  <rect x="50" y="875" width="1700" height="105" class="lane"/>
+  <rect x="50" y="1000" width="1700" height="105" class="lane"/>
+
+  <text x="75" y="158" class="lane-title">Operator / CLI</text>
+  <text x="75" y="283" class="lane-title">Core Paper App</text>
+  <text x="75" y="408" class="lane-title">Market Data</text>
+  <text x="75" y="533" class="lane-title">Strategy + Risk</text>
+  <text x="75" y="658" class="lane-title">Execution + Portfolio</text>
+  <text x="75" y="783" class="lane-title">Backtest / RL</text>
+  <text x="75" y="908" class="lane-title">Broker Boundary</text>
+  <text x="75" y="1033" class="lane-title">Ops / Reports</text>
+
+  <!-- Operator / CLI -->
+  <rect x="260" y="145" width="190" height="64" class="box"/>
+  <text x="285" y="173" class="box-title">./tradebot-local</text>
+  <text x="285" y="195" class="box-text">repo-local wrapper</text>
+
+  <rect x="515" y="145" width="190" height="64" class="box"/>
+  <text x="545" y="173" class="box-title">trading_bot.main</text>
+  <text x="545" y="195" class="box-text">module entry</text>
+
+  <rect x="770" y="145" width="190" height="64" class="box"/>
+  <text x="815" y="173" class="box-title">cli/app.py</text>
+  <text x="805" y="195" class="box-text">Typer commands</text>
+
+  <rect x="1185" y="145" width="250" height="64" class="box"/>
+  <text x="1225" y="173" class="box-title">scripts/*.sh + *.py</text>
+  <text x="1225" y="195" class="box-text">ops and research wrappers</text>
+
+  <!-- Core -->
+  <rect x="260" y="270" width="160" height="64" class="box"/>
+  <text x="315" y="298" class="box-title">scan</text>
+  <text x="290" y="320" class="box-text">find candidates</text>
+
+  <rect x="470" y="270" width="180" height="64" class="box"/>
+  <text x="510" y="298" class="box-title">paper-trade</text>
+  <text x="497" y="320" class="box-text">simulate entries</text>
+
+  <rect x="700" y="270" width="205" height="64" class="box"/>
+  <text x="733" y="298" class="box-title">manage-positions</text>
+  <text x="744" y="320" class="box-text">exits and stops</text>
+
+  <rect x="955" y="270" width="235" height="64" class="box"/>
+  <text x="995" y="298" class="box-title">run-manager</text>
+  <text x="1005" y="320" class="box-text">continuous loop</text>
+
+  <rect x="1240" y="270" width="170" height="64" class="box"/>
+  <text x="1288" y="298" class="box-title">kill-switch</text>
+  <text x="1279" y="320" class="box-text">hard safety gate</text>
+
+  <!-- Data -->
+  <rect x="260" y="395" width="230" height="64" class="box"/>
+  <text x="295" y="423" class="box-title">data/market_data.py</text>
+  <text x="304" y="445" class="box-text">shared fetch path</text>
+
+  <rect x="545" y="395" width="285" height="64" class="box"/>
+  <text x="585" y="423" class="box-title">providers</text>
+  <text x="575" y="445" class="box-text">Alpaca / YFinance / Finnhub / Polygon</text>
+
+  <rect x="885" y="395" width="150" height="64" class="box"/>
+  <text x="925" y="423" class="box-title">cache.py</text>
+  <text x="920" y="445" class="box-text">reuse bars</text>
+
+  <rect x="1090" y="395" width="170" height="64" class="box"/>
+  <text x="1122" y="423" class="box-title">validation.py</text>
+  <text x="1128" y="445" class="box-text">fail closed</text>
+
+  <rect x="1315" y="395" width="170" height="64" class="box"/>
+  <text x="1348" y="423" class="box-title">indicators.py</text>
+  <text x="1347" y="445" class="box-text">features</text>
+
+  <!-- Strategy -->
+  <rect x="260" y="520" width="230" height="64" class="box"/>
+  <text x="289" y="548" class="box-title">signal engines</text>
+  <text x="286" y="570" class="box-text">daily + intraday</text>
+
+  <rect x="545" y="520" width="290" height="64" class="box"/>
+  <text x="582" y="548" class="box-title">selector / confluence / regime</text>
+  <text x="623" y="570" class="box-text">V3 scoring layer</text>
+
+  <rect x="890" y="520" width="200" height="64" class="box"/>
+  <text x="924" y="548" class="box-title">counter_thesis.py</text>
+  <text x="932" y="570" class="box-text">veto or scale</text>
+
+  <rect x="1145" y="520" width="245" height="64" class="box"/>
+  <text x="1184" y="548" class="box-title">risk + sizing</text>
+  <text x="1180" y="570" class="box-text">risk_manager / exposure</text>
+
+  <rect x="1445" y="520" width="215" height="64" class="box"/>
+  <text x="1480" y="548" class="box-title">exit checks</text>
+  <text x="1474" y="570" class="box-text">EOD / stop / target</text>
+
+  <!-- Execution -->
+  <rect x="260" y="645" width="230" height="64" class="box"/>
+  <text x="294" y="673" class="box-title">order_manager.py</text>
+  <text x="294" y="695" class="box-text">signal to order</text>
+
+  <rect x="545" y="645" width="230" height="64" class="box"/>
+  <text x="582" y="673" class="box-title">paper_broker.py</text>
+  <text x="595" y="695" class="box-text">fills, fees, slip</text>
+
+  <rect x="830" y="645" width="210" height="64" class="box"/>
+  <text x="880" y="673" class="box-title">ledger.py</text>
+  <text x="872" y="695" class="box-text">positions + cash</text>
+
+  <rect x="1095" y="645" width="230" height="64" class="box"/>
+  <text x="1133" y="673" class="box-title">performance.py</text>
+  <text x="1142" y="695" class="box-text">paper confidence</text>
+
+  <rect x="1380" y="645" width="255" height="64" class="box"/>
+  <text x="1415" y="673" class="box-title">decision_log + state</text>
+  <text x="1424" y="695" class="box-text">durable evidence</text>
+
+  <!-- Backtest / RL -->
+  <rect x="260" y="770" width="225" height="64" class="box"/>
+  <text x="297" y="798" class="box-title">backtest/runner.py</text>
+  <text x="310" y="820" class="box-text">V2.5 / V3 / RL</text>
+
+  <rect x="540" y="770" width="230" height="64" class="box"/>
+  <text x="575" y="798" class="box-title">diagnostics.py</text>
+  <text x="581" y="820" class="box-text">summary metrics</text>
+
+  <rect x="825" y="770" width="250" height="64" class="box"/>
+  <text x="865" y="798" class="box-title">rl-train</text>
+  <text x="866" y="820" class="box-text">scripts/train_rl.py</text>
+
+  <rect x="1130" y="770" width="250" height="64" class="box"/>
+  <text x="1163" y="798" class="box-title">rl/env + trainer + agent</text>
+  <text x="1190" y="820" class="box-text">training core</text>
+
+  <rect x="1435" y="770" width="230" height="64" class="box"/>
+  <text x="1471" y="798" class="box-title">rl-benchmark</text>
+  <text x="1462" y="820" class="box-text">rl-walkforward</text>
+
+  <!-- Broker -->
+  <rect x="260" y="895" width="305" height="64" class="box"/>
+  <text x="290" y="923" class="box-title">robinhood-status / sync-* </text>
+  <text x="324" y="945" class="box-text">read synced snapshots</text>
+
+  <rect x="620" y="895" width="285" height="64" class="box"/>
+  <text x="650" y="923" class="box-title">brokers/robinhood/boundary.py</text>
+  <text x="705" y="945" class="box-text">MCP-only boundary</text>
+
+  <rect x="960" y="895" width="245" height="64" class="box"/>
+  <text x="1000" y="923" class="box-title">state/robinhood_*.json</text>
+  <text x="1015" y="945" class="box-text">operator-synced truth</text>
+
+  <rect x="1260" y="895" width="280" height="64" class="box"/>
+  <text x="1305" y="923" class="box-title">operator / MCP handoff</text>
+  <text x="1325" y="945" class="box-text">intents, not local auth</text>
+
+  <!-- Ops -->
+  <rect x="260" y="1020" width="190" height="64" class="box"/>
+  <text x="303" y="1048" class="box-title">doctor / health</text>
+  <text x="307" y="1070" class="box-text">runtime checks</text>
+
+  <rect x="515" y="1020" width="190" height="64" class="box"/>
+  <text x="565" y="1048" class="box-title">reports/*.py</text>
+  <text x="558" y="1070" class="box-text">summaries</text>
+
+  <rect x="770" y="1020" width="190" height="64" class="box"/>
+  <text x="815" y="1048" class="box-title">monitoring/*.py</text>
+  <text x="814" y="1070" class="box-text">signals + alerts</text>
+
+  <rect x="1030" y="1020" width="230" height="64" class="box"/>
+  <text x="1072" y="1048" class="box-title">burn-in scripts</text>
+  <text x="1078" y="1070" class="box-text">ops automation</text>
+
+  <!-- Notes -->
+  <rect x="1330" y="1008" width="380" height="86" class="note"/>
+  <text x="1354" y="1037" class="note-title">Core confidence path</text>
+  <text x="1354" y="1061" class="note-text">data -> signal -> risk -> paper execution</text>
+  <text x="1354" y="1083" class="note-text">-> ledger -> diagnostics</text>
+
+  <rect x="60" y="1115" width="1680" height="44" class="note"/>
+  <text x="84" y="1143" class="note-title">Prune review candidates:</text>
+  <text x="285" y="1143" class="note-text">events/*, env/trading_env.py, brokers/paper.py, research-only RL scripts. Verify callers/tests before deleting.</text>
+
+  <!-- Arrows: CLI -->
+  <path d="M 450 177 L 515 177" class="line"/>
+  <path d="M 705 177 L 770 177" class="line"/>
+  <path d="M 1185 177 L 960 177" class="thin-line"/>
+
+  <!-- CLI fanout -->
+  <path d="M 865 209 L 865 238 L 340 238 L 340 270" class="thin-line"/>
+  <path d="M 865 209 L 865 238 L 560 238 L 560 270" class="thin-line"/>
+  <path d="M 865 209 L 865 238 L 802 238 L 802 270" class="thin-line"/>
+  <path d="M 865 209 L 865 238 L 1072 238 L 1072 270" class="thin-line"/>
+  <path d="M 865 209 L 865 238 L 1325 238 L 1325 270" class="thin-line"/>
+  <path d="M 865 209 L 865 738 L 372 738 L 372 770" class="thin-line"/>
+  <path d="M 865 209 L 865 738 L 950 738 L 950 770" class="thin-line"/>
+  <path d="M 865 209 L 865 738 L 1550 738 L 1550 770" class="thin-line"/>
+  <path d="M 865 209 L 865 862 L 412 862 L 412 895" class="thin-line"/>
+  <path d="M 865 209 L 865 988 L 355 988 L 355 1020" class="thin-line"/>
+
+  <!-- Core to data -->
+  <path d="M 340 334 L 340 395" class="line"/>
+  <path d="M 560 334 L 560 365 L 375 365 L 375 395" class="line"/>
+  <path d="M 802 334 L 802 365 L 375 365 L 375 395" class="line"/>
+
+  <!-- Data internals -->
+  <path d="M 490 427 L 545 427" class="line"/>
+  <path d="M 830 427 L 885 427" class="thin-line"/>
+  <path d="M 1035 427 L 1090 427" class="thin-line"/>
+  <path d="M 1260 427 L 1315 427" class="thin-line"/>
+
+  <!-- Data to strategy -->
+  <path d="M 375 459 L 375 520" class="line"/>
+  <path d="M 960 459 L 960 492 L 375 492 L 375 520" class="thin-line"/>
+  <path d="M 1175 459 L 1175 492 L 375 492 L 375 520" class="thin-line"/>
+  <path d="M 1400 459 L 1400 492 L 375 492 L 375 520" class="thin-line"/>
+
+  <!-- Strategy flow -->
+  <path d="M 490 552 L 545 552" class="line"/>
+  <path d="M 835 552 L 890 552" class="thin-line"/>
+  <path d="M 1090 552 L 1145 552" class="line"/>
+  <path d="M 1390 552 L 1445 552" class="thin-line"/>
+
+  <!-- Strategy to execution -->
+  <path d="M 1268 584 L 1268 614 L 375 614 L 375 645" class="line"/>
+  <path d="M 1552 584 L 1552 614 L 935 614 L 935 645" class="thin-line"/>
+
+  <!-- Execution flow -->
+  <path d="M 490 677 L 545 677" class="line"/>
+  <path d="M 775 677 L 830 677" class="line"/>
+  <path d="M 1040 677 L 1095 677" class="line"/>
+  <path d="M 1325 677 L 1380 677" class="line"/>
+
+  <!-- Research flow -->
+  <path d="M 375 459 L 375 738 L 372 738 L 372 770" class="thin-line"/>
+  <path d="M 485 802 L 540 802" class="line"/>
+  <path d="M 1075 802 L 1130 802" class="line"/>
+  <path d="M 1380 802 L 1435 802" class="thin-line"/>
+  <path d="M 1550 770 L 1550 738 L 372 738 L 372 770" class="thin-line"/>
+
+  <!-- Broker flow -->
+  <path d="M 565 927 L 620 927" class="line"/>
+  <path d="M 905 927 L 960 927" class="line"/>
+  <path d="M 1205 927 L 1260 927" class="thin-line"/>
+
+  <!-- Logs to ops -->
+  <path d="M 1508 709 L 1508 988 L 610 988 L 610 1020" class="thin-line"/>
+  <path d="M 1508 709 L 1508 988 L 865 988 L 865 1020" class="thin-line"/>
+  <path d="M 1145 1020 L 1145 988 L 865 988 L 865 209" class="thin-line"/>
+</svg>
