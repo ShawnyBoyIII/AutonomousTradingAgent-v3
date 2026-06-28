@@ -460,8 +460,10 @@ def _render_live_dashboard(snapshot: dict[str, Any]) -> str:
     @media (max-width: 900px) {{ .two-col {{ grid-template-columns: 1fr; }} }}
     .badge {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; background: #18202a; }}
     .feed {{ max-height: 480px; overflow-y: auto; }}
-    .btn {{ cursor: pointer; padding: 6px 14px; border: none; border-radius: 6px; font-weight: bold; font-size: 13px; margin-left: 12px; }}
-    .btn:hover {{ opacity: 0.85; }}
+    .btn {{ cursor: pointer; padding: 6px 14px; border: none; border-radius: 6px; font-weight: bold; font-size: 13px; margin-left: 12px; transition: opacity 0.2s, outline 0.2s; }}
+    .btn:hover:not(:disabled) {{ opacity: 0.85; }}
+    .btn:disabled {{ cursor: not-allowed; opacity: 0.5; }}
+    .btn:focus-visible {{ outline: 2px solid #58a6ff; outline-offset: 2px; }}
     .kill-halt {{ background: #f85149; color: #fff; }}
     #kill-banner button {{ background: #238636; color: #fff; }}
     .pnl-positive {{ color: #3fb950; }}
