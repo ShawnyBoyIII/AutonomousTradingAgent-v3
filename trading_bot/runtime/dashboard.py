@@ -423,11 +423,11 @@ def _render_live_dashboard(snapshot: dict[str, Any]) -> str:
         cb_raw = True
 
     kill_banner = (
-        '<div class="banner kill-active" id="kill-banner">KILL SWITCH ACTIVE - trading halted '
-        '<button class="btn" onclick="toggleKillSwitch(\'resume\')">Resume Trading</button></div>'
+        '<div class="banner kill-active" id="kill-banner" role="alert">KILL SWITCH ACTIVE - trading halted '
+        '<button class="btn" onclick="toggleKillSwitch(\'resume\')" aria-label="Resume all trading activity">Resume Trading</button></div>'
         if kill.get("active")
-        else '<div class="banner kill-inactive" id="kill-banner">Kill switch: inactive (trading enabled) '
-             '<button class="btn kill-halt" onclick="toggleKillSwitch(\'halt\')">HALT Trading</button></div>'
+        else '<div class="banner kill-inactive" id="kill-banner" role="status">Kill switch: inactive (trading enabled) '
+             '<button class="btn kill-halt" onclick="toggleKillSwitch(\'halt\')" aria-label="Halt all trading activity">HALT Trading</button></div>'
     )
 
     return f"""<!doctype html>
@@ -538,7 +538,12 @@ def _render_live_dashboard(snapshot: dict[str, Any]) -> str:
   <script>
   async function toggleKillSwitch(action) {{
     const btn = document.querySelector('#kill-banner button');
-    if (btn) btn.disabled = true;
+    let originalText = '';
+    if (btn) {{
+      originalText = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = action === 'halt' ? 'Halting... ⏳' : 'Resuming... ⏳';
+    }}
     try {{
       const resp = await fetch('/api/kill-switch', {{
         method: 'POST',
@@ -550,11 +555,11 @@ def _render_live_dashboard(snapshot: dict[str, Any]) -> str:
         location.reload();
       }} else {{
         alert('Failed: ' + (data.error || 'unknown error'));
-        if (btn) btn.disabled = false;
+        if (btn) {{ btn.disabled = false; btn.innerHTML = originalText; }}
       }}
     }} catch (e) {{
       alert('Network error: ' + e.message);
-      if (btn) btn.disabled = false;
+      if (btn) {{ btn.disabled = false; btn.innerHTML = originalText; }}
     }}
   }}
   </script>
