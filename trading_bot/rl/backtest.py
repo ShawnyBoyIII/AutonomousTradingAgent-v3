@@ -11,7 +11,9 @@ from trading_bot.backtest.diagnostics import diagnostics
 from trading_bot.execution.paper_broker import PaperBroker
 from trading_bot.models.portfolio import PortfolioState, Position
 from trading_bot.rl.features import (
+    CROSS_SYMBOL_FEATURES,
     FEATURE_COLS,
+    build_cross_symbol_features,
     build_market_feature_row,
     build_observation,
     build_portfolio_feature_row,
@@ -152,14 +154,22 @@ class RLBacktestRunner:
         self,
         all_symbols: list[str],
         portfolio_state: PortfolioState,
+        end_index: int,
     ) -> np.ndarray:
-        """Build an observation from all symbol features + portfolio state."""
+        """Build an observation from all symbol features + cross-symbol features + portfolio state."""
         market_rows = [self._compute_features_for_symbol(sym) for sym in all_symbols]
+        cross_rows = [build_cross_symbol_features(sym, self._data_cache, end_index) for sym in all_symbols]
         max_sym = self.config.max_symbols or len(all_symbols)
         while len(market_rows) < max_sym:
             market_rows.append([0.0] * len(self.FEATURE_COLS))
+            cross_rows.append([0.0] * len(self.CROSS_SYMBOL_FEATURES))
+        
+        combined_rows = []
+        for m_row, c_row in zip(market_rows[:max_sym], cross_rows[:max_sym]):
+            combined_rows.append(m_row + c_row)
+        
         return build_observation(
-            market_rows[:max_sym],
+            combined_rows,
             build_portfolio_feature_row(portfolio_state),
             observer_window=self.config.observer_window,
         )
@@ -427,7 +437,7 @@ class RLBacktestRunner:
                     prices[sym] = float(df.iloc[end_index]["close"])
 
             portfolio_state = self._build_portfolio_state(broker, prices, entry_cost_basis)
-            observation = self._build_observation_batch(all_symbols, portfolio_state)
+            observation = self._build_observation_batch(all_symbols, portfolio_state, end_index)
 
             action = self._predict_action(observation)
             rl_actions.append({"step": end_index, "action": action})

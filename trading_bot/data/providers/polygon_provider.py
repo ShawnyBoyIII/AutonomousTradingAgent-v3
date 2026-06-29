@@ -7,6 +7,10 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 
+def _redact_query_secrets(message: object) -> str:
+    return re.sub(r"(?i)(apiKey|token)=([^&\s)]+)", r"\1=<redacted>", str(message))
+
+
 class PolygonProvider:
     """Market data provider backed by the Polygon.io Aggregates API.
 
@@ -84,14 +88,19 @@ class PolygonProvider:
 
         last_status: int | None = None
         for attempt in range(1, self._MAX_RETRIES + 1):
-            resp = requests.get(url, params=params, timeout=30)
-            if resp.status_code == 429:
-                wait = self._RETRY_DELAY * attempt
-                time.sleep(wait)
-                last_status = 429
-                continue
-            resp.raise_for_status()
-            break
+            try:
+                resp = requests.get(url, params=params, timeout=30)
+                if resp.status_code == 429:
+                    wait = self._RETRY_DELAY * attempt
+                    time.sleep(wait)
+                    last_status = 429
+                    continue
+                resp.raise_for_status()
+                break
+            except Exception as exc:
+                raise ValueError(
+                    f"Polygon request failed for {symbol}: {_redact_query_secrets(exc)}"
+                ) from exc
         else:
             raise ValueError(
                 f"Polygon rate limit exceeded for {symbol} "

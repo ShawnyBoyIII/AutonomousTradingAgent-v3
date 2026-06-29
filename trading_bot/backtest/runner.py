@@ -168,6 +168,31 @@ def run_backtest(
             "rows": rows,
         },
     )
+
+    # Run attribution analysis
+    try:
+        from trading_bot.backtest.attribution import run_attribution
+        benchmark_data = None
+        if benchmark_symbol := getattr(settings.app, "benchmark_symbol", None):
+            try:
+                benchmark_data = _fetch_bars_compat(
+                    market_data.fetch_bars,
+                    benchmark_symbol,
+                    settings.market_data.daily_period,
+                    "1d",
+                    start=start,
+                    end=end,
+                    settings=settings.market_data,
+                )
+            except Exception:
+                pass
+        summary["attribution"] = run_attribution(
+            summary,
+            benchmark_data=benchmark_data,
+        )
+    except Exception as e:
+        logger.warning("Attribution analysis failed: %s", e)
+
     return summary
 
 
@@ -771,6 +796,7 @@ def run_rl_backtest(
     resolved_model_path = model_path or (getattr(settings.rl, "model_path", None) if hasattr(settings, "rl") else None)
     meta_symbols = list(symbols)
     meta_max_symbols: int | None = None
+    meta_action_scheme = "bsh"
     if resolved_model_path:
         import json
         meta_path = Path(resolved_model_path).with_suffix(".zip")
@@ -782,18 +808,21 @@ def run_rl_backtest(
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
                 meta_symbols = [s.strip().upper() for s in meta.get("symbols", symbols)]
                 meta_max_symbols = meta.get("max_symbols")
+                meta_action_scheme = str(meta.get("action_scheme", meta_action_scheme))
             except Exception:
                 pass
 
     rl_config = RLBacktestConfig(
         model_path=resolved_model_path,
         symbols=meta_symbols,
-        starting_cash=10_000.0,
+        starting_cash=settings.rl.backtest_starting_cash,
         fee_per_order=settings.paper.fee_per_order,
         slippage_bps=settings.paper.slippage_bps,
+        max_shares=settings.rl.backtest_max_shares,
         max_symbols=meta_max_symbols,
-        stop_loss_pct=0.05,
-        profit_target_pct=0.08,
+        stop_loss_pct=settings.rl.backtest_stop_loss_pct,
+        profit_target_pct=settings.rl.backtest_profit_target_pct,
+        action_scheme=meta_action_scheme,
     )
 
     runner = RLBacktestRunner(config=rl_config)
@@ -804,10 +833,14 @@ def run_rl_backtest(
             model_obs_space = getattr(runner._model, "observation_space", None)
             if model_obs_space is not None and hasattr(model_obs_space, "shape") and len(model_obs_space.shape) >= 2:
                 expected_features = model_obs_space.shape[1]
-                n_market_features = len(RLBacktestRunner.FEATURE_COLS)
+                from trading_bot.rl.features import CROSS_SYMBOL_FEATURES
+                n_market_features = len(RLBacktestRunner.FEATURE_COLS) + len(CROSS_SYMBOL_FEATURES)
                 n_portfolio_features = 5
                 expected_max = (expected_features - n_portfolio_features) // n_market_features
                 actual_max = rl_config.max_symbols or len(rl_config.symbols)
+                if rl_config.max_symbols is None and expected_max >= len(rl_config.symbols):
+                    rl_config.max_symbols = expected_max
+                    actual_max = expected_max
                 if expected_features != actual_max * n_market_features + n_portfolio_features:
                     print(f"Warning: RL model expects {expected_features} features ({expected_max} max symbols) but backtest uses {actual_max} max symbols. Skipping RL backtest.")
                     return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0, "win_rate": 0.0, "rows": rows, "rl_actions": []}
@@ -822,25 +855,29 @@ def run_rl_backtest(
         meta_symbols, settings, start, end
     )
 
-    for symbol in (value.strip() for value in meta_symbols if value.strip()):
-        master_intraday = intraday_frames.get(symbol)
-        if master_intraday is None or len(master_intraday) < 15:
-            continue
-
+    primary = next(
+        (
+            symbol
+            for symbol in (value.strip() for value in meta_symbols if value.strip())
+            if intraday_frames.get(symbol) is not None and len(intraday_frames[symbol]) >= 15
+        ),
+        None,
+    )
+    if primary is not None:
         result = runner.run_backtest(
-            symbol=symbol,
+            symbol=primary,
             daily_frames=daily_frames,
             intraday_frames=intraday_frames,
             trade_symbols=symbols,
         )
-        trades += result["trades"]
-        wins += result["wins"]
-        losses += result["losses"]
-        net_pnl += result["net_pnl"]
-        gross_profit += float(result.get("gross_profit", 0.0))
-        gross_loss += float(result.get("gross_loss", 0.0))
+        trades = result["trades"]
+        wins = result["wins"]
+        losses = result["losses"]
+        net_pnl = result["net_pnl"]
+        gross_profit = float(result.get("gross_profit", 0.0))
+        gross_loss = float(result.get("gross_loss", 0.0))
         rows.append({
-            "ticker": symbol,
+            "ticker": ",".join(meta_symbols),
             "trades": result["trades"],
             "wins": result["wins"],
             "losses": result["losses"],
@@ -853,7 +890,7 @@ def run_rl_backtest(
             log_path,
             {
                 "command": "backtest",
-                "ticker": symbol,
+                "ticker": ",".join(meta_symbols),
                 "strategy": "rl",
                 "trades": result["trades"],
                 "wins": result["wins"],

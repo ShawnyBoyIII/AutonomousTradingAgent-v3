@@ -65,7 +65,9 @@ What `--train-symbols` means:
 
 ## Run the benchmark against V2.5 and V3
 
-Use a config with RL enabled and a real model path:
+Root `config.yaml` keeps `rl.enabled: false` so normal paper scans do not depend on local model artifacts. For RL checks, use a real model path explicitly or a temporary config with RL enabled.
+
+Use a config with RL enabled and a real model path when you want RL scan inference:
 
 ```yaml
 strategy:
@@ -123,6 +125,69 @@ Important:
 - the RL side validates requested symbols against model metadata before fetching data
 - RL scan inference now builds observations with frames for every trained symbol in model metadata
 - it uses the configured `rl.model_path`, or `--model-path` if you override it
+
+## Current sector confidence run
+
+Best current local candidate:
+
+- symbols: `XOM,CVX,UNH,LLY,CAT,DE`
+- model: `state/rl_logs/sector_diversity/PPO_seed_789.zip`
+- benchmark sizing: `$100k`, max `150` shares, `3%` stop, `8%` target
+- last known app benchmark: `23` trades, `+6.58%`, profit factor `1.84`
+
+Promotion rule:
+
+- count results only when market-data providers are reachable
+- do not promote from a run that prints `market data unavailable`
+- do not promote from a run that falls back to daily bars for an intraday/hold-period confidence check
+- sandbox DNS failures are useful for smoke testing command behavior, not for proving the model is good
+
+Re-run the app benchmark:
+
+```bash
+./tradebot-local rl-benchmark \
+  --symbols XOM,CVX,UNH,LLY,CAT,DE \
+  --model-path state/rl_logs/sector_diversity/PPO_seed_789.zip \
+  --start 2025-06-25 \
+  --end 2026-06-25
+```
+
+Re-run fixed-model sequential windows:
+
+```bash
+./tradebot-local rl-walkforward \
+  --symbols XOM,CVX,UNH,LLY,CAT,DE \
+  --model-path state/rl_logs/sector_diversity/PPO_seed_789.zip \
+  --start 2025-06-25 \
+  --end 2026-06-25 \
+  --windows 5
+```
+
+Re-run the sector seed/exit sweep without retraining:
+
+```bash
+.venv/bin/python scripts/sector_diversity_rl.py \
+  --evaluate-only \
+  --sweep-exits \
+  --seeds 123,789 \
+  --max-shares 150
+```
+
+If the model file is missing, train it first:
+
+```bash
+.venv/bin/python scripts/sector_diversity_rl.py \
+  --seeds 789 \
+  --timesteps 300000
+```
+
+If provider DNS/network is blocked, expect a clean failure like:
+
+```text
+market data unavailable: All providers failed for XOM ...
+```
+
+Fix the provider/network issue first, then rerun `rl-walkforward`; do not treat a blocked run as paper confidence.
 
 Reward scheme notes:
 

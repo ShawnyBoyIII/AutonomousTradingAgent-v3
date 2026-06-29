@@ -77,7 +77,7 @@ class TestTradingEnv:
         obs, info = env.reset()
         assert obs is not None
         assert isinstance(obs, np.ndarray)
-        assert obs.shape == (5, 44)  # (window_size, n_features)
+        assert obs.shape == (5, 53)  # (window_size, n_features)
         assert "net_worth" in info
         assert "step" in info
         assert info["step"] == 0
@@ -98,7 +98,7 @@ class TestTradingEnv:
         for _ in range(10):
             action = env.action_space.sample()
             obs, reward, terminated, truncated, info = env.step(action)
-            assert obs.shape == (5, 44)
+            assert obs.shape == (5, 53)
             assert isinstance(reward, float)
 
     def test_portfolio_tracking(self, env, mock_market_data):
@@ -319,7 +319,7 @@ class TestObserver:
 
         obs = observer.observe(state, prices, 0)
         assert isinstance(obs, np.ndarray)
-        assert obs.shape == (config.observer_window, 44)
+        assert obs.shape == (config.observer_window, 53)
 
     def test_observation_space(self, config, mock_market_data):
         observer = TensorTradeObserver(
@@ -329,7 +329,7 @@ class TestObserver:
         assert isinstance(observer.observation_space, gym.spaces.Box)
         assert observer.observation_space.shape == (
             config.observer_window,
-            44,
+            53,
         )
 
     def test_observation_padded_initial(self, config, mock_market_data):
@@ -341,7 +341,7 @@ class TestObserver:
         prices = {"AAPL": 150.0, "MSFT": 380.0, "GOOGL": 140.0}
 
         obs = observer.observe(state, prices, 0)
-        assert obs.shape == (10, 44)
+        assert obs.shape == (10, 53)
 
     def test_portfolio_features(self, config, mock_market_data):
         observer = TensorTradeObserver(

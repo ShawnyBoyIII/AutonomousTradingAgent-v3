@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 import json
 import math
@@ -7,7 +8,7 @@ from pathlib import Path
 
 from trading_bot.config.settings import Settings
 from trading_bot.data import market_data
-from trading_bot.data.indicators import add_atr, add_bollinger_bands, add_ema, add_rsi, add_sma
+from trading_bot.data.indicators import add_atr, add_bollinger_bands, add_ema, add_rsi, add_sma, add_vwap
 from trading_bot.execution.fills import apply_slippage
 from trading_bot.execution.order_manager import submit_signal_as_order
 from trading_bot.execution.paper_broker import PaperBroker
@@ -19,7 +20,10 @@ from trading_bot.runtime.decision_log import append_decision_event
 from trading_bot.runtime.snapshots import write_snapshot
 from trading_bot.risk.risk_manager import evaluate_signal
 from trading_bot.strategy.intraday_signal_engine import generate_recent_signal_with_reason
+from trading_bot.strategy.supermodel import build_stacked_signal
 from trading_bot.rl.utils import rl_model_meta_path, rl_model_symbols
+
+logger = logging.getLogger(__name__)
 def run_scan(
     symbols: list[str],
     settings: Settings,
@@ -80,6 +84,15 @@ def run_scan(
             "candidates": [],
         }
 
+    # Phase 1: Swarm analysis (read-only overlay)
+    swarm_results: dict[str, Any] = {}
+    if settings.swarm.enabled:
+        try:
+            swarm_results = _run_swarm_overlay(symbols, settings)
+        except Exception as e:
+            logger.warning("Swarm overlay failed: %s", e)
+            swarm_results = {}
+
     for symbol in (value.strip() for value in symbols if value.strip()):
         try:
             signal, no_signal_reason, details = _build_signal_result(symbol, settings)
@@ -108,10 +121,17 @@ def run_scan(
                 )
                 other_results.append(f"{symbol} NO_SIGNAL reason={no_signal_reason}{detail_text}")
                 row = {"ticker": symbol, "status": "NO_SIGNAL", "reason": no_signal_reason}
+                if settings.swarm.enabled and symbol in swarm_results:
+                    swarm_decision = swarm_results[symbol]
+                    row["swarm_decision"] = swarm_decision.decision
+                    row["swarm_confidence"] = round(swarm_decision.confidence, 2)
                 if include_details:
                     row["details"] = details
                 candidate_rows.append(row)
                 continue
+
+            details.update(build_stacked_signal(symbol, signal, details).to_details())
+            detail_text = _format_scan_details(details) if include_details else ""
 
             # V2.5: Fetch ATR for volatility-adjusted sizing
             atr = _fetch_atr(symbol, settings) if settings.risk.use_atr_sizing else None
@@ -136,6 +156,10 @@ def run_scan(
                     "status": "REJECTED",
                     "reason": decision.reason,
                 }
+                if settings.swarm.enabled and symbol in swarm_results:
+                    swarm_decision = swarm_results[symbol]
+                    row["swarm_decision"] = swarm_decision.decision
+                    row["swarm_confidence"] = round(swarm_decision.confidence, 2)
                 if include_details:
                     row["details"] = details
                 candidate_rows.append(row)
@@ -146,6 +170,28 @@ def run_scan(
                 signal.timestamp, settings.market_data.intraday_interval,
                 max_age_minutes=settings.market_data.max_data_age_minutes,
             )
+            if market_status == "stale":
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "scan",
+                        "ticker": symbol,
+                        "status": "REJECTED",
+                        "reason": "stale market data",
+                    },
+                )
+                market_age = _market_data_age(signal.timestamp)
+                other_results.append(f"{symbol} REJECTED stale market data age={market_age}")
+                row = {
+                    "ticker": symbol,
+                    "status": "REJECTED",
+                    "reason": "stale market data",
+                }
+                if include_details:
+                    row["details"] = details
+                candidate_rows.append(row)
+                continue
+
             market_age = _market_data_age(signal.timestamp)
             quality = _scan_quality(details)
             append_decision_event(
@@ -206,6 +252,11 @@ def run_scan(
                 "target": round(signal.profit_target, 2),
                 "reasons": signal.reasons,
             }
+            if settings.swarm.enabled and symbol in swarm_results:
+                swarm_decision = swarm_results[symbol]
+                row["swarm_decision"] = swarm_decision.decision
+                row["swarm_confidence"] = round(swarm_decision.confidence, 2)
+                row["swarm_rationale"] = swarm_decision.key_rationale
             if include_details:
                 row["details"] = details
             candidate_rows.append(row)
@@ -215,7 +266,11 @@ def run_scan(
                 {"command": "scan", "ticker": symbol, "status": "ERROR", "error": str(exc)},
             )
             other_results.append(f"{symbol} ERROR {exc}")
-            candidate_rows.append({"ticker": symbol, "status": "ERROR", "error": str(exc)})
+            row = {"ticker": symbol, "status": "ERROR", "error": str(exc)}
+            if settings.swarm.enabled and symbol in swarm_results:
+                swarm_decision = swarm_results[symbol]
+                row["swarm_decision"] = swarm_decision.decision
+            candidate_rows.append(row)
 
     approved_results.sort(key=lambda item: item[0], reverse=True)
     candidate_rows.sort(
@@ -232,6 +287,14 @@ def run_scan(
         "no_signal": sum(1 for row in candidate_rows if row["status"] == "NO_SIGNAL"),
         "errors": sum(1 for row in candidate_rows if row["status"] == "ERROR"),
     }
+    if settings.swarm.enabled:
+        swarm_decisions = [row.get("swarm_decision") for row in candidate_rows if "swarm_decision" in row]
+        summary.update({
+            "swarm_enabled": True,
+            "swarm_approved": sum(1 for d in swarm_decisions if d == "APPROVE"),
+            "swarm_rejected": sum(1 for d in swarm_decisions if d == "REJECT"),
+            "swarm_hold": sum(1 for d in swarm_decisions if d == "HOLD"),
+        })
     if getattr(settings, "rl", None) is not None and settings.rl.enabled:
         summary.update(
             {
@@ -247,6 +310,22 @@ def run_scan(
                 else 0.0,
             }
         )
+    supermodel_decisions = [
+        decision
+        for row in candidate_rows
+        if isinstance(row.get("details"), dict)
+        for decision in [row["details"].get("supermodel_decision")]
+        if decision
+    ]
+    if supermodel_decisions:
+        summary.update(
+            {
+                "supermodel_support": sum(1 for value in supermodel_decisions if value == "support"),
+                "supermodel_caution": sum(1 for value in supermodel_decisions if value == "caution"),
+                "supermodel_block": sum(1 for value in supermodel_decisions if value == "block"),
+                "supermodel_no_signal": sum(1 for value in supermodel_decisions if value == "no_signal"),
+            }
+        )
     write_snapshot(
         settings.app.scan_results_path,
         {
@@ -255,7 +334,60 @@ def run_scan(
             "candidates": candidate_rows,
         },
     )
+    _persist_scan_results_to_db(candidate_rows, settings)
     return {"lines": lines, "summary": summary, "candidates": candidate_rows}
+
+
+def _run_swarm_overlay(symbols: list[str], settings: Settings) -> dict[str, Any]:
+    """Run swarm analysis as read-only overlay (Phase 1).
+
+    Returns a dict mapping ticker -> CommitteeDecision for each symbol.
+    Does NOT affect trading behavior - results are logged alongside
+    scanner output for comparison.
+    """
+    try:
+        from trading_bot.swarm.engine import SwarmEngine
+        from trading_bot.swarm.workers import WORKER_CLASSES
+
+        engine = SwarmEngine(
+            preset_name=settings.swarm.preset,
+            max_concurrent=settings.swarm.max_workers,
+        )
+
+        # Fetch market data for swarm
+        frames: dict[str, pd.DataFrame] = {}
+        for symbol in symbols:
+            try:
+                frame = market_data.fetch_bars(
+                    symbol=symbol,
+                    period=settings.market_data.daily_period,
+                    interval=settings.market_data.intraday_interval,
+                    settings=settings.market_data,
+                )
+                if frame is not None and not frame.empty:
+                    frames[symbol] = frame
+            except Exception:
+                continue
+
+        if not frames:
+            return {}
+
+        # Run swarm analysis
+        run_summary = engine.run(
+            symbols=list(frames.keys()),
+            market_data=frames,
+        )
+
+        # Extract per-ticker decisions
+        results = {}
+        for ticker, decision in run_summary.decisions.items():
+            results[ticker] = decision
+
+        return results
+
+    except Exception as e:
+        logger.warning("Swarm overlay failed: %s", e)
+        return {}
 
 
 def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = False) -> list[str]:
@@ -486,6 +618,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 continue
 
             ledger.record_fill(fill, side="BUY")
+            _persist_trade_to_db(fill, signal, settings)
             updated_state = _portfolio_state_from_broker(
                 broker,
                 signal,
@@ -545,8 +678,12 @@ def _build_signal_with_reason(symbol: str, settings: Settings):
 
 
 def _build_signal_result(symbol: str, settings: Settings):
+    # RL path: use RL model if enabled AND trained for this symbol.
+    # If RL is enabled but the symbol isn't trained, fall through to V3.
     if getattr(settings, "rl", None) is not None and settings.rl.enabled:
-        return _build_rl_signal_result(symbol, settings)
+        result = _build_rl_signal_result(symbol, settings)
+        if result[0] is not None or "rl_trained_symbols" not in result[2]:
+            return result
 
     if getattr(settings, "strategy", None) is not None and settings.strategy.use_v3_signals:
         return _build_v3_signal_result(symbol, settings)
@@ -605,16 +742,17 @@ def _build_rl_signal_result(symbol: str, settings: Settings):
     except Exception as e:
         return None, f"RL model load failed: {e}", {}
 
-    if symbol.upper().strip() not in trained_symbols:
-        return (
-            None,
-            f"RL model not trained for {symbol} (trained_symbols={','.join(trained_symbols)})",
-            {"rl_trained_symbols": trained_symbols},
-        )
-
+    symbol_upper = symbol.upper().strip()
+    is_trained_symbol = symbol_upper in trained_symbols
+    
     daily_frames = {}
     intraday_frames = {}
-    for trained_symbol in trained_symbols:
+    
+    symbols_for_inference = trained_symbols.copy()
+    if not is_trained_symbol:
+        symbols_for_inference.append(symbol_upper)
+    
+    for trained_symbol in symbols_for_inference:
         daily_frame, daily_valid = market_data.fetch_and_validate_bars(
             trained_symbol,
             settings.market_data.daily_period,
@@ -635,8 +773,8 @@ def _build_rl_signal_result(symbol: str, settings: Settings):
         daily_frames[trained_symbol] = daily_frame
         intraday_frames[trained_symbol] = intraday_frame
 
-    daily_frame = daily_frames[symbol.upper().strip()]
-    intraday_frame = intraday_frames[symbol.upper().strip()]
+    daily_frame = daily_frames[symbol_upper]
+    intraday_frame = intraday_frames[symbol_upper]
 
     daily_frame = daily_frame.copy()
     daily_frame = add_ema(daily_frame, period=20, column_name="ema_20")
@@ -651,19 +789,23 @@ def _build_rl_signal_result(symbol: str, settings: Settings):
 
     current_price = float(intraday_frame["close"].iloc[-1])
     action, confidence = agent.predict_signal(
-        daily_frame=intraday_frame,
-        ticker=symbol,
+        daily_frame=daily_frame,
+        ticker=symbol_upper,
         portfolio_weight=0.0,
         unrealized_pnl_pct=0.0,
         cash_ratio=1.0,
-        symbols=trained_symbols,
-        market_frames=intraday_frames,
+        symbols=symbols_for_inference,
+        market_frames=daily_frames,
     )
+
+    _persist_rl_prediction_to_db(symbol, action, confidence, settings)
 
     details = _scan_details(daily_frame, intraday_frame)
     details["rl_action"] = action
     details["rl_confidence"] = confidence
     details["rl_agent_type"] = settings.rl.agent_type
+    details["rl_trained_symbols"] = trained_symbols
+    details["rl_untrained_symbol"] = not is_trained_symbol
 
     if action == 0:
         return None, f"RL agent predicts HOLD (confidence={confidence:.2f})", details
@@ -671,8 +813,13 @@ def _build_rl_signal_result(symbol: str, settings: Settings):
     if action == 2:
         return None, f"RL agent predicts SELL (confidence={confidence:.2f})", details
 
-    if confidence < settings.rl.action_confidence_threshold:
-        return None, f"RL confidence {confidence:.2f} below threshold {settings.rl.action_confidence_threshold}", details
+    confidence_threshold = settings.rl.action_confidence_threshold
+    if not is_trained_symbol:
+        confidence_threshold = confidence_threshold * 0.8
+        confidence *= 0.85
+
+    if confidence < confidence_threshold:
+        return None, f"RL confidence {confidence:.2f} below threshold {confidence_threshold}", details
 
     atr = float(intraday_frame[f"atr_{settings.risk.atr_period}"].iloc[-1]) if f"atr_{settings.risk.atr_period}" in intraday_frame.columns else current_price * 0.02
     stop_distance = atr * settings.risk.atr_multiplier
@@ -735,6 +882,8 @@ def _build_v3_signal_result(symbol: str, settings: Settings):
     intraday_frame["volume_avg_5"] = intraday_frame["volume"].rolling(5).mean()
     intraday_frame = add_rsi(intraday_frame, period=14)
     intraday_frame = add_atr(intraday_frame, period=settings.risk.atr_period)
+    intraday_frame = add_bollinger_bands(intraday_frame, period=20)
+    intraday_frame = add_vwap(intraday_frame)
 
     selector = StrategySelector(risk_tolerance=settings.strategy.risk_tolerance)
     selector.min_confidence = settings.strategy.min_confidence
@@ -870,6 +1019,14 @@ def _format_scan_details(details: dict[str, object]) -> str:
             parts.append(f"{key}={value}")
     if details.get("counter_thesis_block"):
         parts.append("counter_thesis_block=true")
+
+    if details.get("supermodel_decision"):
+        parts.append(
+            f"supermodel={details.get('supermodel_decision')}"
+            f":{details.get('supermodel_score')}"
+        )
+    if details.get("supermodel_layers"):
+        parts.append(f"supermodel_layers={details.get('supermodel_layers')}")
 
     return f" {' '.join(parts)}" if parts else ""
 
@@ -1138,3 +1295,141 @@ def _calculate_portfolio_heat(state: PortfolioState, settings: Settings) -> floa
         latest_prices[ticker] = fallback
 
     return compute_portfolio_heat(state.positions, latest_prices, state.equity)
+
+
+def _persist_scan_results_to_db(candidate_rows: list[dict], settings: Settings) -> None:
+    try:
+        from trading_bot.db.session import init_db, make_session_factory, get_session
+        from trading_bot.db.repositories import upsert_scan_result
+        engine = init_db(settings)
+        session_factory = make_session_factory(engine)
+        session = get_session(session_factory)
+        try:
+            for row in candidate_rows:
+                ticker = row.get("ticker", "")
+                status = row.get("status", "")
+                if status == "APPROVED":
+                    action = "BUY"
+                    confidence = float(row.get("confidence", 0.0))
+                    reasons = row.get("reasons")
+                    if isinstance(reasons, list):
+                        reasons = [str(r) for r in reasons]
+                    else:
+                        reasons = None
+                    score = None
+                    strategy_tag = None
+                    details_dict = row.get("details")
+                    if isinstance(details_dict, dict):
+                        score = details_dict.get("v3_total_score")
+                        strategy_tag = details_dict.get("rl_agent_type") or details_dict.get("v3_strategy")
+                    upsert_scan_result(
+                        session=session,
+                        ticker=ticker.upper(),
+                        action=action,
+                        confidence=confidence,
+                        score=score,
+                        strategy_tag=strategy_tag,
+                        reasons=reasons,
+                        details=row.get("details") if row.get("details") else None,
+                    )
+                elif status == "NO_SIGNAL":
+                    reason = row.get("reason", "no signal")
+                    upsert_scan_result(
+                        session=session,
+                        ticker=ticker.upper(),
+                        action="HOLD",
+                        confidence=0.0,
+                        reasons=[str(reason)],
+                    )
+                elif status == "REJECTED":
+                    reason = row.get("reason", "rejected")
+                    upsert_scan_result(
+                        session=session,
+                        ticker=ticker.upper(),
+                        action="HOLD",
+                        confidence=0.0,
+                        reasons=[str(reason)],
+                    )
+                elif status == "ERROR":
+                    error = row.get("error", "unknown error")
+                    upsert_scan_result(
+                        session=session,
+                        ticker=ticker.upper(),
+                        action="HOLD",
+                        confidence=0.0,
+                        reasons=[str(error)],
+                    )
+        finally:
+            session.close()
+            engine.dispose()
+    except Exception:
+        pass
+
+
+def _persist_trade_to_db(
+    fill,
+    signal,
+    settings: Settings,
+) -> None:
+    try:
+        from trading_bot.db.session import init_db, make_session_factory, get_session
+        from trading_bot.db.repositories import upsert_trade, upsert_position
+        engine = init_db(settings)
+        session_factory = make_session_factory(engine)
+        session = get_session(session_factory)
+        try:
+            strategy_tag = getattr(signal, "strategy_tag", None) if signal else None
+            upsert_trade(
+                session=session,
+                ticker=fill.ticker.upper(),
+                side="BUY",
+                order_type=fill.order_type if hasattr(fill, "order_type") else "market",
+                quantity=fill.quantity,
+                entry_price=fill.fill_price,
+                stop_loss=signal.stop_loss if signal else None,
+                profit_target=signal.profit_target if signal else None,
+                fees=fill.fees,
+                strategy_tag=strategy_tag,
+                status="FILLED",
+            )
+            upsert_position(
+                session=session,
+                ticker=fill.ticker.upper(),
+                quantity=fill.quantity,
+                average_cost=fill.fill_price,
+                stop_loss=signal.stop_loss if signal else None,
+                profit_target=signal.profit_target if signal else None,
+                strategy_tag=strategy_tag,
+            )
+        finally:
+            session.close()
+            engine.dispose()
+    except Exception:
+        pass
+
+
+def _persist_rl_prediction_to_db(
+    symbol: str,
+    action: int,
+    confidence: float,
+    settings: Settings,
+) -> None:
+    try:
+        from trading_bot.db.session import init_db, make_session_factory, get_session
+        from trading_bot.db.repositories import upsert_prediction
+        engine = init_db(settings)
+        session_factory = make_session_factory(engine)
+        session = get_session(session_factory)
+        try:
+            upsert_prediction(
+                session=session,
+                ticker=symbol.upper(),
+                action=int(action),
+                confidence=float(confidence),
+                model_path=str(settings.rl.model_path),
+            )
+        finally:
+            session.close()
+            engine.dispose()
+    except Exception:
+        pass

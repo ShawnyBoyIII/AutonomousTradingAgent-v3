@@ -4,6 +4,79 @@ One-liner per change. Date, category, summary.
 
 ---
 
+## 2026-06-29 (Session 2)
+
+- **bugfix** — Fixed `watchlist_path` not being resolved relative to config file in `loader.py:114-119`, causing `scan-universe` to read from workspace `state/watchlist.txt` instead of test tmp_path.
+- **bugfix** — Updated `test_rl_signal_rejects_symbols_outside_model_metadata` test: RL now supports inference on untrained symbols via dynamic padding, so the test was rewritten to verify the new behavior (confidence adjustment + lower threshold for untrained symbols).
+- **feature** — RL inference now handles untrained symbols: removed hard rejection in `orchestrator.py:724-729`, added dynamic observation padding for new symbols, applies 15% confidence penalty and 20% lower confidence threshold for untrained symbols.
+- **feature** — Added `rl_untrained_symbol: true` flag in scan details when RL trades a symbol not in its trained set, enabling transparency on signal source.
+- **feature** — Burn-in script (`auto-burn-in.sh`) now reads from Python-configured paths (`state/universe.txt` + `state/watchlist.txt`) instead of separate `burn-in-symbols.txt`, unifying symbol sources.
+- **feature** — Burn-in discovery (`run_discovery`) now preserves manually added watchlist symbols by merging discovered symbols with watchlist.txt into universe.txt.
+- **feature** — `scan-universe` command now always merges watchlist into the symbol set, regardless of whether a custom `--universe-path` is provided.
+- **feature** — Added confidence gates to burn-in loop: `check_confidence_gates()` checks trades>=10, realized_pnl>=500, profit_factor>=1.2, positive_windows>=60% every 10 cycles.
+- **feature** — Added max drawdown kill switch to burn-in loop: `check_max_drawdown()` monitors equity history, halts script if drawdown >= 10% (configurable), warns at 80% threshold.
+- **feature** — Created `scripts/daily_supermodel.py`: 5-step pipeline (load burn-in stats → discover symbols → evaluate models → train supermodel → build ensemble), outputs to `state/rl_logs/supermodel/`.
+- **feature** — Added `supermodel` CLI command: runs daily supermodel retrain pipeline with `--symbols`, `--epochs`, `--timesteps`, `--dry-run` options.
+- **feature** — Created `scripts/live_data_collector.py`: collects burn-in trades with market context into replay buffer (`state/rl_logs/replay_buffer.jsonl`), supports `--watch` (continuous) and `--buffer` (stats) modes.
+- **feature** — Added `live-data` CLI command: wraps live data collector with `--watch`, `--buffer`, `--db-path`, `--buffer-path` options.
+- **feature** — Created `scripts/auto_retrain_trigger.py`: detects new symbols in universe/watchlist not covered by existing RL models, triggers retrain via `daily_supermodel.py`.
+- **feature** — Added `auto-retrain` CLI command: checks symbol coverage, triggers retrain with `--force` or `--dry-run` options.
+- **refactor** — Burn-in script unified symbol sources: removed `burn-in-symbols.txt`, now reads `state/universe.txt` + `state/watchlist.txt`, merges and deduplicates.
+- **refactor** — `scripts/auto-burn-in.sh` discovery function preserves watchlist symbols by merging with discovered symbols into universe.txt.
+- **bugfix** — Confidence gates now halt burn-in trading when thresholds fail (was only logging warnings), exits with code 1 and logs to `halt.log`.
+- **feature** — Supermodel pipeline now loads replay buffer for continual learning: `--replay-buffer` and `--replay-weight` args, `load_replay_buffer()` parses JSONL trade entries, `replay_buffer_stats()` computes win rate/PnL/ticker coverage.
+- **feature** — `train_supermodel()` accepts `replay_entries` and `replay_weight` parameters, logs replay buffer stats during training, includes replay info in pipeline result JSON.
+- **bugfix** — Fixed RL observation shape mismatch: `predict_signal()` was passing untrained symbols to `build_observation()`, causing `(10, 117)` instead of `(10, 101)`. Now truncates `symbol_list` to `n_symbols` before building observations, returns HOLD for untrained symbols not in the trained set.
+- **bugfix** — Added `add_bollinger_bands()` and `add_vwap()` to intraday frame in `_build_v3_signal_result()`, enabling mean reversion setups (`detect_oversold_bounce` requires `bb_lower`/`bb_upper`, `detect_vwap_reversion` requires `vwap`).
+- **bugfix** — Fixed `SYMBOLS_FILE` undefined variable in `auto-burn-in.sh` (lines 86, 88, 195, 198, 330), replaced with `UNIVERSE_FILE`.
+- **config** — Changed `strategy.risk_tolerance` from `"medium"` to `"high"` in `burn-in-config.yaml` to trade through HIGH_VOLATILITY regime.
+
+---
+
+## 2026-06-29
+
+- **feature** — Created research autopilot system (`trading_bot/research/`): hypothesis → backtest → evaluate → learn loop with SQLite storage, auto-hypothesis generation from alpha benching results, and configurable evaluation criteria.
+- **feature** — Added `research-autopilot` CLI command: create/run/stats/cycles/bench-to-hypothesis actions for automated research pipeline.
+- **feature** — Created research data models: Hypothesis (with status tracking), ExperimentResult (with success criteria), ResearchCycle (complete research loop).
+- **feature** — Created ResearchStore: SQLite-backed persistence for hypotheses, experiments, and cycles with filtering and statistics.
+- **feature** — Created ResearchEngine: manages research loop execution, pending hypothesis processing, and benching-to-hypothesis conversion.
+- **bugfix** — Fixed alpha factor scoring in signal_confluence.py: equal-weight factor list now uses tuples (factor, weight) to match weighted factor list format, preventing unpack error.
+- **bugfix** — Updated confidence thresholds in `_score_to_confidence()` to match new 12-point score scale (was 10-point).
+- **bugfix** — Updated position size multiplier base from 10.0 to 12.0 to match new score scale.
+- **tests** — Added 20 research autopilot tests (store, engine, models) — 922 tests passing.
+- **feature** — Created persistent memory system (`trading_bot/memory/`): FTS5 full-text search, cross-session learning, intelligent recall, and auto-context building.
+- **feature** — Added `memory` CLI command: store/recall/search/stats/list/clear actions for persistent trading insights.
+- **feature** — Created memory data models: MemoryEntry (with types), MemoryQuery (with filters), MemoryStats (with aggregations).
+- **feature** — Created MemoryStore: SQLite-backed persistence with FTS5 search, tag filtering, and batch operations.
+- **feature** — Created MemoryRetriever: intelligent recall system with context-aware searching, research integration, and prompt building.
+- **tests** — Added 23 persistent memory tests (store, retriever, models) — 944 tests passing.
+- **feature** — Created BenchingWeightsManager: persistent IC IR weights for alpha factors, integrates with scanner scoring.
+- **feature** — Added `bench-weights` CLI command: update/show/set/reset actions for managing benching weights.
+- **feature** — Wired benching weights into signal_confluence.py: scanner now uses BenchingWeightsManager for persistent factor scoring.
+- **feature** — BenchingWeightsManager supports min/max IC IR filters, auto-normalization, and persistence across sessions.
+- **tests** — Added 12 benching weights tests (manager, persistence, filters) — 956 tests passing.
+
+---
+
+## 2026-06-28
+
+- **feature** — Created SQLite database layer (`trading_bot/db/`) for local persistence: models (MarketData, ScanResult, Trade, Position, PortfolioSnapshot, ModelPrediction, Event), session management, and repository pattern for all entities.
+- **feature** — Wired all 6 persistence integrations: `fetch_bars()` auto-persists OHLCV bars, `run_scan()` persists APPROVED/NO_SIGNAL/REJECTED results, `run_paper_trade()` persists BUY trades + positions, `_fill_sell_position()` persists SELL exits, `_build_rl_signal_result()` persists RL predictions.
+- **feature** — Added 3 CLI commands: `db-history` (query scan results), `db-portfolio` (query portfolio snapshots), `db-trades` (query trades).
+- **feature** — Created multi-agent swarm system (`trading_bot/swarm/`): DAG-based execution engine with 7 presets (investment_committee, quant_desk, risk_committee, technical_analysis_panel, fundamental_analysis_team, crypto_desk, macro_economics_team), 3 concrete workers (technical_analyst, risk_manager, factor_model), streaming status tracking, and result aggregation.
+- **feature** — Added `swarm` CLI command for running multi-agent analysis with configurable presets and symbols.
+- **feature** — Created post-backtest attribution system (`trading_bot/backtest/attribution.py`): trade-level attribution, winner/loser analysis, beta regression, regime analysis, Monte Carlo simulation, holding period statistics, exit reason attribution, signal quality correlation.
+- **feature** — Added `attribution` CLI command for running post-backtest analysis with benchmark comparison.
+- **feature** — Integrated attribution into `run_backtest()` automatically (opt-in via `benchmark_symbol` config).
+- **bugfix** — Fixed `predict_signal` agent wrong padding width on missing market frames (pad to `features_per_symbol - len(market_feat)` instead of `features_per_symbol - 13`).
+- **bugfix** — Fixed `_fill_sell_position` silent error swallowing: wrapped `update_trade_exit` in try/except to handle concurrent trade closure gracefully.
+- **bugfix** — Replaced all 7 occurrences of deprecated `datetime.utcnow()` with `datetime.now(timezone.utc)` across repository files.
+- **bugfix** — Fixed RL scan inference to use configured `settings.market_data.daily_period` instead of hardcoded "1y".
+- **bugfix** — Removed dead code from `db_trades` CLI command (redundant ternary expression).
+- **refactor** — All DB operations wrapped in try/except (fail-safe: DB failures don't break trading logic).
+
+---
+
 ## 2026-06-27
 
 - **bugfix** — Fixed `net_pnl` mislabeling in `_format_paper_confidence_gate`: renamed check from `"return>=5pct"` to `"net_pnl>=500"` and changed output from `rl_return_pct={net_pnl/100}` to `rl_net_pnl=${net_pnl}` (dollars, not fake percentage).
@@ -19,7 +92,9 @@ One-liner per change. Date, category, summary.
 - **rl-backtest** — Fixed `RLBacktestRunner` to support `ProportionActionScheme`: added `action_scheme` config parameter, refactored `_decode_action()` to return 3 values `(symbol, direction, proportion)`, added `_decode_bsh_action()` and `_decode_proportion_action()` methods. Updated `_execute_buy()` and `_execute_sell()` to accept `proportion` parameter for position sizing. Fixed all 5 test cases to handle new return signature.
 - **rl-tuning** — Created `scripts/tune_multisymbol.py` for systematic hyperparameter tuning: tests combinations of ent_coef (0.005, 0.01, 0.02), gamma (0.99, 0.995, 0.999), learning_rate (1e-4, 3e-4, 5e-4), reward_scheme (risk_adjusted, sharpe, drawdown_penalty). Quick mode: 3 configs × 2 seeds = 6 runs (~2 hours). Full mode: 81 configs × 2 seeds = 162 runs (~2 days).
 - **rl-ops** — Created `scripts/compare_models.py` to evaluate all existing models in `state/rl_logs/` against 6 months of fresh data and rank by performance. Auto-detects action_scheme from metadata.
-- **tests** — Updated 5 RL backtest tests to handle new 3-value return from `_action_to_trade()` (added `proportion` field). All 854 tests passing.
+- **bugfix** — Fixed `sweep_exits` crash when all data fetches fail: added early return when `frames` is empty and error handling for when `backtest_model` returns error dict (prevents KeyError on `result['trades']`).
+- **refactor** — Replaced dead `getattr` fallbacks with direct attribute access in `backtest/runner.py`: `settings.rl.backtest_starting_cash`, `settings.rl.backtest_max_shares`, `settings.rl.backtest_stop_loss_pct`, `settings.rl.backtest_profit_target_pct` (Pydantic model always has these fields).
+- **tests** — Updated 5 RL backtest tests to handle new 3-value return from `_action_to_trade()` (added `proportion` field). All 863 tests passing.
 
 ---
 
@@ -73,3 +148,4 @@ One-liner per change. Date, category, summary.
 - **rl-feature** — Added SharpeReward and DrawdownPenaltyReward schemes to trading_bot/rl/rewards.py. SharpeReward uses rolling 20-step window; DrawdownPenaltyReward penalises drawdown from peak. Stateful with reset() method. Registered in TradingEnv reward_schemes dict.
 - **rl-fix** — Added `data_end_date` to TradingConfig to prevent training-on-test leakage. Sweeps train on data ending 2025-06-24, walk-forward from 2025-06-25.
 - **rl-polygon** — Added PolygonProvider with 429 rate-limit retry (2s/4s/6s backoff). Period pattern parser now supports arbitrary "3y"/"6m" intervals via regex fallback.
+- **bugfix** — Provider stack resolution failed when Polygon/Finnhub API keys were missing: `PolygonProvider()` constructor raised `ValueError` during `_resolve_provider_stack()`, which propagated before Alpaca was tried. Fixed by moving provider instantiation inside the try-except loop in `_fallback_fetch()`, so failed providers are skipped and the next one is tried. Also fixed swarm overlay to pass `settings.market_data` to `fetch_bars()` (was using default yfinance fallback).

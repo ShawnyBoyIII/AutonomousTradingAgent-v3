@@ -24,6 +24,8 @@ SEEDS = [42, 123, 789]
 TRAIN_END_DATE = "2025-06-24"
 BACKTEST_START = "2025-06-25"
 BACKTEST_END = "2026-06-25"
+DEFAULT_STOP_LOSS = 0.05
+DEFAULT_PROFIT_TARGET = 0.08
 OUTPUT_DIR = Path("state/rl_logs/sector_diversity")
 RESULTS_DIR = Path("state/rl_logs/sector_diversity/results")
 STARTING_CASH = 100_000.0
@@ -35,6 +37,14 @@ def _parse_seeds(raw: str) -> list[int]:
 
 def _model_path(seed: int) -> Path:
     return OUTPUT_DIR / f"PPO_seed_{seed}"
+
+
+def _parse_pcts(raw: str) -> list[float]:
+    return [float(value.strip()) for value in raw.split(",") if value.strip()]
+
+
+def _parse_ints(raw: str) -> list[int]:
+    return [int(value.strip()) for value in raw.split(",") if value.strip()]
 
 
 def _confidence_verdict(result: dict, starting_cash: float = STARTING_CASH) -> str:
@@ -114,6 +124,7 @@ def train_one(seed: int, timesteps: int, verbose: int) -> Path:
         "ent_coef": 0.01,
         "gamma": 0.995,
         "total_timesteps": timesteps,
+        "max_symbols": len(SYMBOLS),
         "reward_scheme": "risk_adjusted",
         "action_scheme": "proportion",
         "train_end_date": TRAIN_END_DATE,
@@ -126,11 +137,7 @@ def train_one(seed: int, timesteps: int, verbose: int) -> Path:
     return model_path
 
 
-def backtest_model(model_path: Path, seed: int) -> dict:
-    print(f"\n{'='*60}")
-    print(f"  Backtesting seed {seed}: {model_path}")
-    print(f"{'='*60}\n", flush=True)
-
+def _load_backtest_frames() -> dict[str, object]:
     from trading_bot.data import market_data
 
     frames = {}
@@ -148,6 +155,23 @@ def backtest_model(model_path: Path, seed: int) -> dict:
             print(f"  {sym}: {len(df)} bars", flush=True)
         else:
             print(f"  WARNING: No data for {sym}", flush=True)
+    return frames
+
+
+def backtest_model(
+    model_path: Path,
+    seed: int,
+    *,
+    stop_loss_pct: float = DEFAULT_STOP_LOSS,
+    profit_target_pct: float = DEFAULT_PROFIT_TARGET,
+    max_shares: int = 100,
+    frames: dict[str, object] | None = None,
+) -> dict:
+    print(f"\n{'='*60}")
+    print(f"  Backtesting seed {seed}: {model_path}")
+    print(f"{'='*60}\n", flush=True)
+
+    frames = frames or _load_backtest_frames()
 
     if not frames:
         print("  No data loaded, skipping backtest", flush=True)
@@ -159,9 +183,10 @@ def backtest_model(model_path: Path, seed: int) -> dict:
         starting_cash=STARTING_CASH,
         fee_per_order=1.0,
         slippage_bps=5,
+        max_shares=max_shares,
         use_intraday_exit=False,
-        stop_loss_pct=0.05,
-        profit_target_pct=0.08,
+        stop_loss_pct=stop_loss_pct,
+        profit_target_pct=profit_target_pct,
         action_scheme="proportion",
     )
 
@@ -177,6 +202,9 @@ def backtest_model(model_path: Path, seed: int) -> dict:
     result["seed"] = seed
     result["model"] = str(model_path)
     result["symbols"] = list(frames.keys())
+    result["stop_loss_pct"] = stop_loss_pct
+    result["profit_target_pct"] = profit_target_pct
+    result["max_shares"] = max_shares
     result["backtested_at"] = datetime.now().isoformat()
 
     print(f"\n  Results (seed {seed}):", flush=True)
@@ -189,12 +217,51 @@ def backtest_model(model_path: Path, seed: int) -> dict:
     return result
 
 
+def sweep_exits(seeds: list[int], stops: list[float], targets: list[float], max_shares_values: list[int]) -> list[dict]:
+    frames = _load_backtest_frames()
+    if not frames:
+        print("  No data loaded, skipping sweep", flush=True)
+        return []
+    results = []
+    for seed in seeds:
+        model_path = _model_path(seed)
+        if not model_path.with_suffix(".zip").exists():
+            print(f"  Seed {seed}: missing model, skipping", flush=True)
+            continue
+        for stop in stops:
+            for target in targets:
+                for max_shares in max_shares_values:
+                    result = backtest_model(
+                        model_path,
+                        seed,
+                        stop_loss_pct=stop,
+                        profit_target_pct=target,
+                        max_shares=max_shares,
+                        frames=frames,
+                    )
+                    results.append(result)
+                    if "error" in result:
+                        print(f"  sweep seed={seed} stop={stop:.2f} target={target:.2f} max_shares={max_shares} ERROR: {result['error']}", flush=True)
+                    else:
+                        print(
+                            f"  sweep seed={seed} stop={stop:.2f} target={target:.2f} max_shares={max_shares} "
+                            f"trades={result['trades']} PnL=${result['net_pnl']:.2f} "
+                            f"{_confidence_verdict(result)}",
+                            flush=True,
+                        )
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds", default=",".join(str(seed) for seed in SEEDS))
     parser.add_argument("--timesteps", type=int, default=TIMESTEPS)
-    parser.add_argument("--verbose", type=int, choices=[0, 1, 2], default=1)
+    parser.add_argument("--verbose", type=int, choices=[0, 1, 2], default=0)
     parser.add_argument("--evaluate-only", action="store_true", help="Backtest existing seed models without training")
+    parser.add_argument("--sweep-exits", action="store_true", help="Evaluate existing models across stop/target grids")
+    parser.add_argument("--stops", default="0.03,0.05,0.07")
+    parser.add_argument("--targets", default="0.06,0.08,0.10,0.12")
+    parser.add_argument("--max-shares", default="100")
     args = parser.parse_args()
     seeds = _parse_seeds(args.seeds)
 
@@ -205,6 +272,18 @@ def main() -> int:
     print(f"Seeds: {seeds}, Timesteps: {args.timesteps:,} each")
     print(f"Training data ends: {TRAIN_END_DATE}")
     print(f"Backtest window: {BACKTEST_START} to {BACKTEST_END}\n", flush=True)
+
+    if args.sweep_exits:
+        results = sweep_exits(
+            seeds,
+            _parse_pcts(args.stops),
+            _parse_pcts(args.targets),
+            _parse_ints(args.max_shares),
+        )
+        sweep_file = RESULTS_DIR / "exit_sweep.json"
+        sweep_file.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
+        print(f"\nSaved exit sweep: {sweep_file}")
+        return 0
 
     all_results = []
 

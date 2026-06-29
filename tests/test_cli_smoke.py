@@ -91,24 +91,41 @@ def test_rl_signal_rejects_symbols_outside_model_metadata(monkeypatch, tmp_path:
     settings.app.log_dir = str(tmp_path / "logs")
     settings.rl.enabled = True
     settings.rl.model_path = "model.zip"
+    settings.rl.action_confidence_threshold = 0.5
 
-    fake_agent = types.SimpleNamespace(
-        config=types.SimpleNamespace(
-            env_config=types.SimpleNamespace(symbols=["AAPL"]),
-        ),
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def predict_signal(self, **kwargs):
+            captured["symbols"] = kwargs["symbols"]
+            captured["market_frames"] = sorted(kwargs["market_frames"])
+            return 0, 0.75
+
+    monkeypatch.setattr("trading_bot.rl.agent.RLAgent.load", lambda model_path: FakeAgent())
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=30, freq="D"),
+            "open": [100.0 + index for index in range(30)],
+            "high": [101.0 + index for index in range(30)],
+            "low": [99.0 + index for index in range(30)],
+            "close": [100.0 + index for index in range(30)],
+            "volume": [1_000_000 for _ in range(30)],
+        }
     )
-    monkeypatch.setattr("trading_bot.rl.agent.RLAgent.load", lambda model_path: fake_agent)
 
-    def fail_fetch(*args, **kwargs):
-        raise AssertionError("unsupported RL symbols should fail before market data fetch")
+    def fake_fetch(symbol: str, *args, **kwargs):
+        return frame.copy(), types.SimpleNamespace(valid=True, reason=None)
 
-    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fail_fetch)
+    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fake_fetch)
 
     signal, reason, details = orchestrator._build_rl_signal_result("MSFT", settings)
 
     assert signal is None
-    assert "RL model not trained for MSFT" in reason
+    assert "RL agent predicts HOLD" in reason
     assert details["rl_trained_symbols"] == ["AAPL"]
+    assert details["rl_untrained_symbol"] is True
+    assert captured["symbols"] == ["AAPL", "MSFT"]
 
 
 def test_rl_signal_rejects_missing_model_metadata_before_fetch(monkeypatch, tmp_path: Path) -> None:
@@ -353,10 +370,12 @@ def test_scan_universe_reads_saved_symbols_file(monkeypatch, tmp_path: Path) -> 
     universe_path.write_text("AAPL\n", encoding="utf-8")
     config_file = tmp_path / "config.yaml"
     db_path = tmp_path / "state.db"
+    candidates_path = tmp_path / "state" / "universe_candidates.json"
     config_file.write_text(
         "app:\n"
         f"  state_db_path: {db_path}\n"
-        f"  universe_path: {universe_path}\n",
+        f"  universe_path: {universe_path}\n"
+        f"  universe_candidates_path: {candidates_path}\n",
         encoding="utf-8",
     )
     PortfolioLedger(db_path).save_portfolio_state(PortfolioState(cash=20_000.0, equity=20_000.0))
@@ -855,9 +874,10 @@ def test_scan_command_marks_stale_market_data(monkeypatch, tmp_path: Path) -> No
     result = runner.invoke(app, ["--config-path", str(config_file), "scan", "--symbols", "AAPL"])
 
     assert result.exit_code == 0
-    assert "status=stale age=40m ts=2026-06-13T10:20:00" in result.stdout
+    assert "REJECTED stale market data" in result.stdout
     snapshot = json.loads((tmp_path / "state" / "scan_results.json").read_text(encoding="utf-8"))
-    assert snapshot["candidates"][0]["freshness"] == "stale"
+    assert snapshot["candidates"][0]["status"] == "REJECTED"
+    assert snapshot["candidates"][0]["reason"] == "stale market data"
 
 
 def test_scan_command_writes_empty_snapshot_for_no_signal(monkeypatch, tmp_path: Path) -> None:

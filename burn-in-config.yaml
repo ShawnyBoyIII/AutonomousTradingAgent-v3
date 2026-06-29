@@ -31,23 +31,28 @@ risk:
   enable_drawdown_circuit_breaker: true
 
 strategy:
-  use_v3_signals: false
-  risk_tolerance: "medium"
+  use_v3_signals: true
+  risk_tolerance: "high"
   min_confidence: "medium"
 
 counter_thesis:
-  enabled: false
+  enabled: true
   block_on_severity: "high"
   aggregate_block_threshold: 0.6
-  exit_on_block: false
+  exit_on_block: true
 
 rl:
   enabled: true
   agent_type: "PPO"
   feature_set: "standard"
   reward_function: "risk_adjusted"
-  model_path: "state/rl_logs/aapl_production/PPO_final.zip"
+  model_path: "state/rl_logs/sector_diversity/PPO_seed_789.zip"
   action_confidence_threshold: 0.4
+
+swarm:
+  enabled: true
+  preset: "investment_committee"
+  max_workers: 4
 
 session:
   eod_enabled: true

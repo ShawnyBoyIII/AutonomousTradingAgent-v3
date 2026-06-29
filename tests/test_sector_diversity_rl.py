@@ -1,8 +1,16 @@
-from scripts.sector_diversity_rl import _confidence_verdict, _model_path, _parse_seeds
+from scripts.sector_diversity_rl import _confidence_verdict, _model_path, _parse_ints, _parse_pcts, _parse_seeds
 
 
 def test_parse_seeds() -> None:
     assert _parse_seeds("42, 123,789") == [42, 123, 789]
+
+
+def test_parse_pcts() -> None:
+    assert _parse_pcts("0.03, 0.05") == [0.03, 0.05]
+
+
+def test_parse_ints() -> None:
+    assert _parse_ints("100, 200") == [100, 200]
 
 
 def test_model_path_uses_seed_name() -> None:

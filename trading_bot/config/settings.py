@@ -199,7 +199,27 @@ class RLSettings(BaseModel):
     training_timesteps: int = Field(default=100000, ge=1000)
     learning_rate: float = Field(default=3e-4, gt=0.0)
     max_position_pct: float = Field(default=0.20, gt=0.0, le=1.0)
+    backtest_starting_cash: float = Field(default=10000.0, gt=0.0)
+    backtest_max_shares: int = Field(default=100, ge=1)
+    backtest_stop_loss_pct: float = Field(default=0.05, gt=0.0, lt=1.0)
+    backtest_profit_target_pct: float = Field(default=0.08, gt=0.0, lt=1.0)
     action_confidence_threshold: float = Field(default=0.5, gt=0.0, le=1.0)
+
+
+class SwarmSettings(BaseModel):
+    """Multi-agent swarm analysis configuration.
+
+    When ``enabled``, the orchestrator runs a swarm analysis on the
+    universe before generating signals. The swarm acts as a read-only
+    overlay in Phase 1: its committee decisions are logged alongside
+    scanner results but do not affect trading behavior.
+
+    Phase 2 (future): swarm confidence modifier
+    Phase 3 (future): swarm veto power
+    """
+    enabled: bool = Field(default=False)
+    preset: str = Field(default="investment_committee")
+    max_workers: int = Field(default=4, ge=1, le=16)
 
 
 class Settings(BaseModel):
@@ -215,3 +235,4 @@ class Settings(BaseModel):
     monitoring: MonitoringSettings = Field(default_factory=MonitoringSettings)
     counter_thesis: CounterThesisSettings = Field(default_factory=CounterThesisSettings)
     rl: RLSettings = Field(default_factory=RLSettings)
+    swarm: SwarmSettings = Field(default_factory=SwarmSettings)

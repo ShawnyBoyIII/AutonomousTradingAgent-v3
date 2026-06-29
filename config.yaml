@@ -103,9 +103,13 @@ counter_thesis:
 
 # RL-based trading (disabled by default)
 rl:
-  enabled: true
+  enabled: false
   agent_type: PPO
   feature_set: standard
   reward_function: risk_adjusted
-  model_path: state/rl_logs/aapl_production/PPO_final.zip
+  model_path: state/rl_logs/sector_diversity/PPO_seed_789.zip
+  backtest_starting_cash: 100000.0
+  backtest_max_shares: 150
+  backtest_stop_loss_pct: 0.03
+  backtest_profit_target_pct: 0.08
   action_confidence_threshold: 0.4

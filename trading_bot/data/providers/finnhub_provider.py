@@ -7,6 +7,10 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 
+def _redact_query_secrets(message: object) -> str:
+    return re.sub(r"(?i)(apiKey|token)=([^&\s)]+)", r"\1=<redacted>", str(message))
+
+
 class FinnhubProvider:
     """Market data provider backed by the Finnhub Stock Candles API.
 
@@ -78,13 +82,20 @@ class FinnhubProvider:
             "token": self._api_key,
         }
 
-        resp = requests.get(self.BASE_URL, params=params, timeout=30)
-        if resp.status_code in (401, 403):
+        try:
+            resp = requests.get(self.BASE_URL, params=params, timeout=30)
+            if resp.status_code in (401, 403):
+                raise ValueError(
+                    f"Finnhub access denied for {symbol} — check API key or plan "
+                    f"at https://finnhub.io/dashboard"
+                )
+            resp.raise_for_status()
+        except ValueError:
+            raise
+        except Exception as exc:
             raise ValueError(
-                f"Finnhub access denied for {symbol} — check API key or plan "
-                f"at https://finnhub.io/dashboard"
-            )
-        resp.raise_for_status()
+                f"Finnhub request failed for {symbol}: {_redact_query_secrets(exc)}"
+            ) from exc
         payload = resp.json()
 
         status = payload.get("s", "")

@@ -57,9 +57,22 @@ def _fallback_fetch(
     primary_settings: MarketDataSettings | None = None,
 ) -> pd.DataFrame:
     """Try each provider in the configured stack; first success wins."""
-    stack = _resolve_provider_stack(primary_settings)
+    stack_names = []
+    if primary_settings is not None:
+        stack_names = primary_settings.provider_stack
+    if not stack_names:
+        stack_names = ["yfinance"]
+    logger.info(f"_fallback_fetch symbol={symbol} stack={stack_names}")
     last_error: Exception | None = None
-    for provider in stack:
+    for name in stack_names:
+        try:
+            provider = _resolve_provider_by_name(name)
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                f"fetch_failed symbol={symbol} provider={name} error=init_failed:{exc}"
+            )
+            continue
         try:
             return provider.fetch_bars(symbol, period, interval, start=start, end=end)
         except (ValueError, ConnectionError, OSError, TimeoutError) as exc:

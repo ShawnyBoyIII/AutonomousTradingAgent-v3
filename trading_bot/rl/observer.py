@@ -10,8 +10,10 @@ import pandas as pd
 
 from trading_bot.models.portfolio import PortfolioState
 from trading_bot.rl.features import (
+    CROSS_SYMBOL_FEATURES,
     FEATURE_COLS,
     PORTFOLIO_FEATURES,
+    build_cross_symbol_features,
     build_market_feature_row,
     build_portfolio_feature_row,
     pad_market_rows,
@@ -54,6 +56,7 @@ class TensorTradeObserver(Observer):
     """
 
     FEATURE_COLS = FEATURE_COLS
+    CROSS_SYMBOL_FEATURES = CROSS_SYMBOL_FEATURES
     PORTFOLIO_FEATURES = PORTFOLIO_FEATURES
 
     def __init__(
@@ -69,6 +72,7 @@ class TensorTradeObserver(Observer):
         self.period = period
         self.interval = interval
         self.n_market_features = len(self.FEATURE_COLS)
+        self.n_cross_features = len(self.CROSS_SYMBOL_FEATURES)
         self.n_portfolio_features = len(self.PORTFOLIO_FEATURES)
         self.n_symbols = len(symbols)
         # Fixed-size observation space allows symbol-agnostic inference/training.
@@ -78,7 +82,7 @@ class TensorTradeObserver(Observer):
             raise ValueError(
                 f"max_symbols ({self.max_symbols}) must be >= number of symbols ({self.n_symbols})"
             )
-        self.n_features = self.max_symbols * self.n_market_features + self.n_portfolio_features
+        self.n_features = self.max_symbols * (self.n_market_features + self.n_cross_features) + self.n_portfolio_features
         self._observation_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -116,9 +120,11 @@ class TensorTradeObserver(Observer):
         step: int,
         data_frames: dict[str, pd.DataFrame] | None = None,
         data_indices: dict[str, int] | None = None,
+        symbol_frames: dict[str, pd.DataFrame] | None = None,
     ) -> np.ndarray:
         if data_frames is not None and data_indices is not None:
             market_rows = []
+            cross_rows = []
             for symbol in self.symbols:
                 df = data_frames.get(symbol)
                 idx = data_indices.get(symbol, 0)
@@ -127,11 +133,25 @@ class TensorTradeObserver(Observer):
                     market_rows.append(build_market_feature_row(sliced))
                 else:
                     market_rows.append([0.0] * self.n_market_features)
+                
+                cross_df = symbol_frames if symbol_frames is not None else data_frames
+                if cross_df is not None:
+                    cross_feat = build_cross_symbol_features(symbol, cross_df, idx)
+                    cross_rows.append(cross_feat)
+                else:
+                    cross_rows.append([0.0] * self.n_cross_features)
         else:
             market_rows = [self._load_and_compute_features(symbol) for symbol in self.symbols]
+            cross_rows = [[0.0] * self.n_cross_features for _ in self.symbols]
+        
         market_rows = pad_market_rows(market_rows, self.max_symbols)
+        cross_rows = pad_market_rows(cross_rows, self.max_symbols)
         portfolio_features = self._compute_portfolio_features(portfolio_state)
-        row = [float(value) for row_values in market_rows for value in row_values]
+        
+        row = []
+        for m_row, c_row in zip(market_rows, cross_rows):
+            row.extend(m_row)
+            row.extend(c_row)
         row.extend(float(value) for value in portfolio_features)
         self._history.append(row)
 

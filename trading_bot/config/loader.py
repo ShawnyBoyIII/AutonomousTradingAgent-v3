@@ -116,6 +116,9 @@ def load_settings(config_path: Path | None = None) -> Settings:
     settings.app.universe_candidates_path = _resolve_relative_value(
         settings.app.universe_candidates_path, base_dir
     )
+    settings.app.watchlist_path = _resolve_relative_value(
+        settings.app.watchlist_path, base_dir
+    )
     settings.app.log_dir = _resolve_relative_value(settings.app.log_dir, base_dir)
     settings.app.dashboard_summary_path = _resolve_relative_value(
         settings.app.dashboard_summary_path, base_dir

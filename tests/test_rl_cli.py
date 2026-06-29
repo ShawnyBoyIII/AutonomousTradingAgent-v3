@@ -7,7 +7,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from scripts import train_rl
-from trading_bot.cli.app import app
+from trading_bot.cli.app import _format_paper_confidence_gate, app
 
 
 def test_backtest_compare_only_adds_rl_when_enabled_and_model_exists(
@@ -313,6 +313,35 @@ def test_rl_benchmark_runs_compare_with_symbols(monkeypatch, tmp_path: Path) -> 
     assert "expectancy=" in result.stdout
 
 
+def test_rl_benchmark_reports_market_data_errors(monkeypatch, tmp_path: Path) -> None:
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "rl:\n"
+        "  enabled: true\n"
+        f"  model_path: {model_path}\n",
+        encoding="utf-8",
+    )
+
+    def fake_compare(*_args, **_kwargs):
+        raise ValueError("All providers failed for AAPL")
+
+    monkeypatch.setattr("trading_bot.backtest.runner.run_strategy_comparison", fake_compare)
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "rl-benchmark", "--symbol", "AAPL"],
+    )
+
+    assert result.exit_code == 1
+    assert "market data unavailable: All providers failed for AAPL" in result.stdout
+    assert "Traceback" not in result.stdout
+
+
 def test_rl_benchmark_rejects_symbol_outside_model_metadata(tmp_path: Path) -> None:
     model_path = tmp_path / "model.zip"
     model_path.write_bytes(b"")
@@ -380,6 +409,24 @@ def test_rl_walkforward_requires_existing_model_path(tmp_path: Path) -> None:
     assert "requires an existing model path" in result.stdout
 
 
+def test_paper_confidence_gate_uses_configured_starting_cash() -> None:
+    result = {
+        "windows": [{"results": {"rl": {"net_pnl": 600.0}}}],
+        "results": {
+            "rl": {
+                "trades": 12,
+                "net_pnl": 600.0,
+                "profit_factor": 1.3,
+            }
+        },
+    }
+
+    output = _format_paper_confidence_gate(result, starting_cash=100_000.0)
+
+    assert "PAPER CONFIDENCE: FAIL" in output
+    assert "net_pnl>=5000" in output
+
+
 def test_rl_walkforward_runs_sequential_windows_for_symbols(monkeypatch, tmp_path: Path) -> None:
     model_path = tmp_path / "model.zip"
     model_path.write_bytes(b"")
@@ -439,6 +486,35 @@ def test_rl_walkforward_runs_sequential_windows_for_symbols(monkeypatch, tmp_pat
     assert "symbols=AAPL,MSFT" in result.stdout
     assert "profit_factor=" in result.stdout
     assert "PAPER CONFIDENCE: FAIL" in result.stdout
+
+
+def test_rl_walkforward_reports_market_data_errors(monkeypatch, tmp_path: Path) -> None:
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        "rl:\n"
+        "  enabled: true\n"
+        f"  model_path: {model_path}\n",
+        encoding="utf-8",
+    )
+
+    def fake_walkforward(*_args, **_kwargs):
+        raise ValueError("All providers failed for AAPL")
+
+    monkeypatch.setattr("trading_bot.backtest.runner.run_rl_walk_forward", fake_walkforward)
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "rl-walkforward", "--symbol", "AAPL"],
+    )
+
+    assert result.exit_code == 1
+    assert "market data unavailable: All providers failed for AAPL" in result.stdout
+    assert "Traceback" not in result.stdout
 
 
 def test_rl_walkforward_rejects_symbol_outside_model_metadata(tmp_path: Path) -> None:
