@@ -544,6 +544,7 @@ def _render_live_dashboard(snapshot: dict[str, Any]) -> str:
     if (btn) {{
       originalText = btn.innerHTML;
       btn.disabled = true;
+      btn.setAttribute('aria-busy', 'true');
       btn.innerHTML = action === 'halt' ? 'Halting... ⏳' : 'Resuming... ⏳';
     }}
     try {{
