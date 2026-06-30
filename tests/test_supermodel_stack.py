@@ -423,6 +423,7 @@ def test_trade_strategy_tag_stays_column_safe() -> None:
 
     assert tag is not None
     assert len(tag) <= 50
+    assert "|swarm:" in tag
     assert tag.endswith("|stack:support|swarm:unknown_stack_block")
     assert _trade_swarm_decision(SimpleNamespace(strategy_tag=tag)) == "unknown_stack_block"
 
@@ -436,6 +437,20 @@ def test_trade_strategy_tag_handles_empty_sanitized_tokens() -> None:
     )
 
     assert tag == "test|stack:unknown|swarm:unknown"
+
+
+def test_trade_strategy_tag_clamps_worst_case_suffix() -> None:
+    tag = _trade_strategy_tag(
+        SimpleNamespace(strategy_tag="long_base"),
+        {
+            "supermodel_decision": "STACK LABEL THAT IS TOO LONG",
+            "swarm_decision": "SWARM LABEL THAT IS TOO LONG",
+        },
+    )
+
+    assert tag is not None
+    assert len(tag) <= 50
+    assert "|swarm:" in tag
 
 
 def test_persisted_trade_carries_supermodel_stack_tag(tmp_path) -> None:
@@ -503,6 +518,8 @@ def test_paper_trade_stack_uses_swarm_decision(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(orchestrator, "_fetch_atr", lambda symbol, settings: None)
     monkeypatch.setattr(orchestrator, "_scan_quality", lambda details: "GREEN")
     monkeypatch.setattr(orchestrator, "_build_signal_result", lambda symbol, settings: (signal, "test", {}))
+    import trading_bot.strategy.setup_rules as setup_rules
+    monkeypatch.setattr(setup_rules, "compute_v25_confluence_score", lambda details: 8.0)
     monkeypatch.setattr(
         orchestrator,
         "_run_swarm_overlay",

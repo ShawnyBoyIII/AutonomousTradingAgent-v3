@@ -1,5 +1,11 @@
 # AGENTS.md - Trading Bot
 
+<!-- CODEGRAPH_START -->
+## CodeGraph
+
+This repo has `.codegraph/`. Use `codegraph explore "question"` or `codegraph node <symbol-or-file>` before grep/read when locating or understanding code.
+<!-- CODEGRAPH_END -->
+
 Critical context for OpenCode sessions.
 
 ---
@@ -31,7 +37,7 @@ Never use bare `tradebot` on PATH—it may resolve to a stale global install.
 ## Testing
 
 ```bash
-.venv/bin/python -m pytest -q          # 650 tests
+.venv/bin/python -m pytest -q          # full suite
 .venv/bin/python -m pytest tests/test_kill_switch.py -v
 .venv/bin/python -m pytest tests/test_kill_switch.py::test_kill_switch_status -v
 ```
@@ -148,8 +154,9 @@ counter_thesis:
 1. **EOD exit** (highest - always exit before close)
 2. **Stop loss**
 3. **Profit target**
-4. **Counter-thesis exit** (V3: thesis broken)
-5. **Trailing stop** (lowest)
+4. **Time-based exit** (stale positions, configurable via `time_exit_minutes`)
+5. **Counter-thesis exit** (V3: thesis broken)
+6. **Trailing stop** (lowest)
 
 ---
 
@@ -178,7 +185,7 @@ Fail-fast: stops on first validation error.
 
 ## Current State
 
-- **650 tests passing**
+- **Focused changed-suite:** 292 tests passing in current review bucket
 - **V2.5 complete:** ATR sizing, validation, kill switches, burn-in
 - **V3 wired:** Regime detection, confluence scoring, counter-thesis (entry + exit + backtest)
 - **Phase D active:** Running paper burn-in with dynamic watchlist

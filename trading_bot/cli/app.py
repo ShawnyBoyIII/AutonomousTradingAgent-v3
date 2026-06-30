@@ -612,7 +612,9 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
             exited_at = datetime.fromisoformat(ts)
         except (ValueError, TypeError):
             return False
-        return (datetime.now() - exited_at).total_seconds() < _EXIT_COOLDOWN_SECONDS
+        if exited_at.tzinfo is None:
+            exited_at = exited_at.replace(tzinfo=manage_now.tzinfo)
+        return (manage_now - exited_at).total_seconds() < _EXIT_COOLDOWN_SECONDS
 
     # V2.5: Check kill switch
     allowed, reason = check_kill_switch_before_trade(ledger)
@@ -713,6 +715,22 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
             actions += 1
             lines.append(line)
             continue
+        time_exit_m = ctx.obj.session.time_exit_minutes
+        if time_exit_m > 0 and position.entry_at is not None:
+            entry_at = position.entry_at
+            if entry_at.tzinfo is None:
+                entry_at = entry_at.replace(tzinfo=manage_now.tzinfo)
+            held = (manage_now - entry_at).total_seconds() / 60.0
+            if held >= time_exit_m:
+                state, event, line = _fill_sell_position(
+                    ticker, position, f"time_exit_{int(held)}m", manage_now, last_price,
+                    broker, ledger, state, log_path,
+                )
+                append_decision_event(log_path, event)
+                exit_events.append(event)
+                actions += 1
+                lines.append(line)
+                continue
         # V3: Counter-thesis exit — original BUY thesis broken, exit early.
         # Priority: EOD > stop > target > counter-thesis > trailing stop.
         counter_exit = _maybe_counter_thesis_exit(
@@ -924,6 +942,58 @@ def paper_audit(ctx: typer.Context) -> None:
         typer.echo(f"- {issue}")
     if issues:
         raise typer.Exit(code=1)
+
+
+@app.command(name="trade-attribution")
+def trade_attribution(ctx: typer.Context) -> None:
+    """Show P&L breakdown by ticker: entries, exits, and strategy tags."""
+    from datetime import datetime as dt
+
+    ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
+    orders = ledger.list_order_rows()
+
+    last_buy: dict[str, dict] = {}
+    print(f'{"Ticker":8} {"Buy@":>9} {"Sell@":>9} {"Qty":>5} {"P&L":>10} {"Ret%":>7} {"Held":>8}')
+    print("-" * 74)
+    total_pnl = 0.0
+    win_pnl = 0.0
+    loss_pnl = 0.0
+    wins = 0
+    losses = 0
+    for s in sorted(orders, key=lambda x: x.get("filled_at", "")):
+        if s["side"] == "BUY":
+            last_buy[s["ticker"]] = s
+            continue
+        t = s["ticker"]
+        pnl = float(s.get("pnl", 0.0) or 0.0)
+        b = last_buy.get(t)
+        buy_price = b["fill_price"] if b else 0.0
+        sell_price = s["fill_price"]
+        ret = (sell_price - buy_price) / max(buy_price, 0.01) * 100 if buy_price > 0 else 0.0
+        held = "N/A"
+        b_at = b.get("filled_at", "") if b else ""
+        s_at = s.get("filled_at", "")
+        if b_at and s_at:
+            try:
+                d = dt.fromisoformat(s_at) - dt.fromisoformat(b_at)
+                held = f"{int(d.total_seconds()//60)}m"
+            except (ValueError, TypeError):
+                pass
+        print(f"{t:8} {buy_price:9.2f} {sell_price:9.2f} {s['quantity']:5} {pnl:10.2f} {ret:7.2f}% {held:>8}")
+        total_pnl += pnl
+        if pnl > 0:
+            wins += 1
+            win_pnl += pnl
+        else:
+            losses += 1
+            loss_pnl += abs(pnl)
+    print("-" * 74)
+    print(f'{"":8} {"TOTAL":>9} {"":9} {"":5} {total_pnl:10.2f}')
+    wl = wins + losses
+    if wl > 0:
+        print(f"\nWins: {wins}, Losses: {losses}, Win rate: {wins/wl*100:.0f}%")
+        pf = "inf" if loss_pnl == 0 else f"{win_pnl / loss_pnl:.2f}"
+        print(f"Profit factor: {pf}")
 
 
 def _build_portfolio_view(state: PortfolioState, settings) -> dict[str, object]:

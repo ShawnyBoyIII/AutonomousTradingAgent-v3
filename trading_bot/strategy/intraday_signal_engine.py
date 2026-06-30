@@ -17,9 +17,12 @@ def generate_signal(
     daily_frame: "pd.DataFrame",
     intraday_frame: "pd.DataFrame",
     atr_stop_multiplier: float = 1.5,
+    min_stop_distance_pct: float = 0.0,
 ) -> TradeSignal | None:
     signal, _ = generate_signal_with_reason(
-        symbol, daily_frame, intraday_frame, atr_stop_multiplier=atr_stop_multiplier
+        symbol, daily_frame, intraday_frame,
+        atr_stop_multiplier=atr_stop_multiplier,
+        min_stop_distance_pct=min_stop_distance_pct,
     )
     return signal
 
@@ -29,6 +32,7 @@ def generate_signal_with_reason(
     daily_frame: "pd.DataFrame",
     intraday_frame: "pd.DataFrame",
     atr_stop_multiplier: float = 1.5,
+    min_stop_distance_pct: float = 0.0,
 ) -> tuple[TradeSignal | None, str]:
     if not is_bullish_daily_regime(daily_frame):
         return None, "daily regime not bullish"
@@ -68,6 +72,10 @@ def generate_signal_with_reason(
     if stop_loss >= entry_price or stop_loss <= 0:
         stop_loss = round(entry_price * 0.99, 4)
 
+    min_stop = round(entry_price * (1.0 - min_stop_distance_pct / 100.0), 4)
+    if stop_loss > min_stop:
+        stop_loss = min_stop
+
     risk = entry_price - stop_loss
     if risk <= 0:
         return None, "invalid risk"
@@ -82,6 +90,14 @@ def generate_signal_with_reason(
     average_volume = _to_finite_float(latest.get("volume_avg_5"))
     if latest_volume is not None and average_volume is not None and latest_volume > average_volume * 1.5:
         confidence = 0.9
+
+    # Set quality based on setup reason + volume confirmation
+    volume_ok = (
+        latest_volume is not None
+        and average_volume is not None
+        and latest_volume >= average_volume
+    )
+    quality = "GREEN" if volume_ok else "YELLOW"
 
     timestamp = _resolve_signal_timestamp(intraday_frame)
     if timestamp is None:
@@ -100,6 +116,7 @@ def generate_signal_with_reason(
             reasons=["bullish daily regime", setup_reason],
             strategy_tag="intraday-signal-engine",
             timestamp=timestamp,
+            quality=quality,
         ),
         "approved",
     )
@@ -110,9 +127,13 @@ def generate_recent_signal(
     daily_frame: "pd.DataFrame",
     intraday_frame: "pd.DataFrame",
     lookback_bars: int = 6,
+    atr_stop_multiplier: float = 1.5,
+    min_stop_distance_pct: float = 0.0,
 ) -> TradeSignal | None:
     signal, _ = generate_recent_signal_with_reason(
-        symbol, daily_frame, intraday_frame, lookback_bars=lookback_bars
+        symbol, daily_frame, intraday_frame, lookback_bars=lookback_bars,
+        atr_stop_multiplier=atr_stop_multiplier,
+        min_stop_distance_pct=min_stop_distance_pct,
     )
     return signal
 
@@ -123,10 +144,13 @@ def generate_recent_signal_with_reason(
     intraday_frame: "pd.DataFrame",
     lookback_bars: int = 6,
     atr_stop_multiplier: float = 1.5,
+    min_stop_distance_pct: float = 0.0,
 ) -> tuple[TradeSignal | None, str]:
     if lookback_bars <= 0:
         return generate_signal_with_reason(
-            symbol, daily_frame, intraday_frame, atr_stop_multiplier=atr_stop_multiplier
+            symbol, daily_frame, intraday_frame,
+            atr_stop_multiplier=atr_stop_multiplier,
+            min_stop_distance_pct=min_stop_distance_pct,
         )
 
     reason = "no intraday setup"
@@ -137,6 +161,7 @@ def generate_recent_signal_with_reason(
             daily_frame,
             intraday_frame.iloc[:end_index].copy(),
             atr_stop_multiplier=atr_stop_multiplier,
+            min_stop_distance_pct=min_stop_distance_pct,
         )
         if signal is not None:
             return signal, "approved"

@@ -390,3 +390,49 @@ class TestIdempotencyGuard:
         state.last_exited_at = {"CIEN": "2025-01-01T00:00:00"}
 
         assert state.last_exited_at.get("AAPL") is None
+
+    def test_manage_positions_formats_open_position_without_error(self, monkeypatch, tmp_path):
+        import types
+
+        import pandas as pd
+
+        from trading_bot.config.settings import Settings
+        from trading_bot.models.portfolio import PortfolioState, Position
+        from trading_bot.portfolio.ledger import PortfolioLedger
+        from trading_bot.runtime import continuous_loop
+
+        settings = Settings(app={"state_db_path": str(tmp_path / "state.db"), "log_dir": str(tmp_path)})
+        settings.session.eod_enabled = False
+        ledger = PortfolioLedger(tmp_path / "state.db")
+        ledger.save_portfolio_state(
+            PortfolioState(
+                cash=9_000.0,
+                equity=10_000.0,
+                positions={
+                    "AAPL": Position(ticker="AAPL", quantity=10, average_cost=100.0)
+                },
+            )
+        )
+        frame = pd.DataFrame(
+            {"close": [105.0], "high": [105.0], "low": [104.0], "volume": [1000]},
+            index=pd.DatetimeIndex([pd.Timestamp.now(tz="UTC")]),
+        )
+
+        monkeypatch.setattr(
+            continuous_loop.market_data,
+            "fetch_and_validate_bars",
+            lambda *args, **kwargs: (frame, types.SimpleNamespace(valid=True, reason="")),
+        )
+        monkeypatch.setattr(
+            "trading_bot.safety.kill_switch.check_kill_switch_before_trade",
+            lambda ledger: (True, ""),
+        )
+        monkeypatch.setattr(
+            "trading_bot.safety.circuit_breaker.check_circuit_breakers",
+            lambda ledger, settings: (True, ""),
+        )
+
+        result = continuous_loop._run_manage_positions_once(settings, ledger)
+
+        assert result["actions"] == 0
+        assert result["lines"] == ["AAPL price=105.00 qty=10 highest_high=105.00"]

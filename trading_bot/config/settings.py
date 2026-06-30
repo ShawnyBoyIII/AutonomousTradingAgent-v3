@@ -16,6 +16,8 @@ class AppSettings(BaseModel):
     portfolio_summary_path: str = "state/portfolio_summary.json"
     backtest_summary_path: str = "state/backtest_summary.json"
     benchmark_symbol: str | None = None
+    allow_yellow_mean_reversion: bool = False
+    min_entry_confluence_score: float = Field(default=4.0, ge=0.0, le=12.0)
 
 
 class MarketDataSettings(BaseModel):
@@ -65,7 +67,11 @@ class RiskSettings(BaseModel):
     # Minimum stop distance = ATR × atr_stop_multiplier.
     # Prevents 0.2–0.6% noise stops on tight consolidations
     # (the 5-bar low min() stops too close to entry on breakouts).
-    atr_stop_multiplier: float = Field(default=1.5, ge=0.5, le=5.0)
+    atr_stop_multiplier: float = Field(default=3.0, ge=0.5, le=10.0)
+    # Absolute minimum stop distance as % of entry price.
+    # Overrides both the 5-bar low and ATR floor when either
+    # produces a stop closer than this threshold. 0 = disabled.
+    min_stop_distance_pct: float = Field(default=0.0, ge=0.0, le=20.0)
     # V2.5: Portfolio heat limits
     max_portfolio_heat_pct: float = Field(default=0.03, gt=0.0, le=0.5)
     # V2.5: Sector concentration
@@ -74,6 +80,12 @@ class RiskSettings(BaseModel):
     max_consecutive_losses: int = Field(default=5, ge=0)
     # V3.1: Circuit breaker — halt on max drawdown (% from peak)
     enable_drawdown_circuit_breaker: bool = True
+    # V3.2: Ticker re-entry cooldown (minutes) — blocks re-entering a
+    # ticker after exit to prevent whipsawing. 0 disables the feature.
+    ticker_reentry_cooldown_minutes: int = Field(default=30, ge=0)
+    # V3.2: Position size multiplier for YELLOW (mean-reversion) signals.
+    # Reduces position size to limit risk on non-breakout entries.
+    yellow_allocation_pct: float = Field(default=0.5, gt=0.0, le=1.0)
 
 
 class SessionSettings(BaseModel):
@@ -81,6 +93,7 @@ class SessionSettings(BaseModel):
     close_minute: int = Field(default=0, ge=0, le=59)
     eod_minutes_before_close: int = Field(default=5, ge=0, le=120)
     eod_enabled: bool = True
+    time_exit_minutes: int = Field(default=0, ge=0, le=480)
 
 
 class PaperSettings(BaseModel):
@@ -198,6 +211,8 @@ class RLSettings(BaseModel):
     feature_set: str = Field(default="standard")  # standard, extended
     reward_function: str = Field(default="risk_adjusted")
     model_path: str = Field(default="trained_models/rl_agent.zip")
+    model_paths: list[str] = Field(default_factory=list)
+    untrained_confidence_threshold_multiplier: float = Field(default=0.8, gt=0.0, le=1.0)
     training_episodes: int = Field(default=100, ge=1)
     training_timesteps: int = Field(default=100000, ge=1000)
     learning_rate: float = Field(default=3e-4, gt=0.0)

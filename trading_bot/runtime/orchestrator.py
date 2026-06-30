@@ -27,6 +27,20 @@ from trading_bot.strategy.supermodel import build_stacked_signal
 from trading_bot.rl.utils import rl_model_meta_path, rl_model_symbols
 
 logger = logging.getLogger(__name__)
+
+
+def _recently_exited(ticker: str, state, cooldown_minutes: int) -> bool:
+    ts = state.last_exited_at.get(ticker)
+    if not ts:
+        return False
+    try:
+        exited_at = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return False
+    now = datetime.now(timezone.utc) if exited_at.tzinfo else datetime.now()
+    return (now - exited_at).total_seconds() < cooldown_minutes * 60
+
+
 def run_scan(
     symbols: list[str],
     settings: Settings,
@@ -221,6 +235,7 @@ def run_scan(
                         if counter_result is not None and counter_result.findings
                         else {}
                     ),
+                    **_paper_evidence_fields(details),
                 },
             )
             approved_results.append(
@@ -522,6 +537,20 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 results.append(f"{symbol} REJECTED duplicate open ticker")
                 continue
 
+            cooldown_minutes = settings.risk.ticker_reentry_cooldown_minutes
+            if cooldown_minutes > 0 and _recently_exited(symbol, state, cooldown_minutes):
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "paper-trade",
+                        "ticker": symbol,
+                        "status": "REJECTED",
+                        "reason": "ticker re-entry cooldown",
+                    },
+                )
+                results.append(f"{symbol} REJECTED ticker re-entry cooldown")
+                continue
+
             signal, _, details = _build_signal_result(symbol, settings)
             if signal is None:
                 if symbol in swarm_results:
@@ -564,20 +593,29 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
 
             # RL signals bypass the rule-based quality filter; the model itself
             # encodes entry criteria. Rule-based signals still require GREEN.
+            # YELLOW signals may be accepted when the mean-reversion feature
+            # flag is enabled and the intraday frame shows a valid setup.
             is_rl_signal = getattr(signal, "strategy_tag", "").startswith("rl_")
-            if not is_rl_signal and _scan_quality(details) != "GREEN":
-                append_decision_event(
-                    log_path,
-                    {
-                        "command": "paper-trade",
-                        "ticker": symbol,
-                        "status": "REJECTED",
-                        "reason": "yellow signal",
-                        **_paper_evidence_fields(details),
-                    },
-                )
-                results.append(f"{symbol} REJECTED yellow signal")
-                continue
+            is_v3_signal = getattr(signal, "strategy_tag", "").startswith("v3-")
+            quality = _scan_quality(details)
+            if not is_rl_signal and quality != "GREEN":
+                yellow_accepted = False
+                if settings.app.allow_yellow_mean_reversion and details.get("is_mean_reversion"):
+                    yellow_accepted = True
+                    details["yellow_mean_reversion"] = True
+                if not yellow_accepted:
+                    append_decision_event(
+                        log_path,
+                        {
+                            "command": "paper-trade",
+                            "ticker": symbol,
+                            "status": "REJECTED",
+                            "reason": "yellow signal",
+                            **_paper_evidence_fields(details),
+                        },
+                    )
+                    results.append(f"{symbol} REJECTED yellow signal")
+                    continue
 
             # V2.5: Fetch ATR for volatility-adjusted sizing
             atr = _fetch_atr(symbol, settings) if settings.risk.use_atr_sizing else None
@@ -603,6 +641,25 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                     continue
             else:
                 alloc = 1.0
+
+            min_conf = settings.app.min_entry_confluence_score
+            if min_conf > 0.0 and not is_rl_signal and not is_v3_signal and not details.get("is_mean_reversion"):
+                from trading_bot.strategy.setup_rules import compute_v25_confluence_score
+                conf_score = compute_v25_confluence_score(details)
+                details["confluence_score"] = conf_score
+                if conf_score < min_conf:
+                    append_decision_event(
+                        log_path,
+                        {
+                            "command": "paper-trade",
+                            "ticker": symbol,
+                            "status": "REJECTED",
+                            "reason": f"confluence_score={conf_score:.1f}<{min_conf}",
+                            **_paper_evidence_fields(details),
+                        },
+                    )
+                    results.append(f"{symbol} REJECTED low confluence {conf_score:.1f}<{min_conf}")
+                    continue
 
             decision = evaluate_signal(
                 signal=signal,
@@ -634,6 +691,9 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
 
             if alloc < 1.0:
                 decision.position_size = max(1, int(decision.position_size * alloc))
+
+            if details.get("yellow_mean_reversion"):
+                decision.position_size = max(1, int(decision.position_size * settings.risk.yellow_allocation_pct))
 
             estimated_fill_price = apply_slippage(
                 signal.entry_price,
@@ -791,12 +851,22 @@ def _build_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal |
     intraday_frame = _drop_trailing_zero_volume_bars(intraday_frame)
     intraday_frame["volume_avg_5"] = intraday_frame["volume"].rolling(5).mean()
     intraday_frame = add_atr(intraday_frame, period=settings.risk.atr_period)
+    intraday_frame = add_rsi(intraday_frame, period=14)
+    intraday_frame = add_bollinger_bands(intraday_frame, period=20, std_dev=2.0)
+    intraday_frame = add_vwap(intraday_frame)
     signal, reason = generate_recent_signal_with_reason(
         symbol, daily_frame, intraday_frame,
         atr_stop_multiplier=settings.risk.atr_stop_multiplier,
+        min_stop_distance_pct=settings.risk.min_stop_distance_pct,
     )
     detail_frame = _frame_through_timestamp(intraday_frame, signal.timestamp) if signal else intraday_frame
-    return signal, reason, _scan_details(daily_frame, detail_frame)
+    details = _scan_details(daily_frame, detail_frame)
+    if signal is not None:
+        details["quality"] = getattr(signal, "quality", "GREEN")
+    if settings.app.allow_yellow_mean_reversion:
+        from trading_bot.strategy.setup_rules import is_valid_mean_reversion_setup
+        details["is_mean_reversion"] = is_valid_mean_reversion_setup(intraday_frame)
+    return signal, reason, details
 
 
 def _build_rl_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal | None, str, dict]:
@@ -967,6 +1037,7 @@ def _build_v3_signal_result(symbol: str, settings: Settings):
     selector = StrategySelector(risk_tolerance=settings.strategy.risk_tolerance)
     selector.min_confidence = settings.strategy.min_confidence
     selector.atr_stop_multiplier = settings.risk.atr_stop_multiplier
+    selector.min_stop_distance_pct = settings.risk.min_stop_distance_pct
     selection = selector.select_strategy(symbol, daily_frame, intraday_frame)
 
     details = _scan_details(daily_frame, intraday_frame)
@@ -979,12 +1050,18 @@ def _build_v3_signal_result(symbol: str, settings: Settings):
     if signal is None:
         return None, "v3 signal adaptation failed", details
 
+    # Set quality for V3 signals (always GREEN since selection passed all gates)
+    signal.quality = "GREEN"
+
     # Surface confluence component scores in scan --why output.
     score = selection.signal_score
     details["v3_total_score"] = round(score.total_score, 2)
     details["v3_confidence"] = score.confidence
     details["v3_regime"] = selection.regime.value if selection.regime else None
     details["v3_setup"] = selection.setup_name
+    details["quality"] = signal.quality
+    if settings.app.allow_yellow_mean_reversion:
+        details["is_mean_reversion"] = selection.strategy_type == "mean_reversion"
     return signal, "v3 approved", details
 
 
@@ -1119,6 +1196,10 @@ def _format_scan_details(details: dict[str, object]) -> str:
 
 
 def _scan_quality(details: dict[str, float | int]) -> str:
+    # Use signal-set quality as source of truth (set by signal engine or V3 path)
+    if "quality" in details:
+        return str(details["quality"])
+    # Legacy fallback: derive from close/range_high/volume
     close = details.get("intraday_close")
     range_high = details.get("range_high")
     volume_ratio = details.get("volume_ratio")
@@ -1523,12 +1604,12 @@ def _trade_strategy_tag(signal, details: dict | None = None) -> str | None:
     swarm_decision = details.get("swarm_decision") if isinstance(details, dict) else None
     suffixes = []
     if decision:
-        suffixes.append(f"stack:{_tag_token(decision, 20)}")
+        suffixes.append(f"stack:{_tag_token(decision, 16)}")
     if swarm_decision:
         suffixes.append(f"swarm:{_short_swarm_decision(swarm_decision)}")
     if not suffixes:
         return base
-    suffix = "|".join(suffixes)
+    suffix = "|".join(suffixes)[:50]
     base = str(base or "")[:max(0, 49 - len(suffix))]
     return f"{base}|{suffix}" if base else suffix
 

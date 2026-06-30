@@ -49,16 +49,17 @@ def detect_oversold_bounce(frame: "pd.DataFrame") -> bool:
     percent_b = (latest_close - bb_lower) / bb_range * 100
 
     # Criteria:
-    # 1. Price near lower band (%B <= 10)
+    # 1. Price near or below lower band (%B <= 10)
     # 2. RSI oversold but not dead (< 35)
-    # 3. Bullish candle (close > open)
+    # 3. Bullish candle (close > open) OR price already below lower band
     # 4. Volume confirmation
     near_lower_band = percent_b <= 10.0
     oversold_rsi = rsi < 35.0
     bullish_candle = latest_close > latest_open
+    below_band = percent_b < 0.0
     volume_ok = latest_volume >= avg_volume * 0.8
 
-    return bool(near_lower_band and oversold_rsi and bullish_candle and volume_ok)
+    return bool(near_lower_band and oversold_rsi and (bullish_candle or below_band) and volume_ok)
 
 
 def detect_vwap_reversion(frame: "pd.DataFrame") -> bool:

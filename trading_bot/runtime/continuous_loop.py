@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import time
 import logging
@@ -163,8 +163,6 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
         _fetch_atr,
         _build_signal_result,
         _evaluate_counter_thesis_for_signal,
-        _market_data_status,
-        _market_data_age,
         _scan_quality,
         _portfolio_state_from_broker,
     )
@@ -202,7 +200,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
     lines: list[str] = []
     exit_events: list[dict] = []
     log_path = Path(settings.app.log_dir) / "decision-log.jsonl"
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
 
     # Idempotency guard: skip exits for tickers recently sold by a concurrent process
     _EXIT_COOLDOWN_SECONDS = 120
@@ -215,6 +213,8 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
             exited_at = datetime.fromisoformat(ts)
         except (ValueError, TypeError):
             return False
+        if exited_at.tzinfo is None:
+            exited_at = exited_at.replace(tzinfo=timezone.utc)
         return (now - exited_at).total_seconds() < _EXIT_COOLDOWN_SECONDS
 
     for ticker, position in list(state.positions.items()):
@@ -236,10 +236,12 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                 lines.append(f"{ticker} SKIP no_intraday_data")
                 continue
 
+            from trading_bot.runtime.latency import data_age_minutes, frame_last_timestamp
+
             latest_bar = intraday_frame.iloc[-1]
-            market_age = _market_data_age(latest_bar.name if hasattr(latest_bar, 'name') else now)
-            if market_age is not None and market_age > 300:
-                lines.append(f"{ticker} SKIP stale_data age={market_age}s")
+            market_age = data_age_minutes(frame_last_timestamp(intraday_frame), now)
+            if market_age is not None and market_age > 5:
+                lines.append(f"{ticker} SKIP stale_data age={int(market_age * 60)}s")
                 continue
 
             current_price = float(latest_bar["close"])
@@ -251,23 +253,22 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                 continue
 
             # Exit priority 1: EOD exit
-            if settings.app.exit_at_eod:
-                from trading_bot.runtime.session import should_eod_exit
-                if should_eod_exit(now, settings):
-                    _close_position(
-                        ticker=ticker,
-                        position=position,
-                        broker=broker,
-                        ledger=ledger,
-                        current_price=current_price,
-                        settings=settings,
-                        line_parts=line_parts,
-                        exit_events=exit_events,
-                        log_path=log_path,
-                        reason="eod_exit",
-                        state=state,
-                    )
-                    continue
+            from trading_bot.runtime.session import now_in_zone, should_eod_exit
+            if should_eod_exit(now_in_zone(settings.app.timezone), settings.session):
+                _close_position(
+                    ticker=ticker,
+                    position=position,
+                    broker=broker,
+                    ledger=ledger,
+                    current_price=current_price,
+                    settings=settings,
+                    line_parts=line_parts,
+                    exit_events=exit_events,
+                    log_path=log_path,
+                    reason="eod_exit",
+                    state=state,
+                )
+                continue
 
             # Exit priority 2: Stop loss
             if position.stop_loss is not None and current_price <= position.stop_loss:
@@ -303,7 +304,30 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                 )
                 continue
 
-            # Exit priority 4: Counter-thesis exit (V3)
+            # Exit priority 4: Time-based exit (stale positions)
+            time_exit_m = settings.session.time_exit_minutes
+            if time_exit_m > 0 and position.entry_at is not None:
+                entry_at = position.entry_at
+                if entry_at.tzinfo is None:
+                    entry_at = entry_at.replace(tzinfo=timezone.utc)
+                held = (now - entry_at).total_seconds() / 60.0
+                if held >= time_exit_m:
+                    _close_position(
+                        ticker=ticker,
+                        position=position,
+                        broker=broker,
+                        ledger=ledger,
+                        current_price=current_price,
+                        settings=settings,
+                        line_parts=line_parts,
+                        exit_events=exit_events,
+                        log_path=log_path,
+                        reason=f"time_exit_{int(held)}m",
+                        state=state,
+                    )
+                    continue
+
+            # Exit priority 5: Counter-thesis exit (V3)
             if getattr(settings, "counter_thesis", None) is not None and settings.counter_thesis.enabled:
                 signal, _, details = _build_signal_result(ticker, settings)
                 if signal is not None:
@@ -326,12 +350,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
 
             # Exit priority 5: Trailing stop
             atr = _fetch_atr(ticker, settings) if settings.risk.use_atr_sizing else None
-            trailing_stop = next_trailing_stop(
-                position=position,
-                current_price=current_price,
-                atr=atr,
-                atr_multiplier=settings.risk.atr_trailing_stop_multiplier,
-            )
+            trailing_stop, _ = next_trailing_stop(position, current_price, atr)
             if trailing_stop is not None and current_price <= trailing_stop:
                 _close_position(
                     ticker=ticker,
@@ -363,7 +382,9 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                 )
                 state.positions[ticker] = updated_position
 
-            line_parts.append(f"highest_high={position.highest_high:.2f if position.highest_high else 'N/A'}")
+            highest_high = state.positions[ticker].highest_high
+            high_text = f"{highest_high:.2f}" if highest_high is not None else "N/A"
+            line_parts.append(f"highest_high={high_text}")
             lines.append(" ".join(line_parts))
 
         except Exception as exc:
@@ -377,7 +398,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
     ledger.save_portfolio_state(state)
     ledger.record_equity_snapshot(state, timestamp=now)
     write_snapshot(
-        settings.app.portfolio_path,
+        settings.app.portfolio_summary_path,
         {
             "mode": "manage-positions",
             "positions": len(state.positions),

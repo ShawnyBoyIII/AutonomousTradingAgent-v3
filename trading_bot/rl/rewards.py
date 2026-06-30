@@ -128,3 +128,73 @@ class DrawdownPenaltyReward(RewardScheme):
         pct_return = (current_net_worth - previous_net_worth) / (previous_net_worth + EPSILON)
         drawdown = (self._peak - current_net_worth) / (self._peak + EPSILON) if self._peak > 0 else 0.0
         return (pct_return - drawdown * self.penalty_weight) * self.reward_scale
+
+
+class WhipsawPenaltyReward(RewardScheme):
+    """Penalises rapid round-trip losses (whipsaw trades).
+
+    Tracks the last few step returns. When a large loss is followed within
+    a few steps by a marginal gain or further loss, a multiplicative
+    penalty is applied. Encourages the agent to avoid overtrading and
+    to let positions develop.
+
+    Stateful: keeps a deque of recent step returns and the previous
+    step's return.
+    """
+
+    def __init__(self, window: int = 5, penalty_scale: float = 2.0) -> None:
+        from collections import deque
+
+        self.window = window
+        self.penalty_scale = penalty_scale
+        self._returns: deque[float] = deque(maxlen=window)
+
+    def reset(self) -> None:
+        self._returns.clear()
+
+    def compute_reward(self, current_net_worth: float, previous_net_worth: float) -> float:
+        if previous_net_worth < EPSILON:
+            return 0.0
+        step_return = (current_net_worth - previous_net_worth) / (previous_net_worth + EPSILON)
+        self._returns.append(step_return)
+
+        penalty = 0.0
+        if len(self._returns) >= 2:
+            recent = list(self._returns)[-2:]
+            if recent[0] < -0.001 and abs(recent[1]) < 0.0005:
+                penalty = abs(recent[0]) * self.penalty_scale
+
+        return step_return - penalty
+
+
+class PositionDurationBonus(RewardScheme):
+    """Small bonus for holding positions through neutral steps.
+
+    Encourages the agent to stay invested rather than entering and exiting
+    rapidly. Adds a small positive signal when the step return is neutral
+    (neither large gain nor loss), simulating the benefit of letting trades
+    develop.
+
+    Stateful: tracks consecutive neutral steps.
+    """
+
+    def __init__(self, base_bonus: float = 0.0001, max_consecutive: int = 20) -> None:
+        self.base_bonus = base_bonus
+        self.max_consecutive = max_consecutive
+        self._consecutive: int = 0
+
+    def reset(self) -> None:
+        self._consecutive = 0
+
+    def compute_reward(self, current_net_worth: float, previous_net_worth: float) -> float:
+        if previous_net_worth < EPSILON:
+            return 0.0
+        step_return = (current_net_worth - previous_net_worth) / (previous_net_worth + EPSILON)
+
+        if abs(step_return) < 0.001:
+            self._consecutive = min(self._consecutive + 1, self.max_consecutive)
+        else:
+            self._consecutive = max(0, self._consecutive - 1)
+
+        bonus = self.base_bonus * min(self._consecutive, self.max_consecutive)
+        return step_return + bonus

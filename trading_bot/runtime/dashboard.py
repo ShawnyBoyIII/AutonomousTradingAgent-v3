@@ -509,7 +509,7 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="refresh" content="5">
+  <meta http-equiv="refresh" content="30">
   <title>Autonomous Trading Agent - Live</title>
   <style>
     :root {{
@@ -945,7 +945,7 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
 </head>
 <body>
   <h1>Autonomous Trading Agent</h1>
-  <div class="timestamp">Live dashboard - auto-refresh 5s - generated {html.escape(str(generated_at))}</div>
+  <div class="timestamp">Live dashboard - auto-refresh 30s - generated {html.escape(str(generated_at))}</div>
   {kill_banner}
 
   <section class="grid">

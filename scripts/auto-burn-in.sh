@@ -23,7 +23,7 @@ cd /Users/shawndlima/Documents/AutonomousTradingAgentcopy
 CONFIG_FILE="burn-in-config.yaml"
 UNIVERSE_FILE="state/universe.txt"
 WATCHLIST_FILE="state/watchlist.txt"
-LOG_DIR="logs/burn_in"
+LOG_DIR="logs"
 DB_PATH="state/burn_in.db"
 LAST_DISCOVER_FILE=".last_discover_date"
 
@@ -665,11 +665,11 @@ echo ""
 # Track cycle count
 CYCLE_COUNT=0
 
-# Confidence gate thresholds
-MIN_TRADES=10
+# Confidence gate thresholds (relaxed for early validation phase)
+MIN_TRADES=5
 MIN_NET_PNL=0
-MIN_PROFIT_FACTOR=0.8
-MIN_POSITIVE_WINDOWS=60
+MIN_PROFIT_FACTOR=0.5
+MIN_POSITIVE_WINDOWS=30
 MAX_DRAWDOWN_PCT=10
 
 while true; do

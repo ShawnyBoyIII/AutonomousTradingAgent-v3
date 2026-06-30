@@ -315,6 +315,7 @@ def _run_symbol_backtest(
         selector = StrategySelector(risk_tolerance=settings.strategy.risk_tolerance)
         selector.min_confidence = settings.strategy.min_confidence
         selector.atr_stop_multiplier = settings.risk.atr_stop_multiplier
+        selector.min_stop_distance_pct = settings.risk.min_stop_distance_pct
 
     for end_index, window in enumerate(iterate_bars(intraday_frame, warmup=5), start=5):
         if end_index <= entry_blocked_until:
@@ -435,6 +436,7 @@ def _run_symbol_backtest_daily(
         selector = StrategySelector(risk_tolerance=settings.strategy.risk_tolerance)
         selector.min_confidence = settings.strategy.min_confidence
         selector.atr_stop_multiplier = settings.risk.atr_stop_multiplier
+        selector.min_stop_distance_pct = settings.risk.min_stop_distance_pct
 
     for index in range(50, len(daily_frame)):
         if index <= entry_blocked_until:

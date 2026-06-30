@@ -173,7 +173,12 @@ def bench_zoo(
 
     factors = AlphaFactorRegistry.get_by_zoo(zoo)
     if not factors:
-        return {"note": f"No factors found for zoo '{zoo.value}'"}
+        return {
+            "zoo": zoo.value,
+            "aggregate": {"n_factors": 0},
+            "factors": [],
+            "note": f"No factors found for zoo '{zoo.value}'",
+        }
 
     results = []
     for factor in factors:

@@ -37,6 +37,7 @@ One-liner per change. Date, category, summary.
 - **bugfix** — Empty sanitized stack/swarm tag tokens now fall back to `unknown` instead of emitting empty `stack:`/`swarm:` suffixes.
 - **bugfix** — `supermodel-report` now normalizes scan swarm decisions to lowercase (`approve/reject/hold`) so scan alignment and trade outcomes group consistently.
 - **feature** — `supermodel-report` now shows open trade counts per stack decision, making pending paper exposure visible by model bucket.
+- **feature** — `supermodel-report` now also shows open trade counts per swarm+stack pair, exposing pending paper risk by agent/stack agreement.
 - **tests** — Phase 2A: 52 tests for `db/` package (session, 7 models, 7 repositories) — 1474 passing.
 - **tests** — Phase 2B: 17 tests for `events/orchestrator.py` (4 handlers, event flow) — 1491 passing.
 - **tests** — Phase 2C: 48 tests across 6 modules (daily_signal_engine, fills, alerts, snapshots, yfinance_provider, provider_base) — 1539 passing.
@@ -200,3 +201,36 @@ One-liner per change. Date, category, summary.
 - **rl-fix** — Added `data_end_date` to TradingConfig to prevent training-on-test leakage. Sweeps train on data ending 2025-06-24, walk-forward from 2025-06-25.
 - **rl-polygon** — Added PolygonProvider with 429 rate-limit retry (2s/4s/6s backoff). Period pattern parser now supports arbitrary "3y"/"6m" intervals via regex fallback.
 - **bugfix** — Provider stack resolution failed when Polygon/Finnhub API keys were missing: `PolygonProvider()` constructor raised `ValueError` during `_resolve_provider_stack()`, which propagated before Alpaca was tried. Fixed by moving provider instantiation inside the try-except loop in `_fallback_fetch()`, so failed providers are skipped and the next one is tried. Also fixed swarm overlay to pass `settings.market_data` to `fetch_bars()` (was using default yfinance fallback).
+
+---
+
+## 2026-06-30 (Session 4)
+
+- **feature** — **Ticker re-entry cooldown**: Added `ticker_reentry_cooldown_minutes` (default 30) to `RiskSettings`. Blocks re-entering a ticker within N minutes of exit to prevent whipsaws. Gate in `run_paper_trade()` after duplicate open ticker check. Uses existing `PortfolioState.last_exited_at` dict. 12 tests.
+- **feature** — **YELLOW mean-reversion acceptance**: Added `allow_yellow_mean_reversion` to `AppSettings` and `yellow_allocation_pct` (0.5) to `RiskSettings`. When enabled, YELLOW signals that pass one of three mean-reversion detectors (oversold bounce, VWAP reversion, range-bound reversal) are accepted with halved position size. Added `is_valid_mean_reversion_setup()` to `setup_rules.py`; wired `rsi_14`, Bollinger Bands, and VWAP indicator computation into V2.5 signal path in `_build_signal_result()`. 10 tests.
+- **feature** — **V2.5 confluence scoring gate**: Added `min_entry_confluence_score` (default 4.0, range 0-12) to `AppSettings`. `compute_v25_confluence_score()` in `setup_rules.py` computes a 3-factor score (volume, breakout strength, daily regime alignment). Rejects signals below threshold in `run_paper_trade()`. RL signals bypass. 10 tests.
+- **feature** — **RL whipsaw penalty reward**: Added `WhipsawPenaltyReward` to `trading_bot/rl/rewards.py`. Tracks recent step returns; applies subtractive penalty when a large loss is followed by a marginal change (classic whipsaw pattern). Stateful with `reset()`. 
+- **feature** — **RL position duration bonus**: Added `PositionDurationBonus` to rewards.py. Rewards holding positions through neutral steps (small bonus per step) to discourage rapid in/out. Resets on large price moves.
+- **config** — Added `model_paths` (list) and `untrained_confidence_threshold_multiplier` (default 0.8) to `RLSettings` for multi-model support.
+- **config** — `burn-in-config.yaml` updated: `allow_yellow_mean_reversion: true`, `min_entry_confluence_score: 4.0`, `ticker_reentry_cooldown_minutes: 30`, `yellow_allocation_pct: 0.5`.
+- **tests** — Full suite: 1770 passing (5 pre-existing flaky failures). 48 new tests across 4 new test files.
+
+---
+
+## 2026-06-30 (Session 5)
+
+- **feature** — **Stop loss calibration**: Increased `atr_stop_multiplier` default from 1.5→3.0. Added `min_stop_distance_pct` (0.0=disabled, opt-in per config) to `RiskSettings`. Enforced in both `intraday_signal_engine.py` (V2.5) and `strategy_selector.py` (V3). Added `min_stop_distance_pct` param to `generate_signal()`, `generate_recent_signal()`, `generate_signal_with_reason()`, and `StrategySelector`. 8 tests.
+- **feature** — **V3 YELLOW mean-reversion wiring**: `_build_v3_signal_result()` in orchestrator now sets `details["is_mean_reversion"]` when the V3 selector picks a mean-reversion setup OR when `is_valid_mean_reversion_setup()` fires on the intraday frame. The YELLOW acceptance gate now works for V3 signals too. 3 tests.
+- **feature** — **Time-based exit**: Added `time_exit_minutes` (default 0=disabled) to `SessionSettings`. Forces exit on positions held longer than the threshold. Wired into both `continuous_loop.py` manage-positions and `cli/app.py` manage-positions (exit priority 4, between profit target and counter-thesis).
+- **feature** — **V3 selector debug logging**: Added `logger.debug()` calls in `strategy_selector.py` to surface why signals are rejected: regime blocked, no setups found, or confidence too low. Logs regime, setup name, signal score, and confidence at each decision point.
+- **feature** — **Trade attribution CLI**: Added `trade-attribution` command to show P&L breakdown by ticker with entry/exit prices, returns, holding times, win rate, and profit factor.
+- **config** — Burn-in confidence gates relaxed: `MIN_PROFIT_FACTOR` 0.8→0.5, `MIN_POSITIVE_WINDOWS` 60%→30%, `MIN_TRADES` 10→5. Halt log reset. Burn-in log dir corrected to `logs/`.
+- **config** — `burn-in-config.yaml` updated: `atr_stop_multiplier: 3.0`, `min_stop_distance_pct: 3.0`, `time_exit_minutes: 120`.
+- **config** — `config.yaml` updated: `atr_stop_multiplier: 3.0`, `min_stop_distance_pct: 3.0`.
+- **bugfix** — Paper trade stack/swarm `strategy_tag` suffixes now clamp at the DB column limit even when both labels are malformed/long.
+- **bugfix** — Re-entry cooldown and time-exit checks now handle timezone-aware ledger timestamps without crashing paper/manage flows.
+- **bugfix** — Continuous manage loop now uses current latency/session/trailing-stop settings and formats open-position `highest_high` lines without error.
+- **bugfix** — `trade-attribution` now reports infinite profit factor as `inf` when there are wins and no losses instead of a fake huge ratio.
+- **bugfix** — `trade-attribution` now matches sells only to prior buys, preventing future re-entry buys from corrupting held-time/return display.
+- **bugfix** — Alpha zoo benching now returns stable `aggregate`/`factors` keys even when a requested zoo has no registered factors.
+- **tests** — Full suite: 1791 passing in sandbox; 4 live-dashboard socket tests pass with localhost-bind escalation. 56 new tests across 7 new test files.

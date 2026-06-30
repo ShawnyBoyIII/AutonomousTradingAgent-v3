@@ -796,7 +796,7 @@ def test_scan_command_sorts_approved_candidates_and_prints_richer_fields(
     assert result.stdout.strip().splitlines() == [
         "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout",
         "MSFT APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=201.00 qty=19 rr=2.00 conf=0.80 risk=$76.00 alloc=0.19 entry=201.00 stop=199.80 target=203.40 reasons=bullish daily regime; intraday breakout",
-        "summary symbols=2 approved=2 green=2 yellow=0 rejected=0 no_signal=0 errors=0",
+        "summary symbols=2 approved=2 green=2 yellow=0 rejected=0 no_signal=0 errors=0 supermodel_support=2 supermodel_caution=0 supermodel_block=0 supermodel_no_signal=0",
     ]
     log_text = (tmp_path / "logs" / "decision-log.jsonl").read_text(encoding="utf-8")
     assert '"command": "scan"' in log_text
@@ -938,6 +938,8 @@ def test_scan_command_writes_empty_snapshot_for_no_signal(monkeypatch, tmp_path:
             "ticker": "AAPL",
             "status": "NO_SIGNAL",
             "reason": "daily regime not bullish",
+            "supermodel_decision": "no_signal",
+            "supermodel_score": 0.0,
         }
     ]
 
@@ -1049,7 +1051,8 @@ def test_scan_command_can_print_gate_details(monkeypatch, tmp_path: Path) -> Non
     assert result.stdout.strip() == (
         "AAPL NO_SIGNAL reason=daily regime not bullish "
         "daily_close=98.00 ema_20=99.81 sma_50=99.96 "
-        "intraday_close=101.00 range_high=100.40 volume=2500 volume_avg=1320.00 volume_ratio=1.89"
+        "intraday_close=101.00 range_high=100.40 volume=2500 volume_avg=1320.00 volume_ratio=1.89 "
+        "supermodel=no_signal:0.0 supermodel_layers=setup:neutral:0.00"
     )
     snapshot = json.loads((tmp_path / "state" / "scan_results.json").read_text(encoding="utf-8"))
     assert snapshot["candidates"][0]["details"] == {
@@ -1061,6 +1064,9 @@ def test_scan_command_can_print_gate_details(monkeypatch, tmp_path: Path) -> Non
         "volume": 2500,
         "volume_avg": 1320.0,
         "volume_ratio": 1.89,
+        "supermodel_decision": "no_signal",
+        "supermodel_score": 0.0,
+        "supermodel_layers": "setup:neutral:0.00",
     }
 
 
@@ -3317,6 +3323,96 @@ def test_report_command_prints_summary_and_exports_files(monkeypatch, tmp_path: 
     assert dashboard_snapshot["mode"] == "report"
     assert dashboard_snapshot["summary"]["net_pnl"] == 175.5
     assert dashboard_snapshot["rows"][0]["ticker"] == "AAPL"
+
+
+def test_trade_attribution_reports_infinite_profit_factor_without_losses(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    ledger = PortfolioLedger(db_path)
+    ledger.record_fill(
+        FillResult(
+            order_id="buy-1",
+            ticker="AAPL",
+            quantity=2,
+            fill_price=100.0,
+            fees=0.0,
+            filled_at=datetime(2026, 6, 13, 10, 0, 0),
+        ),
+        side="BUY",
+    )
+    ledger.record_fill(
+        FillResult(
+            order_id="sell-1",
+            ticker="AAPL",
+            quantity=2,
+            fill_price=110.0,
+            fees=0.0,
+            filled_at=datetime(2026, 6, 13, 11, 0, 0),
+        ),
+        side="SELL",
+        realized_pnl=20.0,
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "trade-attribution"])
+
+    assert result.exit_code == 0
+    assert "Profit factor: inf" in result.stdout
+
+
+def test_trade_attribution_does_not_match_sell_to_future_buy(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    ledger = PortfolioLedger(db_path)
+    ledger.record_fill(
+        FillResult(
+            order_id="buy-1",
+            ticker="AAPL",
+            quantity=1,
+            fill_price=100.0,
+            fees=0.0,
+            filled_at=datetime(2026, 6, 13, 10, 0, 0),
+        ),
+        side="BUY",
+    )
+    ledger.record_fill(
+        FillResult(
+            order_id="sell-1",
+            ticker="AAPL",
+            quantity=1,
+            fill_price=110.0,
+            fees=0.0,
+            filled_at=datetime(2026, 6, 13, 11, 0, 0),
+        ),
+        side="SELL",
+        realized_pnl=10.0,
+    )
+    ledger.record_fill(
+        FillResult(
+            order_id="buy-2",
+            ticker="AAPL",
+            quantity=1,
+            fill_price=200.0,
+            fees=0.0,
+            filled_at=datetime(2026, 6, 13, 12, 0, 0),
+        ),
+        side="BUY",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "trade-attribution"])
+
+    assert result.exit_code == 0
+    assert "AAPL        100.00    110.00" in result.stdout
+    assert "60m" in result.stdout
 
 
 def test_backtest_command_replays_data_and_prints_summary(monkeypatch, tmp_path: Path) -> None:
