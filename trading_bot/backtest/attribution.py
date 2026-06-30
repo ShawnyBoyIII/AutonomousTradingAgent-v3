@@ -114,8 +114,8 @@ def _winner_loser_analysis(result: dict[str, Any]) -> dict[str, Any]:
     wins = result.get("wins", 0)
     losses = result.get("losses", 0)
 
-    # Win/loser ratio
-    win_loss_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else float("inf")
+    # Win/loser ratio (cap to None when avg_loss is 0 to avoid inf which is not JSON-serializable)
+    win_loss_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else None
 
     # Profit factor
     loss_abs = abs(gross_loss)
@@ -131,7 +131,7 @@ def _winner_loser_analysis(result: dict[str, Any]) -> dict[str, Any]:
     return {
         "avg_win": round(avg_win, 2),
         "avg_loss": round(avg_loss, 2),
-        "win_loss_ratio": round(win_loss_ratio, 2),
+        "win_loss_ratio": round(win_loss_ratio, 2) if win_loss_ratio is not None else None,
         "profit_factor": profit_factor,
         "expectancy": expectancy,
         "gross_profit": round(gross_profit, 2),
@@ -142,7 +142,13 @@ def _winner_loser_analysis(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _holding_period_analysis(result: dict[str, Any]) -> dict[str, Any]:
-    """Holding period statistics."""
+    """Walk-forward window statistics.
+
+    Despite the name, this function reports per-window trade counts and P&L
+    stats from walk-forward windows, not actual holding durations.  When
+    detailed trade records with entry/exit timestamps become available, a
+    future enhancement can compute true holding-period distributions.
+    """
     # If we have window data (walk-forward), extract holding periods
     windows = result.get("windows", [])
 
@@ -199,7 +205,13 @@ def _exit_reason_attribution(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _signal_quality_attribution(result: dict[str, Any]) -> dict[str, Any]:
-    """Signal quality correlation with P&L."""
+    """Classify tickers into win-rate tiers and summarize per-tier stats.
+
+    This is a realized-win-rate tier analysis, not a forward-looking signal
+    quality correlation.  When V3 confidence metadata (``v3_confidence``,
+    ``v3_total_score``) is available in trade rows, a future enhancement can
+    correlate signal confidence with P&L.
+    """
     # Analyze if higher confidence signals produce better results
     rows = result.get("rows", [])
 
@@ -251,50 +263,74 @@ def _beta_regression(
     benchmark_data: pd.DataFrame,
     risk_free_rate: float = 0.05,
 ) -> dict[str, Any]:
-    """Beta regression against benchmark."""
+    """Beta regression against benchmark.
+
+    Requires a per-bar strategy return series (``result["strategy_returns"]``)
+    aligned to the benchmark for a meaningful CAPM beta.  When the runner does
+    not supply that series, the function degrades gracefully with an
+    explanatory note instead of producing a broken statistic.
+    """
     try:
-        # Calculate daily returns from benchmark
         benchmark_returns = benchmark_data["close"].pct_change().dropna()
 
         if len(benchmark_returns) < 20:
             return {"note": "Insufficient benchmark data for beta calculation"}
 
-        # Calculate strategy returns (simplified from net_pnl)
-        net_pnl = result.get("net_pnl", 0.0)
         trades = result.get("trades", 0)
-
         if trades == 0:
             return {"note": "No trades to calculate beta"}
 
-        # Use win rate and profit factor as proxy for strategy performance
-        gross_profit = result.get("gross_profit", 0.0)
-        gross_loss = result.get("gross_loss", 0.0)
+        strategy_returns = result.get("strategy_returns")
 
-        # Calculate alpha and beta
-        strategy_return = net_pnl / 10000.0  # Assume $10k starting capital
+        if strategy_returns is not None:
+            strategy_returns = pd.Series(strategy_returns).reindex(benchmark_returns.index).dropna()
+            benchmark_aligned = benchmark_returns.reindex(strategy_returns.index)
+
+            if len(strategy_returns) < 20:
+                return {"note": "Insufficient aligned strategy returns for beta calculation"}
+
+            cov_matrix = np.cov(strategy_returns, benchmark_aligned)
+            bench_var = cov_matrix[1, 1]
+            beta = float(cov_matrix[0, 1] / bench_var) if bench_var != 0 else 1.0
+
+            strategy_return = float(strategy_returns.sum())
+            benchmark_return = float(benchmark_aligned.sum())
+            alpha = strategy_return - (risk_free_rate + beta * (benchmark_return - risk_free_rate))
+
+            strategy_vol = float(strategy_returns.std()) * (252 ** 0.5)
+            sharpe = (strategy_return - risk_free_rate) / strategy_vol if strategy_vol > 0 else 0.0
+
+            return {
+                "beta": round(beta, 3),
+                "alpha": round(float(alpha), 4),
+                "sharpe_ratio": round(float(sharpe), 2),
+                "benchmark_return": round(float(benchmark_return), 4),
+                "strategy_return": round(float(strategy_return), 4),
+                "risk_free_rate": risk_free_rate,
+                "interpretation": _interpret_beta_alpha(beta, alpha),
+            }
+
+        # Degraded path: no aligned strategy return series available
+        net_pnl = result.get("net_pnl", 0.0)
+        strategy_return = net_pnl / 10000.0
         benchmark_return = (
             benchmark_data["close"].iloc[-1] / benchmark_data["close"].iloc[0] - 1
         )
-
-        # Simple beta estimation
-        cov_matrix = np.cov(benchmark_returns, net_pnl / max(trades, 1))
-        beta = cov_matrix[0, 1] / cov_matrix[0, 0] if cov_matrix[0, 0] != 0 else 1.0
-
-        # Alpha calculation (Jensen's alpha)
-        alpha = strategy_return - (risk_free_rate + beta * (benchmark_return - risk_free_rate))
-
-        # Sharpe ratio
-        volatility = benchmark_returns.std() * (252 ** 0.5)
-        sharpe = (strategy_return - risk_free_rate) / volatility if volatility > 0 else 0.0
+        benchmark_vol = float(benchmark_returns.std()) * (252 ** 0.5)
+        sharpe_proxy = (strategy_return - risk_free_rate) / benchmark_vol if benchmark_vol > 0 else 0.0
 
         return {
-            "beta": round(float(beta), 3),
-            "alpha": round(float(alpha), 4),
-            "sharpe_ratio": round(float(sharpe), 2),
-            "benchmark_return": round(float(benchmark_return), 4),
+            "note": (
+                "Beta requires a per-bar strategy return series aligned to the "
+                "benchmark. Aggregate backtest summary stats cannot produce a "
+                "meaningful beta. Provide result['strategy_returns'] for full "
+                "CAPM analysis."
+            ),
             "strategy_return": round(float(strategy_return), 4),
+            "benchmark_return": round(float(benchmark_return), 4),
+            "sharpe_proxy": round(float(sharpe_proxy), 2),
+            "sharpe_proxy_note": "Sharpe uses benchmark volatility as a proxy; not a true strategy Sharpe.",
             "risk_free_rate": risk_free_rate,
-            "interpretation": _interpret_beta_alpha(beta, alpha),
         }
 
     except Exception as e:
@@ -412,19 +448,14 @@ def _monte_carlo_simulation(
         avg_win = result.get("avg_win", 0.0)
         avg_loss = result.get("avg_loss", 0.0)
 
-        # Simulate future performance
-        simulated_pnls = []
-        for _ in range(num_simulations):
-            # Random walk of trades
-            sim_pnl = 0.0
-            for _ in range(trades):
-                if np.random.random() < win_rate:
-                    sim_pnl += avg_win * np.random.uniform(0.5, 1.5)
-                else:
-                    sim_pnl += avg_loss * np.random.uniform(0.5, 1.5)
-            simulated_pnls.append(sim_pnl)
+        # Simulate future performance with proper per-trade equity paths
+        rng = np.random.default_rng()
+        win_mask = rng.random((num_simulations, trades)) < win_rate
+        win_amounts = avg_win * rng.uniform(0.5, 1.5, (num_simulations, trades))
+        loss_amounts = avg_loss * rng.uniform(0.5, 1.5, (num_simulations, trades))
+        per_trade_pnl = np.where(win_mask, win_amounts, loss_amounts)
 
-        simulated_pnls = np.array(simulated_pnls)
+        simulated_pnls = per_trade_pnl.sum(axis=1)
 
         # Calculate confidence intervals
         ci_results = {}
@@ -442,11 +473,12 @@ def _monte_carlo_simulation(
         # Probability of profitability
         prob_profit = np.mean(simulated_pnls > 0)
 
-        # Max drawdown simulation
-        cum_returns = np.cumsum(simulated_pnls / max(trades, 1))
-        running_max = np.maximum.accumulate(cum_returns)
-        drawdowns = running_max - cum_returns
-        max_drawdown = np.max(drawdowns)
+        # Max drawdown: compute along the trade axis per simulation, then take 95th pct
+        equity_paths = np.cumsum(per_trade_pnl, axis=1)
+        running_max = np.maximum.accumulate(equity_paths, axis=1)
+        drawdowns = running_max - equity_paths
+        max_drawdown_per_sim = np.max(drawdowns, axis=1)
+        max_drawdown = float(np.percentile(max_drawdown_per_sim, 95))
 
         return {
             "num_simulations": num_simulations,

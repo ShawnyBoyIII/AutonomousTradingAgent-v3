@@ -210,7 +210,7 @@ class MarketDataCache:
         if df.empty:
             return json.dumps({"empty": True})
 
-        def _convert_value(v):
+        def _convert_value(v: Any) -> Any:
             if isinstance(v, (pd.Timestamp, datetime)):
                 return v.isoformat() if hasattr(v, "isoformat") else str(v)
             return v

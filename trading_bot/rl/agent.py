@@ -75,8 +75,8 @@ class RLAgent:
                     meta_symbols = [s.strip().upper() for s in meta.get("symbols", ["AAPL"])]
                     meta_max_symbols = meta.get("max_symbols")
                     meta_action_scheme = meta.get("action_scheme")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("RL agent error: %s", e)
 
         config = RLAgentConfig(
             enabled=True,
@@ -301,8 +301,8 @@ class RLAgent:
                 confidence = min(confidence, 1.0)
             elif confidence < 0.5:
                 confidence = 0.5
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("RL agent error: %s", e)
 
         return normalized_action, confidence
 

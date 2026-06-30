@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class TechnicalAnalystWorker(BaseSwarmWorker):
     """Technical analysis worker using indicators and chart patterns."""
 
-    def __init__(self, config: WorkerConfig):
+    def __init__(self, config: WorkerConfig) -> None:
         super().__init__(config)
 
     def execute(
@@ -192,7 +192,7 @@ class TechnicalAnalystWorker(BaseSwarmWorker):
 class RiskManagerWorker(BaseSwarmWorker):
     """Risk assessment worker evaluating portfolio impact and risk metrics."""
 
-    def __init__(self, config: WorkerConfig):
+    def __init__(self, config: WorkerConfig) -> None:
         super().__init__(config)
 
     def execute(
@@ -206,6 +206,7 @@ class RiskManagerWorker(BaseSwarmWorker):
         analysis_parts = []
         signals = []
         ticker_results = {}
+        worker_results = kwargs.get("worker_results", {})
 
         # Portfolio-level risk checks
         if portfolio_state:
@@ -221,9 +222,25 @@ class RiskManagerWorker(BaseSwarmWorker):
 
             ticker_risks = self._assess_ticker_risk(ticker, frame, portfolio_state)
             risks.extend(ticker_risks)
+            technical_context = self._worker_vote_context(
+                worker_results,
+                "technical_analyst",
+                ticker,
+            )
+            fundamental_context = self._worker_vote_context(
+                worker_results,
+                "fundamental_analyst",
+                ticker,
+            )
 
             # Generate risk-adjusted signal
-            signal = self._risk_adjusted_signal(ticker, frame, ticker_risks)
+            signal = self._risk_adjusted_signal(
+                ticker,
+                frame,
+                ticker_risks,
+                technical_context,
+                fundamental_context,
+            )
             if signal:
                 signals.append(signal.model_dump())
                 ticker_results[ticker] = signal.model_dump()
@@ -237,8 +254,24 @@ class RiskManagerWorker(BaseSwarmWorker):
             signals=signals,
             analysis="\n".join(analysis_parts),
             ticker_results=ticker_results,
-            data={"risks": risks, "total_risks": len(risks)},
+            data={
+                "risks": risks,
+                "total_risks": len(risks),
+                "upstream_workers": sorted(worker_results),
+            },
         )
+
+    def _worker_vote_context(
+        self,
+        worker_results: dict[str, Any],
+        worker_name: str,
+        ticker: str,
+    ) -> dict[str, Any]:
+        result = worker_results.get(worker_name)
+        if not isinstance(result, WorkerResult):
+            return {}
+        vote = result.ticker_results.get(ticker)
+        return vote if isinstance(vote, dict) else {}
 
     def _assess_portfolio_risk(self, portfolio_state: dict[str, Any]) -> list[str]:
         """Assess portfolio-level risks."""
@@ -306,6 +339,8 @@ class RiskManagerWorker(BaseSwarmWorker):
         ticker: str,
         frame: pd.DataFrame,
         risks: list[str],
+        technical_context: dict[str, Any] | None = None,
+        fundamental_context: dict[str, Any] | None = None,
     ) -> SignalVote | None:
         """Generate risk-adjusted signal."""
         try:
@@ -336,7 +371,13 @@ class RiskManagerWorker(BaseSwarmWorker):
                 worker_name=self.config.name,
                 preset=self.config.preset,
                 reasons=risks,
-                metadata={"risk_count": len(risks)},
+                metadata={
+                    "risk_count": len(risks),
+                    "technical_action": (technical_context or {}).get("action"),
+                    "technical_confidence": (technical_context or {}).get("confidence"),
+                    "fundamental_action": (fundamental_context or {}).get("action"),
+                    "fundamental_confidence": (fundamental_context or {}).get("confidence"),
+                },
             )
 
         except Exception as e:
@@ -347,7 +388,7 @@ class RiskManagerWorker(BaseSwarmWorker):
 class QuantFactorWorker(BaseSwarmWorker):
     """Quantitative factor model worker."""
 
-    def __init__(self, config: WorkerConfig):
+    def __init__(self, config: WorkerConfig) -> None:
         super().__init__(config)
 
     def execute(
@@ -480,7 +521,7 @@ class QuantFactorWorker(BaseSwarmWorker):
 class FundamentalAnalystWorker(BaseSwarmWorker):
     """Fundamental analysis worker using price-based proxies."""
 
-    def __init__(self, config: WorkerConfig):
+    def __init__(self, config: WorkerConfig) -> None:
         super().__init__(config)
 
     def execute(
@@ -631,7 +672,7 @@ class FundamentalAnalystWorker(BaseSwarmWorker):
 class MacroStrategistWorker(BaseSwarmWorker):
     """Macro strategy worker analyzing market regime and sector rotation."""
 
-    def __init__(self, config: WorkerConfig):
+    def __init__(self, config: WorkerConfig) -> None:
         super().__init__(config)
 
     def execute(
@@ -781,7 +822,7 @@ class MacroStrategistWorker(BaseSwarmWorker):
 class PatternRecognizerWorker(BaseSwarmWorker):
     """Chart pattern recognition worker."""
 
-    def __init__(self, config: WorkerConfig):
+    def __init__(self, config: WorkerConfig) -> None:
         super().__init__(config)
 
     def execute(
@@ -990,7 +1031,7 @@ class PatternRecognizerWorker(BaseSwarmWorker):
 class OnChainAnalystWorker(BaseSwarmWorker):
     """Volume and order flow analysis worker (equity-adapted)."""
 
-    def __init__(self, config: WorkerConfig):
+    def __init__(self, config: WorkerConfig) -> None:
         super().__init__(config)
 
     def execute(

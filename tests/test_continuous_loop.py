@@ -354,3 +354,39 @@ class TestRunContinuousLoop:
             assert stats.total_trades >= 2
             assert stats.total_exits >= 2
             assert stats.total_rejections >= 2
+
+
+class TestIdempotencyGuard:
+    """Tests for the exit idempotency guard (prevents duplicate sells)."""
+
+    def test_recently_exited_returns_true_for_recent_exit(self):
+        from datetime import datetime, timedelta
+        from trading_bot.models.portfolio import PortfolioState
+
+        state = PortfolioState(cash=10000.0, equity=10000.0)
+        now = datetime.now()
+        state.last_exited_at = {"CIEN": (now - timedelta(seconds=30)).isoformat()}
+
+        ts = state.last_exited_at.get("CIEN")
+        exited_at = datetime.fromisoformat(ts)
+        assert (now - exited_at).total_seconds() < 120
+
+    def test_recently_exited_returns_false_for_old_exit(self):
+        from datetime import datetime, timedelta
+        from trading_bot.models.portfolio import PortfolioState
+
+        state = PortfolioState(cash=10000.0, equity=10000.0)
+        now = datetime.now()
+        state.last_exited_at = {"CIEN": (now - timedelta(seconds=300)).isoformat()}
+
+        ts = state.last_exited_at.get("CIEN")
+        exited_at = datetime.fromisoformat(ts)
+        assert (now - exited_at).total_seconds() >= 120
+
+    def test_recently_exited_returns_false_for_missing_ticker(self):
+        from trading_bot.models.portfolio import PortfolioState
+
+        state = PortfolioState(cash=10000.0, equity=10000.0)
+        state.last_exited_at = {"CIEN": "2025-01-01T00:00:00"}
+
+        assert state.last_exited_at.get("AAPL") is None

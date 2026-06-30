@@ -3539,3 +3539,78 @@ def test_paper_trade_v3_lifecycle_creates_position_and_tracks_pnl(monkeypatch, t
     assert len(buy_rows) == 1
     # PnL column exists and is None for BUY (realized PnL on sells only)
     assert "pnl" in buy_rows[0]
+
+
+def test_cache_data_command_with_symbols(monkeypatch, tmp_path: Path) -> None:
+    """Test cache-data command downloads and saves CSV for symbols."""
+    from unittest.mock import MagicMock
+    from trading_bot.cli.app import app
+    from typer.testing import CliRunner
+
+    runner = CliRunner()
+
+    # Mock fetch_bars to return a small DataFrame
+    mock_df = pd.DataFrame({
+        "close": [100.0, 101.0, 102.0],
+        "open": [99.0, 100.0, 101.0],
+        "high": [101.5, 102.0, 103.0],
+        "low": [98.5, 99.5, 100.5],
+        "volume": [1000, 1100, 1200],
+    })
+
+    def mock_fetch_bars(symbol, period="1y", interval="1d", start=None, end=None):
+        return mock_df.copy()
+
+    monkeypatch.setattr("trading_bot.data.market_data.fetch_bars", mock_fetch_bars)
+
+    output_dir = tmp_path / "cache"
+    result = runner.invoke(
+        app,
+        ["cache-data", "--symbols", "AAPL,MSFT", "--output-dir", str(output_dir)],
+    )
+
+    assert result.exit_code == 0
+    assert "AAPL" in result.stdout
+    assert "MSFT" in result.stdout
+    assert "2 cached" in result.stdout
+
+    # Verify CSV files were created
+    assert (output_dir / "AAPL.csv").exists()
+    assert (output_dir / "MSFT.csv").exists()
+
+
+def test_cache_data_command_from_watchlist(monkeypatch, tmp_path: Path) -> None:
+    """Test cache-data reads symbols from watchlist file."""
+    from trading_bot.cli.app import app
+    from typer.testing import CliRunner
+    from trading_bot.runtime.watchlist import write_watchlist
+
+    runner = CliRunner()
+
+    watchlist_path = tmp_path / "watchlist.txt"
+    write_watchlist(watchlist_path, ["AAPL", "GOOGL"])
+
+    output_dir = tmp_path / "cache"
+
+    mock_df = pd.DataFrame({
+        "close": [100.0, 101.0],
+        "open": [99.0, 100.0],
+        "high": [101.5, 102.0],
+        "low": [98.5, 99.5],
+        "volume": [1000, 1100],
+    })
+
+    def mock_fetch_bars(symbol, period="1y", interval="1d", start=None, end=None):
+        return mock_df.copy()
+
+    monkeypatch.setattr("trading_bot.data.market_data.fetch_bars", mock_fetch_bars)
+
+    result = runner.invoke(
+        app,
+        ["cache-data", "--watchlist-path", str(watchlist_path), "--output-dir", str(output_dir)],
+    )
+
+    assert result.exit_code == 0
+    assert "2 cached" in result.stdout
+    assert (output_dir / "AAPL.csv").exists()
+    assert (output_dir / "GOOGL.csv").exists()

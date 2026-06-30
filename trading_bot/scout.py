@@ -3,12 +3,13 @@ from __future__ import annotations
 from math import isfinite
 
 from trading_bot.config.settings import ScoutSettings
+from trading_bot.models.scout import ScoutCandidate, ScoutResult, ScoutSummary
 
 
 def build_scout_candidates(
     rows: list[dict[str, object]],
     settings: ScoutSettings,
-) -> dict[str, object]:
+) -> ScoutResult:
     grouped: dict[str, list[dict[str, object]]] = {}
     errors = 0
     for row in rows:
@@ -27,54 +28,54 @@ def build_scout_candidates(
     ]
     ranked = sorted(
         candidates,
-        key=lambda row: (
-            not bool(row["included"]),
-            -float(row["scout_score"]),
-            str(row["ticker"]),
+        key=lambda candidate: (
+            not candidate.included,
+            -candidate.scout_score,
+            candidate.ticker,
         ),
     )
 
     included_rank = 1
     included_count = 0
     included_symbols: list[str] = []
-    for row in ranked:
-        if row["included"] and included_count < settings.max_universe_size:
-            row["rank"] = included_rank
+    for candidate in ranked:
+        if candidate.included and included_count < settings.max_universe_size:
+            candidate.rank = included_rank
             included_rank += 1
             included_count += 1
-            included_symbols.append(str(row["ticker"]))
+            included_symbols.append(candidate.ticker)
             continue
-        if row["included"]:
-            row["included"] = False
-            row["reasons"].append("outside top universe limit")
-        row["rank"] = None
+        if candidate.included:
+            candidate.included = False
+            candidate.reasons.append("outside top universe limit")
+        candidate.rank = None
 
     ranked.sort(
-        key=lambda row: (
-            not bool(row["included"]),
-            row["rank"] if row["rank"] is not None else 999999,
-            -float(row["scout_score"]),
-            str(row["ticker"]),
+        key=lambda candidate: (
+            not candidate.included,
+            candidate.rank if candidate.rank is not None else 999999,
+            -candidate.scout_score,
+            candidate.ticker,
         )
     )
 
-    return {
-        "candidates": ranked,
-        "included_symbols": included_symbols,
-        "summary": {
-            "candidates": len(ranked),
-            "included": len(included_symbols),
-            "excluded": len(ranked) - len(included_symbols),
-            "errors": errors,
-        },
-    }
+    return ScoutResult(
+        candidates=ranked,
+        included_symbols=included_symbols,
+        summary=ScoutSummary(
+            candidates=len(ranked),
+            included=len(included_symbols),
+            excluded=len(ranked) - len(included_symbols),
+            errors=errors,
+        ),
+    )
 
 
 def _build_candidate(
     ticker: str,
     rows: list[dict[str, object]],
     settings: ScoutSettings,
-) -> dict[str, object]:
+) -> ScoutCandidate:
     source_names: list[str] = []
     for row in rows:
         source = str(row.get("source", "")).strip()
@@ -146,19 +147,19 @@ def _build_candidate(
         2,
     )
 
-    return {
-        "ticker": ticker,
-        "scout_score": scout_score,
-        "rank": None,
-        "included": included,
-        "source_hits": len(source_names),
-        "source_names": source_names,
-        "market_cap": int(market_cap) if market_cap is not None else None,
-        "price": round(price, 2) if price is not None else None,
-        "avg_dollar_volume": avg_dollar_volume,
-        "volume_ratio": volume_ratio,
-        "reasons": reasons,
-    }
+    return ScoutCandidate(
+        ticker=ticker,
+        scout_score=scout_score,
+        rank=None,
+        included=included,
+        source_hits=len(source_names),
+        source_names=source_names,
+        market_cap=int(market_cap) if market_cap is not None else None,
+        price=round(price, 2) if price is not None else None,
+        avg_dollar_volume=avg_dollar_volume,
+        volume_ratio=volume_ratio,
+        reasons=reasons,
+    )
 
 
 def _select_primary_row(
@@ -220,14 +221,6 @@ def _ticker(row: dict[str, object]) -> str:
         if value:
             return value
     return ""
-
-
-def _first_text(rows: list[dict[str, object]], key: str, default: str = "") -> str:
-    for row in rows:
-        value = str(row.get(key, "")).strip()
-        if value:
-            return value
-    return default
 
 
 def _max_float(rows: list[dict[str, object]], *keys: str) -> float | None:

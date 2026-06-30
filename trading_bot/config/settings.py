@@ -9,10 +9,13 @@ class AppSettings(BaseModel):
     watchlist_path: str = "state/watchlist.txt"
     universe_candidates_path: str = "state/universe_candidates.json"
     log_dir: str = "logs"
+    log_level: str = "INFO"
+    log_file: str | None = None
     dashboard_summary_path: str = "state/dashboard_summary.json"
     scan_results_path: str = "state/scan_results.json"
     portfolio_summary_path: str = "state/portfolio_summary.json"
     backtest_summary_path: str = "state/backtest_summary.json"
+    benchmark_symbol: str | None = None
 
 
 class MarketDataSettings(BaseModel):

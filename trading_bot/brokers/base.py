@@ -157,7 +157,7 @@ class BrokerAdapter(ABC):
     - All operations logged to audit trail
     """
     
-    def __init__(self, mode: BrokerMode, config: dict[str, Any]):
+    def __init__(self, mode: BrokerMode, config: dict[str, Any]) -> None:
         self.mode = mode
         self.config = config
         self._live_enabled = False  # Must explicitly enable

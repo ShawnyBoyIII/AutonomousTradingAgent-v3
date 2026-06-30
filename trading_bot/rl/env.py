@@ -343,12 +343,16 @@ class TradingEnv(gym.Env):
     @property
     def action_space(self) -> gym.spaces.Space:
         self._ensure_initialized()
-        return self._action_space  # type: ignore
+        if self._action_space is None:
+            raise RuntimeError("action_space not initialized")
+        return self._action_space
 
     @property
     def observation_space(self) -> gym.spaces.Space:
         self._ensure_initialized()
-        return self._observation_space  # type: ignore
+        if self._observation_space is None:
+            raise RuntimeError("observation_space not initialized")
+        return self._observation_space
 
     def get_portfolio_state(self) -> PortfolioState | None:
         return self._portfolio_state

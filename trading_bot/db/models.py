@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import (
@@ -16,6 +16,10 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class Base(DeclarativeBase):
@@ -34,7 +38,7 @@ class MarketData(Base):
     low = Column(Float, nullable=False)
     close = Column(Float, nullable=False)
     volume = Column(Integer, nullable=False)
-    fetched_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    fetched_at = Column(DateTime, nullable=False, default=utc_now)
 
     __table_args__ = (
         UniqueConstraint("ticker", "timeframe", "timestamp", name="uq_market_data"),
@@ -46,7 +50,7 @@ class ScanResult(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     ticker = Column(String(20), nullable=False, index=True)
-    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    timestamp = Column(DateTime, nullable=False, default=utc_now, index=True)
     action = Column(String(10), nullable=False)
     confidence = Column(Float, nullable=False)
     score = Column(Float, nullable=True)
@@ -67,7 +71,7 @@ class Trade(Base):
     stop_loss = Column(Float, nullable=True)
     profit_target = Column(Float, nullable=True)
     fees = Column(Float, nullable=False, default=0.0)
-    filled_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    filled_at = Column(DateTime, nullable=False, default=utc_now, index=True)
     strategy_tag = Column(String(50), nullable=True)
     status = Column(String(20), nullable=False, default="FILLED")
     exit_price = Column(Float, nullable=True)
@@ -95,7 +99,7 @@ class PortfolioSnapshot(Base):
     __tablename__ = "portfolio_snapshots"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    timestamp = Column(DateTime, nullable=False, default=utc_now, index=True)
     cash = Column(Float, nullable=False)
     equity = Column(Float, nullable=False)
     unrealized_pnl = Column(Float, nullable=False, default=0.0)
@@ -108,7 +112,7 @@ class ModelPrediction(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     ticker = Column(String(20), nullable=False, index=True)
-    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    timestamp = Column(DateTime, nullable=False, default=utc_now, index=True)
     action = Column(Integer, nullable=False)
     confidence = Column(Float, nullable=False)
     model_path = Column(String(255), nullable=True)
@@ -119,7 +123,7 @@ class Event(Base):
     __tablename__ = "events"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    timestamp = Column(DateTime, nullable=False, default=utc_now, index=True)
     event_type = Column(String(50), nullable=False)
     entity_type = Column(String(50), nullable=True)
     entity_id = Column(Integer, nullable=True)

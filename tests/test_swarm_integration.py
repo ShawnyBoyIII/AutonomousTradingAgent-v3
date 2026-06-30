@@ -81,7 +81,7 @@ class TestSwarmOverlayIntegration:
                 ):
                     from trading_bot.runtime.orchestrator import run_scan
 
-                    result = run_scan(["AAPL"], settings)
+                    result = run_scan(["AAPL"], settings, include_details=True)
 
                     # Swarm should not be called when disabled
                     mock_swarm.assert_not_called()
@@ -113,7 +113,7 @@ class TestSwarmOverlayIntegration:
                 ):
                     from trading_bot.runtime.orchestrator import run_scan
 
-                    result = run_scan(["AAPL"], settings)
+                    result = run_scan(["AAPL"], settings, include_details=True)
 
                     # Swarm should be called when enabled
                     mock_swarm.assert_called_once()
@@ -146,7 +146,7 @@ class TestSwarmOverlayIntegration:
                 ):
                     from trading_bot.runtime.orchestrator import run_scan
 
-                    result = run_scan(["AAPL"], settings)
+                    result = run_scan(["AAPL"], settings, include_details=True)
 
                     # Candidate rows should include swarm info
                     candidates = result["candidates"]
@@ -155,6 +155,7 @@ class TestSwarmOverlayIntegration:
                     if approved:
                         assert "swarm_decision" in approved[0]
                         assert approved[0]["swarm_decision"] == "APPROVE"
+                        assert "swarm:support" in approved[0]["details"]["supermodel_layers"]
 
     def test_swarm_summary_includes_stats(self, tmp_path: Path) -> None:
         """Test that swarm summary includes approval/rejection counts."""
@@ -246,3 +247,21 @@ class TestSwarmOverlayIntegration:
 
             results = _run_swarm_overlay(["AAPL"], settings)
             assert results == {}
+            assert mock_fetch.call_args.kwargs["period"] == settings.market_data.daily_period
+            assert mock_fetch.call_args.kwargs["interval"] == "1d"
+
+    def test_swarm_overlay_sets_up_workers(self, tmp_path: Path) -> None:
+        """Test overlay runs real workers instead of aggregating an empty engine."""
+        settings = Settings(
+            app={"state_db_path": str(tmp_path / "state.db")},
+            swarm={"enabled": True, "preset": "investment_committee"},
+        )
+
+        import trading_bot.data.market_data as market_data
+        with patch.object(market_data, "fetch_bars", return_value=_make_frame()):
+            from trading_bot.runtime.orchestrator import _run_swarm_overlay
+
+            results = _run_swarm_overlay(["AAPL"], settings)
+
+        assert "AAPL" in results
+        assert results["AAPL"].total_workers > 0

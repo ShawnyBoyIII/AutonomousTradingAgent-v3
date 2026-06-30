@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -13,6 +14,8 @@ from trading_bot.models.order import OrderRequest
 
 if TYPE_CHECKING:
     import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 class TradingEnv(gym.Env):
@@ -282,11 +285,11 @@ class TradingEnv(gym.Env):
         self, action: int, price: float, equity: float, reward: float
     ) -> None:
         action_names = {0: "HOLD", 1: "BUY", 2: "SELL"}
-        print(
-            f"Step {self._current_step}: {action_names.get(action, 'UNKNOWN')} | "
-            f"Price: ${price:.2f} | Equity: ${equity:.2f} | Reward: {reward:.4f}"
+        logger.info(
+            "Step %s: %s | Price: $%.2f | Equity: $%.2f | Reward: %.4f",
+            self._current_step, action_names.get(action, "UNKNOWN"), price, equity, reward,
         )
 
     def render(self) -> None:
         if self.render_mode == "human":
-            print(f"Episode finished. Final equity: ${self._get_portfolio_value(self._get_current_price()):.2f}")
+            logger.info("Episode finished. Final equity: $%.2f", self._get_portfolio_value(self._get_current_price()))

@@ -13,6 +13,7 @@ from trading_bot.swarm.base import BaseSwarmWorker, WorkerConfig, WorkerResult, 
 from trading_bot.swarm.presets import get_preset
 from trading_bot.swarm.results import (
     CommitteeDecision,
+    SignalVote,
     SwarmRunSummary,
     WorkerVerdict,
 )
@@ -27,7 +28,7 @@ class SwarmEngine:
     and result aggregation for multi-agent trading analysis.
     """
 
-    def __init__(self, preset_name: str, max_concurrent: int = 3):
+    def __init__(self, preset_name: str, max_concurrent: int = 3) -> None:
         self.preset_name = preset_name
         self.max_concurrent = max_concurrent
         self.workers: dict[str, BaseSwarmWorker] = {}
@@ -42,6 +43,9 @@ class SwarmEngine:
             worker_classes: Mapping of worker name to worker class.
         """
         configs = get_preset(self.preset_name)
+        self.workers = {}
+        self.results = {}
+        self.run_summary = None
 
         for config in configs:
             if config.name not in worker_classes:
@@ -97,10 +101,13 @@ class SwarmEngine:
     ) -> WorkerResult:
         """Execute a single worker."""
         try:
+            with self._lock:
+                worker_results = dict(self.results)
             result = worker.run(
                 symbols=symbols,
                 market_data=market_data,
                 portfolio_state=portfolio_state,
+                worker_results=worker_results,
                 **kwargs,
             )
             with self._lock:
@@ -137,6 +144,10 @@ class SwarmEngine:
         """
         run_id = str(uuid.uuid4())[:8]
         started_at = datetime.now(timezone.utc)
+        self.results = {}
+        for worker in self.workers.values():
+            worker.state = WorkerState.WAITING
+            worker.result = None
 
         self.run_summary = SwarmRunSummary(
             run_id=run_id,
@@ -243,33 +254,50 @@ class SwarmEngine:
             votes_abstain = 0
             rationales: list[str] = []
             risk_factors: list[str] = []
+            supporting_signals: list[SignalVote] = []
+            opposing_signals: list[SignalVote] = []
 
             for worker_name, result in self.results.items():
                 if symbol not in result.ticker_results:
                     continue
 
                 ticker_result = result.ticker_results[symbol]
+                signal_vote = None
                 # Handle both dict and object formats
                 if isinstance(ticker_result, dict):
                     action = ticker_result.get("action", "HOLD")
                     rationale = ticker_result.get("reasons", [])
+                    metadata = ticker_result.get("metadata", {})
                     risk_factors_list = ticker_result.get("risk_factors", [])
+                    try:
+                        signal_vote = SignalVote.model_validate(ticker_result)
+                    except (TypeError, ValueError):
+                        signal_vote = None
                 else:
                     if ticker_result.verdict is None:
                         continue
                     action = ticker_result.verdict.action
                     rationale = ticker_result.verdict.rationale or []
+                    metadata = {}
                     risk_factors_list = ticker_result.verdict.risk_factors or []
 
                 if action == "BUY":
                     votes_for += 1
+                    if signal_vote is not None:
+                        supporting_signals.append(signal_vote)
                 elif action == "SELL":
                     votes_against += 1
+                    if signal_vote is not None:
+                        opposing_signals.append(signal_vote)
                 else:
                     votes_abstain += 1
 
                 if rationale:
                     rationales.append(f"{worker_name}: {', '.join(rationale)}")
+                handoff = _handoff_rationale(worker_name, metadata)
+                if handoff:
+                    rationales.append(handoff)
+                    risk_factors.append(handoff)
                 if risk_factors_list:
                     risk_factors.extend(risk_factors_list)
 
@@ -300,7 +328,19 @@ class SwarmEngine:
                 votes_abstain=votes_abstain,
                 total_workers=total_votes,
                 key_rationale=key_rationale,
+                supporting_signals=supporting_signals,
+                opposing_signals=opposing_signals,
                 risk_factors=risk_factors[:10],
             )
 
         return decisions
+
+
+def _handoff_rationale(worker_name: str, metadata: dict[str, Any]) -> str | None:
+    if worker_name != "risk_manager":
+        return None
+    technical = metadata.get("technical_action")
+    fundamental = metadata.get("fundamental_action")
+    if not technical and not fundamental:
+        return None
+    return f"risk_manager handoff: technical={technical or 'n/a'} fundamental={fundamental or 'n/a'}"

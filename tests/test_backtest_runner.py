@@ -740,3 +740,156 @@ def test_run_backtest_passes_market_data_settings_to_fetches(monkeypatch) -> Non
     assert result["trades"] >= 0
     assert seen_providers
     assert all(provider == "alpaca" for provider in seen_providers)
+
+
+def test_run_symbol_backtest_intraday_produces_equity_curve() -> None:
+    daily = pd.DataFrame(
+        {
+            "close": [100.0 + index for index in range(60)],
+            "ema_20": [90.0 + index for index in range(60)],
+            "sma_50": [80.0 + index for index in range(60)],
+        }
+    )
+    intraday = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2026-06-13 10:00:00",
+                    "2026-06-13 10:05:00",
+                    "2026-06-13 10:10:00",
+                    "2026-06-13 10:15:00",
+                    "2026-06-13 10:20:00",
+                    "2026-06-13 10:25:00",
+                    "2026-06-13 10:30:00",
+                ]
+            ),
+            "open": [99.9, 100.1, 100.0, 100.2, 100.5, 101.0, 102.5],
+            "high": [100.1, 100.3, 100.2, 100.4, 101.1, 101.1, 103.5],
+            "low": [99.8, 100.0, 99.9, 100.1, 100.4, 99.7, 102.0],
+            "close": [100.0, 100.2, 100.1, 100.3, 101.0, 100.8, 103.0],
+            "volume": [1000, 1100, 950, 1050, 2500, 1500, 1800],
+        }
+    )
+    intraday["volume_avg_5"] = intraday["volume"].rolling(5).mean()
+
+    result = _run_symbol_backtest("AAPL", daily, intraday, Settings())
+
+    assert "equity_curve" in result
+    assert isinstance(result["equity_curve"], list)
+    assert len(result["equity_curve"]) == len(intraday)
+    assert all(isinstance(v, float) for v in result["equity_curve"])
+
+
+def test_run_backtest_summary_contains_strategy_returns(monkeypatch, tmp_path) -> None:
+    import trading_bot.data.market_data as market_data
+    from trading_bot.data.indicators import add_atr, add_bollinger_bands, add_ema, add_sma
+
+    closes = [100.0 + i * 0.5 for i in range(80)]
+    daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=80, freq="D"),
+            "open": [c - 0.2 for c in closes],
+            "high": [c + 1.0 for c in closes],
+            "low": [c - 1.0 for c in closes],
+            "close": closes,
+            "volume": [1_000_000] * 80,
+        }
+    )
+    daily = add_ema(daily, 20, "ema_20")
+    daily = add_sma(daily, 50, "sma_50")
+    daily = add_atr(daily, 14, "atr_14")
+    daily = add_bollinger_bands(daily, 20)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        return daily.copy(deep=True)
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    settings = Settings()
+    settings.app.log_dir = str(tmp_path)
+    settings.app.backtest_summary_path = str(tmp_path / "backtest_summary.json")
+
+    result = run_backtest(["AAPL"], settings, start="2026-01-01", end="2026-04-01")
+
+    assert "strategy_returns" in result
+    assert isinstance(result["strategy_returns"], list)
+    if result["trades"] > 0:
+        assert len(result["strategy_returns"]) >= 20
+        assert all(isinstance(r, float) for r in result["strategy_returns"])
+
+
+def test_run_backtest_strategy_returns_empty_when_no_trades(monkeypatch, tmp_path) -> None:
+    import trading_bot.data.market_data as market_data
+
+    daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=60, freq="D"),
+            "open": [100.0] * 60,
+            "high": [100.01] * 60,
+            "low": [99.99] * 60,
+            "close": [100.0] * 60,
+            "volume": [1000] * 60,
+        }
+    )
+    intraday = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-13", periods=20, freq="5min"),
+            "open": [100.0] * 20,
+            "high": [100.01] * 20,
+            "low": [99.99] * 20,
+            "close": [100.0] * 20,
+            "volume": [1000] * 20,
+        }
+    )
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        return daily.copy(deep=True) if interval == "1d" else intraday.copy(deep=True)
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    settings = Settings()
+    settings.app.log_dir = str(tmp_path)
+    settings.app.backtest_summary_path = str(tmp_path / "backtest_summary.json")
+
+    result = run_backtest(["AAPL"], settings, start="2026-01-01", end="2026-03-31")
+
+    assert "strategy_returns" in result
+    assert result["strategy_returns"] == []
+
+
+def test_run_backtest_includes_benchmark_returns_when_benchmark_available(monkeypatch, tmp_path) -> None:
+    import trading_bot.data.market_data as market_data
+
+    daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=60, freq="D"),
+            "open": [100.0] * 60,
+            "high": [100.01] * 60,
+            "low": [99.99] * 60,
+            "close": [100.0] * 60,
+            "volume": [1000] * 60,
+        }
+    )
+    benchmark = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=60, freq="D"),
+            "close": [100.0 + i for i in range(60)],
+            "volume": [1000] * 60,
+        }
+    )
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        return benchmark.copy(deep=True) if symbol == "SPY" else daily.copy(deep=True)
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    settings = Settings()
+    settings.app.log_dir = str(tmp_path)
+    settings.app.backtest_summary_path = str(tmp_path / "backtest_summary.json")
+    settings.app.benchmark_symbol = "SPY"
+
+    result = run_backtest(["AAPL"], settings, start="2026-01-01", end="2026-03-31")
+
+    assert "benchmark_returns" in result
+    assert isinstance(result["benchmark_returns"], list)
+    assert len(result["benchmark_returns"]) >= 20

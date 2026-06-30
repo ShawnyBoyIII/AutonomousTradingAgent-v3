@@ -97,7 +97,7 @@ def _build_universe(settings: Settings) -> list[str]:
         screeners=settings.scout.screeners,
     )
     scout_result = build_scout_candidates(rows, settings.scout)
-    included_symbols = scout_result["included_symbols"]
+    included_symbols = scout_result.included_symbols
 
     path = Path(settings.app.universe_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,12 +106,13 @@ def _build_universe(settings: Settings) -> list[str]:
     tmp_path.replace(path)
 
     snapshot_limit = max(settings.scout.max_universe_size, settings.scout.max_snapshot_candidates)
+    scout_dump = scout_result.model_dump()
     write_snapshot(
         settings.app.universe_candidates_path,
         {
             "mode": "universe",
-            "summary": scout_result["summary"],
-            "candidates": scout_result["candidates"][:snapshot_limit],
+            "summary": scout_dump["summary"],
+            "candidates": scout_dump["candidates"][:snapshot_limit],
         },
     )
 
@@ -134,18 +135,18 @@ def _read_universe_symbols(settings: Settings) -> list[str]:
     candidates_path = Path(settings.app.universe_candidates_path)
     if candidates_path.exists():
         import json
+        from trading_bot.models.scout import UniverseCandidatesSnapshot
+
         snapshot = json.loads(candidates_path.read_text(encoding="utf-8"))
-        candidates = snapshot.get("candidates", [])
-        if isinstance(candidates, list):
-            ranked = [
-                row for row in candidates
-                if isinstance(row, dict)
-                and row.get("included") is True
-                and str(row.get("ticker", "")).strip()
-            ]
-            if ranked:
-                ranked.sort(key=lambda row: int(row.get("rank") or 999999))
-                return [str(row["ticker"]).strip() for row in ranked]
+        parsed = UniverseCandidatesSnapshot.model_validate(snapshot)
+        ranked = [
+            candidate
+            for candidate in parsed.candidates
+            if candidate.included and candidate.ticker.strip()
+        ]
+        if ranked:
+            ranked.sort(key=lambda candidate: candidate.rank or 999999)
+            return [candidate.ticker.strip() for candidate in ranked]
 
     return []
 
@@ -203,6 +204,19 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
     log_path = Path(settings.app.log_dir) / "decision-log.jsonl"
     now = datetime.now()
 
+    # Idempotency guard: skip exits for tickers recently sold by a concurrent process
+    _EXIT_COOLDOWN_SECONDS = 120
+
+    def _recently_exited(ticker: str) -> bool:
+        ts = state.last_exited_at.get(ticker)
+        if not ts:
+            return False
+        try:
+            exited_at = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            return False
+        return (now - exited_at).total_seconds() < _EXIT_COOLDOWN_SECONDS
+
     for ticker, position in list(state.positions.items()):
         if position.quantity <= 0:
             continue
@@ -231,6 +245,11 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
             current_price = float(latest_bar["close"])
             line_parts = [f"{ticker} price={current_price:.2f} qty={position.quantity}"]
 
+            # Idempotency: skip if another process already sold this ticker
+            if _recently_exited(ticker):
+                lines.append(f"{ticker} SKIP recently-exited-cooldown")
+                continue
+
             # Exit priority 1: EOD exit
             if settings.app.exit_at_eod:
                 from trading_bot.runtime.session import should_eod_exit
@@ -246,6 +265,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                         exit_events=exit_events,
                         log_path=log_path,
                         reason="eod_exit",
+                        state=state,
                     )
                     continue
 
@@ -262,6 +282,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                     exit_events=exit_events,
                     log_path=log_path,
                     reason="stop_loss",
+                    state=state,
                 )
                 continue
 
@@ -278,6 +299,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                     exit_events=exit_events,
                     log_path=log_path,
                     reason="profit_target",
+                    state=state,
                 )
                 continue
 
@@ -298,6 +320,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                             exit_events=exit_events,
                             log_path=log_path,
                             reason="counter_thesis",
+                            state=state,
                         )
                         continue
 
@@ -321,6 +344,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                     exit_events=exit_events,
                     log_path=log_path,
                     reason="trailing_stop",
+                    state=state,
                 )
                 continue
 
@@ -382,6 +406,7 @@ def _close_position(
     exit_events: list[dict],
     log_path: Path,
     reason: str,
+    state: PortfolioState | None = None,
 ) -> None:
     """Close a position and record the fill."""
     estimated_fill_price = apply_slippage(current_price, broker.slippage_bps, "SELL")
@@ -405,10 +430,14 @@ def _close_position(
     updated_state = _portfolio_state_from_broker(
         broker,
         None,
-        previous_state=None,
+        previous_state=state,
         fill_fees=fill.fees,
         filled_at=fill.filled_at,
     )
+    # Record exit timestamp for idempotency guard against concurrent sells
+    if state is not None:
+        updated_state.last_exited_at = dict(state.last_exited_at)
+        updated_state.last_exited_at[ticker] = fill.filled_at.isoformat()
     ledger.save_portfolio_state(updated_state)
     ledger.record_equity_snapshot(updated_state, timestamp=fill.filled_at)
 

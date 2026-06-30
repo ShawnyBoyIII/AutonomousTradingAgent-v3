@@ -12,7 +12,9 @@ import typer
 logger = logging.getLogger(__name__)
 
 from trading_bot.config.loader import load_settings
+from trading_bot.config.settings import Settings
 from trading_bot.data.indicators import add_atr
+from trading_bot.logging_config import configure_from_settings
 from trading_bot.execution.paper_broker import PaperBroker
 from trading_bot.models.order import OrderRequest
 from trading_bot.models.portfolio import PortfolioState
@@ -36,11 +38,11 @@ from trading_bot.strategy.trailing_stop import next_trailing_stop
 app = typer.Typer(help="Paper-trading CLI for stocks and ETFs.")
 
 
-def now_in_zone(timezone: str):
+def now_in_zone(timezone: str) -> datetime:
     return runtime_session.now_in_zone(timezone)
 
 
-def should_eod_exit(now: datetime, settings):
+def should_eod_exit(now: datetime, settings: Settings) -> bool:
     return runtime_session.should_eod_exit(now, settings)
 
 
@@ -60,6 +62,7 @@ def main(
         if env_path:
             config_path = Path(env_path)
     ctx.obj = load_settings(config_path)
+    configure_from_settings(ctx.obj)
 
 
 @app.command()
@@ -596,6 +599,21 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
     ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
     state = ledger.ensure_portfolio_state()
 
+    # Idempotency guard: skip exits for tickers recently sold by a concurrent
+    # process.  Two manage-positions processes can read the same stale state and
+    # both try to sell the same ticker — this prevents duplicate fills.
+    _EXIT_COOLDOWN_SECONDS = 120  # 2-minute window after a sell
+
+    def _recently_existed(ticker: str) -> bool:
+        ts = state.last_exited_at.get(ticker)
+        if not ts:
+            return False
+        try:
+            exited_at = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            return False
+        return (datetime.now() - exited_at).total_seconds() < _EXIT_COOLDOWN_SECONDS
+
     # V2.5: Check kill switch
     allowed, reason = check_kill_switch_before_trade(ledger)
     if not allowed:
@@ -660,6 +678,10 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
                 },
             )
             lines.append(f"{ticker} SKIP reason=stale-data last=unknown")
+            continue
+        # Idempotency: skip if another process already sold this ticker
+        if _recently_existed(ticker):
+            lines.append(f"{ticker} SKIP recently-exited-cooldown")
             continue
         if eod_active:
             state, event, line = _fill_sell_position(
@@ -1118,22 +1140,22 @@ def _build_universe_file(settings) -> dict[str, object]:
         screeners=settings.scout.screeners,
     )
     scout_result = build_scout_candidates(rows, settings.scout)
-    included_symbols = scout_result["included_symbols"]
+    included_symbols = scout_result.included_symbols
     lines = [
         " ".join(
             [
-                str(candidate["rank"]),
-                str(candidate["ticker"]),
-                f"score={float(candidate['scout_score']):.2f}",
-                f"price={float(candidate['price'] or 0.0):.2f}",
-                f"market_cap={int(candidate['market_cap'] or 0)}",
-                f"avg_dollar_volume={float(candidate['avg_dollar_volume']):.2f}",
-                f"source_hits={int(candidate['source_hits'])}",
-                f"reasons={'; '.join(candidate['reasons'])}",
+                str(candidate.rank),
+                str(candidate.ticker),
+                f"score={float(candidate.scout_score):.2f}",
+                f"price={float(candidate.price or 0.0):.2f}",
+                f"market_cap={int(candidate.market_cap or 0)}",
+                f"avg_dollar_volume={float(candidate.avg_dollar_volume):.2f}",
+                f"source_hits={int(candidate.source_hits)}",
+                f"reasons={'; '.join(candidate.reasons)}",
             ]
         )
-        for candidate in scout_result["candidates"]
-        if candidate["included"]
+        for candidate in scout_result.candidates
+        if candidate.included
     ]
 
     path = Path(settings.app.universe_path)
@@ -1143,19 +1165,20 @@ def _build_universe_file(settings) -> dict[str, object]:
     tmp_path.replace(path)
 
     snapshot_limit = max(settings.scout.max_universe_size, settings.scout.max_snapshot_candidates)
+    scout_dump = scout_result.model_dump()
     write_snapshot(
         settings.app.universe_candidates_path,
         {
             "mode": "universe",
-            "summary": scout_result["summary"],
-            "candidates": scout_result["candidates"][:snapshot_limit],
+            "summary": scout_dump["summary"],
+            "candidates": scout_dump["candidates"][:snapshot_limit],
         },
     )
     lines.append(
-        f"summary candidates={scout_result['summary']['candidates']} "
-        f"included={scout_result['summary']['included']} "
-        f"excluded={scout_result['summary']['excluded']} "
-        f"errors={scout_result['summary']['errors']} path={path}"
+        f"summary candidates={scout_result.summary.candidates} "
+        f"included={scout_result.summary.included} "
+        f"excluded={scout_result.summary.excluded} "
+        f"errors={scout_result.summary.errors} path={path}"
     )
     return {"lines": lines, "symbols": included_symbols}
 
@@ -1173,19 +1196,19 @@ def _read_universe_symbols(path: Path) -> list[str]:
 
 
 def _read_ranked_universe_symbols(settings) -> list[str]:
+    from trading_bot.models.scout import UniverseCandidatesSnapshot
+
     snapshot = _load_json_snapshot(Path(settings.app.universe_candidates_path))
-    candidates = snapshot.get("candidates", [])
-    if isinstance(candidates, list):
+    if snapshot:
+        parsed = UniverseCandidatesSnapshot.model_validate(snapshot)
         ranked = [
-            row
-            for row in candidates
-            if isinstance(row, dict)
-            and row.get("included") is True
-            and str(row.get("ticker", "")).strip()
+            candidate
+            for candidate in parsed.candidates
+            if candidate.included and candidate.ticker.strip()
         ]
         if ranked:
-            ranked.sort(key=lambda row: int(row.get("rank") or 999999))
-            return [str(row["ticker"]).strip() for row in ranked]
+            ranked.sort(key=lambda candidate: candidate.rank or 999999)
+            return [candidate.ticker.strip() for candidate in ranked]
     return _read_universe_symbols(Path(settings.app.universe_path))
 
 
@@ -1345,7 +1368,6 @@ def _fill_sell_position(
         from trading_bot.db.repositories import update_trade_exit, close_position
         from trading_bot.db.models import Trade
         from sqlalchemy import select
-        from trading_bot.config.loader import load_settings
         cfg = load_settings()
         engine = init_db(cfg)
         session_factory = make_session_factory(engine)
@@ -1373,7 +1395,7 @@ def _fill_sell_position(
             session.close()
             engine.dispose()
     except Exception:
-        pass
+        logger.debug("Failed to persist sell trade to database")
     new_state = _portfolio_state_after_sell(
         previous_state=state,
         ticker=ticker,
@@ -1381,6 +1403,9 @@ def _fill_sell_position(
         fill_fees=fill.fees,
         broker=broker,
     )
+    # Record exit timestamp for idempotency guard against concurrent sells
+    new_state.last_exited_at = dict(state.last_exited_at)
+    new_state.last_exited_at[ticker] = fill.filled_at.isoformat()
     ledger.save_portfolio_state(new_state)
     ledger.record_equity_snapshot(new_state, timestamp=fill.filled_at)
     event = {
@@ -1580,6 +1605,14 @@ def _format_scan_summary(summary: dict[str, object]) -> str:
                 f"rl_sell={summary['rl_sell']}",
                 f"rl_unsupported={summary.get('rl_unsupported', 0)}",
                 f"rl_avg_conf={summary.get('rl_avg_confidence', 0.0)}",
+            ]
+        )
+    if summary.get("swarm_enabled"):
+        parts.extend(
+            [
+                f"swarm_approved={summary.get('swarm_approved', 0)}",
+                f"swarm_rejected={summary.get('swarm_rejected', 0)}",
+                f"swarm_hold={summary.get('swarm_hold', 0)}",
             ]
         )
     if "supermodel_support" in summary:
@@ -1899,8 +1932,8 @@ def risk_report(ctx: typer.Context) -> None:
                 bars = fetch_bars(ticker, period="1y", interval="1d", settings=settings.market_data)
                 if not bars.empty:
                     price_history[ticker] = [float(c) for c in bars["Close"].tolist()]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Error in CLI: %s", e)
 
         position_values: dict[str, float] = {}
         for ticker, position in state.positions.items():
@@ -2014,7 +2047,7 @@ def _exists_label(path: str) -> str:
     return "ok" if Path(path).exists() else "missing"
 
 
-def _robinhood_boundary(settings):
+def _robinhood_boundary(settings: Settings) -> "RobinhoodBrokerBoundary":
     from trading_bot.brokers.robinhood.boundary import RobinhoodBrokerBoundary
 
     return RobinhoodBrokerBoundary(settings)
@@ -2286,7 +2319,7 @@ def discover_symbols(
 
     watchlist = DynamicWatchlist(max_symbols=max_symbols)
 
-    def data_provider(symbol: str):
+    def data_provider(symbol: str) -> pd.DataFrame | None:
         try:
             return fetch_bars(symbol, interval="1d", period="1mo")
         except Exception:
@@ -2339,8 +2372,8 @@ def sector_analysis_cmd(ctx: typer.Context) -> None:
     try:
         spy_data = fetch_bars("SPY", interval="1d", period="3mo")
         typer.echo("  ✓ SPY (benchmark)")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Error in CLI: %s", e)
 
     if len(sector_data) < 3:
         typer.echo("")
@@ -2710,6 +2743,193 @@ def db_history(
     finally:
         if engine:
             engine.dispose()
+
+
+@app.command(name="supermodel-report")
+def supermodel_report(
+    ctx: typer.Context,
+    since: str | None = typer.Option(None, "--since", help="Start date (YYYY-MM-DD)"),
+    limit: int = typer.Option(500, "--limit", help="Max scan rows to inspect"),
+) -> None:
+    """Summarize persisted supermodel scan decisions."""
+    from collections import Counter
+    from datetime import datetime
+
+    from trading_bot.db.session import get_session, init_db, make_session_factory
+    from trading_bot.db.repositories import get_scan_results, get_trades
+
+    engine = init_db(ctx.obj)
+    session = get_session(make_session_factory(engine))
+    try:
+        rows = get_scan_results(
+            session,
+            since=datetime.fromisoformat(since) if since else None,
+            limit=limit,
+        )
+        trades = get_trades(
+            session,
+            since=datetime.fromisoformat(since) if since else None,
+            limit=limit,
+        )
+    finally:
+        session.close()
+        engine.dispose()
+
+    counts: Counter[str] = Counter()
+    actions: Counter[tuple[str, str]] = Counter()
+    swarm_pairs: Counter[tuple[str, str]] = Counter()
+    swarm_handoff_rows = 0
+    scores: dict[str, list[float]] = {}
+    missing = 0
+    for row in rows:
+        decision, score = _scan_row_supermodel(row)
+        if not decision:
+            missing += 1
+            continue
+        counts[decision] += 1
+        actions[(decision, row.action)] += 1
+        swarm_decision = _scan_row_swarm_decision(row)
+        if swarm_decision:
+            swarm_pairs[(swarm_decision, decision)] += 1
+        if _scan_row_swarm_handoff(row):
+            swarm_handoff_rows += 1
+        if score is not None:
+            scores.setdefault(decision, []).append(score)
+
+    typer.echo("SUPERMODEL REPORT")
+    typer.echo(f"scan_rows={len(rows)} stack_rows={sum(counts.values())} missing_stack={missing}")
+    for decision in ("support", "caution", "block", "no_signal"):
+        total = counts[decision]
+        if not total:
+            continue
+        values = scores.get(decision, [])
+        avg_score = sum(values) / len(values) if values else 0.0
+        typer.echo(
+            f"{decision} count={total} "
+            f"buy={actions[(decision, 'BUY')]} hold={actions[(decision, 'HOLD')]} "
+            f"avg_score={avg_score:.2f}"
+        )
+    if swarm_pairs:
+        typer.echo("SWARM ALIGNMENT")
+        typer.echo(f"swarm_handoff_rows={swarm_handoff_rows}")
+        for (swarm_decision, stack_decision), total in sorted(swarm_pairs.items()):
+            typer.echo(
+                f"swarm={swarm_decision} stack={stack_decision} count={total}"
+            )
+
+    trade_counts: Counter[str] = Counter()
+    trade_pnl: Counter[str] = Counter()
+    trade_open_counts: Counter[str] = Counter()
+    trade_pairs: Counter[tuple[str, str]] = Counter()
+    trade_pair_pnl: Counter[tuple[str, str]] = Counter()
+    trade_pair_open_counts: Counter[tuple[str, str]] = Counter()
+    open_trades = 0
+    for trade in trades:
+        decision = _trade_stack_decision(trade)
+        if not decision:
+            continue
+        if trade.pnl is None:
+            open_trades += 1
+            trade_open_counts[decision] += 1
+            swarm_decision = _trade_swarm_decision(trade)
+            if swarm_decision:
+                trade_pair_open_counts[(swarm_decision, decision)] += 1
+            continue
+        trade_counts[decision] += 1
+        trade_pnl[decision] += float(trade.pnl)
+        swarm_decision = _trade_swarm_decision(trade)
+        if swarm_decision:
+            trade_pairs[(swarm_decision, decision)] += 1
+            trade_pair_pnl[(swarm_decision, decision)] += float(trade.pnl)
+    if trade_counts or open_trades:
+        typer.echo("TRADE OUTCOMES")
+        typer.echo(f"closed_stack_trades={sum(trade_counts.values())} open_stack_trades={open_trades}")
+        for decision in ("support", "caution", "block", "no_signal"):
+            total = trade_counts[decision]
+            open_total = trade_open_counts[decision]
+            if not total and not open_total:
+                continue
+            avg_pnl = trade_pnl[decision] / total if total else 0.0
+            typer.echo(
+                f"{decision} closed={total} net_pnl={trade_pnl[decision]:.2f} "
+                f"avg_pnl={avg_pnl:.2f} open={open_total}"
+            )
+        trade_pair_keys = set(trade_pairs) | set(trade_pair_open_counts)
+        for swarm_decision, stack_decision in sorted(trade_pair_keys):
+            total = trade_pairs[(swarm_decision, stack_decision)]
+            open_total = trade_pair_open_counts[(swarm_decision, stack_decision)]
+            typer.echo(
+                f"swarm={swarm_decision} stack={stack_decision} closed={total} "
+                f"net_pnl={trade_pair_pnl[(swarm_decision, stack_decision)]:.2f} "
+                f"open={open_total}"
+            )
+
+
+def _scan_row_supermodel(row) -> tuple[str | None, float | None]:
+    details = _scan_row_details(row)
+    if not details:
+        return None, None
+    decision = details.get("supermodel_decision")
+    if not decision:
+        return None, None
+    try:
+        score = float(details.get("supermodel_score"))
+    except (TypeError, ValueError):
+        score = None
+    return str(decision), score
+
+
+def _scan_row_swarm_decision(row) -> str | None:
+    details = _scan_row_details(row)
+    if not details:
+        return None
+    decision = details.get("swarm_decision")
+    return _normalize_swarm_decision(decision) if decision else None
+
+
+def _scan_row_swarm_handoff(row) -> str | None:
+    details = _scan_row_details(row)
+    if not details:
+        return None
+    handoff = details.get("swarm_handoff")
+    return str(handoff) if handoff else None
+
+
+def _scan_row_details(row) -> dict[str, Any] | None:
+    if not row.details:
+        return None
+    try:
+        details = json.loads(row.details)
+    except (TypeError, ValueError):
+        return None
+    return details if isinstance(details, dict) else None
+
+
+def _trade_stack_decision(trade) -> str | None:
+    tag = getattr(trade, "strategy_tag", None)
+    if not tag:
+        return None
+    for part in str(tag).split("|"):
+        if part.startswith("stack:"):
+            return part.split(":", 1)[1] or None
+    return None
+
+
+def _trade_swarm_decision(trade) -> str | None:
+    tag = getattr(trade, "strategy_tag", None)
+    if not tag:
+        return None
+    for part in str(tag).split("|"):
+        if part.startswith("swarm:"):
+            return part.split(":", 1)[1] or None
+    return None
+
+
+def _normalize_swarm_decision(decision: object) -> str:
+    value = str(decision).lower()
+    if value == "hold_for_more_info":
+        return "hold"
+    return value
 
 
 @app.command()
@@ -3318,7 +3538,7 @@ def research_autopilot(
 
         typer.echo(f"Running {len(pending)} pending hypothesis(es)...")
 
-        def _backtest_fn(hyp):
+        def _backtest_fn(hyp: Any) -> dict[str, Any]:
             params = hyp.parameters
             syms = _parse_symbols(params.get("symbols", []))
             if not syms:
@@ -4241,6 +4461,97 @@ def live_data(
         raise typer.Exit(code=result.returncode)
 
 
+@app.command(name="cache-data")
+def cache_data(
+    symbols: str = typer.Option(
+        "",
+        "--symbols",
+        help="Comma-separated symbols to cache (default: watchlist)",
+    ),
+    period: str = typer.Option(
+        "1y",
+        "--period",
+        help="Data period (default: 1y)",
+    ),
+    interval: str = typer.Option(
+        "1d",
+        "--interval",
+        help="Data interval (default: 1d)",
+    ),
+    watchlist_path: str = typer.Option(
+        "state/watchlist.txt",
+        "--watchlist-path",
+        help="Path to watchlist file (default: state/watchlist.txt)",
+    ),
+    output_dir: str = typer.Option(
+        "state/market_data_cache",
+        "--output-dir",
+        help="Directory to save cached data (default: state/market_data_cache)",
+    ),
+) -> None:
+    """Download and cache historical market data for watchlist symbols.
+
+    Pre-downloads data so RL training and backtesting can run without
+    network calls. Data is saved as CSV files in the output directory.
+    """
+    from pathlib import Path
+
+    from trading_bot.data import market_data
+    from trading_bot.runtime.watchlist import read_watchlist
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Resolve symbols
+    if symbols:
+        symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    else:
+        symbol_list = read_watchlist(watchlist_path)
+
+    if not symbol_list:
+        typer.echo("No symbols to cache.")
+        raise typer.Exit(code=1)
+
+    typer.echo("CACHE DATA")
+    typer.echo("=" * 60)
+    typer.echo(f"  Symbols: {len(symbol_list)}")
+    typer.echo(f"  Period:  {period}")
+    typer.echo(f"  Interval: {interval}")
+    typer.echo(f"  Output:  {output_path}")
+    typer.echo("")
+
+    success = 0
+    failed = 0
+
+    for ticker in symbol_list:
+        cache_file = output_path / f"{ticker}.csv"
+        if cache_file.exists():
+            typer.echo(f"  {ticker} SKIP (already cached)")
+            success += 1
+            continue
+
+        try:
+            typer.echo(f"  {ticker} downloading...", nl=False)
+            df = market_data.fetch_bars(ticker, period=period, interval=interval)
+
+            if df.empty:
+                typer.echo(f" FAILED (no data)")
+                failed += 1
+                continue
+
+            df.to_csv(cache_file)
+            typer.echo(f" OK ({len(df)} bars)")
+            success += 1
+
+        except Exception as e:
+            typer.echo(f" FAILED ({e})")
+            failed += 1
+
+    typer.echo("")
+    typer.echo(f"Done: {success} cached, {failed} failed")
+    typer.echo(f"Data saved to: {output_path}")
+
+
 @app.command(name="auto-retrain")
 def auto_retrain(
     ctx: typer.Context,
@@ -4337,4 +4648,3 @@ def auto_retrain(
         typer.echo("-" * 60)
         typer.echo(f"Auto-retrain failed with exit code {result.returncode}")
         raise typer.Exit(code=result.returncode)
-

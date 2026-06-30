@@ -39,18 +39,18 @@ def test_build_scout_candidates_merges_duplicates_and_ranks_stably() -> None:
 
     result = build_scout_candidates(rows, settings)
 
-    assert result["summary"]["candidates"] == 2
-    assert result["summary"]["included"] == 2
-    assert [row["ticker"] for row in result["candidates"]] == ["DUPE", "SLOW"]
-    assert result["included_symbols"] == ["DUPE", "SLOW"]
+    assert result.summary.candidates == 2
+    assert result.summary.included == 2
+    assert [row.ticker for row in result.candidates] == ["DUPE", "SLOW"]
+    assert result.included_symbols == ["DUPE", "SLOW"]
 
-    first = result["candidates"][0]
-    assert first["source_hits"] == 2
-    assert first["source_names"] == ["aggressive_small_caps", "small_cap_gainers"]
-    assert first["included"] is True
-    assert first["rank"] == 1
-    assert first["volume_ratio"] == 2.5
-    assert first["scout_score"] > result["candidates"][1]["scout_score"]
+    first = result.candidates[0]
+    assert first.source_hits == 2
+    assert first.source_names == ["aggressive_small_caps", "small_cap_gainers"]
+    assert first.included is True
+    assert first.rank == 1
+    assert first.volume_ratio == 2.5
+    assert first.scout_score > result.candidates[1].scout_score
 
 
 def test_build_scout_candidates_excludes_bad_filters() -> None:
@@ -87,9 +87,9 @@ def test_build_scout_candidates_excludes_bad_filters() -> None:
 
     result = build_scout_candidates(rows, settings)
 
-    assert result["summary"]["included"] == 0
-    assert result["included_symbols"] == []
-    assert all(row["included"] is False for row in result["candidates"])
+    assert result.summary.included == 0
+    assert result.included_symbols == []
+    assert all(row.included is False for row in result.candidates)
 
 
 def test_build_scout_candidates_does_not_mix_best_fields_across_rows() -> None:
@@ -117,5 +117,5 @@ def test_build_scout_candidates_does_not_mix_best_fields_across_rows() -> None:
 
     result = build_scout_candidates(rows, settings)
 
-    assert result["summary"]["included"] == 0
-    assert result["candidates"][0]["included"] is False
+    assert result.summary.included == 0
+    assert result.candidates[0].included is False

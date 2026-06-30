@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -78,6 +79,18 @@ def build_stacked_signal(
         else:
             layers.append(StackLayer("rl", 0.5, "neutral", "RL hold vote"))
 
+    swarm_decision = str(details.get("swarm_decision", "")).upper()
+    if swarm_decision:
+        swarm_confidence = _clamp(_as_float(details.get("swarm_confidence"), 0.5))
+        if swarm_decision == "APPROVE":
+            layers.append(
+                StackLayer("swarm", swarm_confidence, _verdict_from_score(swarm_confidence), "agent committee approve")
+            )
+        elif swarm_decision == "REJECT":
+            layers.append(StackLayer("swarm", 0.0, "block", "agent committee reject"))
+        else:
+            layers.append(StackLayer("swarm", 0.5, "neutral", "agent committee hold"))
+
     if details.get("counter_thesis_block"):
         layers.append(StackLayer("counter", 0.0, "block", "counter-thesis blocked"))
     elif "counter_thesis_confidence" in details:
@@ -114,7 +127,7 @@ def _verdict_from_score(score: float) -> LayerVerdict:
     return "block"
 
 
-def _average(values) -> float:
+def _average(values: Iterable[float]) -> float:
     numeric = list(values)
     if not numeric:
         return 0.0

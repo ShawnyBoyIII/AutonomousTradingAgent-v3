@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
@@ -14,6 +15,8 @@ from trading_bot.data.indicators import (
     add_sma,
 )
 from trading_bot.models.portfolio import PortfolioState
+
+logger = logging.getLogger(__name__)
 
 FEATURE_COLS = [
     "close",
@@ -280,8 +283,8 @@ def _finite_float(value: Any, *, default: float) -> float:
     try:
         if pd.notna(value):
             return float(value)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Feature computation error: %s", e)
     return default
 
 

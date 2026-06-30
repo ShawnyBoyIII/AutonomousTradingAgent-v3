@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import pandas as pd
 
@@ -33,7 +34,7 @@ def _resolve_provider_stack(settings: MarketDataSettings | None = None) -> list:
     return providers
 
 
-def _resolve_provider_by_name(name: str):
+def _resolve_provider_by_name(name: str) -> Any:
     """Return a single provider instance for the given *name* string."""
     if name == "alpaca":
         from trading_bot.data.providers.alpaca_provider import AlpacaProvider

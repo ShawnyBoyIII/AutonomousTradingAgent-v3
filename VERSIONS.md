@@ -4,6 +4,57 @@ One-liner per change. Date, category, summary.
 
 ---
 
+## 2026-06-29 (Session 3)
+
+- **feature** — Supermodel stack now consumes swarm committee output as an agent layer (`APPROVE` supports, `REJECT` blocks), aligning scan confidence with multi-agent review.
+- **feature** — Scan rows now persist compact supermodel decisions even without `--why`, giving paper-confidence reports durable stack history.
+- **feature** — Added `supermodel-report` CLI command to summarize persisted support/caution/block scan history.
+- **feature** — Paper trade DB records now include stack decision in `strategy_tag` (for example `v3-trend_following|stack:support`) so closed-trade PnL can be attributed later.
+- **feature** — `supermodel-report` now rolls up closed trade PnL by stack decision from `strategy_tag`.
+- **feature** — Paper-trade path now feeds enabled swarm committee decisions into the supermodel stack before tagging trades.
+- **feature** — Swarm workers now receive completed upstream `worker_results`, giving dependency-ordered agents a simple handoff channel.
+- **feature** — Risk manager now consumes technical and fundamental analyst output for each ticker, exposing upstream action/confidence in risk signal metadata.
+- **feature** — Scan summaries and compact DB details now preserve swarm approval/hold/reject evidence alongside supermodel decisions.
+- **feature** — `supermodel-report` now shows swarm-vs-stack alignment pairs so paper review can see whether agent committee and stack agree.
+- **feature** — Swarm committee decisions now surface risk-manager handoff context in `risk_factors`, preserving analyst-to-risk model chatter in aggregated output.
+- **feature** — Scan `--why` and compact scan persistence now expose swarm handoff context (`swarm_handoff=...`) for immediate paper-mode review.
+- **bugfix** — `NO_SIGNAL` scan lines with swarm enabled now include swarm decision/handoff details in `--why` output instead of formatting before swarm augmentation.
+- **bugfix** — Swarm scan summary now counts engine `HOLD_FOR_MORE_INFO` decisions as `swarm_hold`.
+- **bugfix** — Swarm overlay now fetches daily `1d` bars for the configured daily period instead of requesting long-range `5m` data that providers often reject.
+- **feature** — `supermodel-report` now counts rows with persisted `swarm_handoff`, showing how often agent-to-agent chatter reached the paper evidence trail.
+- **feature** — Paper-trade decision events now include compact supermodel/swarm evidence fields so fills, dry-runs, rejects, and no-signal rows retain stack context.
+- **bugfix** — Post-stack paper-trade rejects (`stale`, `yellow`, allocation, cash, broker reject) now retain compact supermodel/swarm evidence in decision logs.
+- **bugfix** — Scan `NO_SIGNAL` rows now build and persist `supermodel_decision=no_signal`, closing missing stack history in reports.
+- **bugfix** — DB model timestamp defaults now use timezone-aware UTC (`datetime.now(timezone.utc)`) instead of deprecated naive `datetime.utcnow`.
+- **bugfix** — Swarm overlay now calls `setup_workers(WORKER_CLASSES)` before running, so scan/paper overlays aggregate real worker votes instead of an empty engine.
+- **bugfix** — `SwarmEngine.run()` now resets worker states/results per run, preventing stale votes when the same engine instance runs multiple symbol batches.
+- **bugfix** — `SwarmEngine.setup_workers()` now clears prior workers/results before rebuilding, preventing stale worker sets after reconfiguration.
+- **bugfix** — Committee decisions now populate `supporting_signals` and `opposing_signals`, preserving worker votes in the aggregate result instead of dropping them.
+- **bugfix** — Scan `ERROR` rows and decision-log events now retain full swarm evidence (`decision`, `confidence`, `rationale`, `handoff`) when overlay data exists.
+- **feature** — Paper trade `strategy_tag` now includes compact swarm decision (`swarm:approve/reject/hold`) when available, and `supermodel-report` rolls up closed PnL by swarm+stack pair.
+- **bugfix** — Swarm strategy-tag suffixes now clamp unknown swarm decision labels so paper trade tags stay within the 50-char DB column.
+- **bugfix** — Stack/swarm strategy-tag tokens now sanitize separators/spaces, preventing malformed decisions from breaking tag parsing.
+- **bugfix** — Empty sanitized stack/swarm tag tokens now fall back to `unknown` instead of emitting empty `stack:`/`swarm:` suffixes.
+- **bugfix** — `supermodel-report` now normalizes scan swarm decisions to lowercase (`approve/reject/hold`) so scan alignment and trade outcomes group consistently.
+- **feature** — `supermodel-report` now shows open trade counts per stack decision, making pending paper exposure visible by model bucket.
+- **tests** — Phase 2A: 52 tests for `db/` package (session, 7 models, 7 repositories) — 1474 passing.
+- **tests** — Phase 2B: 17 tests for `events/orchestrator.py` (4 handlers, event flow) — 1491 passing.
+- **tests** — Phase 2C: 48 tests across 6 modules (daily_signal_engine, fills, alerts, snapshots, yfinance_provider, provider_base) — 1539 passing.
+- **tests** — Phase 2D: 72 tests for supermodel (40) and portfolio_ledger (32) — 1611 passing.
+- **bugfix** — Phase 1A: 4 critical bugs in `brokers/paper.py` — market orders without price now fetch quote, `submit_order` wraps ValueError → REJECTED, `get_account`/`get_positions` use `ensure_portfolio_state` instead of `load_portfolio_state`, STOP_LIMIT maps via `_ORDER_TYPE_MAP`.
+- **bugfix** — Phase 1B: 6 bugs in `backtest/attribution.py` — beta regression supports `strategy_returns` for CAPM, Monte Carlo vectorized to 2D array, `win_loss_ratio` returns None instead of inf, docstrings corrected for signal quality and holding period.
+- **quality** — Phase 1C: Replaced 20 silent `except Exception: pass` with `logger.debug(...)` across 8 files (events/loop, events/bus, cli/app, rl/agent, rl/features, rl/actions, backtest/runner, runtime/orchestrator).
+- **quality** — Phase 1D: Replaced 11 `print()` statements with logging (9 in backtest/runner, 2 in env/trading_env); kept Gym render() as print.
+- **refactor** — Phase 3: Scout Pydantic refactoring — 5 new models (ScoutScreenerQuote, ScoutCandidate, ScoutSummary, ScoutResult, UniverseCandidatesSnapshot) in `trading_bot/models/scout.py`; `build_scout_candidates` returns `ScoutResult`; 4 call sites updated; removed dead `_first_text`.
+- **feature** — Phase 4A: Backtest runner now populates `strategy_returns` and `benchmark_returns` in result dict for proper CAPM beta regression; added `benchmark_symbol` to AppSettings.
+- **feature** — Phase 4B: Implemented order history in paper broker — `get_orders()` returns all submitted orders (filterable by `since`), `get_order(order_id)` finds by ID; 9 new tests.
+- **quality** — Phase 5A: Fixed 4 `type: ignore` annotations — rl/env.py (2): added None guards raising RuntimeError; robinhood/reconciliation.py: used `cast(RobinhoodBrokerBoundary)`; monitoring/notifiers.py: early None guard on webhook_url.
+- **quality** — Phase 5B: Added type annotations to 11 untyped functions across orchestrator.py (5), runner.py (3), market_data.py (1).
+- **quality** — Phase 5C: Created centralized `trading_bot/logging_config.py` with `setup_logging()` (idempotent, optional FileHandler) and `configure_from_settings()`; wired into CLI callback; added `log_level`/`log_file` to AppSettings; 9 new tests.
+- **tests** — Full suite: 1687 passing (1 pre-existing flaky: `test_auto_bench_cron`).
+
+---
+
 ## 2026-06-29 (Session 2)
 
 - **bugfix** — Fixed `watchlist_path` not being resolved relative to config file in `loader.py:114-119`, causing `scan-universe` to read from workspace `state/watchlist.txt` instead of test tmp_path.

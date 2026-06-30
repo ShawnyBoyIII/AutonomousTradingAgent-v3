@@ -61,7 +61,7 @@ class BaseSwarmWorker(ABC):
     the committee decision process.
     """
 
-    def __init__(self, config: WorkerConfig):
+    def __init__(self, config: WorkerConfig) -> None:
         self.config = config
         self.state = WorkerState.WAITING
         self.result: WorkerResult | None = None

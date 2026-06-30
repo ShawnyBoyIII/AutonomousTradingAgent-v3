@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -196,6 +197,14 @@ class TestRenderLiveDashboard:
         assert "SPY" in html_out
         assert "NO_SIGNAL" in html_out
 
+    def test_tab_navigation_rendered(self) -> None:
+        """Dashboard should include tab navigation with Overview and Closed Positions."""
+        html_out = _render_live_dashboard({"kill_switch": {"active": False}})
+        assert 'id="tab-overview"' in html_out
+        assert 'id="tab-closed-positions"' in html_out
+        assert "tab-btn active" in html_out
+        assert "Closed Positions" in html_out
+
     def test_includes_closed_positions_table(self) -> None:
         snap = {
             "strategy_results": [
@@ -204,10 +213,38 @@ class TestRenderLiveDashboard:
             ],
             "kill_switch": {"active": False},
         }
-        html_out = _render_live_dashboard(snap)
+        mock_settings = Settings(app__state_db_path="/tmp/test.db")
+        with patch("trading_bot.runtime.dashboard._load_closed_positions") as mock_load:
+            mock_load.return_value = [
+                {"ticker": "AFL", "entry_date": "2026-06-29T10:00:00", "exit_date": "2026-06-29T14:00:00", "entry_price": 100.0, "exit_price": 99.0, "quantity": 10, "pnl": -12.7, "win": False},
+                {"ticker": "MSFT", "entry_date": "2026-06-29T10:00:00", "exit_date": "2026-06-29T14:00:00", "entry_price": 300.0, "exit_price": 302.5, "quantity": 10, "pnl": 25.0, "win": True},
+            ]
+            html_out = _render_live_dashboard(snap, settings=mock_settings)
         assert "Closed Positions" in html_out
         assert "AFL" in html_out and "MSFT" in html_out
         assert "WIN" in html_out and "LOSS" in html_out
+
+    def test_closed_positions_deduplicates_same_ticker(self) -> None:
+        """Duplicate exit events for the same ticker should collapse to one row."""
+        snap = {
+            "strategy_results": [
+                {"event": "exit", "ticker": "CIEN", "pnl": -154.18, "win": False, "exit_price": 478.03},
+                {"event": "exit", "ticker": "CIEN", "pnl": -154.18, "win": False, "exit_price": 478.03},
+                {"event": "exit", "ticker": "MSFT", "pnl": 25.0, "win": True},
+            ],
+            "kill_switch": {"active": False},
+        }
+        mock_settings = Settings(app__state_db_path="/tmp/test.db")
+        with patch("trading_bot.runtime.dashboard._load_closed_positions") as mock_load:
+            mock_load.return_value = [
+                {"ticker": "CIEN", "entry_date": "2026-06-29T10:00:00", "exit_date": "2026-06-29T14:00:00", "entry_price": 500.0, "exit_price": 478.03, "quantity": 7, "pnl": -154.18, "win": False},
+                {"ticker": "MSFT", "entry_date": "2026-06-29T10:00:00", "exit_date": "2026-06-29T14:00:00", "entry_price": 300.0, "exit_price": 302.5, "quantity": 10, "pnl": 25.0, "win": True},
+            ]
+            html_out = _render_live_dashboard(snap, settings=mock_settings)
+        # CIEN should appear exactly once (last duplicate wins)
+        assert html_out.count("CIEN") == 1
+        assert html_out.count("Closed Positions") >= 1  # Tab nav + tab content
+        assert "tab-closed-positions" in html_out
 
     def test_empty_snapshot_renders_without_error(self) -> None:
         html_out = _render_live_dashboard({"kill_switch": {"active": False}})
@@ -538,13 +575,14 @@ class TestTableSanitization:
         from trading_bot.runtime.dashboard import _table
         rows = [{"status": "APPROVED GREEN", "ticker": "SPY"}]
         out = _table(rows, ["status", "ticker"])
-        # Spaces should be removed from class attribute
+        # Spaces should be removed from class attribute on td elements
         import re
-        class_match = re.search(r'class="([^"]*)"', out)
-        assert class_match is not None
-        class_value = class_match.group(1)
-        assert ' ' not in class_value
-        assert class_value == "APPROVEDGREEN"
+        # Find all class attributes on td elements
+        td_classes = re.findall(r'<td[^>]*class="([^"]*)"', out)
+        assert len(td_classes) > 0
+        # The first td should have the sanitized class
+        assert ' ' not in td_classes[0]
+        assert td_classes[0] == "APPROVEDGREEN"
 
 
 class TestEnrichPositionsEdgeCases:

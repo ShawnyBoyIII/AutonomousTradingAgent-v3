@@ -26,7 +26,7 @@ class PortfolioLedger:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=self.busy_timeout_ms / 1000.0)
         if self.busy_timeout_ms > 0:
-            conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
+            conn.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
         return conn
 
     def _execute_write(self, statement: str, params: tuple) -> None:

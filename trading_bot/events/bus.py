@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import fnmatch
+import logging
 from collections import defaultdict
 from typing import Any, Callable
 
 from trading_bot.events.types import Event
+
+logger = logging.getLogger(__name__)
 
 
 class MessageBus:
@@ -41,8 +44,8 @@ class MessageBus:
                 for handler in handlers:
                     try:
                         handler(event)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Handler error in publish: %s", e)
 
     def publish_to(self, topic: str, event: Event) -> None:
         self._event_log.append(event)
@@ -53,8 +56,8 @@ class MessageBus:
         for handler in handlers:
             try:
                 handler(event)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Handler error in publish_to: %s", e)
 
     def _topic_matches(self, topic: str, event: Event) -> bool:
         if topic == "*":

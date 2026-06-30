@@ -52,7 +52,7 @@ def update_trade_exit(
         raise ValueError(f"Trade {trade_id} not found")
     trade.exit_price = exit_price
     trade.exit_fees = exit_fees
-    trade.exited_at = datetime.utcnow()
+    trade.exited_at = datetime.now(timezone.utc)
     trade.pnl = pnl
     trade.status = "CLOSED"
     session.commit()

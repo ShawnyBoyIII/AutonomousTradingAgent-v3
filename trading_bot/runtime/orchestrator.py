@@ -5,6 +5,9 @@ from datetime import datetime, timedelta, timezone
 import json
 import math
 from pathlib import Path
+from typing import Any
+
+import pandas as pd
 
 from trading_bot.config.settings import Settings
 from trading_bot.data import market_data
@@ -108,8 +111,12 @@ def run_scan(
             counter_result = _evaluate_counter_thesis_for_signal(symbol, signal, settings)
             if counter_result is not None:
                 _augment_details_with_counter_thesis(details, counter_result)
-            detail_text = _format_scan_details(details) if include_details else ""
             if signal is None:
+                if settings.swarm.enabled and symbol in swarm_results:
+                    swarm_decision = swarm_results[symbol]
+                    _augment_details_with_swarm(details, swarm_decision)
+                details.update(build_stacked_signal(symbol, signal, details).to_details())
+                detail_text = _format_scan_details(details) if include_details else ""
                 append_decision_event(
                     log_path,
                     {
@@ -117,19 +124,23 @@ def run_scan(
                         "ticker": symbol,
                         "status": "NO_SIGNAL",
                         "reason": no_signal_reason,
+                        **_paper_evidence_fields(details),
                     },
                 )
                 other_results.append(f"{symbol} NO_SIGNAL reason={no_signal_reason}{detail_text}")
                 row = {"ticker": symbol, "status": "NO_SIGNAL", "reason": no_signal_reason}
+                _attach_supermodel_row_fields(row, details)
                 if settings.swarm.enabled and symbol in swarm_results:
                     swarm_decision = swarm_results[symbol]
-                    row["swarm_decision"] = swarm_decision.decision
-                    row["swarm_confidence"] = round(swarm_decision.confidence, 2)
+                    _attach_swarm_row_fields(row, swarm_decision)
                 if include_details:
                     row["details"] = details
                 candidate_rows.append(row)
                 continue
 
+            if settings.swarm.enabled and symbol in swarm_results:
+                swarm_decision = swarm_results[symbol]
+                _augment_details_with_swarm(details, swarm_decision)
             details.update(build_stacked_signal(symbol, signal, details).to_details())
             detail_text = _format_scan_details(details) if include_details else ""
 
@@ -156,10 +167,10 @@ def run_scan(
                     "status": "REJECTED",
                     "reason": decision.reason,
                 }
+                _attach_supermodel_row_fields(row, details)
                 if settings.swarm.enabled and symbol in swarm_results:
                     swarm_decision = swarm_results[symbol]
-                    row["swarm_decision"] = swarm_decision.decision
-                    row["swarm_confidence"] = round(swarm_decision.confidence, 2)
+                    _attach_swarm_row_fields(row, swarm_decision)
                 if include_details:
                     row["details"] = details
                 candidate_rows.append(row)
@@ -178,6 +189,7 @@ def run_scan(
                         "ticker": symbol,
                         "status": "REJECTED",
                         "reason": "stale market data",
+                        **_paper_evidence_fields(details),
                     },
                 )
                 market_age = _market_data_age(signal.timestamp)
@@ -187,6 +199,7 @@ def run_scan(
                     "status": "REJECTED",
                     "reason": "stale market data",
                 }
+                _attach_supermodel_row_fields(row, details)
                 if include_details:
                     row["details"] = details
                 candidate_rows.append(row)
@@ -252,24 +265,31 @@ def run_scan(
                 "target": round(signal.profit_target, 2),
                 "reasons": signal.reasons,
             }
+            _attach_supermodel_row_fields(row, details)
             if settings.swarm.enabled and symbol in swarm_results:
                 swarm_decision = swarm_results[symbol]
-                row["swarm_decision"] = swarm_decision.decision
-                row["swarm_confidence"] = round(swarm_decision.confidence, 2)
-                row["swarm_rationale"] = swarm_decision.key_rationale
+                _attach_swarm_row_fields(row, swarm_decision)
             if include_details:
                 row["details"] = details
             candidate_rows.append(row)
         except Exception as exc:
+            error_evidence: dict[str, object] = {}
+            if settings.swarm.enabled and symbol in swarm_results:
+                swarm_decision = swarm_results[symbol]
+                _attach_swarm_row_fields(error_evidence, swarm_decision)
             append_decision_event(
                 log_path,
-                {"command": "scan", "ticker": symbol, "status": "ERROR", "error": str(exc)},
+                {
+                    "command": "scan",
+                    "ticker": symbol,
+                    "status": "ERROR",
+                    "error": str(exc),
+                    **error_evidence,
+                },
             )
             other_results.append(f"{symbol} ERROR {exc}")
             row = {"ticker": symbol, "status": "ERROR", "error": str(exc)}
-            if settings.swarm.enabled and symbol in swarm_results:
-                swarm_decision = swarm_results[symbol]
-                row["swarm_decision"] = swarm_decision.decision
+            row.update(error_evidence)
             candidate_rows.append(row)
 
     approved_results.sort(key=lambda item: item[0], reverse=True)
@@ -293,7 +313,7 @@ def run_scan(
             "swarm_enabled": True,
             "swarm_approved": sum(1 for d in swarm_decisions if d == "APPROVE"),
             "swarm_rejected": sum(1 for d in swarm_decisions if d == "REJECT"),
-            "swarm_hold": sum(1 for d in swarm_decisions if d == "HOLD"),
+            "swarm_hold": sum(1 for d in swarm_decisions if d in ("HOLD", "HOLD_FOR_MORE_INFO")),
         })
     if getattr(settings, "rl", None) is not None and settings.rl.enabled:
         summary.update(
@@ -310,13 +330,7 @@ def run_scan(
                 else 0.0,
             }
         )
-    supermodel_decisions = [
-        decision
-        for row in candidate_rows
-        if isinstance(row.get("details"), dict)
-        for decision in [row["details"].get("supermodel_decision")]
-        if decision
-    ]
+    supermodel_decisions = [row["supermodel_decision"] for row in candidate_rows if row.get("supermodel_decision")]
     if supermodel_decisions:
         summary.update(
             {
@@ -338,6 +352,40 @@ def run_scan(
     return {"lines": lines, "summary": summary, "candidates": candidate_rows}
 
 
+def _attach_supermodel_row_fields(row: dict[str, object], details: dict[str, object]) -> None:
+    if details.get("supermodel_decision"):
+        row["supermodel_decision"] = details["supermodel_decision"]
+        row["supermodel_score"] = details.get("supermodel_score")
+
+
+def _augment_details_with_swarm(details: dict[str, object], swarm_decision: Any) -> None:
+    details["swarm_decision"] = swarm_decision.decision
+    details["swarm_confidence"] = round(swarm_decision.confidence, 2)
+    if swarm_decision.key_rationale:
+        details["swarm_rationale"] = swarm_decision.key_rationale
+    handoff = _swarm_handoff(swarm_decision)
+    if handoff:
+        details["swarm_handoff"] = handoff
+
+
+def _attach_swarm_row_fields(row: dict[str, object], swarm_decision: Any) -> None:
+    row["swarm_decision"] = swarm_decision.decision
+    row["swarm_confidence"] = round(swarm_decision.confidence, 2)
+    if swarm_decision.key_rationale:
+        row["swarm_rationale"] = swarm_decision.key_rationale
+    handoff = _swarm_handoff(swarm_decision)
+    if handoff:
+        row["swarm_handoff"] = handoff
+
+
+def _swarm_handoff(swarm_decision: Any) -> str | None:
+    for risk in getattr(swarm_decision, "risk_factors", []) or []:
+        text = str(risk)
+        if text.startswith("risk_manager handoff:"):
+            return text
+    return None
+
+
 def _run_swarm_overlay(symbols: list[str], settings: Settings) -> dict[str, Any]:
     """Run swarm analysis as read-only overlay (Phase 1).
 
@@ -353,6 +401,7 @@ def _run_swarm_overlay(symbols: list[str], settings: Settings) -> dict[str, Any]
             preset_name=settings.swarm.preset,
             max_concurrent=settings.swarm.max_workers,
         )
+        engine.setup_workers(WORKER_CLASSES)
 
         # Fetch market data for swarm
         frames: dict[str, pd.DataFrame] = {}
@@ -361,7 +410,7 @@ def _run_swarm_overlay(symbols: list[str], settings: Settings) -> dict[str, Any]
                 frame = market_data.fetch_bars(
                     symbol=symbol,
                     period=settings.market_data.daily_period,
-                    interval=settings.market_data.intraday_interval,
+                    interval="1d",
                     settings=settings.market_data,
                 )
                 if frame is not None and not frame.empty:
@@ -424,6 +473,14 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
         )
         return [f"CIRCUIT_BREAKER: {cb_reason}"]
 
+    swarm_results: dict[str, Any] = {}
+    if settings.swarm.enabled:
+        try:
+            swarm_results = _run_swarm_overlay(symbols, settings)
+        except Exception as e:
+            logger.warning("Swarm overlay failed: %s", e)
+            swarm_results = {}
+
     for symbol in (value.strip() for value in symbols if value.strip()):
         try:
             if _daily_loss_limit_hit(state, settings):
@@ -467,14 +524,29 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
 
             signal, _, details = _build_signal_result(symbol, settings)
             if signal is None:
+                if symbol in swarm_results:
+                    swarm_decision = swarm_results[symbol]
+                    _augment_details_with_swarm(details, swarm_decision)
+                details.update(build_stacked_signal(symbol, signal, details).to_details())
                 append_decision_event(
                     log_path,
-                    {"command": "paper-trade", "ticker": symbol, "status": "NO_SIGNAL"},
+                    {
+                        "command": "paper-trade",
+                        "ticker": symbol,
+                        "status": "NO_SIGNAL",
+                        **_paper_evidence_fields(details),
+                    },
                 )
                 results.append(f"{symbol} NO_SIGNAL")
                 continue
 
             counter_result = _evaluate_counter_thesis_for_signal(symbol, signal, settings)
+            if counter_result is not None:
+                _augment_details_with_counter_thesis(details, counter_result)
+            if symbol in swarm_results:
+                swarm_decision = swarm_results[symbol]
+                _augment_details_with_swarm(details, swarm_decision)
+            details.update(build_stacked_signal(symbol, signal, details).to_details())
 
             if _market_data_status(signal.timestamp, settings.market_data.intraday_interval,
                                   max_age_minutes=settings.market_data.max_data_age_minutes) == "stale":
@@ -501,6 +573,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                         "ticker": symbol,
                         "status": "REJECTED",
                         "reason": "yellow signal",
+                        **_paper_evidence_fields(details),
                     },
                 )
                 results.append(f"{symbol} REJECTED yellow signal")
@@ -523,6 +596,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                             "ticker": symbol,
                             "status": "REJECTED",
                             "reason": f"strategy={strategy_tag} allocation=0",
+                            **_paper_evidence_fields(details),
                         },
                     )
                     results.append(f"{symbol} REJECTED strategy={strategy_tag} allocation=0")
@@ -547,6 +621,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                         "ticker": symbol,
                         "status": "REJECTED",
                         "reason": decision.reason,
+                        **_paper_evidence_fields(details),
                         **(
                             {"counter_thesis": counter_result.to_dict()}
                             if counter_result is not None and counter_result.findings
@@ -574,6 +649,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                         "ticker": symbol,
                         "status": "REJECTED",
                         "reason": "insufficient cash",
+                        **_paper_evidence_fields(details),
                     },
                 )
                 results.append(f"{symbol} REJECTED insufficient cash")
@@ -589,6 +665,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                         "quantity": decision.position_size,
                         "fill_price": estimated_fill_price,
                         "cash_after": broker.cash - estimated_total_cost,
+                        **_paper_evidence_fields(details),
                     },
                 )
                 results.append(
@@ -612,13 +689,14 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                         "ticker": symbol,
                         "status": "REJECTED",
                         "reason": "broker rejected order",
+                        **_paper_evidence_fields(details),
                     },
                 )
                 results.append(f"{symbol} REJECTED broker rejected order")
                 continue
 
             ledger.record_fill(fill, side="BUY")
-            _persist_trade_to_db(fill, signal, settings)
+            _persist_trade_to_db(fill, signal, settings, details)
             updated_state = _portfolio_state_from_broker(
                 broker,
                 signal,
@@ -652,6 +730,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                     "fill_price": fill.fill_price,
                     "fees": fill.fees,
                     "cash": state.cash,
+                    **_paper_evidence_fields(details),
                 },
             )
             results.append(
@@ -667,17 +746,17 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
     return results
 
 
-def _build_signal(symbol: str, settings: Settings):
+def _build_signal(symbol: str, settings: Settings) -> TradeSignal | None:
     signal, _ = _build_signal_with_reason(symbol, settings)
     return signal
 
 
-def _build_signal_with_reason(symbol: str, settings: Settings):
+def _build_signal_with_reason(symbol: str, settings: Settings) -> tuple[TradeSignal | None, str]:
     signal, reason, _ = _build_signal_result(symbol, settings)
     return signal, reason
 
 
-def _build_signal_result(symbol: str, settings: Settings):
+def _build_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal | None, str, dict]:
     # RL path: use RL model if enabled AND trained for this symbol.
     # If RL is enabled but the symbol isn't trained, fall through to V3.
     if getattr(settings, "rl", None) is not None and settings.rl.enabled:
@@ -720,7 +799,7 @@ def _build_signal_result(symbol: str, settings: Settings):
     return signal, reason, _scan_details(daily_frame, detail_frame)
 
 
-def _build_rl_signal_result(symbol: str, settings: Settings):
+def _build_rl_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal | None, str, dict]:
     """RL-based signal generation using trained DRL agent.
 
     Loads a trained model and uses it to predict actions (HOLD/BUY/SELL).
@@ -909,7 +988,7 @@ def _build_v3_signal_result(symbol: str, settings: Settings):
     return signal, "v3 approved", details
 
 
-def _drop_trailing_zero_volume_bars(frame):
+def _drop_trailing_zero_volume_bars(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty or "volume" not in frame.columns:
         return frame.copy(deep=True)
 
@@ -922,7 +1001,7 @@ def _drop_trailing_zero_volume_bars(frame):
     return frame.iloc[:end].copy(deep=True)
 
 
-def _frame_through_timestamp(frame, timestamp: datetime):
+def _frame_through_timestamp(frame: pd.DataFrame, timestamp: datetime) -> pd.DataFrame:
     if frame.empty or "timestamp" not in frame.columns:
         return frame
     ts = timestamp
@@ -1028,6 +1107,14 @@ def _format_scan_details(details: dict[str, object]) -> str:
     if details.get("supermodel_layers"):
         parts.append(f"supermodel_layers={details.get('supermodel_layers')}")
 
+    if details.get("swarm_decision"):
+        parts.append(
+            f"swarm={details.get('swarm_decision')}"
+            f":{details.get('swarm_confidence')}"
+        )
+    if details.get("swarm_handoff"):
+        parts.append(f"swarm_handoff={str(details.get('swarm_handoff')).replace(' ', '_')}")
+
     return f" {' '.join(parts)}" if parts else ""
 
 
@@ -1073,8 +1160,8 @@ def _scan_now(signal_timestamp: datetime) -> datetime:
     if signal_timestamp.tzinfo is not None:
         try:
             now = now.astimezone(signal_timestamp.tzinfo)
-        except (ValueError, OSError):
-            pass
+        except (ValueError, OSError) as e:
+            logger.debug("Orchestrator error: %s", e)
     return now
 
 
@@ -1180,7 +1267,7 @@ def _fetch_atr(symbol: str, settings: Settings) -> float | None:
         return None
 
 
-def _evaluate_counter_thesis_for_signal(symbol: str, signal, settings: Settings):
+def _evaluate_counter_thesis_for_signal(symbol: str, signal: Any, settings: Settings) -> Any:
     """Fetch counter-thesis context and run the checks against ``signal``.
 
     Returns None when the feature is disabled (so the risk manager skips it
@@ -1288,7 +1375,7 @@ def _calculate_portfolio_heat(state: PortfolioState, settings: Settings) -> floa
                     latest_prices[ticker] = last_price
                     continue
         except Exception:
-            pass
+            logger.debug("Failed to fetch price for portfolio heat calculation")
         # Fail-closed: use stop-loss as fallback (worst-case heat).
         # If no stop-loss is defined, fall back to average_cost.
         fallback = pos.stop_loss if pos.stop_loss is not None else pos.average_cost
@@ -1318,7 +1405,7 @@ def _persist_scan_results_to_db(candidate_rows: list[dict], settings: Settings) 
                         reasons = None
                     score = None
                     strategy_tag = None
-                    details_dict = row.get("details")
+                    details_dict = _scan_row_details_for_persistence(row)
                     if isinstance(details_dict, dict):
                         score = details_dict.get("v3_total_score")
                         strategy_tag = details_dict.get("rl_agent_type") or details_dict.get("v3_strategy")
@@ -1330,7 +1417,7 @@ def _persist_scan_results_to_db(candidate_rows: list[dict], settings: Settings) 
                         score=score,
                         strategy_tag=strategy_tag,
                         reasons=reasons,
-                        details=row.get("details") if row.get("details") else None,
+                        details=details_dict,
                     )
                 elif status == "NO_SIGNAL":
                     reason = row.get("reason", "no signal")
@@ -1340,6 +1427,7 @@ def _persist_scan_results_to_db(candidate_rows: list[dict], settings: Settings) 
                         action="HOLD",
                         confidence=0.0,
                         reasons=[str(reason)],
+                        details=_scan_row_details_for_persistence(row),
                     )
                 elif status == "REJECTED":
                     reason = row.get("reason", "rejected")
@@ -1349,6 +1437,7 @@ def _persist_scan_results_to_db(candidate_rows: list[dict], settings: Settings) 
                         action="HOLD",
                         confidence=0.0,
                         reasons=[str(reason)],
+                        details=_scan_row_details_for_persistence(row),
                     )
                 elif status == "ERROR":
                     error = row.get("error", "unknown error")
@@ -1363,13 +1452,33 @@ def _persist_scan_results_to_db(candidate_rows: list[dict], settings: Settings) 
             session.close()
             engine.dispose()
     except Exception:
-        pass
+        logger.debug("Failed to persist scan results to database")
+
+
+def _scan_row_details_for_persistence(row: dict) -> dict | None:
+    details = row.get("details")
+    if isinstance(details, dict):
+        return details
+    compact = {
+        key: row[key]
+        for key in (
+            "supermodel_decision",
+            "supermodel_score",
+            "swarm_decision",
+            "swarm_confidence",
+            "swarm_rationale",
+            "swarm_handoff",
+        )
+        if key in row
+    }
+    return compact or None
 
 
 def _persist_trade_to_db(
     fill,
     signal,
     settings: Settings,
+    details: dict | None = None,
 ) -> None:
     try:
         from trading_bot.db.session import init_db, make_session_factory, get_session
@@ -1378,7 +1487,7 @@ def _persist_trade_to_db(
         session_factory = make_session_factory(engine)
         session = get_session(session_factory)
         try:
-            strategy_tag = getattr(signal, "strategy_tag", None) if signal else None
+            strategy_tag = _trade_strategy_tag(signal, details)
             upsert_trade(
                 session=session,
                 ticker=fill.ticker.upper(),
@@ -1405,7 +1514,54 @@ def _persist_trade_to_db(
             session.close()
             engine.dispose()
     except Exception:
-        pass
+        logger.debug("Failed to persist trade to database")
+
+
+def _trade_strategy_tag(signal, details: dict | None = None) -> str | None:
+    base = getattr(signal, "strategy_tag", None) if signal else None
+    decision = details.get("supermodel_decision") if isinstance(details, dict) else None
+    swarm_decision = details.get("swarm_decision") if isinstance(details, dict) else None
+    suffixes = []
+    if decision:
+        suffixes.append(f"stack:{_tag_token(decision, 20)}")
+    if swarm_decision:
+        suffixes.append(f"swarm:{_short_swarm_decision(swarm_decision)}")
+    if not suffixes:
+        return base
+    suffix = "|".join(suffixes)
+    base = str(base or "")[:max(0, 49 - len(suffix))]
+    return f"{base}|{suffix}" if base else suffix
+
+
+def _short_swarm_decision(decision: object) -> str:
+    value = _tag_token(decision, 20)
+    if value == "hold_for_more_info":
+        return "hold"
+    return value
+
+
+def _tag_token(value: object, max_length: int) -> str:
+    token = "".join(
+        char if char.isalnum() or char in ("_", "-") else "_"
+        for char in str(value).lower()
+    )
+    return token[:max_length].strip("_") or "unknown"
+
+
+def _paper_evidence_fields(details: dict | None) -> dict[str, object]:
+    if not isinstance(details, dict):
+        return {}
+    return {
+        key: details[key]
+        for key in (
+            "supermodel_decision",
+            "supermodel_score",
+            "swarm_decision",
+            "swarm_confidence",
+            "swarm_handoff",
+        )
+        if key in details
+    }
 
 
 def _persist_rl_prediction_to_db(
@@ -1432,4 +1588,4 @@ def _persist_rl_prediction_to_db(
             session.close()
             engine.dispose()
     except Exception:
-        pass
+        logger.debug("Failed to persist RL prediction to database")

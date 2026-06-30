@@ -24,7 +24,7 @@ risk:
   min_reward_risk_ratio: 2.0
   use_atr_sizing: true
   atr_period: 14
-  atr_multiplier: 2.0
+  atr_multiplier: 2.5
   atr_stop_multiplier: 1.5
   max_portfolio_heat_pct: 0.03
   max_consecutive_losses: 5
@@ -37,9 +37,9 @@ strategy:
 
 counter_thesis:
   enabled: true
-  block_on_severity: "high"
-  aggregate_block_threshold: 0.6
-  exit_on_block: true
+  block_on_severity: "severe"
+  aggregate_block_threshold: 0.8
+  exit_on_block: false
 
 rl:
   enabled: true
@@ -60,7 +60,7 @@ session:
 
 paper:
   fee_per_order: 1.0
-  slippage_bps: 0
+  slippage_bps: 5
 
 alerts:
   slack_webhook_url: ""
