@@ -91,10 +91,16 @@ class TechnicalAnalystWorker(BaseSwarmWorker):
             else:
                 score -= 1
 
+            if indicators["price_momentum"] > 0:
+                score += 1
+                reasons.append("positive price momentum")
+            elif indicators["price_momentum"] < 0 and indicators["ema_trend"] <= 0:
+                score -= 1
+
             if indicators["rsi"] < 40:
                 score += 1
                 reasons.append("oversold RSI")
-            elif indicators["rsi"] > 60:
+            elif indicators["rsi"] > 60 and indicators["ema_trend"] <= 0:
                 score -= 1
                 reasons.append("overbought RSI")
 
@@ -144,8 +150,11 @@ class TechnicalAnalystWorker(BaseSwarmWorker):
         loss = (-delta).where(delta < 0, 0.0)
         avg_gain = gain.rolling(window=14, min_periods=14).mean()
         avg_loss = loss.rolling(window=14, min_periods=14).mean()
-        rs = avg_gain / avg_loss.replace(0, float("inf"))
+        rs = avg_gain / avg_loss.replace(0, pd.NA)
         rsi = 100 - (100 / (1 + rs))
+        rsi = rsi.where(avg_loss != 0, 100.0)
+        rsi = rsi.where(avg_gain != 0, 0.0)
+        rsi = rsi.where((avg_gain != 0) | (avg_loss != 0), 50.0)
         rsi_value = float(rsi.iloc[-1]) if not rsi.empty else 50.0
 
         # EMA trend (20-period vs 50-period)
@@ -160,11 +169,13 @@ class TechnicalAnalystWorker(BaseSwarmWorker):
         # Volume ratio (current vs 20-period average)
         vol_avg = volumes.rolling(window=20, min_periods=1).mean()
         volume_ratio = float(volumes.iloc[-1] / vol_avg.iloc[-1]) if not vol_avg.empty and vol_avg.iloc[-1] > 0 else 1.0
+        price_momentum = float(closes.iloc[-1] / closes.iloc[-20] - 1) if len(closes) >= 20 and closes.iloc[-20] > 0 else 0.0
 
         return {
             "rsi": rsi_value,
             "ema_trend": ema_trend,
             "volume_ratio": volume_ratio,
+            "price_momentum": price_momentum,
         }
 
     def _compute_technical_rating(self, frame: pd.DataFrame) -> str:
@@ -174,9 +185,13 @@ class TechnicalAnalystWorker(BaseSwarmWorker):
 
         if indicators["ema_trend"] > 0:
             score += 1
+        if indicators["price_momentum"] > 0:
+            score += 1
+        elif indicators["price_momentum"] < 0 and indicators["ema_trend"] <= 0:
+            score -= 1
         if indicators["rsi"] < 40:
             score += 1
-        elif indicators["rsi"] > 60:
+        elif indicators["rsi"] > 60 and indicators["ema_trend"] <= 0:
             score -= 1
         if indicators["volume_ratio"] > 1.5:
             score += 1
@@ -1193,6 +1208,212 @@ class OnChainAnalystWorker(BaseSwarmWorker):
             return None
 
 
+class TrendFollowerWorker(BaseSwarmWorker):
+    """Trend-following worker using ADX, EMA alignment, and momentum."""
+
+    def execute(self, symbols, market_data, portfolio_state=None, **kwargs):
+        signals = []
+        ticker_results = {}
+        for ticker in symbols:
+            frame = market_data.get(ticker)
+            if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+                continue
+            vote = self._analyze(ticker, frame)
+            if vote:
+                signals.append(vote.model_dump())
+                ticker_results[ticker] = vote.model_dump()
+        return WorkerResult(
+            worker_name=self.config.name, preset=self.config.preset,
+            state=WorkerState.DONE, signals=signals,
+            analysis=f"Trend analysis: {len(signals)} signals",
+            ticker_results=ticker_results,
+        )
+
+    def _analyze(self, ticker, frame):
+        try:
+            latest = frame.iloc[-1]
+            close = float(latest.get("close", 0))
+            if close <= 0:
+                return None
+            rsi = float(latest.get("rsi_14", 0) or 0)
+            ema20 = float(latest.get("ema_20", 0) or 0)
+            sma50 = float(latest.get("sma_50", 0) or 0)
+            vr = float(latest.get("volume_avg_5", 0) or 0)
+            vol = float(latest.get("volume", 0) or 0)
+            score = 0
+            if close > ema20 > sma50: score += 2
+            if close > ema20: score += 1
+            if 40 < rsi < 70: score += 1
+            if vr > 0 and vol > vr: score += 1
+            if score >= 3:
+                return SignalVote(ticker=ticker, action="BUY", confidence=min(0.9, score / 5),
+                                  worker_name=self.config.name, preset=self.config.preset,
+                                  reasons=[f"trend score={score}"],
+                                  metadata={"ema_trend": close > ema20, "rsi": rsi})
+            if score <= 0:
+                return SignalVote(ticker=ticker, action="SELL", confidence=0.4,
+                                  worker_name=self.config.name, preset=self.config.preset,
+                                  reasons=[f"trend score={score}"], metadata={})
+            return SignalVote(ticker=ticker, action="HOLD", confidence=0.5,
+                              worker_name=self.config.name, preset=self.config.preset,
+                              reasons=[f"trend score={score}"], metadata={})
+        except Exception:
+            return None
+
+
+class MeanReversionWorker(BaseSwarmWorker):
+    """Detects oversold reversion opportunities using %B, RSI, and VWAP."""
+
+    def execute(self, symbols, market_data, portfolio_state=None, **kwargs):
+        signals = []
+        ticker_results = {}
+        for ticker in symbols:
+            frame = market_data.get(ticker)
+            if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+                continue
+            vote = self._analyze(ticker, frame)
+            if vote:
+                signals.append(vote.model_dump())
+                ticker_results[ticker] = vote.model_dump()
+        return WorkerResult(
+            worker_name=self.config.name, preset=self.config.preset,
+            state=WorkerState.DONE, signals=signals,
+            analysis=f"Mean reversion: {len(signals)} signals",
+            ticker_results=ticker_results,
+        )
+
+    def _analyze(self, ticker, frame):
+        try:
+            latest = frame.iloc[-1]
+            close = float(latest.get("close", 0))
+            if close <= 0:
+                return None
+            rsi = float(latest.get("rsi_14", 0) or 0)
+            bb_l = float(latest.get("bb_lower", 0) or 0)
+            bb_u = float(latest.get("bb_upper", 0) or 0)
+            score = 0
+            if bb_u > bb_l:
+                pct_b = (close - bb_l) / (bb_u - bb_l) * 100
+                if pct_b < 0: score += 3
+                elif pct_b < 10: score += 2
+                elif pct_b < 20: score += 1
+            if rsi < 30: score += 2
+            elif rsi < 35: score += 1
+            if score >= 3:
+                return SignalVote(ticker=ticker, action="BUY", confidence=min(0.9, score / 5),
+                                  worker_name=self.config.name, preset=self.config.preset,
+                                  reasons=[f"mr score={score} rsi={rsi}"],
+                                  metadata={"rsi": rsi, "pct_b": round((close - bb_l) / (bb_u - bb_l) * 100, 1) if bb_u > bb_l else 0})
+            return SignalVote(ticker=ticker, action="HOLD", confidence=0.5,
+                              worker_name=self.config.name, preset=self.config.preset,
+                              reasons=[f"mr score={score}"], metadata={})
+        except Exception:
+            return None
+
+
+class VolumeAnalystWorker(BaseSwarmWorker):
+    """Evaluates volume profile, volume trend, and accumulation/distribution."""
+
+    def execute(self, symbols, market_data, portfolio_state=None, **kwargs):
+        signals = []
+        ticker_results = {}
+        for ticker in symbols:
+            frame = market_data.get(ticker)
+            if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+                continue
+            vote = self._analyze(ticker, frame)
+            if vote:
+                signals.append(vote.model_dump())
+                ticker_results[ticker] = vote.model_dump()
+        return WorkerResult(
+            worker_name=self.config.name, preset=self.config.preset,
+            state=WorkerState.DONE, signals=signals,
+            analysis=f"Volume analysis: {len(signals)} signals",
+            ticker_results=ticker_results,
+        )
+
+    def _analyze(self, ticker, frame):
+        try:
+            latest = frame.iloc[-1]
+            vol = float(latest.get("volume", 0) or 0)
+            avg_vol = float(latest.get("volume_avg_5", 0) or 0)
+            close = float(latest.get("close", 0) or 0)
+            open_p = float(latest.get("open", 0) or 0)
+            if avg_vol <= 0:
+                return None
+            vr = vol / avg_vol
+            score = 0
+            if vr > 2.0: score += 3
+            elif vr > 1.5: score += 2
+            elif vr > 1.0: score += 1
+            if close > open_p: score += 1
+            if score >= 3:
+                return SignalVote(ticker=ticker, action="BUY", confidence=min(0.9, score / 4),
+                                  worker_name=self.config.name, preset=self.config.preset,
+                                  reasons=[f"vol score={score} vr={vr:.1f}"],
+                                  metadata={"volume_ratio": round(vr, 2)})
+            if vr < 0.5:
+                return SignalVote(ticker=ticker, action="SELL", confidence=0.5,
+                                  worker_name=self.config.name, preset=self.config.preset,
+                                  reasons=[f"low volume vr={vr:.1f}"], metadata={})
+            return SignalVote(ticker=ticker, action="HOLD", confidence=0.5,
+                              worker_name=self.config.name, preset=self.config.preset,
+                              reasons=[f"vol score={score}"], metadata={})
+        except Exception:
+            return None
+
+
+class TechnicalConsensusWorker(BaseSwarmWorker):
+    """Reads upstream trend_follower, mean_reversion, volume_analyst, and pattern_recognizer
+    votes. Returns majority consensus or HOLD when disagreement is high."""
+
+    def execute(self, symbols, market_data, portfolio_state=None, **kwargs):
+        signals = []
+        ticker_results = {}
+        worker_results = kwargs.get("worker_results", {})
+        for ticker in symbols:
+            buys = sells = holds = 0
+            for wname in ("trend_follower", "mean_reversion", "volume_analyst", "pattern_recognizer"):
+                wr = worker_results.get(wname)
+                if wr is None:
+                    continue
+                ticker_vote = wr.ticker_results.get(ticker) if isinstance(wr.ticker_results, dict) else None
+                if ticker_vote is None:
+                    continue
+                action = ticker_vote.get("action", "") if isinstance(ticker_vote, dict) else ""
+                if action == "BUY": buys += 1
+                elif action == "SELL": sells += 1
+                else: holds += 1
+            total = buys + sells + holds
+            if total == 0:
+                continue
+            if buys > sells and buys >= 2:
+                conf = buys / total
+                vote = SignalVote(ticker=ticker, action="BUY", confidence=conf,
+                                  worker_name=self.config.name, preset=self.config.preset,
+                                  reasons=[f"consensus BUY {buys}/{total}"],
+                                  metadata={"buys": buys, "sells": sells, "holds": holds})
+            elif sells > buys and sells >= 2:
+                conf = sells / total
+                vote = SignalVote(ticker=ticker, action="SELL", confidence=conf,
+                                  worker_name=self.config.name, preset=self.config.preset,
+                                  reasons=[f"consensus SELL {sells}/{total}"],
+                                  metadata={"buys": buys, "sells": sells, "holds": holds})
+            else:
+                vote = SignalVote(ticker=ticker, action="HOLD", confidence=0.5,
+                                  worker_name=self.config.name, preset=self.config.preset,
+                                  reasons=[f"consensus HOLD {buys}B/{sells}S/{holds}H"],
+                                  metadata={"buys": buys, "sells": sells, "holds": holds})
+            signals.append(vote.model_dump())
+            ticker_results[ticker] = vote.model_dump()
+        return WorkerResult(
+            worker_name=self.config.name, preset=self.config.preset,
+            state=WorkerState.DONE, signals=signals,
+            analysis=f"Technical consensus: {len(signals)} tickers",
+            ticker_results=ticker_results,
+        )
+
+
 # Worker class registry
 WORKER_CLASSES: dict[str, type[BaseSwarmWorker]] = {
     "technical_analyst": TechnicalAnalystWorker,
@@ -1202,6 +1423,10 @@ WORKER_CLASSES: dict[str, type[BaseSwarmWorker]] = {
     "macro_strategist": MacroStrategistWorker,
     "pattern_recognizer": PatternRecognizerWorker,
     "on_chain_analyst": OnChainAnalystWorker,
+    "trend_follower": TrendFollowerWorker,
+    "mean_reversion": MeanReversionWorker,
+    "volume_analyst": VolumeAnalystWorker,
+    "technical_consensus": TechnicalConsensusWorker,
 }
 
 

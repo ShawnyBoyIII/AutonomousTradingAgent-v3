@@ -223,7 +223,7 @@ class StrategySelector:
                     score.confidence = self._recalculate_confidence(score.total_score)
                     candidates.append(("trend_following", trend_setup, score))
                 
-                # Also try mean reversion
+                # Also try mean reversion (less penalty: high vol helps reversion)
                 reversion_setup = identify_mean_reversion_setup(intraday_frame)
                 if reversion_setup:
                     score = calculate_signal_confluence(
@@ -234,7 +234,7 @@ class StrategySelector:
                         regime_metrics=regime_metrics,
                         setup_type=reversion_setup.replace(" ", "_"),
                     )
-                    score.regime_alignment *= 0.3
+                    score.regime_alignment *= 0.5
                     score.total_score = (
                         score.technical_score
                         + score.volume_score

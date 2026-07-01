@@ -61,6 +61,20 @@ def test_no_signal_to_details_shape() -> None:
     assert isinstance(details["supermodel_layers"], str)
 
 
+def test_no_signal_with_rl_sell_blocks() -> None:
+    signal = build_stacked_signal("AAPL", None, {"rl_action": 2, "rl_confidence": 0.9})
+
+    assert signal.decision == "block"
+    assert any(layer.name == "rl" and layer.verdict == "block" for layer in signal.layers)
+
+
+def test_no_signal_with_parallel_sell_consensus_blocks() -> None:
+    signal = build_stacked_signal("AAPL", None, {"consensus": "SELL"})
+
+    assert signal.decision == "block"
+    assert any(layer.name == "consensus" and layer.verdict == "block" for layer in signal.layers)
+
+
 def test_signal_only_has_setup_layer() -> None:
     signal = build_stacked_signal("AAPL", FakeSignal(confidence=0.8), {})
     assert len(signal.layers) == 1

@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -265,3 +266,28 @@ class TestSwarmOverlayIntegration:
 
         assert "AAPL" in results
         assert results["AAPL"].total_workers > 0
+
+    def test_swarm_overlay_enriches_raw_frames_for_technical_workers(self, tmp_path: Path) -> None:
+        """Technical swarm workers need indicator columns, not raw OHLCV only."""
+        settings = Settings(
+            app={"state_db_path": str(tmp_path / "state.db")},
+            swarm={"enabled": True, "preset": "technical_analysis_panel"},
+        )
+        captured: dict[str, pd.DataFrame] = {}
+
+        def capture_run(self, symbols, market_data):
+            captured.update(market_data)
+            return SimpleNamespace(decisions={})
+
+        import trading_bot.data.market_data as market_data
+        from trading_bot.swarm.engine import SwarmEngine
+
+        with patch.object(market_data, "fetch_bars", return_value=_make_frame()):
+            with patch.object(SwarmEngine, "run", capture_run):
+                from trading_bot.runtime.orchestrator import _run_swarm_overlay
+
+                _run_swarm_overlay(["AAPL"], settings)
+
+        frame = captured["AAPL"]
+        for column in ("ema_20", "sma_50", "rsi_14", "bb_lower", "bb_upper", "volume_avg_5"):
+            assert column in frame.columns

@@ -147,3 +147,42 @@ def _to_finite_float(value: object) -> float | None:
         return None
 
     return numeric
+
+
+def compute_mean_reversion_confluence_score(details: dict) -> float:
+    """Compute a 0-12 confluence score for mean-reversion signals.
+
+    Scores based on oversold depth (%B), RSI, and volume confirmation.
+    Higher score = stronger reversion thesis.
+    """
+    score = 0.0
+
+    close = float(details.get("intraday_close", 0) or 0)
+    bb_lower = float(details.get("bb_lower", 0) or 0)
+    bb_upper = float(details.get("bb_upper", 0) or 0)
+    rsi = float(details.get("rsi_14", 0) or 0)
+    vr = float(details.get("volume_ratio", 0) or 0)
+
+    if bb_upper > bb_lower:
+        pct_b = (close - bb_lower) / (bb_upper - bb_lower) * 100
+        if pct_b < 0:
+            score += 4.0
+        elif pct_b < 10:
+            score += 3.0
+        elif pct_b < 20:
+            score += 2.0
+        elif pct_b < 35:
+            score += 1.0
+
+    if rsi < 25:
+        score += 4.0
+    elif rsi < 30:
+        score += 3.0
+    elif rsi < 35:
+        score += 2.0
+    elif rsi < 45:
+        score += 1.0
+
+    score += min(4.0, max(0.0, vr * 2.0))
+
+    return round(score, 2)

@@ -45,17 +45,27 @@ def build_stacked_signal(
 
     if signal is None:
         layers.append(StackLayer("setup", 0.0, "neutral", "no local trade signal"))
-        return StackedSignal(symbol=symbol, score=0.0, decision="no_signal", layers=tuple(layers))
-
-    confidence = _clamp(_as_float(getattr(signal, "confidence", None), 0.0))
-    layers.append(
-        StackLayer(
-            "setup",
-            confidence,
-            _verdict_from_score(confidence),
-            "local strategy confidence",
+        has_blocking_evidence = (
+            str(details.get("consensus", "")).upper() == "SELL"
+            or _as_int(details.get("rl_action")) == 2
+            or str(details.get("swarm_decision", "")).upper() == "REJECT"
+            or bool(details.get("counter_thesis_block"))
         )
-    )
+        if not has_blocking_evidence:
+            return StackedSignal(symbol=symbol, score=0.0, decision="no_signal", layers=tuple(layers))
+    else:
+        confidence = _clamp(_as_float(getattr(signal, "confidence", None), 0.0))
+        layers.append(
+            StackLayer(
+                "setup",
+                confidence,
+                _verdict_from_score(confidence),
+                "local strategy confidence",
+            )
+        )
+
+    if str(details.get("consensus", "")).upper() == "SELL":
+        layers.append(StackLayer("consensus", 0.0, "block", "parallel sell veto"))
 
     v3_score = _as_float(details.get("v3_total_score"), None)
     if v3_score is not None:

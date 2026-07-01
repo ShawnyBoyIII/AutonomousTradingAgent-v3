@@ -10,6 +10,27 @@ Critical context for OpenCode sessions.
 
 ---
 
+## Paper Validation Goal
+
+**Target**: Profit factor > 1.3 over 100 closed trades on paper with $100K starting capital.
+
+- Burn-in runs daily via `./scripts/auto-burn-in.sh`
+- Parallel signal mode (RL ensemble + V3 + V2.5 + Swarm consensus)
+- 5% minimum stop distance on 5-minute bars (intraday noise protection)
+- 15% max per ticker, $100K capital
+- Confidence gates auto-halt at PF < 0.8 after 50+ trades
+- Strategy tags recorded on all buys and sells for attribution
+- Run `./tradebot-local trade-attribution` to review P&L by strategy
+
+**Decision gate**: When 100 closed trades are reached, review profit factor.
+- PF > 1.3 → graduate to live trading consideration
+- PF 0.8–1.3 → continue paper tuning
+- PF < 0.8 → confidence gates already halt; address strategy failures
+
+---
+
+---
+
 ## Entry Point
 
 **Always use the repo-local wrapper:**

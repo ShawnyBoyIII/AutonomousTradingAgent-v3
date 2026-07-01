@@ -252,6 +252,28 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                 lines.append(f"{ticker} SKIP recently-exited-cooldown")
                 continue
 
+            # Enforce min_stop_distance_pct on existing positions
+            min_stop_pct = settings.risk.min_stop_distance_pct
+            if min_stop_pct > 0 and position.stop_loss is not None:
+                entry = position.average_cost
+                min_stop = round(entry * (1.0 - min_stop_pct / 100.0), 4)
+                if position.stop_loss > min_stop:
+                    old_stop = position.stop_loss
+                    pos = Position(
+                        ticker=ticker,
+                        quantity=position.quantity,
+                        average_cost=position.average_cost,
+                        stop_loss=min_stop,
+                        profit_target=position.profit_target,
+                        highest_high=position.highest_high,
+                        initial_risk=position.initial_risk,
+                        entry_at=position.entry_at,
+                        strategy_tag=position.strategy_tag,
+                    )
+                    state.positions[ticker] = pos
+                    position = pos
+                    line_parts.append(f"stop_widened {old_stop:.4f}->{min_stop:.4f}")
+
             # Exit priority 1: EOD exit
             from trading_bot.runtime.session import now_in_zone, should_eod_exit
             if should_eod_exit(now_in_zone(settings.app.timezone), settings.session):
@@ -447,7 +469,7 @@ def _close_position(
         line_parts.append(f"SELL_FAILED reason={reason}")
         return
 
-    ledger.record_fill(fill, side="SELL")
+    ledger.record_fill(fill, side="SELL", strategy_tag=position.strategy_tag)
     updated_state = _portfolio_state_from_broker(
         broker,
         None,

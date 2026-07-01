@@ -665,11 +665,11 @@ echo ""
 # Track cycle count
 CYCLE_COUNT=0
 
-# Confidence gate thresholds (relaxed for early validation phase)
-MIN_TRADES=5
+# Confidence gate thresholds (tightened after 50+ trade sample)
+MIN_TRADES=50
 MIN_NET_PNL=0
-MIN_PROFIT_FACTOR=0.5
-MIN_POSITIVE_WINDOWS=30
+MIN_PROFIT_FACTOR=0.8
+MIN_POSITIVE_WINDOWS=40
 MAX_DRAWDOWN_PCT=10
 
 while true; do

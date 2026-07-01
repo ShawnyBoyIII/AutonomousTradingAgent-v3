@@ -25,6 +25,7 @@ def submit_signal_as_order(
     risk_settings: RiskSettings | None = None,
     counter_thesis: "CounterThesisResult | None" = None,
     mode: ExecutionMode = ExecutionMode.PAPER,
+    position_size_override: int | None = None,
 ) -> FillResult | None:
     require_paper_mode(mode)
 
@@ -40,11 +41,16 @@ def submit_signal_as_order(
     if not decision.approved:
         return None
 
+    quantity = (
+        min(position_size_override, decision.position_size)
+        if position_size_override is not None
+        else decision.position_size
+    )
     order = OrderRequest(
         ticker=signal.ticker,
         side="BUY",
         order_type="market",
-        quantity=decision.position_size,
+        quantity=quantity,
         submitted_at=signal.timestamp,
     )
 
@@ -54,7 +60,7 @@ def submit_signal_as_order(
         getattr(broker, "slippage_bps", 0),
         "BUY",
     )
-    estimated_total_cost = (estimated_fill_price * decision.position_size) + getattr(
+    estimated_total_cost = (estimated_fill_price * quantity) + getattr(
         broker, "fee_per_order", 0.0
     )
     if broker_cash is not None and broker_cash < estimated_total_cost:

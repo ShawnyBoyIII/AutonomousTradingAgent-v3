@@ -125,11 +125,12 @@ class BaseSwarmWorker(ABC):
                     portfolio_state=portfolio_state,
                     **kwargs,
                 )
-                result.state = WorkerState.DONE
+                if result.state not in (WorkerState.FAILED, WorkerState.BLOCKED):
+                    result.state = WorkerState.DONE
                 result.started_at = self._started_at
                 result.completed_at = datetime.now(timezone.utc)
                 self.result = result
-                self.state = WorkerState.DONE
+                self.state = result.state
                 return result
 
             except Exception as e:

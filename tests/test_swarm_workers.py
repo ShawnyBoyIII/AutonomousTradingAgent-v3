@@ -194,6 +194,28 @@ class TestTechnicalAnalystWorker:
         rsi = indicators["rsi"]
         assert 0 <= rsi <= 100
 
+    def test_rsi_handles_zero_loss_and_flat_series(self):
+        config = WorkerConfig(name="test_tech", preset="technical_analysis_panel")
+        worker = TechnicalAnalystWorker(config)
+        dates = pd.date_range(end=datetime.now(), periods=60, freq="B")
+        up = pd.DataFrame(
+            {
+                "close": list(range(100, 160)),
+                "volume": [1_000_000] * 60,
+            },
+            index=dates,
+        )
+        flat = pd.DataFrame(
+            {
+                "close": [100.0] * 60,
+                "volume": [1_000_000] * 60,
+            },
+            index=dates,
+        )
+
+        assert worker._compute_indicators(up)["rsi"] == 100.0
+        assert worker._compute_indicators(flat)["rsi"] == 50.0
+
 
 class TestRiskManagerWorker:
     """RiskManagerWorker tests."""

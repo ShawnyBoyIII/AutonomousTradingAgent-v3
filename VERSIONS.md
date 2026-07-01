@@ -234,3 +234,76 @@ One-liner per change. Date, category, summary.
 - **bugfix** — `trade-attribution` now matches sells only to prior buys, preventing future re-entry buys from corrupting held-time/return display.
 - **bugfix** — Alpha zoo benching now returns stable `aggregate`/`factors` keys even when a requested zoo has no registered factors.
 - **tests** — Full suite: 1791 passing in sandbox; 4 live-dashboard socket tests pass with localhost-bind escalation. 56 new tests across 7 new test files.
+
+---
+
+## 2026-06-30 (Session 6)
+
+- **feature** — **Parallel signal mode**: Added `signal_mode` to `AppSettings` (`"serial"` or `"parallel"`). In parallel mode, RL, V3, and V2.5 run per symbol; a consensus vote resolves the final signal. 2+ BUY votes → full size, 1 BUY vote → half size, any SELL → veto, 0 BUY votes → no trade. Source votes recorded in scan details for attribution. 10 tests.
+- **feature** — **Swarm confidence modifier (Phase 2)**: Added `swarm_weight` to `SwarmSettings` (default 0.3). In parallel mode, swarm APPROVE boosts position size (+30% × confidence), REJECT reduces it (−30% × confidence). Wire in `run_paper_trade()` after allocation sizing.
+- **feature** — **Runtime stop enforcement**: `min_stop_distance_pct` now enforced on existing positions in both `continuous_loop.py` and `cli/app.py` manage-positions. Widen stops retroactively on open positions.
+- **feature** — **Multi-model RL ensemble**: `_build_rl_signal_result()` now uses `_resolve_rl_model_paths()` to find all models covering a symbol. Ensemble prediction: majority action + average confidence across models. `model_paths` list in config. `untrained_confidence_threshold_multiplier` added.
+- **feature** — **Oversold bounce relaxation**: `detect_oversold_bounce()` now accepts signals when `%B < 0` (below lower band) even without a bullish candle. Enables YELLOW mean-reversion acceptance for EBS and PRTA (both at %B=-25 to -40).
+- **bugfix** — **Confluence gate scoped**: Now skips V3 signals (`is_v3_signal`) and mean-reversion signals (`is_mean_reversion`) — only gates V2.5 breakout signals. 2 tests.
+- **bugfix** — **V3 is_mean_reversion**: Changed from intraday frame detector to `selection.strategy_type == "mean_reversion"` — avoids falsely tagging trend-following signals as mean-reversion. 2 tests through real `_build_v3_signal_result`.
+- **bugfix** — **trade-attribution**: Uses stored `pnl` from orders table instead of FIFO `(sell-buy)*qty`. Fixes scale-out and dropped-sell bugs.
+- **bugfix** — **WhipsawPenaltyReward**: Removed dead `_prev_return` state. AGENTS.md exit priority updated for time-based exit.
+- **config** — `max_ticker_allocation_pct` reduced 0.20→0.15 in `burn-in-config.yaml` and `config.yaml`. Pydantic default unchanged for backward compat.
+- **config** — Burn-in config: `model_paths` with 3 ensemble models, `signal_mode: "parallel"`, `swarm_weight: 0.3`, `min_stop_distance_pct: 3.0`, `atr_stop_multiplier: 3.0`.
+- **tests** — Full suite: 1807 passing, 0 failures. 10 new tests for parallel signal mode.
+
+---
+
+## 2026-06-30 (Session 7)
+
+- **feature** — **V3 debug CLI**: Added `v3-debug --symbols` command. Shows regime detection, ADX, setup search (trend + mean-reversion), confluence scores, confidence thresholds, and final decision per symbol. Surfaces why V3 rejects or approves.
+- **feature** — **Strategy attribution**: `trade-attribution` now shows strategy tag per closed trade and groups P&L by strategy at bottom. Added `strategy_tag` column to orders table via migration; `list_order_rows` conditionally includes it. Sell-to-prior-buy matching preserved.
+- **feature** — **Mean-reversion confluence scorer**: `compute_mean_reversion_confluence_score()` in `setup_rules.py`. Scores on %B proximity, RSI depth, and volume. 0-12 scale for future mean-reversion quality gating.
+- **tuning** — **V3 mean-reversion penalty**: In `recommended_strategy == "none"` (high_volatility/strong_downtrend), mean-reversion `regime_alignment` penalty reduced from ×0.3 to ×0.5. High volatility helps reversion, not hurts it.
+- **bugfix** — `list_order_rows` made backward-compatible: `strategy_tag` column detected via PRAGMA, only included in dict when non-empty.
+- **tests** — Full suite: 1807 passing, 0 failures. Ledger schema test updated for new `strategy_tag` column.
+
+---
+
+## 2026-06-30 (Session 8)
+
+- **rl** — **Retrained on universe symbols**: Replaced the outdated sector_diversity models (XOM, CVX, UNH, LLY, CAT, DE) with new models trained on the actual 8 most-traded universe symbols: EBS, SOFI, PRTA, GCTS, TNXP, CWH, AVXL, UTZ. 3 seeds (789, 42, 123) at 100K timesteps each. `risk_adjusted` reward, `data_end_date=2026-06-24` for walk-forward separation. Output: `state/rl_logs/universe_v1/`.
+- **rl** — **Ensemble now produces real signals**: SOFI BUY at 0.947 confidence from the 3-model ensemble. First RL BUY signal in the entire burn-in run.
+- **config** — `burn-in-config.yaml`: `model_path` and `model_paths` updated to point to `state/rl_logs/universe_v1/` models.
+- **analysis** — RL audit: found 0 overlap between old trained symbols and active universe (57 small-caps vs 6 large-caps). Old RL models had produced 0 BUY signals across entire burn-in. Confirmed via decision log: "RL model not found" and "RLAgent.load() missing positional argument" errors throughout.
+- **tests** — Full suite: 1807 passing, 0 failures. RL models load and predict correctly on new universe symbols.
+
+---
+
+## 2026-06-30 (Session 9)
+
+- **bugfix** — Approved, risk-rejected, and stale scan outputs now keep compact supermodel/swarm evidence, matching no-signal/error paper audit trails.
+- **bugfix** — One-shot `manage-positions` now persists runtime `min_stop_distance_pct` stop widening even when no exit/trail action fires.
+- **bugfix** — Continuous-loop `manage-positions` now reports stop widening with the real old→new stop values and verifies the widened stop persists.
+- **bugfix** — Parallel signal `source_votes` are now JSON-safe compact vote records, preventing scan snapshots from failing on embedded `TradeSignal` objects.
+- **bugfix** — RL ensemble now treats empty model metadata as unavailable and fails before fetching market data.
+- **bugfix** — RL BUY signals now price from the validated target intraday frame only, fail closed when that close is unavailable, and avoid extra provider calls for HOLD/SELL predictions.
+- **bugfix** — RL ensemble action ties now fail closed instead of selecting a BUY/SELL by model path order.
+- **bugfix** — Parallel resolver now honors RL SELL details as a real SELL veto even when RL returns no `TradeSignal` object.
+- **bugfix** — Parallel resolver now preserves source detail fields (`rl_*`, `v3_total_score`, V2.5 scan fields) so supermodel scoring and quality gates still see underlying model evidence.
+- **bugfix** — Supermodel scoring now treats no-local-signal veto evidence (parallel SELL, RL SELL, swarm REJECT, counter block) as `block` instead of hiding it as `no_signal`.
+- **bugfix** — Untrained-symbol RL inference now discounts confidence before thresholding instead of lowering the threshold, so unknown symbols fail safer in paper mode.
+- **bugfix** — Paper execution now honors final stack/swarm-adjusted position size, including parallel half-size and swarm boost/reduce decisions, instead of re-sizing inside the order helper.
+- **bugfix** — Paper fills now write stack/swarm strategy tags to the local orders ledger too, so `trade-attribution` can group filled stack trades instead of showing `unknown`.
+- **bugfix** — Paper fills now also tag parallel consensus on trades, so closed/open outcomes can be grouped by model vote consensus instead of scan rows only.
+- **bugfix** — Swarm APPROVE sizing can boost reduced entries but is capped at the risk-approved base size; order submission also clamps overrides to risk size, so model consensus cannot bypass per-trade risk limits.
+- **bugfix** — Swarm worker/engine state handling now preserves returned `FAILED` state, so dependent agents block instead of running after failed upstream analysis.
+- **bugfix** — Swarm committee confidence now counts failed/blocked/missing worker votes as abstentions, preventing overconfident approvals when only surviving agents voted.
+- **bugfix** — Technical swarm RSI now handles zero-loss/flat series correctly and uses price momentum, so strong uptrends no longer look oversold or collapse to HOLD.
+- **bugfix** — Swarm overlay now enriches raw market frames with EMA/SMA/RSI/Bollinger/volume-average indicators before technical panel workers vote, preventing missing indicator columns from weakening multi-agent evidence.
+- **bugfix** — Paper sector-concentration checks now use the local sector map only, avoiding hidden `yfinance` metadata calls in normal paper execution.
+- **bugfix** — Paper sector-concentration checks now evaluate projected exposure after final position-size modifiers, blocking trades that would push a sector over its cap.
+- **diagnostics** — Paper decision events now persist parallel consensus, source votes, and risk-size cap evidence, making stack decisions auditable after fills/rejections.
+- **diagnostics** — Scan summaries now include parallel consensus counts (`parallel_buy`, `parallel_sell`, `parallel_no_trade`) even without `--why`.
+- **diagnostics** — `supermodel-report` now shows persisted parallel consensus versus stack decisions, making model-vote alignment reviewable after scans.
+- **diagnostics** — `supermodel-report` now groups trade outcomes by persisted parallel consensus, making P&L reviewable for BUY/SELL/NO_TRADE vote paths.
+- **diagnostics** — Paper stale-data rejections now retain stack/swarm evidence, matching other paper reject paths.
+- **docs** — Swarm/parallel wording now matches runtime behavior: strategy models vote on consensus; swarm applies bounded sizing after consensus.
+- **diagnostics** — `supermodel-report` now groups held scan rows by stack decision and persisted reason, making stale-data/risk blocks visible in paper review.
+- **diagnostics** — `supermodel-report` now shows win rate plus win/loss counts for stack and swarm-stack trade outcome groups.
+- **tests** — Focused continuous-loop suite: 24 passing. Broader paper-confidence bucket: 366 passing. CLI min-stop, RL metadata/price, RL tie/veto/detail preservation, ledger attribution, swarm dependency/confidence, technical RSI/frame-enrichment, local/projected sector checks, consensus outcome tagging, and stack/swarm sizing regressions added.

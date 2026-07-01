@@ -224,6 +224,76 @@ class TestSwarmEngineDependencyResolution:
 
         assert engine.results["sink"].data["saw_source"] == "source-ready"
 
+    def test_failed_dependency_blocks_dependent_worker(self):
+        class FailingWorker(BaseSwarmWorker):
+            def execute(self, symbols, market_data, portfolio_state=None, **kwargs):
+                return WorkerResult(
+                    worker_name=self.config.name,
+                    preset=self.config.preset,
+                    state=WorkerState.FAILED,
+                    error="boom",
+                )
+
+        class SinkWorker(BaseSwarmWorker):
+            def execute(self, symbols, market_data, portfolio_state=None, **kwargs):
+                raise AssertionError("blocked dependency should not run")
+
+        engine = SwarmEngine(preset_name="investment_committee", max_concurrent=1)
+        engine.workers = {
+            "source": FailingWorker(WorkerConfig(name="source", preset="test")),
+            "sink": SinkWorker(WorkerConfig(name="sink", preset="test", depends_on=["source"])),
+        }
+
+        summary = engine.run(["AAPL"], {"AAPL": _make_dataframe()})
+
+        assert engine.workers["source"].state == WorkerState.FAILED
+        assert engine.workers["sink"].state == WorkerState.BLOCKED
+        assert "sink" not in engine.results
+        assert summary.failed_workers == 1
+        assert summary.blocked_workers == 1
+
+    def test_failed_worker_counts_as_abstain_in_committee_confidence(self):
+        class BuyWorker(BaseSwarmWorker):
+            def execute(self, symbols, market_data, portfolio_state=None, **kwargs):
+                return WorkerResult(
+                    worker_name=self.config.name,
+                    preset=self.config.preset,
+                    state=WorkerState.DONE,
+                    ticker_results={
+                        "AAPL": {
+                            "ticker": "AAPL",
+                            "action": "BUY",
+                            "confidence": 0.9,
+                            "worker_name": self.config.name,
+                            "preset": self.config.preset,
+                            "reasons": ["buy"],
+                            "metadata": {},
+                        }
+                    },
+                )
+
+        class FailingWorker(BaseSwarmWorker):
+            def execute(self, symbols, market_data, portfolio_state=None, **kwargs):
+                return WorkerResult(
+                    worker_name=self.config.name,
+                    preset=self.config.preset,
+                    state=WorkerState.FAILED,
+                    error="boom",
+                )
+
+        engine = SwarmEngine(preset_name="investment_committee", max_concurrent=2)
+        engine.workers = {
+            "buyer": BuyWorker(WorkerConfig(name="buyer", preset="test")),
+            "failing": FailingWorker(WorkerConfig(name="failing", preset="test")),
+        }
+
+        decision = engine.run(["AAPL"], {"AAPL": _make_dataframe()}).decisions["AAPL"]
+
+        assert decision.votes_for == 1
+        assert decision.votes_abstain == 1
+        assert decision.total_workers == 2
+        assert decision.confidence == 0.5
+
     def test_risk_manager_consumes_upstream_analyst_results(self):
         engine = SwarmEngine(preset_name="investment_committee", max_concurrent=1)
         engine.setup_workers(WORKER_CLASSES)

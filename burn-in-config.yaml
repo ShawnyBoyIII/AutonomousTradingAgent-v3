@@ -6,6 +6,7 @@ app:
   scan_results_path: "state/burn_in/scan_results.json"
   allow_yellow_mean_reversion: true
   min_entry_confluence_score: 4.0
+  signal_mode: "parallel"
 
 market_data:
   providers:
@@ -22,13 +23,13 @@ risk:
   max_risk_per_trade_pct: 0.01
   max_daily_risk_pct: 0.03
   max_daily_orders: 150
-  max_ticker_allocation_pct: 0.20
+  max_ticker_allocation_pct: 0.15
   min_reward_risk_ratio: 2.0
   use_atr_sizing: true
   atr_period: 14
   atr_multiplier: 2.5
   atr_stop_multiplier: 3.0
-  min_stop_distance_pct: 3.0
+  min_stop_distance_pct: 5.0
   max_portfolio_heat_pct: 0.03
   max_consecutive_losses: 5
   enable_drawdown_circuit_breaker: true
@@ -51,13 +52,19 @@ rl:
   agent_type: "PPO"
   feature_set: "standard"
   reward_function: "risk_adjusted"
-  model_path: "state/rl_logs/sector_diversity/PPO_seed_789.zip"
+  model_path: "state/rl_logs/universe_v2/PPO_seed_789.zip"
+  model_paths:
+    - "state/rl_logs/universe_v2/PPO_seed_789.zip"
+    - "state/rl_logs/universe_v2/PPO_seed_42.zip"
+    - "state/rl_logs/universe_v2/PPO_seed_123.zip"
   action_confidence_threshold: 0.4
+  untrained_confidence_threshold_multiplier: 0.8
 
 swarm:
   enabled: true
   preset: "investment_committee"
   max_workers: 4
+  swarm_weight: 0.3
 
 session:
   eod_enabled: true

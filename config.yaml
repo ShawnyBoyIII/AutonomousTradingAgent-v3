@@ -34,7 +34,7 @@ risk:
   max_risk_per_trade_pct: 0.01
   max_daily_risk_pct: 0.03
   max_daily_orders: 3
-  max_ticker_allocation_pct: 0.20
+  max_ticker_allocation_pct: 0.15
   min_reward_risk_ratio: 2.0
   use_atr_sizing: true
   atr_period: 14

@@ -201,7 +201,7 @@ class SwarmEngine:
                     worker = self.workers[name]
                     try:
                         result = future.result()
-                        worker.state = WorkerState.DONE
+                        worker.state = result.state
                     except Exception as e:
                         worker.state = WorkerState.FAILED
                         self.results[name] = WorkerResult(
@@ -257,8 +257,10 @@ class SwarmEngine:
             supporting_signals: list[SignalVote] = []
             opposing_signals: list[SignalVote] = []
 
-            for worker_name, result in self.results.items():
-                if symbol not in result.ticker_results:
+            for worker_name in self.workers:
+                result = self.results.get(worker_name)
+                if result is None or symbol not in result.ticker_results:
+                    votes_abstain += 1
                     continue
 
                 ticker_result = result.ticker_results[symbol]
@@ -275,6 +277,7 @@ class SwarmEngine:
                         signal_vote = None
                 else:
                     if ticker_result.verdict is None:
+                        votes_abstain += 1
                         continue
                     action = ticker_result.verdict.action
                     rationale = ticker_result.verdict.rationale or []

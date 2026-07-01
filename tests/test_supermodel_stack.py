@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 from trading_bot.cli.app import (
     _format_scan_summary,
     _scan_row_supermodel,
+    _trade_consensus,
     _trade_stack_decision,
     _trade_swarm_decision,
     app,
@@ -93,6 +94,9 @@ def test_supermodel_scan_details_and_summary_are_visible() -> None:
         "swarm_approved": 1,
         "swarm_rejected": 0,
         "swarm_hold": 0,
+        "parallel_buy": 1,
+        "parallel_sell": 0,
+        "parallel_no_trade": 0,
     }
 
     assert "supermodel=support:0.8" in _format_scan_details(details)
@@ -103,6 +107,7 @@ def test_supermodel_scan_details_and_summary_are_visible() -> None:
     )
     assert "supermodel_support=1" in _format_scan_summary(summary)
     assert "swarm_approved=1" in _format_scan_summary(summary)
+    assert "parallel_buy=1" in _format_scan_summary(summary)
 
 
 def test_compact_scan_persistence_keeps_swarm_evidence() -> None:
@@ -246,8 +251,9 @@ def test_supermodel_persists_without_why(monkeypatch, tmp_path) -> None:
     import trading_bot.runtime.orchestrator as orchestrator
 
     db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
     PortfolioLedger(db_path).save_portfolio_state(PortfolioState(cash=10_000.0, equity=10_000.0))
-    settings = Settings(app={"state_db_path": str(db_path)})
+    settings = Settings(app={"state_db_path": str(db_path), "log_dir": str(log_dir)})
     signal = TradeSignal(
         ticker="AAPL",
         timeframe="intraday",
@@ -280,6 +286,9 @@ def test_supermodel_persists_without_why(monkeypatch, tmp_path) -> None:
     row = result["candidates"][0]
     assert "details" not in row
     assert row["supermodel_decision"] == "support"
+    event = json.loads((log_dir / "decision-log.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert event["status"] == "APPROVED"
+    assert event["supermodel_decision"] == "support"
 
     engine = init_db(settings)
     session = get_session(make_session_factory(engine))
@@ -293,6 +302,112 @@ def test_supermodel_persists_without_why(monkeypatch, tmp_path) -> None:
         engine.dispose()
 
 
+def test_scan_reject_event_keeps_stack_evidence(monkeypatch, tmp_path) -> None:
+    import trading_bot.runtime.orchestrator as orchestrator
+
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    PortfolioLedger(db_path).save_portfolio_state(PortfolioState(cash=10_000.0, equity=10_000.0))
+    settings = Settings(app={"state_db_path": str(db_path), "log_dir": str(log_dir)})
+    signal = TradeSignal(
+        ticker="AAPL",
+        timeframe="intraday",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=95.0,
+        profit_target=110.0,
+        risk_reward_ratio=2.0,
+        confidence=0.8,
+        reasons=["test"],
+        strategy_tag="test",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    monkeypatch.setattr(orchestrator, "_calculate_portfolio_heat", lambda state, settings: 0.0)
+    monkeypatch.setattr(orchestrator, "_fetch_atr", lambda symbol, settings: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_build_signal_result",
+        lambda symbol, settings: (signal, "test", {"v3_total_score": 12.0}),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "evaluate_signal",
+        lambda **kwargs: RiskDecision(approved=False, reason="too much heat", position_size=0, dollar_risk=0.0),
+    )
+
+    result = run_scan(["AAPL"], settings, include_details=False)
+
+    assert result["candidates"][0]["supermodel_decision"] == "support"
+    event = json.loads((log_dir / "decision-log.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert event["status"] == "REJECTED"
+    assert event["reason"] == "too much heat"
+    assert event["supermodel_decision"] == "support"
+
+
+def test_stale_scan_row_keeps_swarm_evidence(monkeypatch, tmp_path) -> None:
+    import trading_bot.runtime.orchestrator as orchestrator
+
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    PortfolioLedger(db_path).save_portfolio_state(PortfolioState(cash=10_000.0, equity=10_000.0))
+    settings = Settings(
+        app={"state_db_path": str(db_path), "log_dir": str(log_dir)},
+        swarm={"enabled": True},
+    )
+    signal = TradeSignal(
+        ticker="AAPL",
+        timeframe="intraday",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=95.0,
+        profit_target=110.0,
+        risk_reward_ratio=2.0,
+        confidence=0.8,
+        reasons=["test"],
+        strategy_tag="test",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    monkeypatch.setattr(orchestrator, "_calculate_portfolio_heat", lambda state, settings: 0.0)
+    monkeypatch.setattr(orchestrator, "_fetch_atr", lambda symbol, settings: None)
+    monkeypatch.setattr(orchestrator, "_market_data_status", lambda *args, **kwargs: "stale")
+    monkeypatch.setattr(orchestrator, "_market_data_age", lambda timestamp: "99m")
+    monkeypatch.setattr(
+        orchestrator,
+        "_build_signal_result",
+        lambda symbol, settings: (signal, "test", {"v3_total_score": 12.0}),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_swarm_overlay",
+        lambda symbols, settings: {
+            "AAPL": SimpleNamespace(
+                decision="APPROVE",
+                confidence=0.75,
+                key_rationale="bullish",
+                risk_factors=["risk_manager handoff: technical=BUY fundamental=BUY"],
+            )
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "evaluate_signal",
+        lambda **kwargs: RiskDecision(approved=True, reason="approved", position_size=1, dollar_risk=5.0),
+    )
+
+    result = run_scan(["AAPL"], settings, include_details=False)
+
+    row = result["candidates"][0]
+    assert row["status"] == "REJECTED"
+    assert row["reason"] == "stale market data"
+    assert row["swarm_decision"] == "APPROVE"
+    assert row["swarm_confidence"] == 0.75
+    assert row["swarm_handoff"] == "risk_manager handoff: technical=BUY fundamental=BUY"
+    event = json.loads((log_dir / "decision-log.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert event["swarm_decision"] == "APPROVE"
+
+
 def test_scan_row_supermodel_handles_malformed_details() -> None:
     assert _scan_row_supermodel(SimpleNamespace(details="not-json")) == (None, None)
 
@@ -301,6 +416,12 @@ def test_trade_stack_decision_parses_strategy_tag() -> None:
     trade = SimpleNamespace(strategy_tag="v3-trend|stack:support")
 
     assert _trade_stack_decision(trade) == "support"
+
+
+def test_trade_consensus_parses_strategy_tag() -> None:
+    trade = SimpleNamespace(strategy_tag="v3-trend|stack:support|consensus:buy")
+
+    assert _trade_consensus(trade) == "buy"
 
 
 def test_supermodel_report_reads_persisted_scan_history(tmp_path) -> None:
@@ -325,6 +446,8 @@ def test_supermodel_report_reads_persisted_scan_history(tmp_path) -> None:
                 "supermodel_score": 0.9,
                 "swarm_decision": "APPROVE",
                 "swarm_handoff": "risk_manager handoff: technical=BUY fundamental=BUY",
+                "signal_mode": "parallel",
+                "consensus": "BUY",
             },
         )
         upsert_scan_result(
@@ -332,10 +455,13 @@ def test_supermodel_report_reads_persisted_scan_history(tmp_path) -> None:
             ticker="MSFT",
             action="HOLD",
             confidence=0.0,
+            reasons=["stale market data"],
             details={
                 "supermodel_decision": "block",
                 "supermodel_score": 0.2,
                 "swarm_decision": "REJECT",
+                "signal_mode": "parallel",
+                "consensus": "SELL",
             },
         )
         winning = upsert_trade(
@@ -345,7 +471,7 @@ def test_supermodel_report_reads_persisted_scan_history(tmp_path) -> None:
             order_type="market",
             quantity=1,
             entry_price=100.0,
-            strategy_tag="test|stack:support|swarm:approve",
+            strategy_tag="test|stack:support|swarm:approve|consensus:buy",
         )
         update_trade_exit(session, winning.id, exit_price=110.0, pnl=10.0)
         losing = upsert_trade(
@@ -355,7 +481,7 @@ def test_supermodel_report_reads_persisted_scan_history(tmp_path) -> None:
             order_type="market",
             quantity=1,
             entry_price=100.0,
-            strategy_tag="test|stack:block|swarm:reject",
+            strategy_tag="test|stack:block|swarm:reject|consensus:sell",
         )
         update_trade_exit(session, losing.id, exit_price=95.0, pnl=-5.0)
         upsert_trade(
@@ -365,7 +491,7 @@ def test_supermodel_report_reads_persisted_scan_history(tmp_path) -> None:
             order_type="market",
             quantity=1,
             entry_price=100.0,
-            strategy_tag="test|stack:support|swarm:approve",
+            strategy_tag="test|stack:support|swarm:approve|consensus:buy",
         )
     finally:
         session.close()
@@ -377,15 +503,22 @@ def test_supermodel_report_reads_persisted_scan_history(tmp_path) -> None:
     assert "scan_rows=2 stack_rows=2 missing_stack=0" in result.stdout
     assert "support count=1 buy=1 hold=0 avg_score=0.90" in result.stdout
     assert "block count=1 buy=0 hold=1 avg_score=0.20" in result.stdout
+    assert "SCAN HOLD REASONS" in result.stdout
+    assert "block reason=stale market data count=1" in result.stdout
     assert "SWARM ALIGNMENT" in result.stdout
     assert "swarm_handoff_rows=1" in result.stdout
     assert "swarm=approve stack=support count=1" in result.stdout
     assert "swarm=reject stack=block count=1" in result.stdout
+    assert "PARALLEL CONSENSUS" in result.stdout
+    assert "consensus=BUY stack=support count=1" in result.stdout
+    assert "consensus=SELL stack=block count=1" in result.stdout
     assert "closed_stack_trades=2 open_stack_trades=1" in result.stdout
-    assert "support closed=1 net_pnl=10.00 avg_pnl=10.00 open=1" in result.stdout
-    assert "block closed=1 net_pnl=-5.00 avg_pnl=-5.00 open=0" in result.stdout
-    assert "swarm=approve stack=support closed=1 net_pnl=10.00 open=1" in result.stdout
-    assert "swarm=reject stack=block closed=1 net_pnl=-5.00 open=0" in result.stdout
+    assert "support closed=1 net_pnl=10.00 avg_pnl=10.00 win_rate=1.00 wins=1 losses=0 open=1" in result.stdout
+    assert "block closed=1 net_pnl=-5.00 avg_pnl=-5.00 win_rate=0.00 wins=0 losses=1 open=0" in result.stdout
+    assert "swarm=approve stack=support closed=1 net_pnl=10.00 win_rate=1.00 wins=1 losses=0 open=1" in result.stdout
+    assert "swarm=reject stack=block closed=1 net_pnl=-5.00 win_rate=0.00 wins=0 losses=1 open=0" in result.stdout
+    assert "consensus=buy stack=support closed=1 net_pnl=10.00 win_rate=1.00 wins=1 losses=0 open=1" in result.stdout
+    assert "consensus=sell stack=block closed=1 net_pnl=-5.00 win_rate=0.00 wins=0 losses=1 open=0" in result.stdout
 
 
 def test_trade_strategy_tag_includes_supermodel_decision() -> None:
@@ -401,13 +534,14 @@ def test_trade_strategy_tag_includes_swarm_decision() -> None:
 
     tag = _trade_strategy_tag(
         signal,
-        {"supermodel_decision": "support", "swarm_decision": "APPROVE"},
+        {"supermodel_decision": "support", "swarm_decision": "APPROVE", "consensus": "BUY"},
     )
 
-    assert tag == "test|stack:support|swarm:approve"
+    assert tag == "test|stack:support|swarm:approve|consensus:buy"
     trade = SimpleNamespace(strategy_tag=tag)
     assert _trade_stack_decision(trade) == "support"
     assert _trade_swarm_decision(trade) == "approve"
+    assert _trade_consensus(trade) == "buy"
 
 
 def test_trade_strategy_tag_stays_column_safe() -> None:
@@ -607,3 +741,55 @@ def test_paper_trade_reject_keeps_stack_evidence(monkeypatch, tmp_path) -> None:
     assert event["reason"] == "yellow signal"
     assert event["supermodel_decision"] == "support"
     assert event["swarm_decision"] == "APPROVE"
+
+
+def test_paper_trade_stale_reject_keeps_stack_evidence(monkeypatch, tmp_path) -> None:
+    import trading_bot.runtime.orchestrator as orchestrator
+
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    PortfolioLedger(db_path).save_portfolio_state(PortfolioState(cash=10_000.0, equity=10_000.0))
+    settings = Settings(
+        app={"state_db_path": str(db_path), "log_dir": str(log_dir)},
+        swarm={"enabled": True},
+    )
+    signal = TradeSignal(
+        ticker="AAPL",
+        timeframe="intraday",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=95.0,
+        profit_target=110.0,
+        risk_reward_ratio=2.0,
+        confidence=0.8,
+        reasons=["test"],
+        strategy_tag="test",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    monkeypatch.setattr(orchestrator, "_calculate_portfolio_heat", lambda state, settings: 0.0)
+    monkeypatch.setattr(orchestrator, "_daily_loss_limit_hit", lambda state, settings: False)
+    monkeypatch.setattr(orchestrator, "_daily_order_limit_hit", lambda ledger, settings: False)
+    monkeypatch.setattr(orchestrator, "_market_data_status", lambda *args, **kwargs: "stale")
+    monkeypatch.setattr(orchestrator, "_build_signal_result", lambda symbol, settings: (signal, "test", {}))
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_swarm_overlay",
+        lambda symbols, settings: {
+            "AAPL": MagicMock(
+                decision="APPROVE",
+                confidence=0.8,
+                key_rationale="bullish",
+                risk_factors=["risk_manager handoff: technical=BUY fundamental=BUY"],
+            )
+        },
+    )
+
+    result = run_paper_trade(["AAPL"], settings)
+
+    assert result == ["AAPL REJECTED stale market data"]
+    event = json.loads((log_dir / "decision-log.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert event["reason"] == "stale market data"
+    assert event["supermodel_decision"] == "support"
+    assert event["swarm_decision"] == "APPROVE"
+    assert event["swarm_handoff"] == "risk_manager handoff: technical=BUY fundamental=BUY"

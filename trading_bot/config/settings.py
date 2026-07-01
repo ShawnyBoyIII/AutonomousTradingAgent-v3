@@ -18,6 +18,7 @@ class AppSettings(BaseModel):
     benchmark_symbol: str | None = None
     allow_yellow_mean_reversion: bool = False
     min_entry_confluence_score: float = Field(default=4.0, ge=0.0, le=12.0)
+    signal_mode: str = Field(default="serial")  # "serial" or "parallel"
 
 
 class MarketDataSettings(BaseModel):
@@ -212,6 +213,7 @@ class RLSettings(BaseModel):
     reward_function: str = Field(default="risk_adjusted")
     model_path: str = Field(default="trained_models/rl_agent.zip")
     model_paths: list[str] = Field(default_factory=list)
+    # For symbols outside model metadata, discount confidence before thresholding.
     untrained_confidence_threshold_multiplier: float = Field(default=0.8, gt=0.0, le=1.0)
     training_episodes: int = Field(default=100, ge=1)
     training_timesteps: int = Field(default=100000, ge=1000)
@@ -228,16 +230,20 @@ class SwarmSettings(BaseModel):
     """Multi-agent swarm analysis configuration.
 
     When ``enabled``, the orchestrator runs a swarm analysis on the
-    universe before generating signals. The swarm acts as a read-only
-    overlay in Phase 1: its committee decisions are logged alongside
-    scanner results but do not affect trading behavior.
+    universe before generating signals. In ``signal_mode="serial"``
+    (default), the swarm acts as a read-only overlay: its committee
+    decisions are logged alongside scanner results but do not affect
+    trading behavior.
 
-    Phase 2 (future): swarm confidence modifier
-    Phase 3 (future): swarm veto power
+    In ``signal_mode="parallel"``, the strategy models resolve consensus.
+    The swarm then acts as a bounded position-size modifier: APPROVE can
+    boost reduced entries, REJECT reduces them, both by ``swarm_weight`` ×
+    swarm_confidence and never above the risk-approved size.
     """
     enabled: bool = Field(default=False)
     preset: str = Field(default="investment_committee")
     max_workers: int = Field(default=4, ge=1, le=16)
+    swarm_weight: float = Field(default=0.3, ge=0.0, le=1.0)
 
 
 class Settings(BaseModel):

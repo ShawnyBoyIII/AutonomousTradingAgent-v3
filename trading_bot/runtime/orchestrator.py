@@ -28,6 +28,45 @@ from trading_bot.rl.utils import rl_model_meta_path, rl_model_symbols
 
 logger = logging.getLogger(__name__)
 
+_sector_cache: dict[str, str] = {}
+
+
+def _get_sector(ticker: str) -> str:
+    """Return locally known sector ETF for a ticker.
+
+    Runtime trading paths must not make metadata network calls. Unknown sectors
+    are left unblocked instead of guessing.
+    """
+    if ticker in _sector_cache:
+        return _sector_cache[ticker]
+    from trading_bot.strategy.dynamic_watchlist import _SECTOR_MAP
+
+    sector = _SECTOR_MAP.get(ticker.upper().strip(), "")
+    _sector_cache[ticker] = sector
+    return sector
+
+
+def _sector_concentration_exceeded(ticker: str, state, settings, pending_value: float = 0.0) -> str | None:
+    max_pct = settings.risk.max_sector_concentration_pct
+    if max_pct <= 0 or max_pct >= 1.0:
+        return None
+    if not state.positions:
+        return None
+    target_sector = _get_sector(ticker)
+    if not target_sector:
+        return None
+    sector_value = 0.0
+    total_value = state.equity
+    if total_value <= 0:
+        return None
+    for t, pos in state.positions.items():
+        if _get_sector(t) == target_sector:
+            sector_value += pos.quantity * pos.average_cost
+    projected_pct = (sector_value + max(0.0, pending_value)) / total_value
+    if projected_pct > max_pct:
+        return f"sector={target_sector} projected {projected_pct:.0%} > {max_pct:.0%}"
+    return None
+
 
 def _recently_exited(ticker: str, state, cooldown_minutes: int) -> bool:
     ts = state.last_exited_at.get(ticker)
@@ -57,6 +96,7 @@ def run_scan(
     rl_confidence_total = 0.0
     rl_confidence_count = 0
     rl_unsupported = 0
+    parallel_counts = {"BUY": 0, "SELL": 0, "NO_TRADE": 0}
 
     # V2.5: Calculate portfolio heat before scanning
     portfolio_heat = _calculate_portfolio_heat(state, settings)
@@ -101,7 +141,7 @@ def run_scan(
             "candidates": [],
         }
 
-    # Phase 1: Swarm analysis (read-only overlay)
+    # Swarm scan evidence stays read-only; paper-trade may use it for sizing.
     swarm_results: dict[str, Any] = {}
     if settings.swarm.enabled:
         try:
@@ -130,6 +170,8 @@ def run_scan(
                     swarm_decision = swarm_results[symbol]
                     _augment_details_with_swarm(details, swarm_decision)
                 details.update(build_stacked_signal(symbol, signal, details).to_details())
+                if details.get("signal_mode") == "parallel" and details.get("consensus") in parallel_counts:
+                    parallel_counts[str(details["consensus"])] += 1
                 detail_text = _format_scan_details(details) if include_details else ""
                 append_decision_event(
                     log_path,
@@ -156,6 +198,8 @@ def run_scan(
                 swarm_decision = swarm_results[symbol]
                 _augment_details_with_swarm(details, swarm_decision)
             details.update(build_stacked_signal(symbol, signal, details).to_details())
+            if details.get("signal_mode") == "parallel" and details.get("consensus") in parallel_counts:
+                parallel_counts[str(details["consensus"])] += 1
             detail_text = _format_scan_details(details) if include_details else ""
 
             # V2.5: Fetch ATR for volatility-adjusted sizing
@@ -173,7 +217,13 @@ def run_scan(
             if not decision.approved:
                 append_decision_event(
                     log_path,
-                    {"command": "scan", "ticker": symbol, "status": "REJECTED", "reason": decision.reason},
+                    {
+                        "command": "scan",
+                        "ticker": symbol,
+                        "status": "REJECTED",
+                        "reason": decision.reason,
+                        **_paper_evidence_fields(details),
+                    },
                 )
                 other_results.append(f"{symbol} REJECTED {decision.reason}{detail_text}")
                 row = {
@@ -214,6 +264,9 @@ def run_scan(
                     "reason": "stale market data",
                 }
                 _attach_supermodel_row_fields(row, details)
+                if settings.swarm.enabled and symbol in swarm_results:
+                    swarm_decision = swarm_results[symbol]
+                    _attach_swarm_row_fields(row, swarm_decision)
                 if include_details:
                     row["details"] = details
                 candidate_rows.append(row)
@@ -346,6 +399,14 @@ def run_scan(
             }
         )
     supermodel_decisions = [row["supermodel_decision"] for row in candidate_rows if row.get("supermodel_decision")]
+    if any(parallel_counts.values()):
+        summary.update(
+            {
+                "parallel_buy": parallel_counts["BUY"],
+                "parallel_sell": parallel_counts["SELL"],
+                "parallel_no_trade": parallel_counts["NO_TRADE"],
+            }
+        )
     if supermodel_decisions:
         summary.update(
             {
@@ -402,11 +463,10 @@ def _swarm_handoff(swarm_decision: Any) -> str | None:
 
 
 def _run_swarm_overlay(symbols: list[str], settings: Settings) -> dict[str, Any]:
-    """Run swarm analysis as read-only overlay (Phase 1).
+    """Run swarm analysis and return per-symbol committee decisions.
 
-    Returns a dict mapping ticker -> CommitteeDecision for each symbol.
-    Does NOT affect trading behavior - results are logged alongside
-    scanner output for comparison.
+    Scanner uses these decisions as evidence only. Paper trading may use the
+    same decisions as bounded position-size modifiers.
     """
     try:
         from trading_bot.swarm.engine import SwarmEngine
@@ -429,6 +489,11 @@ def _run_swarm_overlay(symbols: list[str], settings: Settings) -> dict[str, Any]
                     settings=settings.market_data,
                 )
                 if frame is not None and not frame.empty:
+                    frame = add_ema(frame, period=20, column_name="ema_20")
+                    frame = add_sma(frame, period=50, column_name="sma_50")
+                    frame = add_rsi(frame, period=14)
+                    frame = add_bollinger_bands(frame, period=20, std_dev=2.0)
+                    frame["volume_avg_5"] = frame["volume"].rolling(5).mean()
                     frames[symbol] = frame
             except Exception:
                 continue
@@ -586,6 +651,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                         "ticker": symbol,
                         "status": "REJECTED",
                         "reason": "stale market data",
+                        **_paper_evidence_fields(details),
                     },
                 )
                 results.append(f"{symbol} REJECTED stale market data")
@@ -689,11 +755,47 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 results.append(f"{symbol} REJECTED {decision.reason}")
                 continue
 
+            risk_approved_size = decision.position_size
             if alloc < 1.0:
                 decision.position_size = max(1, int(decision.position_size * alloc))
 
             if details.get("yellow_mean_reversion"):
                 decision.position_size = max(1, int(decision.position_size * settings.risk.yellow_allocation_pct))
+
+            if details.get("is_half_size"):
+                decision.position_size = max(1, int(decision.position_size * 0.5))
+
+            if settings.swarm.enabled and settings.swarm.swarm_weight > 0 and symbol in swarm_results:
+                swarm_decision = swarm_results[symbol]
+                swarm_conf = getattr(swarm_decision, "confidence", 0.0)
+                swarm_adjust = settings.swarm.swarm_weight * swarm_conf
+                if getattr(swarm_decision, "decision", "") == "APPROVE":
+                    decision.position_size = max(1, int(decision.position_size * (1.0 + swarm_adjust)))
+                elif getattr(swarm_decision, "decision", "") == "REJECT":
+                    decision.position_size = max(1, int(decision.position_size * max(0.1, 1.0 - swarm_adjust)))
+            if decision.position_size > risk_approved_size:
+                decision.position_size = risk_approved_size
+                details["position_size_capped"] = "risk_approved"
+
+            sector_reason = _sector_concentration_exceeded(
+                symbol,
+                state,
+                settings,
+                pending_value=signal.entry_price * decision.position_size,
+            )
+            if sector_reason:
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "paper-trade",
+                        "ticker": symbol,
+                        "status": "REJECTED",
+                        "reason": f"sector concentration: {sector_reason}",
+                        **_paper_evidence_fields(details),
+                    },
+                )
+                results.append(f"{symbol} REJECTED sector concentration: {sector_reason}")
+                continue
 
             estimated_fill_price = apply_slippage(
                 signal.entry_price,
@@ -739,7 +841,11 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 broker=broker,
                 account_equity=state.equity,
                 open_tickers=open_tickers,
+                portfolio_heat_pct=portfolio_heat,
+                atr=atr,
                 risk_settings=settings.risk,
+                counter_thesis=counter_result,
+                position_size_override=decision.position_size,
             )
             if fill is None:
                 append_decision_event(
@@ -755,7 +861,8 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 results.append(f"{symbol} REJECTED broker rejected order")
                 continue
 
-            ledger.record_fill(fill, side="BUY")
+            strategy_tag = _trade_strategy_tag(signal, details) or ""
+            ledger.record_fill(fill, side="BUY", strategy_tag=strategy_tag)
             _persist_trade_to_db(fill, signal, settings, details)
             updated_state = _portfolio_state_from_broker(
                 broker,
@@ -816,7 +923,216 @@ def _build_signal_with_reason(symbol: str, settings: Settings) -> tuple[TradeSig
     return signal, reason
 
 
+def _build_parallel_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal | None, str, dict]:
+    """Run all enabled signal sources in parallel and resolve by consensus.
+
+    Each source emits a ``(signal, confidence, details)`` tuple. The
+    consensus logic:
+      - 2+ sources agree BUY → full position size
+      - 1 source says BUY → half position size (via details flag)
+      - 0 sources say BUY → no trade
+      - Any source says SELL → veto (no trade)
+    Swarm runs outside this resolver; paper trading applies it later as a
+    bounded position-size modifier.
+    """
+    source_votes: list[dict] = []
+
+    rl_sig: TradeSignal | None = None
+    v3_sig: TradeSignal | None = None
+    v25_sig: TradeSignal | None = None
+    rl_details: dict = {}
+    v3_details: dict = {}
+    v25_details: dict = {}
+
+    rl_enabled = getattr(settings, "rl", None) is not None and settings.rl.enabled
+    v3_enabled = getattr(settings, "strategy", None) is not None and settings.strategy.use_v3_signals
+
+    if rl_enabled:
+        rl_sig, rl_reason, rl_details = _build_rl_signal_result(symbol, settings)
+
+    shared_daily = None
+    shared_intraday = None
+    daily_frame, daily_valid = market_data.fetch_and_validate_bars(
+        symbol, settings.market_data.daily_period, "1d", settings.market_data,
+    )
+    if daily_valid.valid:
+        intraday_frame, intraday_valid = market_data.fetch_and_validate_bars(
+            symbol, settings.market_data.intraday_period,
+            settings.market_data.intraday_interval, settings.market_data,
+        )
+        if intraday_valid.valid:
+            daily_frame = add_ema(daily_frame, period=20, column_name="ema_20")
+            daily_frame = add_sma(daily_frame, period=50, column_name="sma_50")
+            shared_daily = daily_frame
+            intraday_frame = _drop_trailing_zero_volume_bars(intraday_frame)
+            intraday_frame["volume_avg_5"] = intraday_frame["volume"].rolling(5).mean()
+            intraday_frame = add_atr(intraday_frame, period=settings.risk.atr_period)
+            intraday_frame = add_rsi(intraday_frame, period=14)
+            intraday_frame = add_bollinger_bands(intraday_frame, period=20, std_dev=2.0)
+            intraday_frame = add_vwap(intraday_frame)
+            shared_intraday = intraday_frame
+            from trading_bot.strategy.intraday_signal_engine import generate_recent_signal_with_reason
+            v25_sig, v25_reason = generate_recent_signal_with_reason(
+                symbol, daily_frame, intraday_frame,
+                atr_stop_multiplier=settings.risk.atr_stop_multiplier,
+                min_stop_distance_pct=settings.risk.min_stop_distance_pct,
+            )
+            v25_details = _scan_details(daily_frame, intraday_frame)
+            if settings.app.allow_yellow_mean_reversion:
+                from trading_bot.strategy.setup_rules import is_valid_mean_reversion_setup
+                v25_details["is_mean_reversion"] = is_valid_mean_reversion_setup(intraday_frame)
+
+    if v3_enabled and shared_daily is not None and shared_intraday is not None:
+        v3_sig, v3_reason, v3_details = _build_v3_signal_result(
+            symbol, settings,
+            daily_frame=shared_daily,
+            intraday_frame=shared_intraday,
+        )
+    elif v3_enabled:
+        v3_sig, v3_reason, v3_details = _build_v3_signal_result(symbol, settings)
+
+    for source, sig, details, cond in [
+        ("rl", rl_sig, rl_details, rl_enabled),
+        ("v3", v3_sig, v3_details, v3_enabled),
+        ("v2.5", v25_sig, v25_details, True),
+    ]:
+        if not cond:
+            continue
+        detail_action = None
+        detail_confidence = 0.0
+        skip_from_consensus = False
+        if source == "rl":
+            rl_action = details.get("rl_action")
+            rl_untrained = details.get("rl_untrained_symbol", False)
+            rl_conf = float(details.get("rl_confidence", 0.0) or 0.0)
+            effective_conf = float(details.get("rl_effective_confidence", rl_conf))
+            threshold = settings.rl.action_confidence_threshold if hasattr(settings.rl, "action_confidence_threshold") else 0.4
+            if rl_action == 2:
+                detail_action = "SELL"
+                detail_confidence = rl_conf
+            elif rl_action == 0:
+                detail_action = "HOLD"
+                detail_confidence = rl_conf
+                # Skip RL from consensus when it's effectively untrained:
+                # all models agree HOLD with confidence below threshold,
+                # and the symbol is not in any trained model's set.
+                # This lets V3+V2.5 consensus fire without RL blocking.
+                if rl_untrained and effective_conf < threshold:
+                    skip_from_consensus = True
+
+        if skip_from_consensus:
+            source_votes.append({
+                "source": source,
+                "action": "SKIPPED",
+                "confidence": 0.0,
+            })
+        elif detail_action == "SELL":
+            source_votes.append({
+                "source": source,
+                "action": "SELL",
+                "confidence": detail_confidence,
+            })
+        elif sig is not None and hasattr(sig, "action") and sig.action == "BUY":
+            conf = getattr(sig, "confidence", 0.0)
+            source_votes.append({
+                "source": source,
+                "action": "BUY",
+                "confidence": float(conf),
+                "signal": sig,
+                "details": details,
+            })
+        elif sig is not None and hasattr(sig, "action") and sig.action == "SELL":
+            source_votes.append({
+                "source": source,
+                "action": "SELL",
+                "confidence": float(getattr(sig, "confidence", 0.0)),
+            })
+        elif detail_action == "HOLD":
+            source_votes.append({
+                "source": source,
+                "action": "HOLD",
+                "confidence": detail_confidence,
+            })
+        else:
+            source_votes.append({
+                "source": source,
+                "action": "HOLD" if sig is None else "NO_SIGNAL",
+                "confidence": 0.0,
+            })
+
+    buy_votes = [v for v in source_votes if v["action"] == "BUY"]
+    sell_votes = [v for v in source_votes if v["action"] == "SELL"]
+    active_votes = [v for v in source_votes if v["action"] != "SKIPPED"]
+    vote_count = len(active_votes)
+
+    public_votes = [
+        {
+            "source": str(v["source"]),
+            "action": str(v["action"]),
+            "confidence": round(float(v.get("confidence", 0.0)), 4),
+        }
+        for v in source_votes
+    ]
+    details: dict[str, object] = {
+        **v25_details,
+        **v3_details,
+        **rl_details,
+        "source_votes": public_votes,
+        "signal_mode": "parallel",
+    }
+
+    for v in public_votes:
+        details[f"vote_{v['source']}"] = f"{v['action']}:{v['confidence']:.2f}"
+
+    if sell_votes:
+        details["consensus"] = "SELL"
+        details["consensus_reason"] = f"veto by {sell_votes[0]['source']}"
+        return None, f"parallel veto: SELL from {sell_votes[0]['source']}", details
+
+    if len(buy_votes) >= 2:
+        best = max(buy_votes, key=lambda v: v["confidence"])
+        details["consensus"] = "BUY"
+        details["consensus_count"] = len(buy_votes)
+        details["consensus_votes"] = vote_count
+        details["is_full_size"] = True
+        signal = _copy_signal_with_confidence(best["signal"], best["confidence"])
+        return signal, f"parallel consensus ({len(buy_votes)}/{vote_count})", details
+
+    if len(buy_votes) == 1:
+        vote = buy_votes[0]
+        details["consensus"] = "BUY"
+        details["consensus_count"] = 1
+        details["consensus_votes"] = vote_count
+        details["is_half_size"] = True
+        signal = _copy_signal_with_confidence(vote["signal"], vote["confidence"])
+        return signal, f"parallel single-source ({vote['source']})", details
+
+    source_list = ", ".join(v["source"] for v in active_votes)
+    details["consensus"] = "NO_TRADE"
+    details["consensus_votes"] = vote_count
+    return None, f"parallel no consensus ({source_list})", details
+
+
+def _copy_signal_with_confidence(signal: TradeSignal, confidence: float) -> TradeSignal:
+    return TradeSignal(
+        ticker=signal.ticker,
+        timeframe=signal.timeframe,
+        action=signal.action,
+        entry_price=signal.entry_price,
+        stop_loss=signal.stop_loss,
+        profit_target=signal.profit_target,
+        risk_reward_ratio=signal.risk_reward_ratio,
+        confidence=round(confidence, 4),
+        reasons=list(signal.reasons),
+        strategy_tag=getattr(signal, "strategy_tag", ""),
+        timestamp=signal.timestamp,
+    )
+
+
 def _build_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal | None, str, dict]:
+    if getattr(settings.app, "signal_mode", "serial") == "parallel":
+        return _build_parallel_signal_result(symbol, settings)
+
     # RL path: use RL model if enabled AND trained for this symbol.
     # If RL is enabled but the symbol isn't trained, fall through to V3.
     if getattr(settings, "rl", None) is not None and settings.rl.enabled:
@@ -872,153 +1188,287 @@ def _build_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal |
 def _build_rl_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal | None, str, dict]:
     """RL-based signal generation using trained DRL agent.
 
-    Loads a trained model and uses it to predict actions (HOLD/BUY/SELL).
+    Loads one or more trained models (via ``model_paths`` or ``model_path``)
+    and uses ensemble prediction when multiple models cover the same symbol.
     Converts BUY actions to TradeSignal objects with risk management parameters.
     """
     from trading_bot.rl.agent import RLAgent
 
-    model_path = Path(settings.app.log_dir).parent / settings.rl.model_path
-    if not model_path.exists():
-        return None, f"RL model not found: {model_path}", {}
-    trained_symbols = rl_model_symbols(model_path)
-    if not trained_symbols:
-        return None, f"RL model metadata missing or empty: {rl_model_meta_path(model_path)}", {}
+    model_paths = _resolve_rl_model_paths(symbol, settings)
+    if not model_paths:
+        return None, "no RL models configured", {}
 
-    try:
-        agent = RLAgent.load(
-            model_path=model_path,
-        )
-    except Exception as e:
-        return None, f"RL model load failed: {e}", {}
+    has_meta = any(rl_model_symbols(p) for p in model_paths)
+    if not has_meta:
+        return None, f"RL model metadata missing or empty: {model_paths[0] if model_paths else 'none'}", {}
 
-    symbol_upper = symbol.upper().strip()
-    is_trained_symbol = symbol_upper in trained_symbols
-    
-    daily_frames = {}
-    intraday_frames = {}
-    
-    symbols_for_inference = trained_symbols.copy()
-    if not is_trained_symbol:
-        symbols_for_inference.append(symbol_upper)
-    
-    for trained_symbol in symbols_for_inference:
-        daily_frame, daily_valid = market_data.fetch_and_validate_bars(
-            trained_symbol,
-            settings.market_data.daily_period,
-            "1d",
-            settings.market_data,
-        )
-        if not daily_valid.valid:
-            return None, f"{trained_symbol} daily data validation failed: {daily_valid.reason}", {}
+    # Load matching models and collect predictions
+    predictions: list[dict] = []
+    target_intraday_frame = None
+    rl_trained_symbols: list[str] = []
+    for mp in model_paths:
+        try:
+            agent = RLAgent.load(model_path=mp)
+        except Exception as e:
+            logger.debug("RL model load failed path=%s error=%s", mp, e)
+            continue
+        trained_symbols = rl_model_symbols(mp) or []
+        if not trained_symbols:
+            logger.debug("RL model skipped path=%s metadata missing or empty", mp)
+            continue
+        for ts in trained_symbols:
+            if ts not in rl_trained_symbols:
+                rl_trained_symbols.append(ts)
 
-        intraday_frame, intraday_valid = market_data.fetch_and_validate_bars(
-            trained_symbol,
-            settings.market_data.intraday_period,
-            settings.market_data.intraday_interval,
-            settings.market_data,
-        )
-        if not intraday_valid.valid:
-            return None, f"{trained_symbol} intraday data validation failed: {intraday_valid.reason}", {}
-        daily_frames[trained_symbol] = daily_frame
-        intraday_frames[trained_symbol] = intraday_frame
+        symbol_upper = symbol.upper().strip()
+        is_trained = symbol_upper in trained_symbols
 
-    daily_frame = daily_frames[symbol_upper]
-    intraday_frame = intraday_frames[symbol_upper]
+        symbols_for_inference = list(trained_symbols)
+        if not is_trained:
+            symbols_for_inference.append(symbol_upper)
 
-    daily_frame = daily_frame.copy()
-    daily_frame = add_ema(daily_frame, period=20, column_name="ema_20")
-    daily_frame = add_sma(daily_frame, period=50, column_name="sma_50")
-    daily_frame = add_atr(daily_frame, period=settings.risk.atr_period)
-    daily_frame = add_bollinger_bands(daily_frame, period=20)
-    intraday_frame = _drop_trailing_zero_volume_bars(intraday_frame)
-    intraday_frame = intraday_frame.copy()
-    intraday_frame["volume_avg_5"] = intraday_frame["volume"].rolling(5).mean()
-    intraday_frame = add_rsi(intraday_frame, period=14)
-    intraday_frame = add_atr(intraday_frame, period=settings.risk.atr_period)
+        daily_frames: dict[str, Any] = {}
+        intraday_frames: dict[str, Any] = {}
+        for sym in symbols_for_inference:
+            daily_frame, daily_valid = market_data.fetch_and_validate_bars(
+                sym, settings.market_data.daily_period, "1d", settings.market_data,
+            )
+            if not daily_valid.valid:
+                break
+            intraday_frame, intraday_valid = market_data.fetch_and_validate_bars(
+                sym, settings.market_data.intraday_period,
+                settings.market_data.intraday_interval, settings.market_data,
+            )
+            if not intraday_valid.valid:
+                break
+            daily_frames[sym] = daily_frame
+            intraday_frames[sym] = intraday_frame
+        else:
+            daily_frame = daily_frames[symbol_upper]
+            intraday_frame = intraday_frames[symbol_upper]
+            daily_frame = daily_frame.copy()
+            daily_frame = add_ema(daily_frame, period=20, column_name="ema_20")
+            daily_frame = add_sma(daily_frame, period=50, column_name="sma_50")
+            daily_frame = add_atr(daily_frame, period=settings.risk.atr_period)
+            daily_frame = add_bollinger_bands(daily_frame, period=20)
+            intraday_frame = _drop_trailing_zero_volume_bars(intraday_frame)
+            intraday_frame = intraday_frame.copy()
+            intraday_frame["volume_avg_5"] = intraday_frame["volume"].rolling(5).mean()
+            intraday_frame = add_rsi(intraday_frame, period=14)
+            intraday_frame = add_atr(intraday_frame, period=settings.risk.atr_period)
+            action, confidence = agent.predict_signal(
+                daily_frame=daily_frame,
+                ticker=symbol_upper,
+                portfolio_weight=0.0,
+                unrealized_pnl_pct=0.0,
+                cash_ratio=1.0,
+                symbols=symbols_for_inference,
+                market_frames=daily_frames,
+            )
+            predictions.append({
+                "action": action,
+                "confidence": float(confidence),
+                "is_trained": is_trained,
+                "model": str(mp),
+            })
+            target_intraday_frame = intraday_frame
+            continue
+        # One or more frames failed validation for this model — skip it
+        logger.debug("RL model skipped path=%s data validation failed", mp)
 
-    current_price = float(intraday_frame["close"].iloc[-1])
-    action, confidence = agent.predict_signal(
-        daily_frame=daily_frame,
-        ticker=symbol_upper,
-        portfolio_weight=0.0,
-        unrealized_pnl_pct=0.0,
-        cash_ratio=1.0,
-        symbols=symbols_for_inference,
-        market_frames=daily_frames,
+    if not predictions:
+        return None, "RL agent failed: no models produced valid predictions", {}
+
+    # Ensemble: majority action, average confidence
+    action_votes: dict[int, int] = {}
+    total_conf = 0.0
+    trained_count = 0
+    for p in predictions:
+        act = int(p["action"])
+        action_votes[act] = action_votes.get(act, 0) + 1
+        total_conf += p["confidence"]
+        if p["is_trained"]:
+            trained_count += 1
+    avg_confidence = total_conf / len(predictions)
+    model_count = len(predictions)
+    top_votes = max(action_votes.values())
+    top_actions = sorted(action for action, count in action_votes.items() if count == top_votes)
+    if len(top_actions) > 1:
+        _persist_rl_prediction_to_db(symbol, 0, avg_confidence, settings)
+        return None, f"RL ensemble action tie ({top_actions})", {
+            "rl_action": 0,
+            "rl_confidence": round(avg_confidence, 3),
+            "rl_trained_symbols": rl_trained_symbols,
+            "rl_untrained_symbol": symbol.upper() not in rl_trained_symbols,
+            "rl_models": model_count,
+            "rl_vote_tie": top_actions,
+        }
+    best_action = top_actions[0]
+
+    # Apply untrained penalty. Unknown symbols must clear the normal threshold
+    # after confidence is discounted, not receive an easier threshold.
+    confidence_mult = settings.rl.untrained_confidence_threshold_multiplier if hasattr(settings.rl, 'untrained_confidence_threshold_multiplier') else 0.8
+    effective_confidence = avg_confidence
+    effective_threshold = settings.rl.action_confidence_threshold
+    if trained_count == 0:
+        effective_confidence *= confidence_mult
+
+    if effective_confidence < effective_threshold or best_action != 1:
+        _persist_rl_prediction_to_db(symbol, best_action, avg_confidence, settings)
+        details: dict[str, object] = {
+            "rl_action": best_action,
+            "rl_confidence": round(avg_confidence, 3),
+            "rl_effective_confidence": round(effective_confidence, 3),
+            "rl_trained_symbols": rl_trained_symbols,
+            "rl_untrained_symbol": symbol.upper() not in rl_trained_symbols,
+            "rl_models": model_count,
+        }
+        if best_action == 0:
+            return None, f"RL agent predicts HOLD (confidence={avg_confidence:.2f})", details
+        elif best_action == 2:
+            return None, f"RL agent predicts SELL (confidence={avg_confidence:.2f})", details
+        return None, f"RL confidence {effective_confidence:.2f} below threshold {effective_threshold}", details
+
+    current_price = 0.0
+    if target_intraday_frame is not None and not target_intraday_frame.empty and "close" in target_intraday_frame.columns:
+        current_price = float(target_intraday_frame["close"].iloc[-1])
+    if not math.isfinite(current_price) or current_price <= 0:
+        _persist_rl_prediction_to_db(symbol, best_action, avg_confidence, settings)
+        return None, "RL current price unavailable", {
+            "rl_action": best_action,
+            "rl_confidence": round(avg_confidence, 3),
+            "rl_effective_confidence": round(effective_confidence, 3),
+            "rl_trained_symbols": rl_trained_symbols,
+            "rl_untrained_symbol": symbol.upper() not in rl_trained_symbols,
+            "rl_models": model_count,
+        }
+
+    atr_col = f"atr_{settings.risk.atr_period}"
+    atr = (
+        float(target_intraday_frame[atr_col].iloc[-1])
+        if target_intraday_frame is not None
+        and not target_intraday_frame.empty
+        and atr_col in target_intraday_frame.columns
+        else current_price * 0.02
     )
-
-    _persist_rl_prediction_to_db(symbol, action, confidence, settings)
-
-    details = _scan_details(daily_frame, intraday_frame)
-    details["rl_action"] = action
-    details["rl_confidence"] = confidence
-    details["rl_agent_type"] = settings.rl.agent_type
-    details["rl_trained_symbols"] = trained_symbols
-    details["rl_untrained_symbol"] = not is_trained_symbol
-
-    if action == 0:
-        return None, f"RL agent predicts HOLD (confidence={confidence:.2f})", details
-
-    if action == 2:
-        return None, f"RL agent predicts SELL (confidence={confidence:.2f})", details
-
-    confidence_threshold = settings.rl.action_confidence_threshold
-    if not is_trained_symbol:
-        confidence_threshold = confidence_threshold * 0.8
-        confidence *= 0.85
-
-    if confidence < confidence_threshold:
-        return None, f"RL confidence {confidence:.2f} below threshold {confidence_threshold}", details
-
-    atr = float(intraday_frame[f"atr_{settings.risk.atr_period}"].iloc[-1]) if f"atr_{settings.risk.atr_period}" in intraday_frame.columns else current_price * 0.02
+    if not math.isfinite(atr) or atr <= 0:
+        atr = current_price * 0.02
     stop_distance = atr * settings.risk.atr_multiplier
     stop_loss = current_price - stop_distance
-    profit_target = current_price + (stop_distance * 2.0)
-    risk_reward_ratio = (profit_target - current_price) / (current_price - stop_loss) if current_price > stop_loss else 0.0
+    target = current_price + (stop_distance * settings.risk.min_reward_risk_ratio)
 
+    if not trained_count:
+        details = {
+            "rl_action": best_action,
+            "rl_confidence": round(avg_confidence, 3),
+            "rl_effective_confidence": round(effective_confidence, 3),
+            "rl_untrained_symbol": True,
+            "rl_models": model_count,
+        }
+        signal = TradeSignal(
+            ticker=symbol.upper(),
+            timeframe="intraday",
+            action="BUY",
+            entry_price=current_price,
+            stop_loss=stop_loss,
+            profit_target=target,
+            risk_reward_ratio=settings.risk.min_reward_risk_ratio,
+            confidence=effective_confidence,
+            reasons=[f"RL ensemble ({model_count} models)"],
+            strategy_tag=f"rl_{settings.rl.agent_type}",
+            timestamp=datetime.now(timezone.utc),
+        )
+        _persist_rl_prediction_to_db(symbol, best_action, avg_confidence, settings)
+        return signal, "rl ensemble untrained", details
+
+    details = {
+        "rl_action": best_action,
+        "rl_confidence": round(avg_confidence, 3),
+        "rl_effective_confidence": round(effective_confidence, 3),
+        "rl_models": model_count,
+    }
     signal = TradeSignal(
-        ticker=symbol,
+        ticker=symbol.upper(),
         timeframe="intraday",
         action="BUY",
         entry_price=current_price,
         stop_loss=stop_loss,
-        profit_target=profit_target,
-        risk_reward_ratio=risk_reward_ratio,
-        confidence=confidence,
-        reasons=[f"RL {settings.rl.agent_type} signal", f"confidence={confidence:.2f}"],
+        profit_target=target,
+        risk_reward_ratio=settings.risk.min_reward_risk_ratio,
+        confidence=avg_confidence,
+        reasons=[f"RL ensemble ({model_count} models)"],
         strategy_tag=f"rl_{settings.rl.agent_type}",
         timestamp=datetime.now(timezone.utc),
     )
+    _persist_rl_prediction_to_db(symbol, best_action, avg_confidence, settings)
+    return signal, "rl ensemble approved", details
 
-    return signal, f"RL {settings.rl.agent_type} approved", details
+
+def _resolve_rl_model_paths(symbol: str, settings: Settings) -> list[Path]:
+    """Resolve which RL model(s) to use for a given symbol.
+
+    Returns an ordered list of model paths that cover the target symbol.
+    When ``model_paths`` is configured, uses those paths. Otherwise falls
+    back to the single ``model_path``.
+    """
+    base = Path(settings.app.log_dir).parent
+    paths = settings.rl.model_paths or []
+    if not paths:
+        default = base / settings.rl.model_path
+        return [default] if default.exists() else []
+
+    matching: list[Path] = []
+    for p in paths:
+        full = base / p
+        if not full.exists():
+            continue
+        symbols = rl_model_symbols(full)
+        if symbols and symbol.upper() in symbols:
+            matching.append(full)
+
+    if matching:
+        return matching
+
+    default = base / settings.rl.model_path
+    return [default] if default.exists() else []
 
 
-def _build_v3_signal_result(symbol: str, settings: Settings):
+def _build_v3_signal_result(
+    symbol: str,
+    settings: Settings,
+    daily_frame: pd.DataFrame | None = None,
+    intraday_frame: pd.DataFrame | None = None,
+):
     """V3 strategy path: regime detection + 5-factor confluence scoring.
 
     Produces a :class:`TradeSignal` adapted from a
     :class:`StrategySelection`. Falls back to the legacy path's details
     structure so downstream scan/report code is unchanged.
+
+    When *daily_frame* and *intraday_frame* are provided, the internal
+    data fetches are skipped — used by the parallel signal resolver to
+    share a single fetch across sources.
     """
     from trading_bot.strategy.strategy_selector import StrategySelector
 
-    daily_frame, daily_valid = market_data.fetch_and_validate_bars(
-        symbol,
-        settings.market_data.daily_period,
-        "1d",
-        settings.market_data,
-    )
-    if not daily_valid.valid:
-        return None, f"daily data validation failed: {daily_valid.reason}", {}
+    if daily_frame is None or intraday_frame is None:
+        daily_frame, daily_valid = market_data.fetch_and_validate_bars(
+            symbol,
+            settings.market_data.daily_period,
+            "1d",
+            settings.market_data,
+        )
+        if not daily_valid.valid:
+            return None, f"daily data validation failed: {daily_valid.reason}", {}
 
-    intraday_frame, intraday_valid = market_data.fetch_and_validate_bars(
-        symbol,
-        settings.market_data.intraday_period,
-        settings.market_data.intraday_interval,
-        settings.market_data,
-    )
-    if not intraday_valid.valid:
-        return None, f"intraday data validation failed: {intraday_valid.reason}", {}
+        intraday_frame, intraday_valid = market_data.fetch_and_validate_bars(
+            symbol,
+            settings.market_data.intraday_period,
+            settings.market_data.intraday_interval,
+            settings.market_data,
+        )
+        if not intraday_valid.valid:
+            return None, f"intraday data validation failed: {intraday_valid.reason}", {}
 
     # detect_market_regime requires ema_20, sma_50, atr_14, and bb_* on daily frame.
     daily_frame = daily_frame.copy()
@@ -1602,11 +2052,14 @@ def _trade_strategy_tag(signal, details: dict | None = None) -> str | None:
     base = getattr(signal, "strategy_tag", None) if signal else None
     decision = details.get("supermodel_decision") if isinstance(details, dict) else None
     swarm_decision = details.get("swarm_decision") if isinstance(details, dict) else None
+    consensus = details.get("consensus") if isinstance(details, dict) else None
     suffixes = []
     if decision:
         suffixes.append(f"stack:{_tag_token(decision, 16)}")
     if swarm_decision:
         suffixes.append(f"swarm:{_short_swarm_decision(swarm_decision)}")
+    if consensus:
+        suffixes.append(f"consensus:{_tag_token(consensus, 8)}")
     if not suffixes:
         return base
     suffix = "|".join(suffixes)[:50]
@@ -1632,9 +2085,15 @@ def _tag_token(value: object, max_length: int) -> str:
 def _paper_evidence_fields(details: dict | None) -> dict[str, object]:
     if not isinstance(details, dict):
         return {}
-    return {
+    compact = {
         key: details[key]
         for key in (
+            "signal_mode",
+            "consensus",
+            "consensus_count",
+            "consensus_votes",
+            "source_votes",
+            "position_size_capped",
             "supermodel_decision",
             "supermodel_score",
             "swarm_decision",
@@ -1643,6 +2102,8 @@ def _paper_evidence_fields(details: dict | None) -> dict[str, object]:
         )
         if key in details
     }
+    compact.update({key: value for key, value in details.items() if str(key).startswith("vote_")})
+    return compact
 
 
 def _persist_rl_prediction_to_db(

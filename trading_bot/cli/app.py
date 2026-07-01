@@ -637,6 +637,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
     lines: list[str] = []
     actions = 0
     skipped_stale = 0
+    state_changed = False
     exit_events: list[dict[str, object]] = []
     for ticker, position in sorted(state.positions.items()):
         # Use intraday bars for responsive trailing stop management
@@ -685,6 +686,13 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
         if _recently_existed(ticker):
             lines.append(f"{ticker} SKIP recently-exited-cooldown")
             continue
+        min_stop_pct = ctx.obj.risk.min_stop_distance_pct
+        if min_stop_pct > 0 and position.stop_loss is not None:
+            min_stop = round(position.average_cost * (1.0 - min_stop_pct / 100.0), 4)
+            if position.stop_loss > min_stop:
+                state.positions[ticker] = position.model_copy(update={"stop_loss": min_stop})
+                position = state.positions[ticker]
+                state_changed = True
         if eod_active:
             state, event, line = _fill_sell_position(
                 ticker, position, "eod", manage_now, last_price,
@@ -780,6 +788,9 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
             f"{ticker} qty={position.quantity} "
             f"avg={position.average_cost:.2f} last={last_price:.2f}"
         )
+    if state_changed:
+        ledger.save_portfolio_state(state)
+        ledger.record_equity_snapshot(state, timestamp=manage_now)
     typer.echo(
         f"positions={len(state.positions)} actions={actions} skipped={skipped_stale}"
     )
@@ -953,33 +964,51 @@ def trade_attribution(ctx: typer.Context) -> None:
     orders = ledger.list_order_rows()
 
     last_buy: dict[str, dict] = {}
-    print(f'{"Ticker":8} {"Buy@":>9} {"Sell@":>9} {"Qty":>5} {"P&L":>10} {"Ret%":>7} {"Held":>8}')
-    print("-" * 74)
+    sells: list[dict] = []
+    for o in orders:
+        if o["side"] == "BUY":
+            last_buy[o["ticker"]] = o
+        else:
+            sells.append(o)
+
+    print(f'{"Ticker":8} {"Strategy":24} {"Buy@":>9} {"Sell@":>9} {"Qty":>5} {"P&L":>10} {"Ret%":>7} {"Held":>8}')
+    print("-" * 90)
     total_pnl = 0.0
     win_pnl = 0.0
     loss_pnl = 0.0
     wins = 0
     losses = 0
-    for s in sorted(orders, key=lambda x: x.get("filled_at", "")):
-        if s["side"] == "BUY":
-            last_buy[s["ticker"]] = s
-            continue
+    strategy_pnl: dict[str, float] = {}
+    strategy_count: dict[str, int] = {}
+    prior_buys: dict[str, list[dict]] = {}
+    for o in orders:
+        if o["side"] == "BUY":
+            prior_buys.setdefault(o["ticker"], []).append(o)
+    for s in sorted(sells, key=lambda x: x.get("filled_at", "")):
         t = s["ticker"]
         pnl = float(s.get("pnl", 0.0) or 0.0)
-        b = last_buy.get(t)
+        b = None
+        s_at = s.get("filled_at", "")
+        if t in prior_buys:
+            for i, candidate in enumerate(reversed(prior_buys[t])):
+                if candidate.get("filled_at", "") < s_at:
+                    b = candidate
+                    actual_idx = len(prior_buys[t]) - 1 - i
+                    prior_buys[t].pop(actual_idx)
+                    break
         buy_price = b["fill_price"] if b else 0.0
         sell_price = s["fill_price"]
         ret = (sell_price - buy_price) / max(buy_price, 0.01) * 100 if buy_price > 0 else 0.0
         held = "N/A"
         b_at = b.get("filled_at", "") if b else ""
-        s_at = s.get("filled_at", "")
         if b_at and s_at:
             try:
                 d = dt.fromisoformat(s_at) - dt.fromisoformat(b_at)
                 held = f"{int(d.total_seconds()//60)}m"
             except (ValueError, TypeError):
                 pass
-        print(f"{t:8} {buy_price:9.2f} {sell_price:9.2f} {s['quantity']:5} {pnl:10.2f} {ret:7.2f}% {held:>8}")
+        tag = s.get("strategy_tag", "") or (b.get("strategy_tag", "") if b else "") or "unknown"
+        print(f"{t:8} {tag[:24]:24} {buy_price:9.2f} {sell_price:9.2f} {s['quantity']:5} {pnl:10.2f} {ret:7.2f}% {held:>8}")
         total_pnl += pnl
         if pnl > 0:
             wins += 1
@@ -987,13 +1016,20 @@ def trade_attribution(ctx: typer.Context) -> None:
         else:
             losses += 1
             loss_pnl += abs(pnl)
-    print("-" * 74)
-    print(f'{"":8} {"TOTAL":>9} {"":9} {"":5} {total_pnl:10.2f}')
+        strategy_pnl[tag] = strategy_pnl.get(tag, 0.0) + pnl
+        strategy_count[tag] = strategy_count.get(tag, 0) + 1
+    print("-" * 90)
+    print(f'{"":8} {"TOTAL":24} {"":9} {"":9} {"":5} {total_pnl:10.2f}')
     wl = wins + losses
     if wl > 0:
         print(f"\nWins: {wins}, Losses: {losses}, Win rate: {wins/wl*100:.0f}%")
         pf = "inf" if loss_pnl == 0 else f"{win_pnl / loss_pnl:.2f}"
         print(f"Profit factor: {pf}")
+    if strategy_pnl:
+        print(f"\n{'Strategy':30} {'Trades':>7} {'P&L':>10}")
+        print("-" * 50)
+        for tag in sorted(strategy_pnl, key=lambda k: strategy_pnl[k]):
+            print(f"{tag[:30]:30} {strategy_count[tag]:7} {strategy_pnl[tag]:10.2f}")
 
 
 def _build_portfolio_view(state: PortfolioState, settings) -> dict[str, object]:
@@ -1431,7 +1467,7 @@ def _fill_sell_position(
         market_price=last_price,
     )
     realized_pnl = (fill.fill_price - position.average_cost) * fill.quantity - fill.fees
-    ledger.record_fill(fill, side="SELL", realized_pnl=realized_pnl)
+    ledger.record_fill(fill, side="SELL", realized_pnl=realized_pnl, strategy_tag=position.strategy_tag)
 
     try:
         from trading_bot.db.session import init_db, make_session_factory, get_session
@@ -1683,6 +1719,14 @@ def _format_scan_summary(summary: dict[str, object]) -> str:
                 f"swarm_approved={summary.get('swarm_approved', 0)}",
                 f"swarm_rejected={summary.get('swarm_rejected', 0)}",
                 f"swarm_hold={summary.get('swarm_hold', 0)}",
+            ]
+        )
+    if "parallel_buy" in summary:
+        parts.extend(
+            [
+                f"parallel_buy={summary['parallel_buy']}",
+                f"parallel_sell={summary['parallel_sell']}",
+                f"parallel_no_trade={summary['parallel_no_trade']}",
             ]
         )
     if "supermodel_support" in summary:
@@ -2317,6 +2361,107 @@ def reconcile_positions_cmd(
         typer.echo(f"\nBroker Only: {', '.join(result.broker_only)}")
 
 
+@app.command(name="v3-debug")
+def v3_debug(
+    ctx: typer.Context,
+    symbols: str = typer.Option(
+        "",
+        "--symbols",
+        help="Comma-separated symbols to debug the V3 strategy selector against.",
+    ),
+) -> None:
+    """Debug why the V3 strategy selector approves or rejects each symbol.
+
+    Shows regime detection, setup search results, confluence scores,
+    confidence thresholds, and the final decision for each symbol.
+    """
+    from trading_bot.config.settings import Settings
+    from trading_bot.data import market_data
+    from trading_bot.runtime.orchestrator import _drop_trailing_zero_volume_bars
+    from trading_bot.strategy.strategy_selector import StrategySelector
+    from trading_bot.strategy.market_regime import detect_market_regime, should_trade_regime, get_recommended_strategy
+    from trading_bot.strategy.setup_rules import identify_intraday_setup, is_valid_mean_reversion_setup
+    from trading_bot.strategy.mean_reversion import identify_mean_reversion_setup
+    from trading_bot.data.indicators import add_ema, add_sma, add_atr, add_rsi, add_bollinger_bands, add_vwap
+
+    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not symbol_list:
+        typer.echo("Usage: v3-debug --symbols AAPL,MSFT,EBS")
+        raise typer.Exit(code=1)
+
+    settings = ctx.obj
+    for sym in symbol_list:
+        print(f"\n{'='*60}")
+        print(f"  {sym}")
+        print(f"{'='*60}")
+
+        daily, daily_ok = market_data.fetch_and_validate_bars(sym, settings.market_data.daily_period, "1d", settings.market_data)
+        if not daily_ok.valid:
+            print(f"  DAILY FAIL: {daily_ok.reason}")
+            continue
+
+        intraday, intra_ok = market_data.fetch_and_validate_bars(sym, settings.market_data.intraday_period, settings.market_data.intraday_interval, settings.market_data)
+        if not intra_ok.valid:
+            print(f"  INTRADAY FAIL: {intra_ok.reason}")
+            continue
+
+        daily = daily.copy()
+        daily = add_ema(daily, period=20, column_name="ema_20")
+        daily = add_sma(daily, period=50, column_name="sma_50")
+        daily = add_atr(daily, period=settings.risk.atr_period)
+        daily = add_bollinger_bands(daily, period=20)
+
+        regime, metrics = detect_market_regime(daily)
+        rec_strat = get_recommended_strategy(regime)
+        can_trade = should_trade_regime(regime, settings.strategy.risk_tolerance)
+        print(f"  Regime: {regime.value} (ADX={metrics.adx:.1f}, vol_pct={metrics.volatility_percentile:.0%})")
+        print(f"  Recommended: {rec_strat} | Trade OK: {can_trade}")
+
+        intraday = _drop_trailing_zero_volume_bars(intraday).copy()
+        intraday["volume_avg_5"] = intraday["volume"].rolling(5).mean()
+        intraday = add_atr(intraday, period=settings.risk.atr_period)
+        intraday = add_rsi(intraday, period=14)
+        intraday = add_bollinger_bands(intraday, period=20)
+        intraday = add_vwap(intraday)
+
+        last = intraday.iloc[-1]
+        close = float(last.get("close", 0))
+        rsi = float(last.get("rsi_14", 0))
+        bb_l = float(last.get("bb_lower", 0))
+        bb_u = float(last.get("bb_upper", 0))
+        vol = float(last.get("volume", 0))
+        avg_vol = float(last.get("volume_avg_5", 0))
+        bb_pct = (close - bb_l) / (bb_u - bb_l) * 100 if bb_u > bb_l else 0
+        print(f"  Last bar: close={close:.2f} RSI={rsi:.1f} %B={bb_pct:.1f} vol={vol:.0f}/{avg_vol:.0f}")
+
+        trend_setup = identify_intraday_setup(intraday)
+        mr_setup = identify_mean_reversion_setup(intraday)
+        mr_frame = is_valid_mean_reversion_setup(intraday)
+        print(f"  Trend setup: {trend_setup or 'NONE'}")
+        print(f"  MR setup:   {mr_setup or 'NONE'}")
+        print(f"  MR frame:   {mr_frame}")
+
+        if can_trade:
+            selector = StrategySelector(risk_tolerance=settings.strategy.risk_tolerance)
+            selector.min_confidence = settings.strategy.min_confidence
+            selector.atr_stop_multiplier = settings.risk.atr_stop_multiplier
+            selector.min_stop_distance_pct = settings.risk.min_stop_distance_pct
+            selection = selector.select_strategy(sym, daily, intraday)
+
+            print(f"  Decision: should_trade={selection.should_trade}")
+            print(f"  Strategy: {selection.strategy_type} | Setup: {selection.setup_name}")
+            if selection.signal_score:
+                s = selection.signal_score
+                print(f"  Score: {s.total_score:.1f}/12 conf={s.confidence} (need {settings.strategy.min_confidence})")
+                print(f"    technical={s.technical_score} volume={s.volume_score} trend={s.trend_score}")
+                print(f"    momentum={s.momentum_score} regime_align={s.regime_alignment} factors={s.factor_score}")
+            print(f"  Reason: {selection.reason}")
+            if selection.should_trade:
+                print(f"  Entry={selection.entry_price} stop={selection.stop_loss} target={selection.profit_target}")
+        else:
+            print(f"  BLOCKED: regime not tradeable at tolerance={settings.strategy.risk_tolerance}")
+
+
 @app.command(name="counter-thesis")
 def counter_thesis(
     ctx: typer.Context,
@@ -2847,7 +2992,9 @@ def supermodel_report(
 
     counts: Counter[str] = Counter()
     actions: Counter[tuple[str, str]] = Counter()
+    hold_reasons: Counter[tuple[str, str]] = Counter()
     swarm_pairs: Counter[tuple[str, str]] = Counter()
+    consensus_pairs: Counter[tuple[str, str]] = Counter()
     swarm_handoff_rows = 0
     scores: dict[str, list[float]] = {}
     missing = 0
@@ -2858,11 +3005,19 @@ def supermodel_report(
             continue
         counts[decision] += 1
         actions[(decision, row.action)] += 1
+        if row.action == "HOLD":
+            for reason in _scan_row_reasons(row):
+                hold_reasons[(decision, reason)] += 1
         swarm_decision = _scan_row_swarm_decision(row)
         if swarm_decision:
             swarm_pairs[(swarm_decision, decision)] += 1
         if _scan_row_swarm_handoff(row):
             swarm_handoff_rows += 1
+        details = _scan_row_details(row)
+        if details and details.get("signal_mode") == "parallel":
+            consensus = str(details.get("consensus") or "")
+            if consensus:
+                consensus_pairs[(consensus, decision)] += 1
         if score is not None:
             scores.setdefault(decision, []).append(score)
 
@@ -2879,6 +3034,10 @@ def supermodel_report(
             f"buy={actions[(decision, 'BUY')]} hold={actions[(decision, 'HOLD')]} "
             f"avg_score={avg_score:.2f}"
         )
+    if hold_reasons:
+        typer.echo("SCAN HOLD REASONS")
+        for (decision, reason), total in sorted(hold_reasons.items()):
+            typer.echo(f"{decision} reason={reason} count={total}")
     if swarm_pairs:
         typer.echo("SWARM ALIGNMENT")
         typer.echo(f"swarm_handoff_rows={swarm_handoff_rows}")
@@ -2886,13 +3045,26 @@ def supermodel_report(
             typer.echo(
                 f"swarm={swarm_decision} stack={stack_decision} count={total}"
             )
+    if consensus_pairs:
+        typer.echo("PARALLEL CONSENSUS")
+        for (consensus, stack_decision), total in sorted(consensus_pairs.items()):
+            typer.echo(f"consensus={consensus} stack={stack_decision} count={total}")
 
     trade_counts: Counter[str] = Counter()
     trade_pnl: Counter[str] = Counter()
+    trade_wins: Counter[str] = Counter()
+    trade_losses: Counter[str] = Counter()
     trade_open_counts: Counter[str] = Counter()
     trade_pairs: Counter[tuple[str, str]] = Counter()
     trade_pair_pnl: Counter[tuple[str, str]] = Counter()
+    trade_pair_wins: Counter[tuple[str, str]] = Counter()
+    trade_pair_losses: Counter[tuple[str, str]] = Counter()
     trade_pair_open_counts: Counter[tuple[str, str]] = Counter()
+    trade_consensus: Counter[tuple[str, str]] = Counter()
+    trade_consensus_pnl: Counter[tuple[str, str]] = Counter()
+    trade_consensus_wins: Counter[tuple[str, str]] = Counter()
+    trade_consensus_losses: Counter[tuple[str, str]] = Counter()
+    trade_consensus_open_counts: Counter[tuple[str, str]] = Counter()
     open_trades = 0
     for trade in trades:
         decision = _trade_stack_decision(trade)
@@ -2904,13 +3076,33 @@ def supermodel_report(
             swarm_decision = _trade_swarm_decision(trade)
             if swarm_decision:
                 trade_pair_open_counts[(swarm_decision, decision)] += 1
+            consensus = _trade_consensus(trade)
+            if consensus:
+                trade_consensus_open_counts[(consensus, decision)] += 1
             continue
         trade_counts[decision] += 1
-        trade_pnl[decision] += float(trade.pnl)
+        pnl = float(trade.pnl)
+        trade_pnl[decision] += pnl
+        if pnl > 0:
+            trade_wins[decision] += 1
+        elif pnl < 0:
+            trade_losses[decision] += 1
         swarm_decision = _trade_swarm_decision(trade)
         if swarm_decision:
             trade_pairs[(swarm_decision, decision)] += 1
-            trade_pair_pnl[(swarm_decision, decision)] += float(trade.pnl)
+            trade_pair_pnl[(swarm_decision, decision)] += pnl
+            if pnl > 0:
+                trade_pair_wins[(swarm_decision, decision)] += 1
+            elif pnl < 0:
+                trade_pair_losses[(swarm_decision, decision)] += 1
+        consensus = _trade_consensus(trade)
+        if consensus:
+            trade_consensus[(consensus, decision)] += 1
+            trade_consensus_pnl[(consensus, decision)] += pnl
+            if pnl > 0:
+                trade_consensus_wins[(consensus, decision)] += 1
+            elif pnl < 0:
+                trade_consensus_losses[(consensus, decision)] += 1
     if trade_counts or open_trades:
         typer.echo("TRADE OUTCOMES")
         typer.echo(f"closed_stack_trades={sum(trade_counts.values())} open_stack_trades={open_trades}")
@@ -2920,18 +3112,33 @@ def supermodel_report(
             if not total and not open_total:
                 continue
             avg_pnl = trade_pnl[decision] / total if total else 0.0
+            win_rate = trade_wins[decision] / total if total else 0.0
             typer.echo(
                 f"{decision} closed={total} net_pnl={trade_pnl[decision]:.2f} "
-                f"avg_pnl={avg_pnl:.2f} open={open_total}"
+                f"avg_pnl={avg_pnl:.2f} win_rate={win_rate:.2f} "
+                f"wins={trade_wins[decision]} losses={trade_losses[decision]} open={open_total}"
             )
         trade_pair_keys = set(trade_pairs) | set(trade_pair_open_counts)
         for swarm_decision, stack_decision in sorted(trade_pair_keys):
             total = trade_pairs[(swarm_decision, stack_decision)]
             open_total = trade_pair_open_counts[(swarm_decision, stack_decision)]
+            win_rate = trade_pair_wins[(swarm_decision, stack_decision)] / total if total else 0.0
             typer.echo(
                 f"swarm={swarm_decision} stack={stack_decision} closed={total} "
                 f"net_pnl={trade_pair_pnl[(swarm_decision, stack_decision)]:.2f} "
-                f"open={open_total}"
+                f"win_rate={win_rate:.2f} wins={trade_pair_wins[(swarm_decision, stack_decision)]} "
+                f"losses={trade_pair_losses[(swarm_decision, stack_decision)]} open={open_total}"
+            )
+        consensus_keys = set(trade_consensus) | set(trade_consensus_open_counts)
+        for consensus, stack_decision in sorted(consensus_keys):
+            total = trade_consensus[(consensus, stack_decision)]
+            open_total = trade_consensus_open_counts[(consensus, stack_decision)]
+            win_rate = trade_consensus_wins[(consensus, stack_decision)] / total if total else 0.0
+            typer.echo(
+                f"consensus={consensus} stack={stack_decision} closed={total} "
+                f"net_pnl={trade_consensus_pnl[(consensus, stack_decision)]:.2f} "
+                f"win_rate={win_rate:.2f} wins={trade_consensus_wins[(consensus, stack_decision)]} "
+                f"losses={trade_consensus_losses[(consensus, stack_decision)]} open={open_total}"
             )
 
 
@@ -2965,6 +3172,18 @@ def _scan_row_swarm_handoff(row) -> str | None:
     return str(handoff) if handoff else None
 
 
+def _scan_row_reasons(row) -> list[str]:
+    if not row.reasons:
+        return []
+    try:
+        reasons = json.loads(row.reasons)
+    except (TypeError, ValueError):
+        return []
+    if isinstance(reasons, list):
+        return [str(reason) for reason in reasons if str(reason)]
+    return []
+
+
 def _scan_row_details(row) -> dict[str, Any] | None:
     if not row.details:
         return None
@@ -2991,6 +3210,16 @@ def _trade_swarm_decision(trade) -> str | None:
         return None
     for part in str(tag).split("|"):
         if part.startswith("swarm:"):
+            return part.split(":", 1)[1] or None
+    return None
+
+
+def _trade_consensus(trade) -> str | None:
+    tag = getattr(trade, "strategy_tag", None)
+    if not tag:
+        return None
+    for part in str(tag).split("|"):
+        if part.startswith("consensus:"):
             return part.split(":", 1)[1] or None
     return None
 
