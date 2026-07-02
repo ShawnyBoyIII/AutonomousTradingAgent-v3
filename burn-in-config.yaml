@@ -16,7 +16,7 @@ market_data:
   intraday_period: "5d"
   intraday_interval: "5m"
   max_data_age_hours: 72
-  max_data_age_minutes: 75
+  max_data_age_minutes: 120
   validate_data: true
 
 risk:

@@ -129,6 +129,57 @@ def test_rl_eval_forwards_agent_and_train_symbols(monkeypatch) -> None:
     ]
 
 
+def test_train_rl_evaluate_uses_loaded_agent(monkeypatch, tmp_path: Path) -> None:
+    model_path = tmp_path / "PPO_final.zip"
+    model_path.write_bytes(b"model")
+    captured: dict[str, object] = {}
+
+    class FakeLoadedAgent:
+        def __init__(self):
+            self.config = Namespace(env_config=None, training=None)
+            self._trainer = object()
+
+        def evaluate(self, n_episodes: int):
+            captured["episodes"] = n_episodes
+            captured["symbols"] = self.config.env_config.symbols
+            captured["trainer_reset"] = self._trainer is None
+            return {
+                "mean_reward": 1.0,
+                "std_reward": 0.0,
+                "mean_final_equity": 101_000.0,
+                "min_final_equity": 101_000.0,
+                "max_final_equity": 101_000.0,
+            }
+
+    def fake_load(cls_or_path, path=None):
+        path = cls_or_path if path is None else path
+        captured["model_path"] = Path(path)
+        return FakeLoadedAgent()
+
+    monkeypatch.setattr(train_rl, "fetch_training_data", lambda *args, **kwargs: None)
+    monkeypatch.setattr("trading_bot.rl.agent.RLAgent.load", fake_load)
+
+    result = train_rl.evaluate_agent(
+        Namespace(
+            train_symbols="AAPL",
+            symbols="AAPL",
+            eval_episodes=3,
+            start_date=None,
+            end_date=None,
+            output_dir=str(tmp_path),
+            agent="PPO",
+        )
+    )
+
+    assert result == 0
+    assert captured == {
+        "model_path": model_path,
+        "episodes": 3,
+        "symbols": ["AAPL"],
+        "trainer_reset": True,
+    }
+
+
 def test_rl_model_info_reports_metadata(tmp_path: Path) -> None:
     model_path = tmp_path / "PPO_final.zip"
     model_path.write_bytes(b"")

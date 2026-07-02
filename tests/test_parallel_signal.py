@@ -337,7 +337,7 @@ class TestParallelModePositionSizing:
         fill = m_ledger.record_fill.call_args.args[0]
         assert fill.quantity == 50
         assert m_ledger.record_fill.call_args.kwargs["strategy_tag"] == (
-            "v3-trend|stack:caution|swarm:approve|consensus:buy"
+            "v3-trend_following|stack:caution|swarm:approve|consensus:buy"
         )
         event = json.loads((tmp_path / "decision-log.jsonl").read_text(encoding="utf-8").splitlines()[-1])
         assert event["consensus"] == "BUY"
@@ -394,7 +394,7 @@ class TestParallelModePositionSizing:
         ), patch(
             "trading_bot.runtime.orchestrator._run_swarm_overlay",
             return_value={"AAPL": swarm_decision},
-        ):
+        ) as m_swarm:
             with patch("trading_bot.runtime.orchestrator.PortfolioLedger") as m_ledger_cls:
                 m_ledger = MagicMock()
                 m_ledger.ensure_portfolio_state.return_value = state
@@ -413,6 +413,7 @@ class TestParallelModePositionSizing:
                         results = run_paper_trade(["AAPL"], settings)
 
         assert any("FILLED" in r for r in results), f"Expected FILLED: {results}"
+        assert m_swarm.call_args.kwargs["portfolio_state"]["cash"] == 10000.0
         fill = m_ledger.record_fill.call_args.args[0]
         assert fill.quantity == 61
 

@@ -183,7 +183,7 @@ def test_no_signal_scan_details_include_swarm_handoff(monkeypatch, tmp_path) -> 
     monkeypatch.setattr(
         orchestrator,
         "_run_swarm_overlay",
-        lambda symbols, settings: {
+        lambda symbols, settings, portfolio_state=None: {
             "AAPL": SimpleNamespace(
                 decision="HOLD_FOR_MORE_INFO",
                 confidence=0.5,
@@ -223,7 +223,7 @@ def test_scan_error_keeps_swarm_evidence(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         orchestrator,
         "_run_swarm_overlay",
-        lambda symbols, settings: {
+        lambda symbols, settings, portfolio_state=None: {
             "AAPL": SimpleNamespace(
                 decision="APPROVE",
                 confidence=0.75,
@@ -381,7 +381,7 @@ def test_stale_scan_row_keeps_swarm_evidence(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         orchestrator,
         "_run_swarm_overlay",
-        lambda symbols, settings: {
+        lambda symbols, settings, portfolio_state=None: {
             "AAPL": SimpleNamespace(
                 decision="APPROVE",
                 confidence=0.75,
@@ -556,10 +556,27 @@ def test_trade_strategy_tag_stays_column_safe() -> None:
     )
 
     assert tag is not None
-    assert len(tag) <= 50
+    assert len(tag) <= 200
     assert "|swarm:" in tag
     assert tag.endswith("|stack:support|swarm:unknown_stack_block")
     assert _trade_swarm_decision(SimpleNamespace(strategy_tag=tag)) == "unknown_stack_block"
+
+
+def test_trade_strategy_tag_preserves_consensus_when_suffix_is_long() -> None:
+    tag = _trade_strategy_tag(
+        SimpleNamespace(strategy_tag="very_long_strategy_name_that_should_be_truncated"),
+        {
+            "supermodel_decision": "STACK LABEL THAT IS TOO LONG",
+            "swarm_decision": "UNKNOWN|stack:block DECISION NAME THAT IS TOO LONG",
+            "consensus": "BUY",
+        },
+    )
+
+    trade = SimpleNamespace(strategy_tag=tag)
+    assert tag is not None
+    assert len(tag) <= 200
+    assert _trade_stack_decision(trade) == "stack_label_that"
+    assert _trade_consensus(trade) == "buy"
 
 
 def test_trade_strategy_tag_handles_empty_sanitized_tokens() -> None:
@@ -583,7 +600,7 @@ def test_trade_strategy_tag_clamps_worst_case_suffix() -> None:
     )
 
     assert tag is not None
-    assert len(tag) <= 50
+    assert len(tag) <= 200
     assert "|swarm:" in tag
 
 
@@ -657,7 +674,7 @@ def test_paper_trade_stack_uses_swarm_decision(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         orchestrator,
         "_run_swarm_overlay",
-        lambda symbols, settings: {
+        lambda symbols, settings, portfolio_state=None: {
             "AAPL": MagicMock(
                 decision="APPROVE",
                 confidence=0.8,
@@ -729,7 +746,7 @@ def test_paper_trade_reject_keeps_stack_evidence(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         orchestrator,
         "_run_swarm_overlay",
-        lambda symbols, settings: {
+        lambda symbols, settings, portfolio_state=None: {
             "AAPL": MagicMock(decision="APPROVE", confidence=0.8, key_rationale="bullish", risk_factors=[])
         },
     )
@@ -775,7 +792,7 @@ def test_paper_trade_stale_reject_keeps_stack_evidence(monkeypatch, tmp_path) ->
     monkeypatch.setattr(
         orchestrator,
         "_run_swarm_overlay",
-        lambda symbols, settings: {
+        lambda symbols, settings, portfolio_state=None: {
             "AAPL": MagicMock(
                 decision="APPROVE",
                 confidence=0.8,

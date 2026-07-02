@@ -291,9 +291,16 @@ One-liner per change. Date, category, summary.
 - **bugfix** — Paper execution now honors final stack/swarm-adjusted position size, including parallel half-size and swarm boost/reduce decisions, instead of re-sizing inside the order helper.
 - **bugfix** — Paper fills now write stack/swarm strategy tags to the local orders ledger too, so `trade-attribution` can group filled stack trades instead of showing `unknown`.
 - **bugfix** — Paper fills now also tag parallel consensus on trades, so closed/open outcomes can be grouped by model vote consensus instead of scan rows only.
+- **bugfix** — Paper trade strategy tags now preserve parallel consensus even when stack/swarm/base labels are long, avoiding truncated audit tags that hide model-vote outcomes.
 - **bugfix** — Swarm APPROVE sizing can boost reduced entries but is capped at the risk-approved base size; order submission also clamps overrides to risk size, so model consensus cannot bypass per-trade risk limits.
 - **bugfix** — Swarm worker/engine state handling now preserves returned `FAILED` state, so dependent agents block instead of running after failed upstream analysis.
 - **bugfix** — Swarm committee confidence now counts failed/blocked/missing worker votes as abstentions, preventing overconfident approvals when only surviving agents voted.
+- **bugfix** — Swarm overlay now passes current portfolio state into agent runs for scan and paper-trade, so risk-manager agents can evaluate cash/position exposure instead of market data only.
+- **bugfix** — Standalone `swarm` CLI now passes saved portfolio state into agent runs too, keeping risk-manager behavior aligned with scan and paper-trade.
+- **ops** — GPU RL training helper/docs added for Windows CUDA training, with generated GPU run folders ignored so model experiments do not pollute normal app diffs.
+- **bugfix** — `scripts/train_rl.py --evaluate` now uses the agent returned by `RLAgent.load(...)` while preserving CLI train symbols, so saved CPU/GPU RL models can actually be evaluated against the requested symbol set.
+- **bugfix** — GPU RL training output names now follow the selected agent type (`PPO_final`, `A2C_final`, etc.) instead of hardcoding PPO for every experiment.
+- **ops** — Burn-in loop now wakes every 60 seconds and accepts 120-minute intraday data freshness for more responsive live paper observation during market sessions.
 - **bugfix** — Technical swarm RSI now handles zero-loss/flat series correctly and uses price momentum, so strong uptrends no longer look oversold or collapse to HOLD.
 - **bugfix** — Swarm overlay now enriches raw market frames with EMA/SMA/RSI/Bollinger/volume-average indicators before technical panel workers vote, preventing missing indicator columns from weakening multi-agent evidence.
 - **bugfix** — Paper sector-concentration checks now use the local sector map only, avoiding hidden `yfinance` metadata calls in normal paper execution.
@@ -306,4 +313,4 @@ One-liner per change. Date, category, summary.
 - **docs** — Swarm/parallel wording now matches runtime behavior: strategy models vote on consensus; swarm applies bounded sizing after consensus.
 - **diagnostics** — `supermodel-report` now groups held scan rows by stack decision and persisted reason, making stale-data/risk blocks visible in paper review.
 - **diagnostics** — `supermodel-report` now shows win rate plus win/loss counts for stack and swarm-stack trade outcome groups.
-- **tests** — Focused continuous-loop suite: 24 passing. Broader paper-confidence bucket: 366 passing. CLI min-stop, RL metadata/price, RL tie/veto/detail preservation, ledger attribution, swarm dependency/confidence, technical RSI/frame-enrichment, local/projected sector checks, consensus outcome tagging, and stack/swarm sizing regressions added.
+- **tests** — Focused continuous-loop suite: 24 passing. Broader paper-confidence bucket: 368 passing. RL/GPU focused suite: 22 passing. CLI min-stop, RL metadata/price, RL tie/veto/detail preservation, ledger attribution, swarm dependency/confidence, technical RSI/frame-enrichment, local/projected sector checks, consensus outcome tagging, and stack/swarm sizing regressions added.

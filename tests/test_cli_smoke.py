@@ -2,6 +2,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 from typer.testing import CliRunner
@@ -47,6 +48,58 @@ def test_doctor_command_reports_local_readiness(tmp_path: Path) -> None:
         "doctor live_trading=false state_db=missing log_dir=missing snapshots=0/4 "
         "provider=yfinance provider_auth=ok"
     )
+
+
+def test_swarm_command_passes_saved_portfolio_state(monkeypatch, tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        f"  log_dir: {tmp_path / 'logs'}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=7_500.0,
+            equity=10_000.0,
+            positions={"MSFT": Position(ticker="MSFT", quantity=5, average_cost=200.0)},
+        )
+    )
+
+    frame = pd.DataFrame(
+        {
+            "open": [100.0] * 60,
+            "high": [101.0] * 60,
+            "low": [99.0] * 60,
+            "close": [100.0] * 60,
+            "volume": [1_000_000] * 60,
+        }
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "trading_bot.data.market_data.fetch_and_validate_bars",
+        lambda *args, **kwargs: (frame, SimpleNamespace(valid=True, reason=None)),
+    )
+    monkeypatch.setattr("trading_bot.swarm.engine.SwarmEngine.setup_workers", lambda self, workers: None)
+
+    def capture_run(self, symbols, market_data, portfolio_state=None, **kwargs):
+        captured["portfolio_state"] = portfolio_state
+        return SimpleNamespace(
+            decisions={},
+            execution_time_seconds=0.0,
+            completed_workers=0,
+            total_workers=0,
+        )
+
+    monkeypatch.setattr("trading_bot.swarm.engine.SwarmEngine.run", capture_run)
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "swarm", "--symbols", "AAPL"])
+
+    assert result.exit_code == 0
+    assert captured["portfolio_state"]["cash"] == 7_500.0
+    assert captured["portfolio_state"]["positions"]["MSFT"]["quantity"] == 5
 
 
 def test_scan_summary_includes_rl_counts_when_present() -> None:

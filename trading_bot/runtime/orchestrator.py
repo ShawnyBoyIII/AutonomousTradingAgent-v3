@@ -145,7 +145,7 @@ def run_scan(
     swarm_results: dict[str, Any] = {}
     if settings.swarm.enabled:
         try:
-            swarm_results = _run_swarm_overlay(symbols, settings)
+            swarm_results = _run_swarm_overlay(symbols, settings, portfolio_state=state.model_dump())
         except Exception as e:
             logger.warning("Swarm overlay failed: %s", e)
             swarm_results = {}
@@ -462,7 +462,11 @@ def _swarm_handoff(swarm_decision: Any) -> str | None:
     return None
 
 
-def _run_swarm_overlay(symbols: list[str], settings: Settings) -> dict[str, Any]:
+def _run_swarm_overlay(
+    symbols: list[str],
+    settings: Settings,
+    portfolio_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Run swarm analysis and return per-symbol committee decisions.
 
     Scanner uses these decisions as evidence only. Paper trading may use the
@@ -505,6 +509,7 @@ def _run_swarm_overlay(symbols: list[str], settings: Settings) -> dict[str, Any]
         run_summary = engine.run(
             symbols=list(frames.keys()),
             market_data=frames,
+            portfolio_state=portfolio_state,
         )
 
         # Extract per-ticker decisions
@@ -556,7 +561,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
     swarm_results: dict[str, Any] = {}
     if settings.swarm.enabled:
         try:
-            swarm_results = _run_swarm_overlay(symbols, settings)
+            swarm_results = _run_swarm_overlay(symbols, settings, portfolio_state=state.model_dump())
         except Exception as e:
             logger.warning("Swarm overlay failed: %s", e)
             swarm_results = {}
@@ -2055,15 +2060,26 @@ def _trade_strategy_tag(signal, details: dict | None = None) -> str | None:
     consensus = details.get("consensus") if isinstance(details, dict) else None
     suffixes = []
     if decision:
-        suffixes.append(f"stack:{_tag_token(decision, 16)}")
-    if swarm_decision:
-        suffixes.append(f"swarm:{_short_swarm_decision(swarm_decision)}")
+        stack_suffix = f"stack:{_tag_token(decision, 16)}"
+        suffixes.append(stack_suffix)
+    else:
+        stack_suffix = ""
     if consensus:
-        suffixes.append(f"consensus:{_tag_token(consensus, 8)}")
+        consensus_suffix = f"consensus:{_tag_token(consensus, 8)}"
+    else:
+        consensus_suffix = ""
+    if swarm_decision:
+        swarm_max = 20
+        if consensus_suffix:
+            reserved = len(consensus_suffix) + (1 if stack_suffix else 0) + len(stack_suffix)
+            swarm_max = max(1, 50 - reserved - len("|swarm:"))
+        suffixes.append(f"swarm:{_tag_token(swarm_decision, swarm_max)}")
+    if consensus_suffix:
+        suffixes.append(consensus_suffix)
     if not suffixes:
         return base
-    suffix = "|".join(suffixes)[:50]
-    base = str(base or "")[:max(0, 49 - len(suffix))]
+    suffix = "|".join(suffixes)
+    base = str(base or "")[:max(0, 200 - len(suffix))]
     return f"{base}|{suffix}" if base else suffix
 
 

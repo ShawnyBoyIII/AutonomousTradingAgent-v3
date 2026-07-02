@@ -146,7 +146,7 @@ def fetch_training_data(
 
 def train_agent(args: argparse.Namespace) -> int:
     """Train DRL agent on historical data."""
-    from trading_bot.rl.agent import RLAgent, RLAgentConfig
+    from trading_bot.rl.agent import RLAgent
     from trading_bot.rl.env import TradingConfig
     from trading_bot.rl.trainer import TrainingConfig as RLTrainingConfig
 
@@ -302,14 +302,10 @@ def evaluate_agent(args: argparse.Namespace) -> int:
 
     print(f"\n  Evaluating {', '.join(eval_symbols)} from {model_path}...")
 
-    agent_config = RLAgentConfig(
-        enabled=True,
-        env_config=env_config,
-        training=training_config,
-    )
-
-    agent = RLAgent(config=agent_config)
-    agent.load(model_path)
+    agent = RLAgent.load(model_path)
+    agent.config.env_config = env_config
+    agent.config.training = training_config
+    agent._trainer = None  # ponytail: force CLI eval symbols; add load(config=...) if more callers need it.
 
     results = agent.evaluate(n_episodes=args.eval_episodes)
 

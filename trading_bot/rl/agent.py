@@ -307,10 +307,20 @@ class RLAgent:
         return normalized_action, confidence
 
     def evaluate(self, n_episodes: int = 10) -> dict[str, float]:
-        if self._trainer is None:
-            raise RuntimeError("No trainer available. Call train() first.")
+        if self._model is None:
+            raise RuntimeError("No model available. Train or load a model first.")
 
-        return self._trainer.evaluate(n_episodes=n_episodes)
+        # If trainer exists (training mode), use it
+        if self._trainer is not None:
+            return self._trainer.evaluate(n_episodes=n_episodes)
+
+        # Otherwise create a temporary trainer for evaluation
+        from trading_bot.rl.trainer import RLTrainer
+
+        trainer = RLTrainer(self.config.training)
+        trainer._model = self._model
+        trainer._env = self._env
+        return trainer.evaluate(n_episodes=n_episodes)
 
     def save(self, path: str | Path) -> None:
         if self._model is None:

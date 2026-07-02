@@ -3353,6 +3353,7 @@ def swarm(
     from trading_bot.swarm.engine import SwarmEngine
     from trading_bot.swarm.workers import WORKER_CLASSES
     from trading_bot.data.market_data import fetch_and_validate_bars
+    from trading_bot.portfolio.ledger import PortfolioLedger
 
     parsed_symbols = _parse_symbols(symbols)
     settings = ctx.obj
@@ -3385,9 +3386,11 @@ def swarm(
     typer.echo()
 
     # Run swarm
+    state = PortfolioLedger(Path(settings.app.state_db_path)).ensure_portfolio_state()
     summary = engine.run(
         symbols=parsed_symbols,
         market_data=market_data,
+        portfolio_state=state.model_dump(),
     )
 
     if json_output:

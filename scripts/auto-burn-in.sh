@@ -728,6 +728,6 @@ while true; do
     fi
     
     echo ""
-    echo "[$timestamp] Sleeping 300 seconds (5 min)..."
-    sleep 300
+    echo "[$timestamp] Sleeping 60 seconds (1 min)..."
+    sleep 60
 done

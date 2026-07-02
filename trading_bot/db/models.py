@@ -54,7 +54,7 @@ class ScanResult(Base):
     action = Column(String(10), nullable=False)
     confidence = Column(Float, nullable=False)
     score = Column(Float, nullable=True)
-    strategy_tag = Column(String(50), nullable=True)
+    strategy_tag = Column(String(200), nullable=True)
     reasons = Column(Text, nullable=True)
     details = Column(Text, nullable=True)
 
@@ -72,7 +72,7 @@ class Trade(Base):
     profit_target = Column(Float, nullable=True)
     fees = Column(Float, nullable=False, default=0.0)
     filled_at = Column(DateTime, nullable=False, default=utc_now, index=True)
-    strategy_tag = Column(String(50), nullable=True)
+    strategy_tag = Column(String(200), nullable=True)
     status = Column(String(20), nullable=False, default="FILLED")
     exit_price = Column(Float, nullable=True)
     exit_fees = Column(Float, nullable=False, default=0.0)
@@ -91,7 +91,7 @@ class Position(Base):
     profit_target = Column(Float, nullable=True)
     highest_high = Column(Float, nullable=True)
     entry_at = Column(DateTime, nullable=True)
-    strategy_tag = Column(String(50), nullable=True)
+    strategy_tag = Column(String(200), nullable=True)
     closed_at = Column(DateTime, nullable=True)
 
 

@@ -11,6 +11,7 @@ import pytest
 from trading_bot.config.settings import Settings
 from trading_bot.models.risk import RiskDecision
 from trading_bot.models.signal import TradeSignal
+from trading_bot.models.portfolio import Position
 from trading_bot.portfolio.ledger import PortfolioLedger, PortfolioState
 
 
@@ -93,7 +94,13 @@ class TestSwarmOverlayIntegration:
         """Test that swarm overlay is run when enabled."""
         db_path = tmp_path / "state.db"
         ledger = PortfolioLedger(db_path)
-        ledger.save_portfolio_state(PortfolioState(cash=10_000.0, equity=10_000.0))
+        ledger.save_portfolio_state(
+            PortfolioState(
+                cash=10_000.0,
+                equity=10_000.0,
+                positions={"MSFT": Position(ticker="MSFT", quantity=10, average_cost=100.0)},
+            )
+        )
 
         settings = Settings(
             app={"state_db_path": str(db_path)},
@@ -118,6 +125,8 @@ class TestSwarmOverlayIntegration:
 
                     # Swarm should be called when enabled
                     mock_swarm.assert_called_once()
+                    assert mock_swarm.call_args.kwargs["portfolio_state"]["cash"] == 10_000.0
+                    assert mock_swarm.call_args.kwargs["portfolio_state"]["positions"]["MSFT"]["quantity"] == 10
                     # Results should include swarm info
                     assert "swarm_enabled" in result["summary"]
                     assert result["summary"]["swarm_enabled"] is True
@@ -275,8 +284,9 @@ class TestSwarmOverlayIntegration:
         )
         captured: dict[str, pd.DataFrame] = {}
 
-        def capture_run(self, symbols, market_data):
+        def capture_run(self, symbols, market_data, portfolio_state=None):
             captured.update(market_data)
+            captured["portfolio_state"] = portfolio_state
             return SimpleNamespace(decisions={})
 
         import trading_bot.data.market_data as market_data
@@ -286,8 +296,9 @@ class TestSwarmOverlayIntegration:
             with patch.object(SwarmEngine, "run", capture_run):
                 from trading_bot.runtime.orchestrator import _run_swarm_overlay
 
-                _run_swarm_overlay(["AAPL"], settings)
+                _run_swarm_overlay(["AAPL"], settings, portfolio_state={"cash": 123.0})
 
         frame = captured["AAPL"]
         for column in ("ema_20", "sma_50", "rsi_14", "bb_lower", "bb_upper", "volume_avg_5"):
             assert column in frame.columns
+        assert captured["portfolio_state"] == {"cash": 123.0}
