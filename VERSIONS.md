@@ -309,6 +309,7 @@ One-liner per change. Date, category, summary.
 - **diagnostics** — Scan summaries now include parallel consensus counts (`parallel_buy`, `parallel_sell`, `parallel_no_trade`) even without `--why`.
 - **diagnostics** — `supermodel-report` now shows persisted parallel consensus versus stack decisions, making model-vote alignment reviewable after scans.
 - **diagnostics** — `supermodel-report` now groups trade outcomes by persisted parallel consensus, making P&L reviewable for BUY/SELL/NO_TRADE vote paths.
+- **diagnostics** — `supermodel-report` now normalizes legacy truncated swarm hold labels in trade outcomes, avoiding split `hold_for_more_in` versus `hold_for_more_info` buckets.
 - **diagnostics** — Paper stale-data rejections now retain stack/swarm evidence, matching other paper reject paths.
 - **docs** — Swarm/parallel wording now matches runtime behavior: strategy models vote on consensus; swarm applies bounded sizing after consensus.
 - **diagnostics** — `supermodel-report` now groups held scan rows by stack decision and persisted reason, making stale-data/risk blocks visible in paper review.

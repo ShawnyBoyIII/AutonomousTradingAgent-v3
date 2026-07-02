@@ -3210,7 +3210,8 @@ def _trade_swarm_decision(trade) -> str | None:
         return None
     for part in str(tag).split("|"):
         if part.startswith("swarm:"):
-            return part.split(":", 1)[1] or None
+            value = part.split(":", 1)[1]
+            return _normalize_swarm_decision(value) if value else None
     return None
 
 
@@ -3226,7 +3227,7 @@ def _trade_consensus(trade) -> str | None:
 
 def _normalize_swarm_decision(decision: object) -> str:
     value = str(decision).lower()
-    if value == "hold_for_more_info":
+    if value in {"hold_for_more_info", "hold_for_more_in"}:
         return "hold"
     return value
 

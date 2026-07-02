@@ -544,6 +544,11 @@ def test_trade_strategy_tag_includes_swarm_decision() -> None:
     assert _trade_consensus(trade) == "buy"
 
 
+def test_trade_swarm_decision_normalizes_legacy_hold_labels() -> None:
+    assert _trade_swarm_decision(SimpleNamespace(strategy_tag="x|swarm:hold_for_more_in")) == "hold"
+    assert _trade_swarm_decision(SimpleNamespace(strategy_tag="x|swarm:hold_for_more_info")) == "hold"
+
+
 def test_trade_strategy_tag_stays_column_safe() -> None:
     signal = SimpleNamespace(strategy_tag="very_long_strategy_name_that_should_be_truncated")
 
