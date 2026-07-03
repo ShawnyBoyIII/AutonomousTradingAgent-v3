@@ -88,6 +88,52 @@ def test_load_settings_ignores_live_enable_flags_without_local_executor(
 
 
 @pytest.mark.parametrize(
+    "credential_line",
+    [
+        "  password: hunter2",
+        "  mfa_secret: abc123",
+        "  api_key: pk_live_123",
+        "  api_secret: shh",
+        "  device_token: device-123",
+        "  token: bearer-token",
+    ],
+)
+def test_load_settings_rejects_hardcoded_credential_like_values(
+    tmp_path: Path, credential_line: str
+) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "robinhood:\n"
+        f"{credential_line}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Credential detected"):
+        load_settings(config_file)
+
+
+@pytest.mark.parametrize(
+    "credential_line",
+    [
+        "  api_key: ${APCA_API_KEY_ID}",
+        "  api_secret: ${APCA_API_SECRET_KEY}",
+        "  token: ${BROKER_TOKEN}",
+    ],
+)
+def test_load_settings_allows_environment_credential_references(
+    tmp_path: Path, credential_line: str
+) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "robinhood:\n"
+        f"{credential_line}\n",
+        encoding="utf-8",
+    )
+
+    load_settings(config_file)
+
+
+@pytest.mark.parametrize(
     "risk_field",
     [
         "max_risk_per_trade_pct",

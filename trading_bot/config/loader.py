@@ -45,7 +45,10 @@ def _validate_credentials_not_in_config(config_text: str) -> None:
     sensitive_patterns = [
         "password:",
         "mfa_secret:",
+        "api_secret:",
         "api_key:",
+        "device_token:",
+        "token:",
         "secret:",
     ]
     
