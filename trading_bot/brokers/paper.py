@@ -138,12 +138,17 @@ class PaperBrokerAdapter(BrokerAdapter):
         """
         Get current quote for symbol.
         
-        Uses yfinance provider via market_data module.
+        Uses the configured market data provider stack via market_data module.
         """
         from trading_bot.data.market_data import fetch_bars
         
         try:
-            bars = fetch_bars(symbol, period="1d", interval="1m")
+            bars = fetch_bars(
+                symbol,
+                period="1d",
+                interval="1m",
+                settings=self.settings.market_data,
+            )
             if bars.empty:
                 return {"error": "No data available"}
             

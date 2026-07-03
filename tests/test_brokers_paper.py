@@ -159,6 +159,32 @@ class TestQuote:
         quote = adapter.get_quote("AAPL")
         assert "error" in quote
 
+    def test_get_quote_uses_configured_provider_stack(self, adapter, monkeypatch):
+        """Paper previews/orders should use the same provider stack as the app."""
+        import pandas as pd
+
+        adapter.settings.market_data.providers = ["alpaca", "polygon"]
+        captured: dict[str, object] = {}
+
+        def fake_fetch_bars(symbol, period, interval, **kwargs):
+            captured["symbol"] = symbol
+            captured["period"] = period
+            captured["interval"] = interval
+            captured["provider_stack"] = kwargs["settings"].provider_stack
+            return pd.DataFrame({"close": [101.25], "volume": [1234]})
+
+        monkeypatch.setattr("trading_bot.data.market_data.fetch_bars", fake_fetch_bars)
+
+        quote = adapter.get_quote("AAPL")
+
+        assert captured == {
+            "symbol": "AAPL",
+            "period": "1d",
+            "interval": "1m",
+            "provider_stack": ["alpaca", "polygon"],
+        }
+        assert quote["last"] == 101.25
+
 
 class TestPreviewOrder:
     def test_preview_buy_order(self, adapter, monkeypatch):
