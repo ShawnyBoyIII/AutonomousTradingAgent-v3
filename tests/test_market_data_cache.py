@@ -10,6 +10,7 @@ import pytest
 
 from trading_bot.config.settings import MarketDataSettings
 from trading_bot.data.cache import MarketDataCache, _interval_to_ttl_seconds, _make_cache_key
+from trading_bot.data.market_data import _resolve_provider_by_name
 
 
 @pytest.fixture
@@ -57,6 +58,17 @@ class TestCacheKey:
         k2 = _make_cache_key("AAPL", "1y", "1d", None, None, "providers=alpaca,polygon")
         assert k1 != k2
         assert k1 == "providers=yfinance:AAPL:1y:1d::"
+
+
+class TestProviderResolution:
+    def test_unknown_provider_is_rejected(self):
+        with pytest.raises(ValueError, match="Unsupported market data provider"):
+            _resolve_provider_by_name("alpacca")
+
+    def test_provider_name_is_normalized(self):
+        provider = _resolve_provider_by_name(" YFINANCE ")
+
+        assert provider.__class__.__name__ == "YFinanceProvider"
 
 
 class TestCacheGetPut:

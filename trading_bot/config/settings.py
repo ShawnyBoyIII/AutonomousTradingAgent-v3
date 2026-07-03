@@ -1,4 +1,20 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+SUPPORTED_MARKET_DATA_PROVIDERS = frozenset(
+    {"alpaca", "finnhub", "polygon", "yfinance"}
+)
+
+
+def _normalize_provider_name(value: str) -> str:
+    name = str(value).strip().lower()
+    if name not in SUPPORTED_MARKET_DATA_PROVIDERS:
+        supported = ", ".join(sorted(SUPPORTED_MARKET_DATA_PROVIDERS))
+        raise ValueError(
+            f"Unsupported market data provider '{value}'. "
+            f"Supported providers: {supported}"
+        )
+    return name
 
 
 class AppSettings(BaseModel):
@@ -24,6 +40,18 @@ class AppSettings(BaseModel):
 class MarketDataSettings(BaseModel):
     provider: str = "yfinance"
     providers: list[str] = Field(default_factory=list)
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _validate_provider(cls, value: str) -> str:
+        return _normalize_provider_name(value)
+
+    @field_validator("providers", mode="before")
+    @classmethod
+    def _validate_providers(cls, value: list[str] | None) -> list[str]:
+        if value is None:
+            return []
+        return [_normalize_provider_name(name) for name in value]
 
     @property
     def provider_stack(self) -> list[str]:

@@ -5,7 +5,10 @@ from typing import Any
 
 import pandas as pd
 
-from trading_bot.config.settings import MarketDataSettings
+from trading_bot.config.settings import (
+    SUPPORTED_MARKET_DATA_PROVIDERS,
+    MarketDataSettings,
+)
 from trading_bot.data.cache import MarketDataCache
 from trading_bot.data.validation import ValidationResult, validate_market_data
 
@@ -41,6 +44,7 @@ def _cache_namespace(settings: MarketDataSettings | None = None) -> str:
 
 def _resolve_provider_by_name(name: str) -> Any:
     """Return a single provider instance for the given *name* string."""
+    name = str(name).strip().lower()
     if name == "alpaca":
         from trading_bot.data.providers.alpaca_provider import AlpacaProvider
         return AlpacaProvider()
@@ -50,6 +54,12 @@ def _resolve_provider_by_name(name: str) -> Any:
     if name == "polygon":
         from trading_bot.data.providers.polygon_provider import PolygonProvider
         return PolygonProvider()
+    if name != "yfinance":
+        supported = ", ".join(sorted(SUPPORTED_MARKET_DATA_PROVIDERS))
+        raise ValueError(
+            f"Unsupported market data provider '{name}'. "
+            f"Supported providers: {supported}"
+        )
     from trading_bot.data.providers.yfinance_provider import YFinanceProvider
     return YFinanceProvider()
 

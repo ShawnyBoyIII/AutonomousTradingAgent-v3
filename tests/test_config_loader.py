@@ -60,6 +60,49 @@ def test_load_settings_forces_live_trading_off(tmp_path: Path) -> None:
     assert settings.app.live_trading_enabled is False
 
 
+def test_load_settings_rejects_unknown_market_data_provider(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "market_data:\n"
+        "  provider: alpacca\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Unsupported market data provider"):
+        load_settings(config_file)
+
+
+def test_load_settings_rejects_unknown_market_data_provider_stack(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "market_data:\n"
+        "  providers:\n"
+        "    - alpaca\n"
+        "    - yahooo\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Unsupported market data provider"):
+        load_settings(config_file)
+
+
+def test_load_settings_normalizes_market_data_provider_names(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "market_data:\n"
+        "  provider: ' Alpaca '\n"
+        "  providers:\n"
+        "    - ' Polygon '\n"
+        "    - YFINANCE\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_file)
+
+    assert settings.market_data.provider == "alpaca"
+    assert settings.market_data.provider_stack == ["polygon", "yfinance"]
+
+
 def test_load_settings_clamps_robinhood_mode_to_local_supported_values(
     monkeypatch, tmp_path: Path
 ) -> None:
