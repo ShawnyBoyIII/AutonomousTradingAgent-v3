@@ -4249,3 +4249,53 @@ def test_supermodel_command_resolves_pipeline_script_from_repo(
     assert Path(cmd[1]).parent.name == "scripts"
     assert "--dry-run" in cmd
     assert cmd[-2:] == ["--symbols", "AAPL"]
+
+
+def test_live_data_command_resolves_collector_script_from_repo(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import subprocess
+
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, capture_output=False):
+        captured["cmd"] = cmd
+        captured["capture_output"] = capture_output
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = CliRunner().invoke(app, ["live-data", "--buffer"])
+
+    assert result.exit_code == 0
+    cmd = captured["cmd"]
+    assert Path(cmd[1]).is_absolute()
+    assert Path(cmd[1]).name == "live_data_collector.py"
+    assert Path(cmd[1]).parent.name == "scripts"
+    assert "--buffer" in cmd
+
+
+def test_auto_retrain_command_resolves_trigger_script_from_repo(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import subprocess
+
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, capture_output=False):
+        captured["cmd"] = cmd
+        captured["capture_output"] = capture_output
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = CliRunner().invoke(app, ["auto-retrain", "--dry-run"])
+
+    assert result.exit_code == 0
+    cmd = captured["cmd"]
+    assert Path(cmd[1]).is_absolute()
+    assert Path(cmd[1]).name == "auto_retrain_trigger.py"
+    assert Path(cmd[1]).parent.name == "scripts"
+    assert "--dry-run" in cmd

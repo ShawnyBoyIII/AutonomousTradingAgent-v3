@@ -38,6 +38,13 @@ from trading_bot.strategy.trailing_stop import next_trailing_stop
 app = typer.Typer(help="Paper-trading CLI for stocks and ETFs.")
 
 
+def _repo_script_path(script_name: str) -> Path:
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / script_name
+    if not script_path.exists():
+        raise FileNotFoundError(f"script not found: {script_path}")
+    return script_path
+
+
 def now_in_zone(timezone: str) -> datetime:
     return runtime_session.now_in_zone(timezone)
 
@@ -4682,9 +4689,10 @@ def supermodel(
     import subprocess
     import sys
 
-    script_path = Path(__file__).resolve().parents[2] / "scripts" / "daily_supermodel.py"
-    if not script_path.exists():
-        typer.echo(f"Supermodel pipeline script not found: {script_path}")
+    try:
+        script_path = _repo_script_path("daily_supermodel.py")
+    except FileNotFoundError as exc:
+        typer.echo(f"Supermodel pipeline script not found: {exc}")
         raise typer.Exit(code=1)
 
     cmd = [
@@ -4771,9 +4779,15 @@ def live_data(
     import subprocess
     import sys
 
+    try:
+        script_path = _repo_script_path("live_data_collector.py")
+    except FileNotFoundError as exc:
+        typer.echo(f"Live data collector script not found: {exc}")
+        raise typer.Exit(code=1)
+
     cmd = [
         sys.executable,
-        "scripts/live_data_collector.py",
+        str(script_path),
         "--db-path", db_path,
         "--buffer-path", buffer_path,
     ]
@@ -4954,9 +4968,15 @@ def auto_retrain(
     import subprocess
     import sys
 
+    try:
+        script_path = _repo_script_path("auto_retrain_trigger.py")
+    except FileNotFoundError as exc:
+        typer.echo(f"Auto-retrain script not found: {exc}")
+        raise typer.Exit(code=1)
+
     cmd = [
         sys.executable,
-        "scripts/auto_retrain_trigger.py",
+        str(script_path),
         "--universe-path", universe_path,
         "--watchlist-path", watchlist_path,
         "--rl-dir", rl_dir,
