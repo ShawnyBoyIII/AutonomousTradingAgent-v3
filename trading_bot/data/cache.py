@@ -240,8 +240,9 @@ class MarketDataCache:
                 return v.isoformat() if hasattr(v, "isoformat") else str(v)
             return v
 
+        # Optimization: use itertuples(index=False) which is much faster than iterrows
         data = []
-        for _, row in df.iterrows():
+        for row in df.itertuples(index=False, name=None):
             data.append([_convert_value(v) for v in row])
 
         index_data = []

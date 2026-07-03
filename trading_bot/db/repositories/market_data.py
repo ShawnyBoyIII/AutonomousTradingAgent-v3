@@ -11,7 +11,8 @@ from trading_bot.db.models import MarketData
 
 def upsert_market_bars(session: Session, ticker: str, timeframe: str, bars: pd.DataFrame) -> int:
     count = 0
-    for _, row in bars.iterrows():
+    # Optimization: use to_dict('records') which is much faster than iterrows
+    for row in bars.to_dict('records'):
         ts = row["timestamp"]
         if isinstance(ts, (int, float)):
             ts = datetime.fromtimestamp(ts, tz=timezone.utc)
