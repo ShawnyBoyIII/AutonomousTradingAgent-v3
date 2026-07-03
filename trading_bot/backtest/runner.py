@@ -581,10 +581,12 @@ def _resolve_exit(signal, intraday_frame: Any, entry_index: int) -> tuple[float,
     if after.empty:
         # No future bars to check; exit at entry bar close.
         return float(intraday_frame.iloc[entry_index]["close"]), entry_index
-    for row_index, (_, row) in enumerate(after.iterrows(), start=entry_index + 1):
-        if float(row["low"]) <= signal.stop_loss:
+
+    # Optimization: use itertuples(index=False) which is much faster than iterrows
+    for row_index, row in enumerate(after.itertuples(index=False), start=entry_index + 1):
+        if float(row.low) <= signal.stop_loss:
             return signal.stop_loss, row_index
-        if float(row["high"]) >= signal.profit_target:
+        if float(row.high) >= signal.profit_target:
             return signal.profit_target, row_index
 
     last_idx = entry_index + len(after) - 1
