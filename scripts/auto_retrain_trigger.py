@@ -22,6 +22,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def repo_script_path(script_name: str) -> Path:
+    script_path = Path(__file__).resolve().parent / script_name
+    if not script_path.exists():
+        raise FileNotFoundError(f"script not found: {script_path}")
+    return script_path
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Auto-retrain trigger for new symbols")
     parser.add_argument(
@@ -148,7 +155,7 @@ def trigger_retrain(
     
     cmd = [
         sys.executable,
-        "scripts/daily_supermodel.py",
+        str(repo_script_path("daily_supermodel.py")),
         "--symbols", ",".join(new_symbols),
         "--epochs", str(epochs),
         "--timesteps", str(timesteps),
