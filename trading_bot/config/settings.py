@@ -213,7 +213,9 @@ class RLSettings(BaseModel):
     reward_function: str = Field(default="risk_adjusted")
     model_path: str = Field(default="trained_models/rl_agent.zip")
     model_paths: list[str] = Field(default_factory=list)
-    # For symbols outside model metadata, discount confidence before thresholding.
+    # Unknown symbols fail closed by default; opt in only for explicit research.
+    allow_untrained_symbol_inference: bool = Field(default=False)
+    # For opted-in symbols outside model metadata, discount confidence before thresholding.
     untrained_confidence_threshold_multiplier: float = Field(default=0.8, gt=0.0, le=1.0)
     training_episodes: int = Field(default=100, ge=1)
     training_timesteps: int = Field(default=100000, ge=1000)

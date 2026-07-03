@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from trading_bot.config.settings import MarketDataSettings
 from trading_bot.data.cache import MarketDataCache, _interval_to_ttl_seconds, _make_cache_key
 
 
@@ -40,16 +41,22 @@ class TestIntervalTTL:
 class TestCacheKey:
     def test_basic_key(self):
         key = _make_cache_key("AAPL", "1y", "1d", None, None)
-        assert key == "AAPL:1y:1d::"
+        assert key == ":AAPL:1y:1d::"
 
     def test_key_with_start_end(self):
         key = _make_cache_key("aapl", "1y", "1d", "2025-01-01", "2025-06-01")
-        assert key == "AAPL:1y:1d:2025-01-01:2025-06-01"
+        assert key == ":AAPL:1y:1d:2025-01-01:2025-06-01"
 
     def test_key_case_insensitive(self):
         k1 = _make_cache_key("aapl", "1y", "1d", None, None)
         k2 = _make_cache_key("AAPL", "1y", "1d", None, None)
         assert k1 == k2
+
+    def test_key_includes_namespace(self):
+        k1 = _make_cache_key("AAPL", "1y", "1d", None, None, "providers=yfinance")
+        k2 = _make_cache_key("AAPL", "1y", "1d", None, None, "providers=alpaca,polygon")
+        assert k1 != k2
+        assert k1 == "providers=yfinance:AAPL:1y:1d::"
 
 
 class TestCacheGetPut:
@@ -83,6 +90,19 @@ class TestCacheGetPut:
         })
         cache.put("AAPL", "1y", "1d", df)
         result = cache.get("AAPL", "1y", "5m")
+        assert result is None
+
+    def test_get_different_namespace(self, cache):
+        df = pd.DataFrame({
+            "timestamp": pd.date_range("2025-01-01", periods=3, freq="1d"),
+            "open": [100.0, 101.0, 102.0],
+            "high": [105.0, 106.0, 107.0],
+            "low": [99.0, 100.0, 101.0],
+            "close": [101.0, 102.0, 103.0],
+            "volume": [1000, 1100, 1200],
+        })
+        cache.put("AAPL", "1y", "1d", df, namespace="providers=yfinance")
+        result = cache.get("AAPL", "1y", "1d", namespace="providers=alpaca,polygon")
         assert result is None
 
     def test_overwrite_existing(self, cache):
@@ -291,3 +311,35 @@ class TestIntegration:
 
         assert fetch_call_count[0] == 2
         assert len(result1) == 3
+
+    def test_fetch_bars_cache_isolated_by_provider_stack(self, cache, monkeypatch):
+        from trading_bot.data import market_data
+
+        fetch_call_count = [0]
+
+        def mock_fetch(symbol, period, interval, start=None, end=None, primary_settings=None):
+            fetch_call_count[0] += 1
+            close = 100.0 + fetch_call_count[0]
+            return pd.DataFrame({
+                "timestamp": pd.date_range("2025-01-01", periods=1, freq="1d"),
+                "open": [close],
+                "high": [close],
+                "low": [close],
+                "close": [close],
+                "volume": [1000],
+            })
+
+        monkeypatch.setattr(market_data, "_get_cache", lambda: cache)
+        monkeypatch.setattr(market_data, "_fallback_fetch", mock_fetch)
+
+        yfinance = MarketDataSettings(provider="yfinance")
+        alpaca_polygon = MarketDataSettings(providers=["alpaca", "polygon"])
+
+        first = market_data.fetch_bars("AAPL", "1y", "1d", settings=yfinance)
+        second = market_data.fetch_bars("AAPL", "1y", "1d", settings=yfinance)
+        third = market_data.fetch_bars("AAPL", "1y", "1d", settings=alpaca_polygon)
+
+        assert fetch_call_count[0] == 2
+        assert float(first["close"].iloc[0]) == 101.0
+        assert float(second["close"].iloc[0]) == 101.0
+        assert float(third["close"].iloc[0]) == 102.0

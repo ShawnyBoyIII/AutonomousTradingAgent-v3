@@ -232,7 +232,7 @@ class DynamicWatchlist:
 
         Returns path to exported file.
         """
-        output_path = output_path or "burn-in-symbols.txt"
+        output_path = output_path or "state/universe.txt"
         path = Path(output_path)
 
         symbols = self.get_symbols()
@@ -248,6 +248,7 @@ class DynamicWatchlist:
             # No existing file to preserve — fall through and write empty file
             # so callers can still detect "no symbols configured"
 
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(symbols), encoding="utf-8")
 
         logger.info(f"Exported {len(symbols)} symbols to {path}")
@@ -408,11 +409,11 @@ def create_watchlist_from_breakouts(
 
 
 def update_burn_in_symbols(watchlist: DynamicWatchlist) -> None:
-    """Update the burn-in script's symbol file."""
+    """Update the burn-in symbol universe file."""
     symbols = watchlist.get_symbols()
 
-    # Update burn-in-symbols.txt
-    path = Path("burn-in-symbols.txt")
+    path = Path("state/universe.txt")
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(symbols), encoding="utf-8")
 
-    logger.info(f"Updated burn-in symbols: {len(symbols)} symbols")
+    logger.info(f"Updated burn-in universe: {len(symbols)} symbols")

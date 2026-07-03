@@ -180,7 +180,7 @@ def compute_mean_reversion_confluence_score(details: dict) -> float:
         score += 3.0
     elif rsi < 35:
         score += 2.0
-    elif rsi < 45:
+    elif rsi < 40:
         score += 1.0
 
     score += min(4.0, max(0.0, vr * 2.0))

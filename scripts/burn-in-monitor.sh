@@ -15,6 +15,7 @@ cd /Users/shawndlima/Documents/AutonomousTradingAgentcopy
 CONFIG_FILE="burn-in-config.yaml"
 LOG_DIR="logs/burn_in"
 DECISION_LOG="$LOG_DIR/decision-log.jsonl"
+UNIVERSE_FILE="state/universe.txt"
 
 echo "1. Burn-In Analytics Report:"
 echo "----------------------------"
@@ -28,14 +29,14 @@ echo ""
 
 echo "2. Market Scan (Burn-In Universe):"
 echo "-----------------------------------"
-if [ -f burn-in-symbols.txt ]; then
-    symbols=$(grep -v "^#" burn-in-symbols.txt | grep -v "^$" | tr '\n' ',' | sed 's/,$//')
+if [ -f "$UNIVERSE_FILE" ]; then
+    symbols=$(grep -v "^#" "$UNIVERSE_FILE" | grep -v "^$" | tr '\n' ',' | sed 's/,$//')
     if [ -n "$symbols" ]; then
         echo "Scanning: $symbols"
         echo ""
         sh ./tradebot-local --config-path "$CONFIG_FILE" scan --symbols "$symbols" --summary 2>&1 | head -15
     else
-        echo "No symbols found in burn-in-symbols.txt"
+        echo "No symbols found in $UNIVERSE_FILE"
     fi
 else
     echo "No universe file found - using default SPY"
@@ -50,8 +51,8 @@ echo ""
 
 echo "4. Universe Status:"
 echo "--------------------"
-if [ -f burn-in-symbols.txt ]; then
-    SYMBOL_COUNT=$(wc -l < burn-in-symbols.txt | tr -d ' ')
+if [ -f "$UNIVERSE_FILE" ]; then
+    SYMBOL_COUNT=$(wc -l < "$UNIVERSE_FILE" | tr -d ' ')
     echo "Universe size: $SYMBOL_COUNT symbols"
     
     if [ "$SYMBOL_COUNT" -lt 10 ]; then

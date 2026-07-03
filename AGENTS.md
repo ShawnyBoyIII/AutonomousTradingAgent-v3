@@ -206,7 +206,10 @@ Fail-fast: stops on first validation error.
 
 ## Current State
 
-- **Focused changed-suite:** 292 tests passing in current review bucket
+- **Test count:** 1853 passing, 0 failures
 - **V2.5 complete:** ATR sizing, validation, kill switches, burn-in
 - **V3 wired:** Regime detection, confluence scoring, counter-thesis (entry + exit + backtest)
+- **Parallel signal mode:** Default — RL + V3 + V2.5 + Swarm consensus
+- **MR detection relaxed (2026-07-02):** RSI < 40 (was 35), VWAP 0.5% (was 1%), range vol 80% (was 100%)
+- **RL disabled:** Burn-in runs V3 + Swarm only; RL produced 0 winning trades
 - **Phase D active:** Running paper burn-in with dynamic watchlist

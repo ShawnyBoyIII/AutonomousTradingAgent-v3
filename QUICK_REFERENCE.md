@@ -83,7 +83,7 @@ tail -f logs/burn_in/decision-log.jsonl # Live decision feed
 - `burn-in-config.yaml` — Burn-in config (Alpaca provider, V3 strategy, risk limits)
 - `config.yaml` — Default config (fallback)
 - `.env` — Secrets + `CONFIG_PATH=burn-in-config.yaml` (don't commit!)
-- `burn-in-symbols.txt` — 150-symbol S&P 500 watchlist
+- `state/universe.txt` — runtime burn-in universe
 - `state/burn_in.db` — Paper trading ledger
 - `logs/burn_in/` — Decision logs + strategy results
 

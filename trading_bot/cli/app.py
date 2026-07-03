@@ -641,11 +641,28 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
     exit_events: list[dict[str, object]] = []
     for ticker, position in sorted(state.positions.items()):
         # Use intraday bars for responsive trailing stop management
-        frame = market_data.fetch_bars(
-            ticker,
-            ctx.obj.market_data.intraday_period,
-            ctx.obj.market_data.intraday_interval,
-        )
+        try:
+            frame = market_data.fetch_bars(
+                ticker,
+                ctx.obj.market_data.intraday_period,
+                ctx.obj.market_data.intraday_interval,
+                settings=ctx.obj.market_data,
+            )
+        except Exception as exc:
+            skipped_stale += 1
+            append_decision_event(
+                log_path,
+                {
+                    "command": "manage-positions",
+                    "ticker": ticker,
+                    "status": "SKIP",
+                    "reason": "market data fetch failed",
+                    "error": str(exc),
+                    "managed_at": manage_now.isoformat(),
+                },
+            )
+            lines.append(f"{ticker} SKIP reason=market-data-fetch-failed")
+            continue
         last_timestamp = frame_last_timestamp(frame)
         last_price: float | None = None
         if not frame.empty and "close" in frame.columns:
@@ -661,7 +678,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
                     "reason": "stale market data",
                     "last_timestamp": last_timestamp.isoformat() if last_timestamp else None,
                     "managed_at": manage_now.isoformat(),
-                    "max_age_hours": ctx.obj.market_data.max_data_age_hours,
+                    "max_age_minutes": ctx.obj.market_data.max_data_age_minutes,
                 },
             )
             lines.append(
@@ -1603,6 +1620,7 @@ def _update_trailing_stop(
             position.ticker,
             settings.market_data.daily_period,
             "1d",
+            settings=settings.market_data,
         )
         atr_frame = add_atr(daily_frame, period=14, column_name="atr_14")
         atr_series = atr_frame["atr_14"].dropna()
@@ -1680,13 +1698,14 @@ def _try_fetch_bars(symbol: str, settings, market_data) -> "pd.DataFrame | None"
             symbol,
             settings.market_data.intraday_period,
             settings.market_data.intraday_interval,
+            settings=settings.market_data,
         )
     except Exception:
         frame = None
     if frame is not None and not frame.empty:
         return frame
     try:
-        frame = market_data.fetch_bars(symbol, "1mo", "1d")
+        frame = market_data.fetch_bars(symbol, "1mo", "1d", settings=settings.market_data)
     except Exception:
         return None
     return frame
@@ -1750,12 +1769,21 @@ def _format_doctor(settings) -> str:
     ]
     ready_snapshots = sum(1 for path in snapshots if Path(path).exists())
 
-    provider = getattr(settings.market_data, "provider", "yfinance")
-    provider_ok = "ok"
-    if provider == "alpaca":
-        import os
-        if not os.environ.get("APCA_API_KEY_ID") or not os.environ.get("APCA_API_SECRET_KEY"):
-            provider_ok = "missing APCA_API_KEY_ID/APCA_API_SECRET_KEY"
+    providers = list(getattr(settings.market_data, "provider_stack", []) or ["yfinance"])
+    provider = ",".join(providers)
+    provider_statuses: list[str] = []
+    for provider_name in providers:
+        provider_ok = "ok"
+        if provider_name == "alpaca":
+            import os
+            if not os.environ.get("APCA_API_KEY_ID") or not os.environ.get("APCA_API_SECRET_KEY"):
+                provider_ok = "missing APCA_API_KEY_ID/APCA_API_SECRET_KEY"
+        elif provider_name == "polygon":
+            import os
+            if not os.environ.get("POLYGON_API_KEY"):
+                provider_ok = "missing POLYGON_API_KEY"
+        provider_statuses.append(f"{provider_name}:{provider_ok}")
+    provider_auth = ",".join(provider_statuses)
 
     return " ".join(
         [
@@ -1765,7 +1793,7 @@ def _format_doctor(settings) -> str:
             f"log_dir={_exists_label(settings.app.log_dir)}",
             f"snapshots={ready_snapshots}/{len(snapshots)}",
             f"provider={provider}",
-            f"provider_auth={provider_ok}",
+            f"provider_auth={provider_auth}",
         ]
     )
 
@@ -2523,7 +2551,7 @@ def discover_symbols(
     ctx: typer.Context,
     mode: str = typer.Option("breakout", "--mode", help="Discovery mode: breakout, mean-reversion, gap-up"),
     max_symbols: int = typer.Option(20, "--max", help="Maximum symbols to return"),
-    export: bool = typer.Option(False, "--export", help="Export to burn-in symbols file"),
+    export: bool = typer.Option(False, "--export", help="Export to configured universe file"),
 ) -> None:
     """Dynamically discover trading candidates based on market conditions."""
     from trading_bot.strategy.dynamic_watchlist import DynamicWatchlist
@@ -2536,7 +2564,7 @@ def discover_symbols(
 
     def data_provider(symbol: str) -> pd.DataFrame | None:
         try:
-            return fetch_bars(symbol, interval="1d", period="1mo")
+            return fetch_bars(symbol, interval="1d", period="1mo", settings=ctx.obj.market_data)
         except Exception:
             return None
 
@@ -2556,7 +2584,7 @@ def discover_symbols(
         typer.echo("No symbols passed screening criteria.")
 
     if export:
-        export_path = watchlist.export_for_burn_in()
+        export_path = watchlist.export_for_burn_in(ctx.obj.app.universe_path)
         typer.echo(f"\nExported {len(watchlist.get_symbols())} symbols to {export_path}")
 
 
@@ -2576,7 +2604,7 @@ def sector_analysis_cmd(ctx: typer.Context) -> None:
     typer.echo("Fetching sector data...")
     for symbol in list(SECTOR_ETFS.keys())[:5]:  # Demo: just first 5
         try:
-            frame = fetch_bars(symbol, interval="1d", period="3mo")
+            frame = fetch_bars(symbol, interval="1d", period="3mo", settings=ctx.obj.market_data)
             if frame is not None:
                 sector_data[symbol] = frame
                 typer.echo(f"  ✓ {symbol}")
@@ -2585,7 +2613,7 @@ def sector_analysis_cmd(ctx: typer.Context) -> None:
 
     # Fetch SPY for relative strength
     try:
-        spy_data = fetch_bars("SPY", interval="1d", period="3mo")
+        spy_data = fetch_bars("SPY", interval="1d", period="3mo", settings=ctx.obj.market_data)
         typer.echo("  ✓ SPY (benchmark)")
     except Exception as e:
         logger.debug("Error in CLI: %s", e)
@@ -2645,7 +2673,7 @@ def screen_market(
     typer.echo("Screening symbols...")
     for symbol in universe:
         try:
-            frame = fetch_bars(symbol, interval="1d", period="1mo")
+            frame = fetch_bars(symbol, interval="1d", period="1mo", settings=ctx.obj.market_data)
             if frame is not None and len(frame) >= 20:
                 result = screener.screen_symbol(symbol, frame)
                 results.append(result)
@@ -3106,6 +3134,11 @@ def supermodel_report(
     if trade_counts or open_trades:
         typer.echo("TRADE OUTCOMES")
         typer.echo(f"closed_stack_trades={sum(trade_counts.values())} open_stack_trades={open_trades}")
+        if not trade_counts and open_trades:
+            typer.echo(
+                "outcome_confidence=INSUFFICIENT reason=no_closed_stack_trades "
+                "message=paper validation needs realized exits before win-rate/P&L are meaningful"
+            )
         for decision in ("support", "caution", "block", "no_signal"):
             total = trade_counts[decision]
             open_total = trade_open_counts[decision]
@@ -4649,9 +4682,14 @@ def supermodel(
     import subprocess
     import sys
 
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "daily_supermodel.py"
+    if not script_path.exists():
+        typer.echo(f"Supermodel pipeline script not found: {script_path}")
+        raise typer.Exit(code=1)
+
     cmd = [
         sys.executable,
-        "scripts/daily_supermodel.py",
+        str(script_path),
         "--db-path", db_path,
         "--rl-dir", rl_dir,
         "--output-dir", output_dir,
@@ -4766,6 +4804,7 @@ def live_data(
 
 @app.command(name="cache-data")
 def cache_data(
+    ctx: typer.Context,
     symbols: str = typer.Option(
         "",
         "--symbols",
@@ -4835,7 +4874,12 @@ def cache_data(
 
         try:
             typer.echo(f"  {ticker} downloading...", nl=False)
-            df = market_data.fetch_bars(ticker, period=period, interval=interval)
+            df = market_data.fetch_bars(
+                ticker,
+                period=period,
+                interval=interval,
+                settings=ctx.obj.market_data,
+            )
 
             if df.empty:
                 typer.echo(f" FAILED (no data)")

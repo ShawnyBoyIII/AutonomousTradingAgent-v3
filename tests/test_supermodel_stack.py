@@ -521,6 +521,43 @@ def test_supermodel_report_reads_persisted_scan_history(tmp_path) -> None:
     assert "consensus=sell stack=block closed=1 net_pnl=-5.00 win_rate=0.00 wins=0 losses=1 open=0" in result.stdout
 
 
+def test_supermodel_report_warns_when_only_open_stack_trades(tmp_path) -> None:
+    from trading_bot.cli.app import app
+    from trading_bot.config.loader import load_settings
+    from trading_bot.db.repositories import upsert_trade
+    from trading_bot.db.session import get_session, init_db, make_session_factory
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state.db'}\n"
+        f"  log_dir: {tmp_path / 'logs'}\n",
+        encoding="utf-8",
+    )
+    settings = load_settings(config_file)
+    engine = init_db(settings)
+    session = get_session(make_session_factory(engine))
+    try:
+        upsert_trade(
+            session,
+            ticker="NVDA",
+            side="BUY",
+            order_type="market",
+            quantity=1,
+            entry_price=100.0,
+            strategy_tag="test|stack:support|swarm:approve|consensus:buy",
+        )
+    finally:
+        session.close()
+        engine.dispose()
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "supermodel-report"])
+
+    assert result.exit_code == 0
+    assert "closed_stack_trades=0 open_stack_trades=1" in result.stdout
+    assert "outcome_confidence=INSUFFICIENT reason=no_closed_stack_trades" in result.stdout
+
+
 def test_trade_strategy_tag_includes_supermodel_decision() -> None:
     signal = SimpleNamespace(strategy_tag="v3-trend_following")
 

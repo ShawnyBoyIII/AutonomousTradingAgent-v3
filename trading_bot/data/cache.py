@@ -37,13 +37,21 @@ def _interval_to_ttl_seconds(interval: str) -> int:
     return 300
 
 
-def _make_cache_key(symbol: str, period: str, interval: str, start: str | None, end: str | None) -> str:
+def _make_cache_key(
+    symbol: str,
+    period: str,
+    interval: str,
+    start: str | None,
+    end: str | None,
+    namespace: str | None = None,
+) -> str:
     s = symbol.upper().strip()
     p = period.strip().lower()
     i = interval.strip().lower()
     st = start.strip().lower() if start else ""
     en = end.strip().lower() if end else ""
-    return f"{s}:{p}:{i}:{st}:{en}"
+    ns = namespace.strip().lower() if namespace else ""
+    return f"{ns}:{s}:{p}:{i}:{st}:{en}"
 
 
 class MarketDataCache:
@@ -93,8 +101,16 @@ class MarketDataCache:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def get(self, symbol: str, period: str, interval: str, start: str | None = None, end: str | None = None) -> pd.DataFrame | None:
-        key = _make_cache_key(symbol, period, interval, start, end)
+    def get(
+        self,
+        symbol: str,
+        period: str,
+        interval: str,
+        start: str | None = None,
+        end: str | None = None,
+        namespace: str | None = None,
+    ) -> pd.DataFrame | None:
+        key = _make_cache_key(symbol, period, interval, start, end, namespace)
         with self._lock:
             conn = self._connect()
             try:
@@ -108,8 +124,17 @@ class MarketDataCache:
             finally:
                 conn.close()
 
-    def put(self, symbol: str, period: str, interval: str, data: pd.DataFrame, start: str | None = None, end: str | None = None) -> None:
-        key = _make_cache_key(symbol, period, interval, start, end)
+    def put(
+        self,
+        symbol: str,
+        period: str,
+        interval: str,
+        data: pd.DataFrame,
+        start: str | None = None,
+        end: str | None = None,
+        namespace: str | None = None,
+    ) -> None:
+        key = _make_cache_key(symbol, period, interval, start, end, namespace)
         ttl = _interval_to_ttl_seconds(interval)
         now = datetime.now(timezone.utc)
         expires = now + timedelta(seconds=ttl)

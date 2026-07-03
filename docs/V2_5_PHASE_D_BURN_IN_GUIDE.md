@@ -63,7 +63,7 @@ sh ./scripts/auto-burn-in.sh
 2. ✅ Verifies kill switch status
 3. ✅ Tests market connection
 4. ✅ **Loops every 60 seconds during market hours:**
-   - Scans all symbols in `burn-in-symbols.txt`
+   - Scans all symbols in `state/universe.txt`
    - Automatically trades GREEN signals
    - Manages positions (stops, targets, EOD exits)
    - Skips weekends and after-hours
@@ -382,7 +382,7 @@ sleep 900
 
 ### Change Symbol Universe
 
-Edit `burn-in-symbols.txt`:
+Edit `state/universe.txt`:
 ```bash
 # Remove symbols you don't want
 # Add new symbols (one per line)

@@ -9,9 +9,7 @@ app:
   signal_mode: "parallel"
 
 market_data:
-  providers:
-    - alpaca
-    - polygon
+  provider: yfinance
   daily_period: "1y"
   intraday_period: "5d"
   intraday_interval: "5m"
@@ -48,17 +46,7 @@ counter_thesis:
   exit_on_block: false
 
 rl:
-  enabled: true
-  agent_type: "PPO"
-  feature_set: "standard"
-  reward_function: "risk_adjusted"
-  model_path: "state/rl_logs/universe_v2/PPO_seed_789.zip"
-  model_paths:
-    - "state/rl_logs/universe_v2/PPO_seed_789.zip"
-    - "state/rl_logs/universe_v2/PPO_seed_42.zip"
-    - "state/rl_logs/universe_v2/PPO_seed_123.zip"
-  action_confidence_threshold: 0.4
-  untrained_confidence_threshold_multiplier: 0.8
+  enabled: false
 
 swarm:
   enabled: true

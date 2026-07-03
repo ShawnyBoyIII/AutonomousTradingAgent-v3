@@ -46,7 +46,7 @@ def test_doctor_command_reports_local_readiness(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert result.stdout.strip() == (
         "doctor live_trading=false state_db=missing log_dir=missing snapshots=0/4 "
-        "provider=yfinance provider_auth=ok"
+        "provider=yfinance provider_auth=yfinance:ok"
     )
 
 
@@ -144,6 +144,7 @@ def test_rl_signal_rejects_symbols_outside_model_metadata(monkeypatch, tmp_path:
     settings.app.log_dir = str(tmp_path / "logs")
     settings.rl.enabled = True
     settings.rl.model_path = "model.zip"
+    settings.rl.allow_untrained_symbol_inference = True
     settings.rl.action_confidence_threshold = 0.5
 
     captured: dict[str, object] = {}
@@ -179,6 +180,32 @@ def test_rl_signal_rejects_symbols_outside_model_metadata(monkeypatch, tmp_path:
     assert details["rl_trained_symbols"] == ["AAPL"]
     assert details["rl_untrained_symbol"] is True
     assert captured["symbols"] == ["AAPL", "MSFT"]
+
+
+def test_rl_signal_rejects_untrained_symbol_by_default(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.runtime.orchestrator as orchestrator
+    from trading_bot.config.settings import Settings
+
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
+    settings = Settings()
+    settings.app.log_dir = str(tmp_path / "logs")
+    settings.rl.enabled = True
+    settings.rl.model_path = "model.zip"
+
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("untrained RL symbol should fail before market data fetch")
+
+    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fail_fetch)
+
+    signal, reason, details = orchestrator._build_rl_signal_result("MSFT", settings)
+
+    assert signal is None
+    assert reason == "RL model not trained for MSFT"
+    assert details["rl_trained_symbols"] == ["AAPL"]
+    assert details["rl_untrained_symbol"] is True
+    assert details["rl_models"] == 0
 
 
 def test_rl_signal_rejects_missing_model_metadata_before_fetch(monkeypatch, tmp_path: Path) -> None:
@@ -347,6 +374,7 @@ def test_rl_signal_penalizes_untrained_symbol_confidence(monkeypatch, tmp_path: 
     settings.rl.model_path = "model.zip"
     settings.rl.action_confidence_threshold = 0.5
     settings.rl.untrained_confidence_threshold_multiplier = 0.8
+    settings.rl.allow_untrained_symbol_inference = True
 
     class FakeAgent:
         def predict_signal(self, **kwargs):
@@ -507,6 +535,106 @@ def test_build_universe_writes_ranked_symbols_and_snapshot(monkeypatch, tmp_path
     snapshot = json.loads((tmp_path / "state" / "universe_candidates.json").read_text(encoding="utf-8"))
     assert snapshot["mode"] == "universe"
     assert snapshot["summary"]["included"] == 2
+
+
+def test_discover_export_writes_configured_universe_path(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+    import trading_bot.strategy.dynamic_watchlist as dynamic_watchlist
+
+    config_file = tmp_path / "config.yaml"
+    universe_path = tmp_path / "state" / "universe.txt"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        f"  universe_path: {universe_path}\n"
+        "market_data:\n"
+        "  providers:\n"
+        "    - alpaca\n"
+        "    - polygon\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs):
+        captured["provider_stack"] = kwargs["settings"].provider_stack
+        return pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-06-01", periods=30, freq="D"),
+                "open": [100.0] * 30,
+                "high": [101.0] * 30,
+                "low": [99.0] * 30,
+                "close": [100.0] * 30,
+                "volume": [1_000_000] * 30,
+            }
+        )
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    class FakeWatchlist:
+        def __init__(self, max_symbols: int) -> None:
+            self.max_symbols = max_symbols
+            self.symbols = ["AAPL", "MSFT"]
+
+        def update(self, data_provider):
+            data_provider("AAPL")
+            return SimpleNamespace(
+                sectors_favored=[],
+                added=[],
+                removed=[],
+                current=[
+                    SimpleNamespace(symbol="AAPL", reason="test", score=80.0),
+                    SimpleNamespace(symbol="MSFT", reason="test", score=75.0),
+                ],
+            )
+
+        def get_symbols(self):
+            return self.symbols
+
+        def export_for_burn_in(self, output_path=None):
+            assert output_path == str(universe_path.resolve())
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_path).write_text("AAPL\nMSFT", encoding="utf-8")
+            return str(output_path)
+
+    monkeypatch.setattr(dynamic_watchlist, "DynamicWatchlist", FakeWatchlist)
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "discover", "--export"])
+
+    assert result.exit_code == 0
+    assert f"Exported 2 symbols to {universe_path.resolve()}" in result.stdout
+    assert universe_path.read_text(encoding="utf-8") == "AAPL\nMSFT"
+    assert not (tmp_path / "burn-in-symbols.txt").exists()
+    assert captured["provider_stack"] == ["alpaca", "polygon"]
+
+
+def test_fetch_latest_prices_uses_configured_provider_stack(monkeypatch) -> None:
+    import trading_bot.data.market_data as market_data
+    from trading_bot.cli.app import _fetch_latest_prices
+    from trading_bot.config.settings import Settings
+
+    settings = Settings()
+    settings.market_data.providers = ["alpaca", "polygon"]
+    captured: list[list[str]] = []
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        captured.append(kwargs["settings"].provider_stack)
+        return pd.DataFrame(
+            {
+                "timestamp": [pd.Timestamp("2026-06-01")],
+                "open": [99.0],
+                "high": [101.0],
+                "low": [98.0],
+                "close": [100.5],
+                "volume": [1_000_000],
+            }
+        )
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    prices = _fetch_latest_prices(["AAPL"], settings)
+
+    assert prices == {"AAPL": 100.5}
+    assert captured == [["alpaca", "polygon"]]
 
 
 def test_build_universe_keeps_multi_screener_hits(monkeypatch, tmp_path: Path) -> None:
@@ -2202,6 +2330,44 @@ def test_manage_positions_reports_open_position_price(monkeypatch, tmp_path: Pat
     ]
 
 
+def test_manage_positions_skips_open_position_when_market_data_fetch_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import trading_bot.data.market_data as market_data
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        raise ValueError("provider outage")
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        f"  log_dir: {log_dir}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={"AAPL": Position(ticker="AAPL", quantity=10, average_cost=100.0)},
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip().splitlines() == [
+        "positions=1 actions=0 skipped=1",
+        "AAPL SKIP reason=market-data-fetch-failed",
+    ]
+    log_text = (log_dir / "decision-log.jsonl").read_text(encoding="utf-8")
+    assert '"reason": "market data fetch failed"' in log_text
+    assert '"error": "provider outage"' in log_text
+
+
 def test_manage_positions_persists_min_stop_widening(monkeypatch, tmp_path: Path) -> None:
     import sys
     import trading_bot.data.market_data as market_data
@@ -2888,9 +3054,11 @@ def test_manage_positions_freezes_on_stale_market_data(monkeypatch, tmp_path: Pa
 
     config_file = tmp_path / "config.yaml"
     db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
     config_file.write_text(
         "app:\n"
         f"  state_db_path: {db_path}\n"
+        f"  log_dir: {log_dir}\n"
         "market_data:\n"
         "  max_data_age_minutes: 30\n",  # Use minutes for intraday staleness
         encoding="utf-8",
@@ -2924,6 +3092,11 @@ def test_manage_positions_freezes_on_stale_market_data(monkeypatch, tmp_path: Pa
     # Position should be untouched despite last_price=80 < stop=99.
     assert state.positions["AAPL"].quantity == 10
     assert state.cash == 9_000.0
+    log_path = log_dir / "decision-log.jsonl"
+    event = json.loads(log_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert event["reason"] == "stale market data"
+    assert event["max_age_minutes"] == 30
+    assert "max_age_hours" not in event
 
 
 def test_manage_positions_skips_empty_intraday_frame(monkeypatch, tmp_path: Path) -> None:
@@ -3953,15 +4126,34 @@ def test_cache_data_command_with_symbols(monkeypatch, tmp_path: Path) -> None:
         "volume": [1000, 1100, 1200],
     })
 
-    def mock_fetch_bars(symbol, period="1y", interval="1d", start=None, end=None):
+    captured_provider_stacks = []
+
+    def mock_fetch_bars(symbol, period="1y", interval="1d", start=None, end=None, settings=None):
+        captured_provider_stacks.append(settings.provider_stack if settings else [])
         return mock_df.copy()
 
     monkeypatch.setattr("trading_bot.data.market_data.fetch_bars", mock_fetch_bars)
 
     output_dir = tmp_path / "cache"
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "market_data:\n"
+        "  providers:\n"
+        "    - alpaca\n"
+        "    - polygon\n",
+        encoding="utf-8",
+    )
     result = runner.invoke(
         app,
-        ["cache-data", "--symbols", "AAPL,MSFT", "--output-dir", str(output_dir)],
+        [
+            "--config-path",
+            str(config_file),
+            "cache-data",
+            "--symbols",
+            "AAPL,MSFT",
+            "--output-dir",
+            str(output_dir),
+        ],
     )
 
     assert result.exit_code == 0
@@ -3972,6 +4164,7 @@ def test_cache_data_command_with_symbols(monkeypatch, tmp_path: Path) -> None:
     # Verify CSV files were created
     assert (output_dir / "AAPL.csv").exists()
     assert (output_dir / "MSFT.csv").exists()
+    assert captured_provider_stacks == [["alpaca", "polygon"], ["alpaca", "polygon"]]
 
 
 def test_cache_data_command_from_watchlist(monkeypatch, tmp_path: Path) -> None:
@@ -3995,17 +4188,64 @@ def test_cache_data_command_from_watchlist(monkeypatch, tmp_path: Path) -> None:
         "volume": [1000, 1100],
     })
 
-    def mock_fetch_bars(symbol, period="1y", interval="1d", start=None, end=None):
+    captured_provider_stacks = []
+
+    def mock_fetch_bars(symbol, period="1y", interval="1d", start=None, end=None, settings=None):
+        captured_provider_stacks.append(settings.provider_stack if settings else [])
         return mock_df.copy()
 
     monkeypatch.setattr("trading_bot.data.market_data.fetch_bars", mock_fetch_bars)
 
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "market_data:\n"
+        "  providers:\n"
+        "    - alpaca\n"
+        "    - polygon\n",
+        encoding="utf-8",
+    )
     result = runner.invoke(
         app,
-        ["cache-data", "--watchlist-path", str(watchlist_path), "--output-dir", str(output_dir)],
+        [
+            "--config-path",
+            str(config_file),
+            "cache-data",
+            "--watchlist-path",
+            str(watchlist_path),
+            "--output-dir",
+            str(output_dir),
+        ],
     )
 
     assert result.exit_code == 0
     assert "2 cached" in result.stdout
     assert (output_dir / "AAPL.csv").exists()
     assert (output_dir / "GOOGL.csv").exists()
+    assert captured_provider_stacks == [["alpaca", "polygon"], ["alpaca", "polygon"]]
+
+
+def test_supermodel_command_resolves_pipeline_script_from_repo(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The supermodel command should work even when invoked outside the repo cwd."""
+    import subprocess
+
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, capture_output=False):
+        captured["cmd"] = cmd
+        captured["capture_output"] = capture_output
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = CliRunner().invoke(app, ["supermodel", "--dry-run", "--symbols", "AAPL"])
+
+    assert result.exit_code == 0
+    cmd = captured["cmd"]
+    assert Path(cmd[1]).is_absolute()
+    assert Path(cmd[1]).name == "daily_supermodel.py"
+    assert Path(cmd[1]).parent.name == "scripts"
+    assert "--dry-run" in cmd
+    assert cmd[-2:] == ["--symbols", "AAPL"]

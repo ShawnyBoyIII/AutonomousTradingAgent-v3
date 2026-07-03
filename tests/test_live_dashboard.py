@@ -9,8 +9,10 @@ from __future__ import annotations
 import json
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pandas as pd
 import pytest
 
 from trading_bot.config.settings import AppSettings, Settings
@@ -162,6 +164,45 @@ class TestDashboardServerSnapshot:
         snap = server.snapshot()
         assert snap["kill_switch"]["checked"] is True
         assert snap["kill_switch"]["active"] is False
+
+    def test_snapshot_market_regime_uses_configured_provider_stack(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        settings = _settings_in(tmp_path)
+        settings.market_data.providers = ["alpaca", "polygon"]
+        captured = {}
+
+        def fake_fetch_bars(symbol: str, **kwargs):
+            captured["symbol"] = symbol
+            captured["provider_stack"] = kwargs["settings"].provider_stack
+            return pd.DataFrame({"close": [100.0, 101.0]})
+
+        def fake_detect_market_regime(frame):
+            return (
+                SimpleNamespace(value="bullish"),
+                SimpleNamespace(
+                    adx=25.0,
+                    volatility_percentile=0.25,
+                    price_vs_ema20=1.2,
+                    price_vs_sma50=2.4,
+                    momentum=0.8,
+                ),
+            )
+
+        server = DashboardServer(settings)
+        monkeypatch.setattr(
+            server,
+            "_resolve_optional_deps",
+            lambda: {
+                "fetch_bars": fake_fetch_bars,
+                "detect_market_regime": fake_detect_market_regime,
+            },
+        )
+
+        snap = server.snapshot()
+
+        assert captured == {"symbol": "SPY", "provider_stack": ["alpaca", "polygon"]}
+        assert snap["market_regime"]["regime"] == "bullish"
 
 
 class TestRenderLiveDashboard:
@@ -627,6 +668,38 @@ class TestEnrichPositionsEdgeCases:
         result = _enrich_positions(positions, settings)
         # Should use average_cost as fallback
         assert result[0].get("last_price") == 150.0
+
+    def test_fetch_uses_configured_provider_stack(self, monkeypatch) -> None:
+        """Live dashboard price fetches should honor configured market data providers."""
+        from trading_bot.runtime.dashboard import _enrich_positions, _price_cache, _price_cache_timestamps
+
+        _price_cache.clear()
+        _price_cache_timestamps.clear()
+        settings = Settings()
+        settings.market_data.providers = ["alpaca", "polygon"]
+        captured = {}
+
+        def fake_fetch_bars(symbol, period, interval, **kwargs):
+            captured["symbol"] = symbol
+            captured["period"] = period
+            captured["interval"] = interval
+            captured["provider_stack"] = kwargs["settings"].provider_stack
+            return pd.DataFrame({"close": [123.45]})
+
+        monkeypatch.setattr("trading_bot.data.market_data.fetch_bars", fake_fetch_bars)
+
+        result = _enrich_positions(
+            [{"ticker": "AAPL", "quantity": 2, "average_cost": 100.0}],
+            settings,
+        )
+
+        assert captured == {
+            "symbol": "AAPL",
+            "period": settings.market_data.intraday_period,
+            "interval": settings.market_data.intraday_interval,
+            "provider_stack": ["alpaca", "polygon"],
+        }
+        assert result[0]["last_price"] == 123.45
 
     def test_fallback_to_stop_loss(self, monkeypatch) -> None:
         """When no live price, use stop_loss as fallback."""

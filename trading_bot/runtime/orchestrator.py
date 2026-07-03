@@ -197,10 +197,38 @@ def run_scan(
             if settings.swarm.enabled and symbol in swarm_results:
                 swarm_decision = swarm_results[symbol]
                 _augment_details_with_swarm(details, swarm_decision)
-            details.update(build_stacked_signal(symbol, signal, details).to_details())
+            stacked = build_stacked_signal(symbol, signal, details)
+            details.update(stacked.to_details())
+            detail_text = _format_scan_details(details) if include_details else ""
+            if stacked.decision == "block":
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "scan",
+                        "ticker": symbol,
+                        "status": "REJECTED",
+                        "reason": f"supermodel block (score={stacked.score:.2f})",
+                        **_paper_evidence_fields(details),
+                    },
+                )
+                other_results.append(
+                    f"{symbol} REJECTED supermodel block score={stacked.score:.2f}{detail_text}",
+                )
+                row = {
+                    "ticker": symbol,
+                    "status": "REJECTED",
+                    "reason": f"supermodel block (score={stacked.score:.2f})",
+                }
+                _attach_supermodel_row_fields(row, details)
+                if settings.swarm.enabled and symbol in swarm_results:
+                    swarm_decision = swarm_results[symbol]
+                    _attach_swarm_row_fields(row, swarm_decision)
+                if include_details:
+                    row["details"] = details
+                candidate_rows.append(row)
+                continue
             if details.get("signal_mode") == "parallel" and details.get("consensus") in parallel_counts:
                 parallel_counts[str(details["consensus"])] += 1
-            detail_text = _format_scan_details(details) if include_details else ""
 
             # V2.5: Fetch ATR for volatility-adjusted sizing
             atr = _fetch_atr(symbol, settings) if settings.risk.use_atr_sizing else None
@@ -645,7 +673,21 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
             if symbol in swarm_results:
                 swarm_decision = swarm_results[symbol]
                 _augment_details_with_swarm(details, swarm_decision)
-            details.update(build_stacked_signal(symbol, signal, details).to_details())
+            stacked = build_stacked_signal(symbol, signal, details)
+            details.update(stacked.to_details())
+            if stacked.decision == "block":
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "paper-trade",
+                        "ticker": symbol,
+                        "status": "REJECTED",
+                        "reason": f"supermodel block (score={stacked.score:.2f})",
+                        **_paper_evidence_fields(details),
+                    },
+                )
+                results.append(f"{symbol} REJECTED supermodel block score={stacked.score:.2f}")
+                continue
 
             if _market_data_status(signal.timestamp, settings.market_data.intraday_interval,
                                   max_age_minutes=settings.market_data.max_data_age_minutes) == "stale":
@@ -1212,11 +1254,6 @@ def _build_rl_signal_result(symbol: str, settings: Settings) -> tuple[TradeSigna
     target_intraday_frame = None
     rl_trained_symbols: list[str] = []
     for mp in model_paths:
-        try:
-            agent = RLAgent.load(model_path=mp)
-        except Exception as e:
-            logger.debug("RL model load failed path=%s error=%s", mp, e)
-            continue
         trained_symbols = rl_model_symbols(mp) or []
         if not trained_symbols:
             logger.debug("RL model skipped path=%s metadata missing or empty", mp)
@@ -1227,6 +1264,15 @@ def _build_rl_signal_result(symbol: str, settings: Settings) -> tuple[TradeSigna
 
         symbol_upper = symbol.upper().strip()
         is_trained = symbol_upper in trained_symbols
+        if not is_trained and not getattr(settings.rl, "allow_untrained_symbol_inference", False):
+            logger.debug("RL model skipped path=%s symbol=%s not in metadata", mp, symbol_upper)
+            continue
+
+        try:
+            agent = RLAgent.load(model_path=mp)
+        except Exception as e:
+            logger.debug("RL model load failed path=%s error=%s", mp, e)
+            continue
 
         symbols_for_inference = list(trained_symbols)
         if not is_trained:
@@ -1282,6 +1328,12 @@ def _build_rl_signal_result(symbol: str, settings: Settings) -> tuple[TradeSigna
         logger.debug("RL model skipped path=%s data validation failed", mp)
 
     if not predictions:
+        if rl_trained_symbols:
+            return None, f"RL model not trained for {symbol.upper()}", {
+                "rl_trained_symbols": rl_trained_symbols,
+                "rl_untrained_symbol": True,
+                "rl_models": 0,
+            }
         return None, "RL agent failed: no models produced valid predictions", {}
 
     # Ensemble: majority action, average confidence
@@ -1784,6 +1836,7 @@ def _fetch_atr(symbol: str, settings: Settings) -> float | None:
             symbol,
             settings.market_data.daily_period,
             "1d",
+            settings=settings.market_data,
         )
         if frame.empty or len(frame) < settings.risk.atr_period + 5:
             return None
@@ -1862,6 +1915,7 @@ def _evaluate_counter_thesis_for_position(
             ticker,
             settings.market_data.daily_period,
             "1d",
+            settings=settings.market_data,
         )
     except Exception:
         return evaluate_counter_thesis(None, position, settings.counter_thesis)

@@ -211,7 +211,9 @@ class DashboardServer:
         market_regime = None
         if "fetch_bars" in deps and "detect_market_regime" in deps:
             try:
-                spy_daily = deps["fetch_bars"]("SPY", period="1y", interval="1d")
+                spy_daily = deps["fetch_bars"](
+                    "SPY", period="1y", interval="1d", settings=self.settings.market_data
+                )
                 if not spy_daily.empty:
                     regime, metrics = deps["detect_market_regime"](spy_daily)
                     market_regime = {
@@ -384,7 +386,12 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
                         if cache_file.exists():
                             return
                         try:
-                            df = market_data.fetch_bars(cache_sym, period="1y", interval="1d")
+                            df = market_data.fetch_bars(
+                                cache_sym,
+                                period="1y",
+                                interval="1d",
+                                settings=server.settings.market_data,
+                            )
                             if not df.empty:
                                 df.to_csv(cache_file)
                                 logger.info(f"watchlist_cache: {cache_sym} cached ({len(df)} bars)")
@@ -1656,6 +1663,7 @@ def _enrich_positions(positions: list[dict[str, Any]], settings: Settings) -> li
                     ticker,
                     settings.market_data.intraday_period,
                     settings.market_data.intraday_interval,
+                    settings=settings.market_data,
                 )
                 if not frame.empty and "close" in frame.columns:
                     last_price = float(frame.iloc[-1]["close"])

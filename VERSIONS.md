@@ -315,3 +315,13 @@ One-liner per change. Date, category, summary.
 - **diagnostics** — `supermodel-report` now groups held scan rows by stack decision and persisted reason, making stale-data/risk blocks visible in paper review.
 - **diagnostics** — `supermodel-report` now shows win rate plus win/loss counts for stack and swarm-stack trade outcome groups.
 - **tests** — Focused continuous-loop suite: 24 passing. Broader paper-confidence bucket: 368 passing. RL/GPU focused suite: 22 passing. CLI min-stop, RL metadata/price, RL tie/veto/detail preservation, ledger attribution, swarm dependency/confidence, technical RSI/frame-enrichment, local/projected sector checks, consensus outcome tagging, and stack/swarm sizing regressions added.
+
+## 2026-07-02 (Session 9)
+
+- **feature** — Relaxed MR detection thresholds to increase signal frequency: RSI oversold 35→40, VWAP distance 1%→0.5%, range-bound reversal volume 100%→80% of average.
+- **feature** — Updated confluence scoring to match new RSI thresholds (RSI < 40 now scores 1 point instead of < 45).
+- **tests** — Added 12 targeted tests for relaxed MR thresholds (`test_mr_threshold_relaxation.py`): RSI 36/39 triggers, VWAP 0.6% triggers, range reversal 80/85% volume triggers, boundary cases at RSI 40 and VWAP 0.5%.
+- **diagnostics** — MR trade analysis: 6 trades, -$134, 1 winner (PRTA +$37), 5 losers. Trend following: 7 trades, -$308, 0% win rate. MR signals too rare (~2/21 symbols fire).
+- **diagnostics** — Burn-in running V3+Swarm only (RL disabled), 83 closed orders, ~-$660 net. CIEN position open (1 qty, $459.78).
+- **research** — Evaluated open-source RL trading frameworks: TradeMaster (2.9k stars, best match), TradingGym (1.9k), tensortrade-ng (197). None provide pre-trained models; all are training frameworks.
+- **decision** — RL remains disabled. V3+Swarm is the signal engine. Focus on fixing v3-trend_following (biggest loser) and relaxing MR thresholds (too strict).

@@ -34,6 +34,11 @@ def _resolve_provider_stack(settings: MarketDataSettings | None = None) -> list:
     return providers
 
 
+def _cache_namespace(settings: MarketDataSettings | None = None) -> str:
+    names = settings.provider_stack if settings is not None else ["yfinance"]
+    return "providers=" + ",".join(str(name).strip().lower() for name in names)
+
+
 def _resolve_provider_by_name(name: str) -> Any:
     """Return a single provider instance for the given *name* string."""
     if name == "alpaca":
@@ -95,13 +100,14 @@ def fetch_bars(
     settings: MarketDataSettings | None = None,
 ) -> pd.DataFrame:
     cache = _get_cache()
-    cached = cache.get(symbol, period, interval, start, end)
+    namespace = _cache_namespace(settings)
+    cached = cache.get(symbol, period, interval, start, end, namespace=namespace)
     if cached is not None:
         return cached
 
     result = _fallback_fetch(symbol, period, interval, start=start, end=end, primary_settings=settings)
     if result is not None and not result.empty:
-        cache.put(symbol, period, interval, result, start=start, end=end)
+        cache.put(symbol, period, interval, result, start=start, end=end, namespace=namespace)
     return result
 
 
