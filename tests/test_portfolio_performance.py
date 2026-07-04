@@ -5,8 +5,76 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from trading_bot.models.portfolio import PortfolioState, Position
-from trading_bot.portfolio.performance import compute_portfolio_heat
+from trading_bot.portfolio.performance import (
+    compute_exposure_ratio,
+    compute_portfolio_heat,
+    compute_position_market_value,
+    compute_unrealized_pnl,
+)
 from trading_bot.runtime.orchestrator import _calculate_portfolio_heat
+
+
+class TestComputeUnrealizedPnl:
+    """Tests for compute_unrealized_pnl."""
+
+    def test_long_position_profit(self) -> None:
+        assert compute_unrealized_pnl(quantity=10, average_cost=100.0, market_price=150.0) == 500.0
+
+    def test_long_position_loss(self) -> None:
+        assert compute_unrealized_pnl(quantity=10, average_cost=100.0, market_price=80.0) == -200.0
+
+    def test_short_position_profit(self) -> None:
+        assert compute_unrealized_pnl(quantity=-10, average_cost=100.0, market_price=80.0) == 200.0
+
+    def test_short_position_loss(self) -> None:
+        assert compute_unrealized_pnl(quantity=-10, average_cost=100.0, market_price=150.0) == -500.0
+
+    def test_breakeven(self) -> None:
+        assert compute_unrealized_pnl(quantity=10, average_cost=100.0, market_price=100.0) == 0.0
+
+    def test_zero_quantity(self) -> None:
+        assert compute_unrealized_pnl(quantity=0, average_cost=100.0, market_price=150.0) == 0.0
+
+
+class TestComputePositionMarketValue:
+    """Tests for compute_position_market_value."""
+
+    def test_long_position(self) -> None:
+        assert compute_position_market_value(quantity=10, market_price=150.0) == 1500.0
+
+    def test_short_position(self) -> None:
+        assert compute_position_market_value(quantity=-10, market_price=150.0) == -1500.0
+
+    def test_zero_quantity(self) -> None:
+        assert compute_position_market_value(quantity=0, market_price=150.0) == 0.0
+
+    def test_zero_price(self) -> None:
+        assert compute_position_market_value(quantity=10, market_price=0.0) == 0.0
+
+
+class TestComputeExposureRatio:
+    """Tests for compute_exposure_ratio."""
+
+    def test_normal_exposure(self) -> None:
+        assert compute_exposure_ratio(market_value=50_000.0, equity=100_000.0) == 0.5
+
+    def test_full_exposure(self) -> None:
+        assert compute_exposure_ratio(market_value=100_000.0, equity=100_000.0) == 1.0
+
+    def test_leveraged_exposure(self) -> None:
+        assert compute_exposure_ratio(market_value=150_000.0, equity=100_000.0) == 1.5
+
+    def test_zero_market_value(self) -> None:
+        assert compute_exposure_ratio(market_value=0.0, equity=100_000.0) == 0.0
+
+    def test_negative_market_value(self) -> None:
+        assert compute_exposure_ratio(market_value=-50_000.0, equity=100_000.0) == -0.5
+
+    def test_zero_equity_returns_zero(self) -> None:
+        assert compute_exposure_ratio(market_value=50_000.0, equity=0.0) == 0.0
+
+    def test_negative_equity_returns_zero(self) -> None:
+        assert compute_exposure_ratio(market_value=50_000.0, equity=-10_000.0) == 0.0
 
 
 class TestComputePortfolioHeat:
