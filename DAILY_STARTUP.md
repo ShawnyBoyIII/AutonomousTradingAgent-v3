@@ -51,7 +51,7 @@ If kill switch is active, resume with:
 ```
 
 **What it does:**
-- Runs `discover` daily at 9:30 AM ET to refresh the watchlist (`burn-in-symbols.txt`)
+- Runs `discover` daily at 9:30 AM ET to refresh the universe (`state/universe.txt`)
 - Scans all 150 symbols every 60 seconds during market hours (9:30 AM – 4:00 PM ET, weekdays)
 - Auto-trades GREEN signals via V3 strategy (regime + confluence scoring)
 - Manages positions: stop-loss, profit target, end-of-day exit, counter-thesis exit
@@ -60,7 +60,7 @@ If kill switch is active, resume with:
 
 **Config file:** `burn-in-config.yaml` (auto-loaded via `CONFIG_PATH` in `.env`)
 **Database:** `state/burn_in.db`
-**Symbols:** `burn-in-symbols.txt` (150 verified S&P 500 tickers)
+**Symbols:** `state/universe.txt` plus optional `state/watchlist.txt`
 
 **Stop:** Press `Ctrl-C`
 
@@ -148,13 +148,14 @@ When kill switch is active, the burn-in script will skip all trade cycles and lo
 
 ## Common Issues
 
-### `burn-in-symbols.txt` is empty (scanning 0–1 symbols)
+### `state/universe.txt` is empty (scanning 0–1 symbols)
 
-The `discover --export` step overwrites this file daily. If discovery finds 0 candidates, the file may be emptied. **This is now guarded** (empty watchlist preserves existing file), but if it happens:
+The `discover --export` step updates this file daily. If discovery finds 0 candidates, the existing file is preserved, but if you need to restore defaults:
 
 ```bash
 # Restore default symbols
-printf 'SPY\nQQQ\nAAPL\nMSFT\nNVDA\n' > burn-in-symbols.txt
+mkdir -p state
+printf 'SPY\nQQQ\nAAPL\nMSFT\nNVDA\n' > state/universe.txt
 ```
 
 ### `fetch_failed ... falling back to yfinance`
@@ -218,7 +219,7 @@ If empty, ensure `.env` has `CONFIG_PATH=burn-in-config.yaml` and restart your s
 |------|---------|
 | `burn-in-config.yaml` | Burn-in configuration (Alpaca, risk, V3 strategy) |
 | `.env` | Credentials + `CONFIG_PATH=burn-in-config.yaml` |
-| `burn-in-symbols.txt` | 150-symbol watchlist (S&P 500 verified) |
+| `state/universe.txt` | Runtime burn-in universe |
 | `state/burn_in.db` | Paper trading ledger + positions |
 | `logs/burn_in/decision-log.jsonl` | Every scan/trade/exit decision |
 | `logs/burn_in/strategy_results.jsonl` | Entry/exit events with P&L |

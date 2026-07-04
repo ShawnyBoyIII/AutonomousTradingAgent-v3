@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from trading_bot.config.settings import Settings
+from trading_bot.portfolio.ledger import PortfolioLedger
+from trading_bot.runtime.watchlist import add_symbol, read_watchlist, remove_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -120,24 +122,24 @@ class DashboardServer:
             deps["is_trading_halted"] = is_trading_halted
             deps["_pathlib"] = pathlib
         except Exception:
-            pass  # Ledger / kill-switch unavailable
+            logger.debug("Ledger / kill-switch unavailable")
         try:
             from trading_bot.monitoring.drawdown import compute_drawdown_from_ledger
             deps["compute_drawdown_from_ledger"] = compute_drawdown_from_ledger
         except Exception:
-            pass
+            logger.debug("Drawdown computation unavailable")
         try:
             from trading_bot.data.market_data import fetch_bars
             from trading_bot.strategy.market_regime import detect_market_regime
             deps["fetch_bars"] = fetch_bars
             deps["detect_market_regime"] = detect_market_regime
         except Exception:
-            pass
+            logger.debug("Market data / regime detection unavailable")
         try:
             from trading_bot.strategy.strategy_tracker import strategy_summary
             deps["strategy_summary"] = strategy_summary
         except Exception:
-            pass
+            logger.debug("Strategy summary unavailable")
         return deps
 
     def snapshot(self) -> dict[str, Any]:
@@ -152,6 +154,7 @@ class DashboardServer:
         backtest = _read_json(self.settings.app.backtest_summary_path)
         decisions = _read_jsonl_tail(self._decision_log_path, limit=50)
         strategy_results = _read_jsonl_tail(self._strategy_log_path, limit=50)
+        watchlist = read_watchlist(self.settings.app.watchlist_path)
 
         deps = self._resolve_optional_deps()
 
@@ -163,11 +166,29 @@ class DashboardServer:
                 kill_state = deps["is_trading_halted"](ledger)
                 kill_active = kill_state.enabled
             except Exception:
-                pass
+                logger.debug("Failed to load ledger or kill-switch state")
 
         # Enrich open positions with live prices + computed metrics
         raw_positions = portfolio.get("positions", [])
         enriched_positions = _enrich_positions(raw_positions, self.settings)
+        # Fallback: if portfolio_summary.json has no positions (stale / not yet
+        # written), read open positions directly from the portfolio ledger.
+        # This covers burn-in sessions where only the state DB is updated.
+        if not enriched_positions and ledger:
+            try:
+                ledger_positions = _load_open_positions_from_ledger(self.settings)
+                if ledger_positions:
+                    enriched_positions = _enrich_positions(ledger_positions, self.settings)
+                    # Also pull cash/equity from ledger state
+                    ledger_state = ledger.load_portfolio_state()
+                    if ledger_state:
+                        portfolio["cash"] = ledger_state.cash
+                        portfolio["equity"] = ledger_state.equity
+                        portfolio["realized_pnl"] = ledger_state.realized_pnl
+                        portfolio["unrealized_pnl"] = ledger_state.unrealized_pnl
+                        portfolio["positions"] = len(ledger_state.positions)
+            except Exception:
+                logger.debug("Ledger fallback for open positions failed")
         if enriched_positions:
             portfolio["positions"] = enriched_positions
 
@@ -177,20 +198,22 @@ class DashboardServer:
             try:
                 consecutive_losses = ledger.get_consecutive_losses()
             except Exception:
-                pass
+                logger.debug("Failed to get consecutive losses from ledger")
 
         drawdown_metrics = None
         if ledger and "compute_drawdown_from_ledger" in deps:
             try:
                 drawdown_metrics = deps["compute_drawdown_from_ledger"](ledger)
             except Exception:
-                pass
+                logger.debug("Failed to compute drawdown metrics")
 
         # Market regime detection (SPY as primary benchmark)
         market_regime = None
         if "fetch_bars" in deps and "detect_market_regime" in deps:
             try:
-                spy_daily = deps["fetch_bars"]("SPY", period="1y", interval="1d")
+                spy_daily = deps["fetch_bars"](
+                    "SPY", period="1y", interval="1d", settings=self.settings.market_data
+                )
                 if not spy_daily.empty:
                     regime, metrics = deps["detect_market_regime"](spy_daily)
                     market_regime = {
@@ -202,7 +225,7 @@ class DashboardServer:
                         "momentum": round(metrics.momentum, 2),
                     }
             except Exception:
-                pass
+                logger.debug("Failed to detect market regime")
 
         # Strategy performance attribution
         strategy_attribution = None
@@ -212,7 +235,7 @@ class DashboardServer:
                 if summary:
                     strategy_attribution = summary
             except Exception:
-                pass
+                logger.debug("Failed to compute strategy attribution")
 
         return {
             "scan": scan,
@@ -221,6 +244,7 @@ class DashboardServer:
             "backtest": backtest,
             "decisions": decisions,
             "strategy_results": strategy_results,
+            "watchlist": watchlist,
             "kill_switch": {
                 "checked": ledger is not None,
                 "active": bool(kill_active),
@@ -265,7 +289,7 @@ def serve_dashboard(
     if block:
         shutdown_requested = threading.Event()
 
-        def _signal_handler(signum, frame):
+        def _signal_handler(signum: int, frame: Any) -> None:
             logger.info(f"Received signal {signum}, shutting down...")
             shutdown_requested.set()
 
@@ -314,6 +338,8 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
             try:
                 if self.path == "/api/kill-switch":
                     self._handle_kill_switch_toggle()
+                elif self.path == "/api/watchlist":
+                    self._handle_watchlist()
                 else:
                     self._respond(HTTPStatus.NOT_FOUND, b"not found", "text/plain")
             except Exception as exc:
@@ -336,9 +362,58 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
             else:
                 self._respond(HTTPStatus.BAD_REQUEST, json.dumps(result).encode("utf-8"), "application/json")
 
+        def _handle_watchlist(self) -> None:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+            try:
+                payload = json.loads(body)
+                action = payload.get("action", "")
+                symbol = payload.get("symbol", "")
+                if action == "add":
+                    symbols = add_symbol(server.settings.app.watchlist_path, str(symbol))
+                    # Start background data download for the new symbol
+                    import threading
+                    import logging
+                    cache_sym = str(symbol).upper().strip()
+                    logger = logging.getLogger(__name__)
+
+                    def _cache_symbol() -> None:
+                        from trading_bot.data import market_data
+                        state_db = Path(server.settings.app.state_db_path)
+                        cache_dir = state_db.parent / "market_data_cache"
+                        cache_dir.mkdir(parents=True, exist_ok=True)
+                        cache_file = cache_dir / f"{cache_sym}.csv"
+                        if cache_file.exists():
+                            return
+                        try:
+                            df = market_data.fetch_bars(
+                                cache_sym,
+                                period="1y",
+                                interval="1d",
+                                settings=server.settings.market_data,
+                            )
+                            if not df.empty:
+                                df.to_csv(cache_file)
+                                logger.info(f"watchlist_cache: {cache_sym} cached ({len(df)} bars)")
+                            else:
+                                logger.warning(f"watchlist_cache: {cache_sym} no data returned")
+                        except Exception as e:
+                            logger.error(f"watchlist_cache: {cache_sym} failed: {e}")
+
+                    threading.Thread(target=_cache_symbol, daemon=True).start()
+                elif action == "remove":
+                    symbols = remove_symbol(server.settings.app.watchlist_path, str(symbol))
+                else:
+                    self._respond(HTTPStatus.BAD_REQUEST, b"unknown action", "text/plain")
+                    return
+            except (json.JSONDecodeError, ValueError) as exc:
+                self._respond(HTTPStatus.BAD_REQUEST, str(exc).encode("utf-8"), "text/plain")
+                return
+            self._respond(HTTPStatus.OK, json.dumps({"success": True, "symbols": symbols}).encode("utf-8"), "application/json")
+
         def _serve_html(self) -> None:
             snapshot = server.snapshot()
-            body = _render_live_dashboard(snapshot).encode("utf-8")
+            body = _render_live_dashboard(snapshot, server.settings).encode("utf-8")
             self._respond(HTTPStatus.OK, body, "text/html; charset=utf-8")
 
         def _serve_json(self) -> None:
@@ -365,13 +440,14 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
 # ---------------------------------------------------------------------------
 
 
-def _render_live_dashboard(snapshot: dict[str, Any]) -> str:
+def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None = None) -> str:
     scan = snapshot.get("scan", {})
     portfolio = snapshot.get("portfolio", {})
     report = snapshot.get("report", {})
     backtest = snapshot.get("backtest", {})
     decisions = snapshot.get("decisions", [])
     strategy_results = snapshot.get("strategy_results", [])
+    watchlist = snapshot.get("watchlist", [])
     kill = snapshot.get("kill_switch", {})
     generated_at = snapshot.get("generated_at", "")
 
@@ -422,6 +498,12 @@ def _render_live_dashboard(snapshot: dict[str, Any]) -> str:
         cb_value = f'<span style="color:#d29922">{consecutive_losses} ⚠️</span>'
         cb_raw = True
 
+    # Closed positions with dates from ledger
+    if settings is not None:
+        closed_positions = _load_closed_positions(settings)
+    else:
+        closed_positions = []
+
     kill_banner = (
         '<div class="banner kill-active" id="kill-banner" role="alert">KILL SWITCH ACTIVE - trading halted '
         '<button class="btn" onclick="toggleKillSwitch(\'resume\')" aria-label="Resume all trading activity">Resume Trading</button></div>'
@@ -434,7 +516,7 @@ def _render_live_dashboard(snapshot: dict[str, Any]) -> str:
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="refresh" content="5">
+  <meta http-equiv="refresh" content="30">
   <title>Autonomous Trading Agent - Live</title>
   <style>
     body {{ margin: 24px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #101418; color: #e6edf3; }}
@@ -472,35 +554,191 @@ def _render_live_dashboard(snapshot: dict[str, Any]) -> str:
     .regime-high_volatility {{ background: #f85149; color: #fff; }}
     .regime-strong_uptrend {{ background: #3fb950; color: #fff; }}
     .regime-weak_uptrend {{ background: #238636; color: #fff; }}
-    .regime-range_bound {{ background: #d29922; color: #000; }}
+    .regime-range_bound {{ background: var(--accent-yellow); color: #000; }}
     .regime-weak_downtrend {{ background: #a45e00; color: #fff; }}
     .regime-strong_downtrend {{ background: #8b0000; color: #fff; }}
-    .regime-metrics {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }}
-    .regime-metric {{ background: #0d1117; padding: 8px; border-radius: 6px; text-align: center; }}
-    .regime-metric .label {{ font-size: 11px; color: #8b949e; }}
-    .regime-metric .value {{ font-size: 16px; margin-top: 4px; }}
-    .regime-explanation {{ font-size: 12px; color: #8b949e; margin-top: 8px; line-height: 1.5; }}
-    .strategy-card {{ background: #18202a; border: 1px solid #2f3b48; border-radius: 10px; padding: 16px; margin: 16px 0; }}
-    .strategy-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }}
-    .strategy-name {{ font-size: 16px; font-weight: bold; color: #e6edf3; }}
-    .strategy-badge {{ padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: bold; }}
-    .strategy-badge-win {{ background: #3fb950; color: #fff; }}
-    .strategy-badge-loss {{ background: #f85149; color: #fff; }}
-    .strategy-badge-neutral {{ background: #8b949e; color: #000; }}
-    .strategy-metrics {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-top: 12px; }}
-    .strategy-metric {{ text-align: center; padding: 8px; background: #0d1117; border-radius: 6px; }}
-    .strategy-metric .label {{ font-size: 11px; color: #8b949e; }}
-    .strategy-metric .value {{ font-size: 18px; margin-top: 4px; font-weight: bold; }}
-    .strategy-pnl {{ font-size: 20px; }}
-    .strategy-allocation {{ font-size: 14px; padding: 4px 8px; border-radius: 4px; }}
-    .allocation-full {{ background: #3fb950; color: #fff; }}
-    .allocation-half {{ background: #d29922; color: #000; }}
-    .allocation-skip {{ background: #f85149; color: #fff; }}
+    
+    .regime-metrics {{
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-top: 16px;
+    }}
+    
+    .regime-metric {{
+      background: var(--bg-tertiary);
+      padding: 12px;
+      border-radius: 8px;
+      text-align: center;
+      border: 1px solid var(--border-color);
+    }}
+    
+    .regime-metric .label {{
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin-bottom: 4px;
+    }}
+    
+    .regime-metric .value {{
+      font-size: 18px;
+      margin-top: 4px;
+      font-weight: 700;
+    }}
+    
+    .regime-explanation {{
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-top: 12px;
+      line-height: 1.6;
+      padding: 12px;
+      background: var(--bg-tertiary);
+      border-radius: 8px;
+      border-left: 3px solid var(--accent-blue);
+    }}
+    
+    .strategy-card {{
+      background: var(--bg-secondary);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 20px;
+      margin: 16px 0;
+      box-shadow: var(--card-shadow);
+    }}
+    
+    .strategy-header {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }}
+    
+    .strategy-name {{
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }}
+    
+    .strategy-badge {{
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 700;
+    }}
+    
+    .strategy-badge-win {{ background: var(--accent-green); color: #fff; }}
+    .strategy-badge-loss {{ background: var(--accent-red); color: #fff; }}
+    .strategy-badge-neutral {{ background: var(--text-secondary); color: #000; }}
+    
+    .strategy-metrics {{
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 16px;
+      margin-top: 16px;
+    }}
+    
+    .strategy-metric {{
+      text-align: center;
+      padding: 12px;
+      background: var(--bg-tertiary);
+      border-radius: 8px;
+      border: 1px solid var(--border-color);
+    }}
+    
+    .strategy-metric .label {{
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin-bottom: 6px;
+    }}
+    
+    .strategy-metric .value {{
+      font-size: 20px;
+      margin-top: 4px;
+      font-weight: 700;
+    }}
+    
+    .strategy-pnl {{ font-size: 22px; }}
+    
+    .strategy-allocation {{
+      font-size: 14px;
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-weight: 700;
+    }}
+    
+    .allocation-full {{ background: var(--accent-green); color: #fff; }}
+    .allocation-half {{ background: var(--accent-yellow); color: #000; }}
+    .allocation-skip {{ background: var(--accent-red); color: #fff; }}
+    
+    .tab-nav {{
+      display: flex;
+      gap: 4px;
+      margin: 24px 0 16px;
+      border-bottom: 2px solid var(--border-color);
+    }}
+    
+    .tab-btn {{
+      padding: 12px 20px;
+      border: none;
+      background: transparent;
+      color: var(--text-secondary);
+      cursor: pointer;
+      border-radius: 8px 8px 0 0;
+      font-size: 14px;
+      font-weight: 600;
+      transition: all 0.2s ease;
+      font-family: inherit;
+    }}
+    
+    .tab-btn:hover {{
+      color: var(--text-primary);
+      background: var(--bg-secondary);
+    }}
+    
+    .tab-btn.active {{
+      color: var(--accent-blue);
+      background: var(--bg-secondary);
+      border-bottom: 2px solid var(--accent-blue);
+    }}
+    
+    .tab-content {{
+      display: none;
+      animation: fadeIn 0.3s ease;
+    }}
+    
+    .tab-content.active {{
+      display: block;
+    }}
+    
+    @keyframes fadeIn {{
+      from {{ opacity: 0; transform: translateY(10px); }}
+      to {{ opacity: 1; transform: translateY(0); }}
+    }}
+    
+    input[type="text"] {{
+      padding: 10px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border-color);
+      background: var(--bg-tertiary);
+      color: var(--text-primary);
+      font-size: 14px;
+      font-family: inherit;
+      transition: border-color 0.2s ease;
+    }}
+    
+    input[type="text"]:focus {{
+      outline: none;
+      border-color: var(--accent-blue);
+      box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.1);
+    }}
+    
+    input[type="text"]::placeholder {{
+      color: var(--text-secondary);
+    }}
   </style>
 </head>
 <body>
   <h1>Autonomous Trading Agent</h1>
-  <div class="timestamp">Live dashboard - auto-refresh 5s - generated {html.escape(str(generated_at))}</div>
+  <div class="timestamp">Live dashboard - auto-refresh 30s - generated {html.escape(str(generated_at))}</div>
   {kill_banner}
 
   <section class="grid">
@@ -519,25 +757,107 @@ def _render_live_dashboard(snapshot: dict[str, Any]) -> str:
 
   {_market_regime_widget(snapshot.get("market_regime"))}
   {_strategy_attribution_widget(snapshot.get("strategy_attribution"))}
+  {_watchlist_widget(watchlist)}
 
-  <div class="two-col">
-    <div>
-      <h2>Open Positions</h2>
-      {_positions_table(positions)}
-      <h2>Recent Scan Candidates</h2>
-      {_table(candidates, ["ticker", "status", "quality", "confidence", "entry"])}
-    </div>
-    <div>
-      <h2>Decision Feed (live)</h2>
-      <div class="feed">
-      {_decision_feed(decisions[-50:])}
+  <div class="tab-nav">
+    <button class="tab-btn active" onclick="switchTab('overview')">Overview</button>
+    <button class="tab-btn" onclick="switchTab('closed-positions')">Closed Positions ({len(closed_positions)})</button>
+  </div>
+
+  <div id="tab-overview" class="tab-content active">
+    <div class="two-col">
+      <div>
+        <h2>Open Positions</h2>
+        {_positions_table(positions)}
+        <h2>Recent Scan Candidates</h2>
+        <div style="margin-bottom: 12px;">
+          <input id="candidates-search" type="text" placeholder="Filter candidates..." onkeyup="filterCandidates()" style="width: 100%; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px; font-family: inherit;">
+        </div>
+        <div id="candidates-container">
+        {_table(candidates, ["ticker", "status", "quality", "confidence", "entry"])}
+        </div>
       </div>
-      <h2>Closed Positions</h2>
-      {_closed_positions_table(exits[-20:])}
+      <div>
+        <h2>Decision Feed (live)</h2>
+        <div style="margin-bottom: 12px;">
+          <input id="feed-search" type="text" placeholder="Filter decisions..." onkeyup="filterFeed()" style="width: 100%; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px; font-family: inherit;">
+        </div>
+        <div id="feed-container" class="feed">
+        {_decision_feed(decisions[-50:])}
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="tab-closed-positions" class="tab-content">
+    <h2>Closed Positions</h2>
+    <div style="margin-bottom: 16px;">
+      <input id="closed-search" type="text" placeholder="Filter by ticker..." onkeyup="filterClosedPositions()" style="width: 200px; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px; font-family: inherit;">
+    </div>
+    <div id="closed-positions-container">
+    {_closed_positions_table_from_ledger(closed_positions)}
     </div>
   </div>
 
   <script>
+  function switchTab(tabName) {{
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+    document.getElementById('tab-' + tabName).classList.add('active');
+    event.target.classList.add('active');
+  }}
+
+  function filterClosedPositions() {{
+    const input = document.getElementById('closed-search');
+    const filter = input.value.toUpperCase();
+    const table = document.getElementById('closed-positions-container').querySelector('table');
+    if (!table) return;
+    const tr = table.getElementsByTagName('tr');
+    for (let i = 1; i < tr.length; i++) {{
+      const td = tr[i].getElementsByTagName('td')[0];
+      if (td) {{
+        const txtValue = td.textContent || td.innerText;
+        tr[i].style.display = txtValue.toUpperCase().indexOf(filter) > -1 ? '' : 'none';
+      }}
+    }}
+  }}
+
+  function filterCandidates() {{
+    const input = document.getElementById('candidates-search');
+    const filter = input.value.toUpperCase();
+    const table = document.getElementById('candidates-container').querySelector('table');
+    if (!table) return;
+    const tr = table.getElementsByTagName('tr');
+    for (let i = 1; i < tr.length; i++) {{
+      const td = tr[i].getElementsByTagName('td')[0];
+      if (td) {{
+        const txtValue = td.textContent || td.innerText;
+        tr[i].style.display = txtValue.toUpperCase().indexOf(filter) > -1 ? '' : 'none';
+      }}
+    }}
+  }}
+
+  function filterFeed() {{
+    const input = document.getElementById('feed-search');
+    const filter = input.value.toUpperCase();
+    const container = document.getElementById('feed-container');
+    if (!container) return;
+    const rows = container.getElementsByTagName('tr');
+    for (let i = 0; i < rows.length; i++) {{
+      const row = rows[i];
+      let found = false;
+      const tds = row.getElementsByTagName('td');
+      for (let j = 0; j < tds.length; j++) {{
+        const txtValue = tds[j].textContent || tds[j].innerText;
+        if (txtValue.toUpperCase().indexOf(filter) > -1) {{
+          found = true;
+          break;
+        }}
+      }}
+      row.style.display = found ? '' : 'none';
+    }}
+  }}
+
   async function toggleKillSwitch(action) {{
     const btn = document.querySelector('#kill-banner button');
     let originalText = '';
@@ -565,9 +885,64 @@ def _render_live_dashboard(snapshot: dict[str, Any]) -> str:
       if (btn) {{ btn.disabled = false; btn.innerHTML = originalText; }}
     }}
   }}
+
+  async function updateWatchlist(action, symbol) {{
+    const value = (symbol || document.querySelector('#watch-symbol')?.value || '').trim();
+    if (!value) return;
+    try {{
+      const resp = await fetch('/api/watchlist', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{action: action, symbol: value}})
+      }});
+      if (resp.ok) {{
+        location.reload();
+      }} else {{
+        alert(await resp.text());
+      }}
+    }} catch (e) {{
+      alert('Network error: ' + e.message);
+    }}
+  }}
+
+  // Scroll to top button
+  function scrollToTop() {{
+    window.scrollTo({{ top: 0, behavior: 'smooth' }});
+  }}
+
+  // Show/hide scroll to top button
+  window.addEventListener('scroll', function() {{
+    const btn = document.getElementById('scroll-top-btn');
+    if (btn) {{
+      btn.style.display = window.scrollY > 300 ? 'block' : 'none';
+    }}
+  }});
   </script>
+
+  <button id="scroll-top-btn" class="btn" onclick="scrollToTop()" style="position: fixed; bottom: 24px; right: 24px; background: var(--accent-blue); color: #fff; width: 48px; height: 48px; border-radius: 50%; display: none; align-items: center; justify-content: center; font-size: 20px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3); z-index: 1000;">↑</button>
 </body>
 </html>
+"""
+
+
+def _watchlist_widget(symbols: list[str]) -> str:
+    items = "".join(
+        f'<span class="badge">{html.escape(symbol)} '
+        f"<button class=\"btn\" onclick=\"updateWatchlist('remove', '{html.escape(symbol)}')\">Remove</button></span> "
+        for symbol in symbols
+    )
+    if not items:
+        items = '<span class="label">No watched symbols.</span>'
+    return f"""
+  <section class="card">
+    <h2>Watcher</h2>
+    <p class="label">Watched symbols are added to the default daily scan universe; normal scanner and risk gates still apply.</p>
+    <div style="display: flex; gap: 8px; align-items: center;">
+      <input id="watch-symbol" placeholder="AAPL" style="flex: 1; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px; font-family: inherit;">
+      <button class="btn" onclick="updateWatchlist('add')" style="background: var(--accent-green); color: #fff;">Add to Watcher</button>
+    </div>
+    <div style="margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px;">{items}</div>
+  </section>
 """
 
 
@@ -644,7 +1019,7 @@ def _positions_table(positions: list[dict[str, Any]]) -> str:
         )
 
     return (
-        '<table><thead><tr>' +
+        '<table class="data-table"><thead><tr>' +
         ''.join(f'<th>{h}</th>' for h in headers) +
         f'</tr></thead><tbody>{"".join(rows)}</tbody></table>'
     )
@@ -808,14 +1183,165 @@ def _strategy_attribution_widget(attribution: list[dict] | None) -> str:
 '''
 
 
+def _load_closed_positions(settings: Settings) -> list[dict[str, Any]]:
+    """Load paired BUY/SELL positions from the portfolio ledger.
+    
+    Reads the orders table from the state database, pairs each BUY order
+    with its corresponding SELL order, and returns a list of dicts with
+    entry_date, exit_date, entry_price, exit_price, quantity, pnl, win,
+    and ticker.
+    """
+    try:
+        ledger = PortfolioLedger(Path(settings.app.state_db_path))
+        order_rows = ledger.list_order_rows()
+    except Exception:
+        return []
+    
+    if not order_rows:
+        return []
+    
+    # Group orders by ticker, pairing buys with sells
+    ticker_orders: dict[str, list[dict[str, Any]]] = {}
+    for row in order_rows:
+        ticker = str(row.get("ticker", "")).upper()
+        if not ticker:
+            continue
+        ticker_orders.setdefault(ticker, []).append(row)
+    
+    # Pair BUY with SELL for each ticker
+    closed: list[dict[str, Any]] = []
+    for ticker, orders in ticker_orders.items():
+        # Sort by filled_at
+        orders.sort(key=lambda o: str(o.get("filled_at", "")))
+        
+        # Match buys with sells
+        pending_buy: dict[str, Any] | None = None
+        for order in orders:
+            side = str(order.get("side", "")).upper()
+            if side == "BUY" and pending_buy is None:
+                pending_buy = order
+            elif side == "SELL" and pending_buy is not None:
+                entry = pending_buy
+                exit_order = order
+                entry_price = float(entry.get("fill_price", 0) or 0)
+                exit_price = float(exit_order.get("fill_price", 0) or 0)
+                quantity = int(exit_order.get("quantity", 0) or entry.get("quantity", 0))
+                pnl_val = float(exit_order.get("pnl", 0) or 0)
+                
+                entry_date = entry.get("filled_at", "")
+                exit_date = exit_order.get("filled_at", "")
+                
+                closed.append({
+                    "ticker": ticker,
+                    "entry_date": entry_date,
+                    "exit_date": exit_date,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "quantity": quantity,
+                    "pnl": pnl_val,
+                    "win": pnl_val > 0,
+                })
+                pending_buy = None
+    
+    # Sort by exit_date descending
+    closed.sort(key=lambda x: x.get("exit_date", ""), reverse=True)
+    return closed
+
+
+def _load_open_positions_from_ledger(settings: Settings) -> list[dict[str, Any]]:
+    """Load open positions from the portfolio ledger.
+    
+    Reads the portfolio_state table from the state database and returns
+    a list of dicts with ticker, quantity, average_cost, stop_loss,
+    profit_target, entry_at, and strategy_tag for each open position.
+    """
+    try:
+        ledger = PortfolioLedger(Path(settings.app.state_db_path))
+        state = ledger.load_portfolio_state()
+    except Exception:
+        return []
+    
+    if state is None:
+        return []
+    
+    positions = state.positions
+    if not positions:
+        return []
+    
+    result = []
+    for ticker, pos in positions.items():
+        result.append({
+            "ticker": pos.ticker,
+            "quantity": pos.quantity,
+            "average_cost": pos.average_cost,
+            "stop_loss": pos.stop_loss,
+            "profit_target": pos.profit_target,
+            "highest_high": pos.highest_high,
+            "initial_risk": pos.initial_risk,
+            "entry_at": pos.entry_at.isoformat() if pos.entry_at else None,
+            "strategy_tag": pos.strategy_tag,
+        })
+    
+    return result
+
+
+def _closed_positions_table_from_ledger(positions: list[dict[str, Any]]) -> str:
+    """Render a table of closed positions from ledger data with dates."""
+    if not positions:
+        return '<p class="label">No closed positions yet.</p>'
+    
+    headers = ["Ticker", "Entry Date", "Exit Date", "Entry $", "Exit $", "Qty", "P&L", "Result"]
+    rows = []
+    for pos in positions:
+        ticker = html.escape(str(pos.get("ticker", "")))
+        entry_date = str(pos.get("entry_date", "—"))[:10] if pos.get("entry_date") else "—"
+        exit_date = str(pos.get("exit_date", "—"))[:10] if pos.get("exit_date") else "—"
+        entry_price = pos.get("entry_price")
+        exit_price = pos.get("exit_price")
+        quantity = pos.get("quantity", 0)
+        pnl = pos.get("pnl", 0)
+        win = pos.get("win", False)
+        
+        entry_str = f"${entry_price:.2f}" if entry_price else "—"
+        exit_str = f"${exit_price:.2f}" if exit_price else "—"
+        
+        if pnl is not None:
+            pnl_class = "pnl-positive" if pnl >= 0 else "pnl-negative"
+            pnl_str = f'<span class="{pnl_class}">${pnl:.2f}</span>'
+        else:
+            pnl_str = "—"
+        
+        result_str = '<span style="color:#3fb950">✓ WIN</span>' if win else '<span style="color:#f85149">✗ LOSS</span>'
+        
+        rows.append(
+            f"<tr><td>{ticker}</td><td>{entry_date}</td><td>{exit_date}</td>"
+            f"<td>{entry_str}</td><td>{exit_str}</td><td>{quantity}</td>"
+            f"<td>{pnl_str}</td><td>{result_str}</td></tr>"
+        )
+    
+    return (
+        '<table class="data-table"><thead><tr>' +
+        ''.join(f'<th>{h}</th>' for h in headers) +
+        f'</tr></thead><tbody>{"".join(rows)}</tbody></table>'
+    )
+
+
 def _closed_positions_table(exits: list[dict[str, Any]]) -> str:
     """Render a table of closed positions with P&L details."""
     if not exits:
         return '<p class="label">No closed positions yet.</p>'
     
+    # Deduplicate: keep only the last exit event per ticker
+    seen: dict[str, dict[str, Any]] = {}
+    for exit_event in exits:
+        ticker = exit_event.get("ticker", "")
+        if ticker:
+            seen[ticker] = exit_event
+    deduped = list(seen.values())
+    
     headers = ["Ticker", "Entry $", "Exit $", "Qty", "P&L", "Result", "Reason"]
     rows = []
-    for exit_event in reversed(exits):  # newest first
+    for exit_event in reversed(deduped):  # newest first
         ticker = html.escape(str(exit_event.get("ticker", "")))
         entry_price = exit_event.get("entry_price")
         exit_price = exit_event.get("exit_price")
@@ -929,6 +1455,7 @@ def _enrich_positions(positions: list[dict[str, Any]], settings: Settings) -> li
                     ticker,
                     settings.market_data.intraday_period,
                     settings.market_data.intraday_interval,
+                    settings=settings.market_data,
                 )
                 if not frame.empty and "close" in frame.columns:
                     last_price = float(frame.iloc[-1]["close"])
@@ -1086,7 +1613,7 @@ def _table(rows: list[dict[str, Any]], columns: list[str]) -> str:
         + "</tr>"
         for row in rows
     )
-    return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+    return f'<table class="data-table"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>'
 
 
 def _money(value: object) -> str:

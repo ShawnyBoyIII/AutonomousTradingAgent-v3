@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 from trading_bot.models.signal import TradeSignal
 from trading_bot.strategy.market_regime import (
@@ -59,6 +62,7 @@ class StrategySelector:
         self.risk_tolerance = risk_tolerance
         self.min_confidence = "medium"  # Minimum confidence to trade
         self.atr_stop_multiplier = 1.5  # Min ATR distance for stops
+        self.min_stop_distance_pct = 0.0  # Min stop as % of entry
 
     def select_strategy(
         self,
@@ -76,6 +80,10 @@ class StrategySelector:
 
         # Step 2: Check if we should trade at all
         if not should_trade_regime(regime, self.risk_tolerance):
+            logger.debug(
+                "V3 regime blocked symbol=%s regime=%s tolerance=%s",
+                symbol, regime.value, self.risk_tolerance,
+            )
             return StrategySelection(
                 should_trade=False,
                 strategy_type="none",
@@ -215,7 +223,7 @@ class StrategySelector:
                     score.confidence = self._recalculate_confidence(score.total_score)
                     candidates.append(("trend_following", trend_setup, score))
                 
-                # Also try mean reversion
+                # Also try mean reversion (less penalty: high vol helps reversion)
                 reversion_setup = identify_mean_reversion_setup(intraday_frame)
                 if reversion_setup:
                     score = calculate_signal_confluence(
@@ -226,7 +234,7 @@ class StrategySelector:
                         regime_metrics=regime_metrics,
                         setup_type=reversion_setup.replace(" ", "_"),
                     )
-                    score.regime_alignment *= 0.3
+                    score.regime_alignment *= 0.5
                     score.total_score = (
                         score.technical_score
                         + score.volume_score
@@ -239,6 +247,10 @@ class StrategySelector:
 
         # Select best candidate
         if not candidates:
+            logger.debug(
+                "V3 no setups symbol=%s regime=%s recommended=%s",
+                symbol, regime.value, recommended_strategy,
+            )
             return StrategySelection(
                 should_trade=False,
                 strategy_type="none",
@@ -254,6 +266,11 @@ class StrategySelector:
 
         # Check minimum confidence
         if not self._meets_confidence_threshold(score.confidence):
+            logger.debug(
+                "V3 low confidence symbol=%s type=%s setup=%s score=%.1f conf=%s min=%s",
+                symbol, strategy_type, setup_name, score.total_score,
+                score.confidence, self.min_confidence,
+            )
             return StrategySelection(
                 should_trade=False,
                 strategy_type=strategy_type,
@@ -266,6 +283,12 @@ class StrategySelector:
         # Calculate trade parameters
         entry, stop, target = self._calculate_trade_parameters(
             intraday_frame, setup_name
+        )
+
+        logger.debug(
+            "V3 signal symbol=%s regime=%s type=%s setup=%s score=%.1f conf=%s entry=%.2f stop=%.2f",
+            symbol, regime.value, strategy_type, setup_name,
+            score.total_score, score.confidence, entry, stop,
         )
 
         return StrategySelection(
@@ -351,6 +374,10 @@ class StrategySelector:
         if stop <= 0:
             stop = entry * 0.99
 
+        min_stop = entry * (1.0 - self.min_stop_distance_pct / 100.0)
+        if stop > min_stop:
+            stop = min_stop
+
         # 2:1 risk-reward target
         risk = entry - stop
         target = entry + (risk * 2)
@@ -427,7 +454,7 @@ def selection_to_signal(
         if isinstance(candidate, datetime):
             timestamp = candidate
     if timestamp is None and not intraday_frame.empty:
-        timestamp = datetime.now()
+        timestamp = datetime.now(timezone.utc)
 
     if timestamp is None:
         return None

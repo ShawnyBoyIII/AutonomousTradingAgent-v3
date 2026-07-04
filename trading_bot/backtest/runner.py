@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
+from trading_bot.backtest.diagnostics import attach_diagnostics, diagnostics
 from trading_bot.config.settings import Settings
 from trading_bot.data import market_data
 from trading_bot.data.indicators import add_atr, add_bollinger_bands, add_ema, add_rsi, add_sma
@@ -15,6 +18,54 @@ from trading_bot.runtime.decision_log import append_decision_event
 from trading_bot.runtime.snapshots import write_snapshot
 from trading_bot.strategy.daily_signal_engine import generate_daily_signal
 from trading_bot.strategy.intraday_signal_engine import generate_signal
+
+logger = logging.getLogger(__name__)
+
+
+def _fetch_bars_compat(fetch_fn: Any, symbol: str, period: str, interval: str, **kwargs: Any) -> Any:
+    """Call fetch_bars, falling back to no-settings signature for test mocks."""
+    try:
+        return fetch_fn(symbol, period, interval, **kwargs)
+    except TypeError:
+        kwargs.pop("settings", None)
+        return fetch_fn(symbol, period, interval, **kwargs)
+
+
+def _build_equity_curve(
+    closes,
+    trade_records: list[dict[str, float | int]],
+    starting_cash: float,
+) -> list[float]:
+    n = len(closes)
+    equity = np.full(n, float(starting_cash))
+    cash = float(starting_cash)
+    for trade in trade_records:
+        entry_idx = int(trade["entry_index"])
+        exit_idx = int(trade["exit_index"])
+        qty = trade["quantity"]
+        if qty == 0:
+            continue
+        cash -= qty * trade["entry_price"] + trade["entry_fees"]
+        last_hold = min(exit_idx, n - 1)
+        for bar in range(entry_idx, last_hold + 1):
+            equity[bar] = cash + qty * closes[bar]
+        cash += qty * trade["exit_price"] - trade["exit_fees"]
+        for bar in range(exit_idx + 1, n):
+            equity[bar] = cash
+    return equity.tolist()
+
+
+def _aggregate_strategy_returns(equity_curves: list[list[float]]) -> list[float]:
+    if not equity_curves:
+        return []
+    min_len = min((len(c) for c in equity_curves), default=0)
+    if min_len < 2:
+        return []
+    combined = np.zeros(min_len)
+    for curve in equity_curves:
+        combined += np.array(curve[:min_len], dtype=float)
+    returns = pd.Series(combined).pct_change().dropna()
+    return returns.tolist()
 
 
 def run_backtest(
@@ -27,36 +78,44 @@ def run_backtest(
     wins = 0
     losses = 0
     net_pnl = 0.0
+    gross_profit = 0.0
+    gross_loss = 0.0
     rows: list[dict[str, float | int | str | None]] = []
+    equity_curves: list[list[float]] = []
     log_path = Path(settings.app.log_dir) / "decision-log.jsonl"
 
     for symbol in (value.strip() for value in symbols if value.strip()):
-        daily_frame = market_data.fetch_bars(
+        daily_frame = _fetch_bars_compat(
+            market_data.fetch_bars,
             symbol,
             settings.market_data.daily_period,
             "1d",
             start=start,
             end=end,
+            settings=settings.market_data,
         )
         try:
-            intraday_frame = market_data.fetch_bars(
+            intraday_frame = _fetch_bars_compat(
+                market_data.fetch_bars,
                 symbol,
                 settings.market_data.intraday_period,
                 settings.market_data.intraday_interval,
                 start=start,
                 end=end,
+                settings=settings.market_data,
             )
         except ValueError:
             # Try 1h data (730 days available)
             try:
-                intraday_frame = market_data.fetch_bars(
-                    symbol, "1y", "1h", start=start, end=end
+                intraday_frame = _fetch_bars_compat(
+                    market_data.fetch_bars,
+                    symbol, "1y", "1h", start=start, end=end, settings=settings.market_data
                 )
-                print(f"Note: Using 1h data for {symbol} (5m unavailable for date range)")
+                logger.info("Note: Using 1h data for %s (5m unavailable for date range)", symbol)
             except ValueError:
                 # Fall back to daily bars as "intraday"
                 intraday_frame = daily_frame.copy()
-                print(f"Note: Using daily bars for {symbol} (intraday unavailable)")
+                logger.info("Note: Using daily bars for %s (intraday unavailable)", symbol)
         
         # Detect daily mode: when intraday is same frequency as daily
         daily_mode = len(intraday_frame) == len(daily_frame) and all(
@@ -90,6 +149,11 @@ def run_backtest(
         wins += result["wins"]
         losses += result["losses"]
         net_pnl += result["net_pnl"]
+        gross_profit += float(result.get("gross_profit", 0.0))
+        gross_loss += float(result.get("gross_loss", 0.0))
+        curve = result.get("equity_curve") or []
+        if curve:
+            equity_curves.append(list(curve))
         rows.append(
             {
                 "ticker": symbol,
@@ -97,6 +161,8 @@ def run_backtest(
                 "wins": result["wins"],
                 "losses": result["losses"],
                 "net_pnl": result["net_pnl"],
+                "gross_profit": result.get("gross_profit", 0.0),
+                "gross_loss": result.get("gross_loss", 0.0),
                 "start": start,
                 "end": end,
             }
@@ -123,6 +189,16 @@ def run_backtest(
         "net_pnl": round(net_pnl, 2),
         "rows": rows,
     }
+    summary.update(
+        diagnostics(
+            trades=trades,
+            wins=wins,
+            losses=losses,
+            net_pnl=net_pnl,
+            gross_profit=gross_profit,
+            gross_loss=gross_loss,
+        )
+    )
     write_snapshot(
         settings.app.backtest_summary_path,
         {
@@ -137,10 +213,39 @@ def run_backtest(
             "rows": rows,
         },
     )
+
+    # Run attribution analysis
+    summary["strategy_returns"] = _aggregate_strategy_returns(equity_curves)
+    try:
+        from trading_bot.backtest.attribution import run_attribution
+        benchmark_data = None
+        if benchmark_symbol := getattr(settings.app, "benchmark_symbol", None):
+            try:
+                benchmark_data = _fetch_bars_compat(
+                    market_data.fetch_bars,
+                    benchmark_symbol,
+                    settings.market_data.daily_period,
+                    "1d",
+                    start=start,
+                    end=end,
+                    settings=settings.market_data,
+                )
+            except Exception as e:
+                logger.debug("Backtest error: %s", e)
+        if benchmark_data is not None and not benchmark_data.empty:
+            benchmark_returns = benchmark_data["close"].astype(float).pct_change().dropna()
+            summary["benchmark_returns"] = benchmark_returns.tolist()
+        summary["attribution"] = run_attribution(
+            summary,
+            benchmark_data=benchmark_data,
+        )
+    except Exception as e:
+        logger.warning("Attribution analysis failed: %s", e)
+
     return summary
 
 
-def iterate_bars(frame: Any, warmup: int):
+def iterate_bars(frame: Any, warmup: int) -> Any:
     if warmup <= 0:
         raise ValueError("warmup must be positive")
 
@@ -187,14 +292,17 @@ def _run_symbol_backtest(
     settings: Settings,
 ) -> dict[str, float | int]:
     if len(intraday_frame) < 5:
-        return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
+        return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0, "equity_curve": []}
 
     broker = PaperBroker(starting_cash=10_000.0, fee_per_order=1.0, slippage_bps=0)
     trades = 0
     wins = 0
     losses = 0
     net_pnl = 0.0
+    gross_profit = 0.0
+    gross_loss = 0.0
     entry_blocked_until = -1
+    trade_records: list[dict[str, float | int]] = []
 
     use_v3 = (
         getattr(settings, "strategy", None) is not None
@@ -207,6 +315,7 @@ def _run_symbol_backtest(
         selector = StrategySelector(risk_tolerance=settings.strategy.risk_tolerance)
         selector.min_confidence = settings.strategy.min_confidence
         selector.atr_stop_multiplier = settings.risk.atr_stop_multiplier
+        selector.min_stop_distance_pct = settings.risk.min_stop_distance_pct
 
     for end_index, window in enumerate(iterate_bars(intraday_frame, warmup=5), start=5):
         if end_index <= entry_blocked_until:
@@ -247,10 +356,23 @@ def _run_symbol_backtest(
         # not precise real-time simulation.
         exit_price, exit_index = _resolve_exit(signal, intraday_frame, entry_index)
         quantity = broker.positions.get(symbol, 0)
+        trade_records.append({
+            "entry_index": entry_index,
+            "exit_index": exit_index,
+            "quantity": quantity,
+            "entry_price": fill.fill_price,
+            "exit_price": exit_price,
+            "entry_fees": fill.fees,
+            "exit_fees": broker.fee_per_order,
+        })
         entry_value = fill.fill_price * quantity
         exit_value = exit_price * quantity
         trade_pnl = exit_value - entry_value - fill.fees - broker.fee_per_order
         net_pnl += trade_pnl
+        if trade_pnl > 0:
+            gross_profit += trade_pnl
+        else:
+            gross_loss += trade_pnl
         trades += 1
         if trade_pnl > 0:
             wins += 1
@@ -261,11 +383,25 @@ def _run_symbol_backtest(
         broker.positions.pop(symbol, None)
         entry_blocked_until = exit_index
 
+    closes = intraday_frame["close"].astype(float).reset_index(drop=True).values
+    equity_curve = _build_equity_curve(closes, trade_records, 10_000.0)
+
     return {
         "trades": trades,
         "wins": wins,
         "losses": losses,
         "net_pnl": round(net_pnl, 2),
+        "gross_profit": round(gross_profit, 2),
+        "gross_loss": round(gross_loss, 2),
+        "equity_curve": equity_curve,
+        **diagnostics(
+            trades=trades,
+            wins=wins,
+            losses=losses,
+            net_pnl=net_pnl,
+            gross_profit=gross_profit,
+            gross_loss=gross_loss,
+        ),
     }
 
 
@@ -276,14 +412,17 @@ def _run_symbol_backtest_daily(
 ) -> dict[str, float | int]:
     """Run backtest using daily bar signals (no intraday data needed)."""
     if len(daily_frame) < 50:  # Need warmup for EMA/SMA
-        return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
+        return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0, "equity_curve": []}
 
     broker = PaperBroker(starting_cash=10_000.0, fee_per_order=1.0, slippage_bps=0)
     trades = 0
     wins = 0
     losses = 0
     net_pnl = 0.0
+    gross_profit = 0.0
+    gross_loss = 0.0
     entry_blocked_until = -1
+    trade_records: list[dict[str, float | int]] = []
 
     use_v3 = (
         getattr(settings, "strategy", None) is not None
@@ -297,6 +436,7 @@ def _run_symbol_backtest_daily(
         selector = StrategySelector(risk_tolerance=settings.strategy.risk_tolerance)
         selector.min_confidence = settings.strategy.min_confidence
         selector.atr_stop_multiplier = settings.risk.atr_stop_multiplier
+        selector.min_stop_distance_pct = settings.risk.min_stop_distance_pct
 
     for index in range(50, len(daily_frame)):
         if index <= entry_blocked_until:
@@ -355,10 +495,23 @@ def _run_symbol_backtest_daily(
             exit_price = daily_frame.iloc[exit_index]["close"]
 
         quantity = broker.positions.get(symbol, 0)
+        trade_records.append({
+            "entry_index": index,
+            "exit_index": exit_index,
+            "quantity": quantity,
+            "entry_price": fill.fill_price,
+            "exit_price": exit_price,
+            "entry_fees": fill.fees,
+            "exit_fees": broker.fee_per_order,
+        })
         entry_value = fill.fill_price * quantity
         exit_value = exit_price * quantity
         trade_pnl = exit_value - entry_value - fill.fees - broker.fee_per_order
         net_pnl += trade_pnl
+        if trade_pnl > 0:
+            gross_profit += trade_pnl
+        else:
+            gross_loss += trade_pnl
         trades += 1
         if trade_pnl > 0:
             wins += 1
@@ -369,19 +522,33 @@ def _run_symbol_backtest_daily(
         broker.positions.pop(symbol, None)
         entry_blocked_until = exit_index
 
+    closes = daily_frame["close"].astype(float).reset_index(drop=True).values
+    equity_curve = _build_equity_curve(closes, trade_records, 10_000.0)
+
     return {
         "trades": trades,
         "wins": wins,
         "losses": losses,
         "net_pnl": round(net_pnl, 2),
+        "gross_profit": round(gross_profit, 2),
+        "gross_loss": round(gross_loss, 2),
+        "equity_curve": equity_curve,
+        **diagnostics(
+            trades=trades,
+            wins=wins,
+            losses=losses,
+            net_pnl=net_pnl,
+            gross_profit=gross_profit,
+            gross_loss=gross_loss,
+        ),
     }
 
 
-def _filter_frame_by_date(frame: Any, start: str | None, end: str | None):
+def _filter_frame_by_date(frame: Any, start: str | None, end: str | None) -> Any:
     if frame.empty or "timestamp" not in frame.columns:
         return frame
 
-    timestamp_series = pd.to_datetime(frame["timestamp"])
+    timestamp_series = pd.to_datetime(frame["timestamp"], utc=True)
     if timestamp_series.isna().all():
         return frame
 
@@ -414,14 +581,85 @@ def _resolve_exit(signal, intraday_frame: Any, entry_index: int) -> tuple[float,
     if after.empty:
         # No future bars to check; exit at entry bar close.
         return float(intraday_frame.iloc[entry_index]["close"]), entry_index
-    for row_index, (_, row) in enumerate(after.iterrows(), start=entry_index + 1):
-        if float(row["low"]) <= signal.stop_loss:
+
+    # Optimization: use itertuples(index=False) which is much faster than iterrows
+    for row_index, row in enumerate(after.itertuples(index=False), start=entry_index + 1):
+        if float(row.low) <= signal.stop_loss:
             return signal.stop_loss, row_index
-        if float(row["high"]) >= signal.profit_target:
+        if float(row.high) >= signal.profit_target:
             return signal.profit_target, row_index
 
     last_idx = entry_index + len(after) - 1
     return float(after.iloc[-1]["close"]), last_idx
+
+
+def _fetch_rl_frames(
+    meta_symbols: list[str],
+    settings: Settings,
+    start: str | None,
+    end: str | None,
+) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+    """Fetch daily + intraday data for every symbol the RL model was trained on.
+
+    Falls back from 5m -> 1h -> daily bars when intraday is unavailable.
+    """
+    daily_frames: dict[str, pd.DataFrame] = {}
+    intraday_frames: dict[str, pd.DataFrame] = {}
+    for sym in (value.strip() for value in meta_symbols if value.strip()):
+        daily_frames[sym] = _fetch_bars_compat(
+            market_data.fetch_bars,
+            sym,
+            settings.market_data.daily_period,
+            "1d",
+            start=start,
+            end=end,
+            settings=settings.market_data,
+        )
+        try:
+            intraday_frames[sym] = _fetch_bars_compat(
+                market_data.fetch_bars,
+                sym,
+                settings.market_data.intraday_period,
+                settings.market_data.intraday_interval,
+                start=start,
+                end=end,
+                settings=settings.market_data,
+            )
+        except ValueError:
+            try:
+                intraday_frames[sym] = _fetch_bars_compat(
+                    market_data.fetch_bars,
+                    sym, "1y", "1h", start=start, end=end,
+                    settings=settings.market_data,
+                )
+                logger.info("Note: Using 1h data for %s (5m unavailable for date range)", sym)
+            except ValueError:
+                intraday_frames[sym] = daily_frames[sym].copy()
+                logger.info("Note: Using daily bars for %s (intraday unavailable)", sym)
+        intraday_frames[sym] = _filter_frame_by_date(
+            intraday_frames[sym], start=start, end=end
+        )
+    return daily_frames, intraday_frames
+
+
+def _write_rl_summary(
+    settings: Settings,
+    summary: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> None:
+    write_snapshot(
+        settings.app.backtest_summary_path,
+        {
+            "mode": "backtest",
+            "strategy": "rl",
+            "summary": {
+                k: summary[k]
+                for k in ("trades", "wins", "losses", "win_rate", "net_pnl")
+                if k in summary
+            },
+            "rows": rows,
+        },
+    )
 
 
 def run_walk_forward(
@@ -509,6 +747,99 @@ def run_walk_forward(
     }
 
 
+def run_rl_walk_forward(
+    symbols: list[str],
+    settings: Settings,
+    *,
+    start: str | None = None,
+    end: str | None = None,
+    windows: int = 5,
+    model_path: str | None = None,
+) -> dict[str, object]:
+    """Run fixed-model sequential benchmark windows.
+
+    This is segmented evaluation, not retrain-per-window walk-forward.
+    """
+    if start is None:
+        start = (date.today() - timedelta(days=365)).isoformat()
+    if end is None:
+        end = date.today().isoformat()
+
+    start_d = date.fromisoformat(start)
+    end_d = date.fromisoformat(end)
+    total_days = (end_d - start_d).days
+    if total_days < 1:
+        return {"windows": [], "results": {}}
+
+    if total_days < windows * 20:
+        windows = max(1, total_days // 20)
+    window_size = max(1, total_days // windows)
+
+    strategy_totals: dict[str, dict[str, float]] = {}
+    window_results: list[dict[str, object]] = []
+
+    for window_index in range(windows):
+        ws = start_d + timedelta(days=window_index * window_size)
+        we = ws + timedelta(days=window_size) if window_index < windows - 1 else end_d
+        comparison = run_strategy_comparison(
+            symbols,
+            settings,
+            start=ws.isoformat(),
+            end=we.isoformat(),
+            strategies=["v2.5", "v3", "rl"],
+            model_path=model_path,
+        )
+        strategy_results = comparison["results"]
+        window_results.append(
+            {
+                "window": window_index + 1,
+                "start": ws.isoformat(),
+                "end": we.isoformat(),
+                "results": strategy_results,
+                "best_pnl_strategy": comparison["best_pnl_strategy"],
+                "best_winrate_strategy": comparison["best_winrate_strategy"],
+            }
+        )
+        for strategy_name, result in strategy_results.items():
+            totals = strategy_totals.setdefault(
+                strategy_name,
+                {
+                    "trades": 0.0,
+                    "wins": 0.0,
+                    "losses": 0.0,
+                    "net_pnl": 0.0,
+                    "gross_profit": 0.0,
+                    "gross_loss": 0.0,
+                },
+            )
+            totals["trades"] += float(result["trades"])
+            totals["wins"] += float(result["wins"])
+            totals["losses"] += float(result["losses"])
+            totals["net_pnl"] += float(result["net_pnl"])
+            totals["gross_profit"] += float(result.get("gross_profit", 0.0))
+            totals["gross_loss"] += float(result.get("gross_loss", 0.0))
+
+    aggregate_results = {
+        strategy_name: {
+            "trades": int(values["trades"]),
+            "wins": int(values["wins"]),
+            "losses": int(values["losses"]),
+            "win_rate": 0.0 if values["trades"] == 0 else values["wins"] / values["trades"],
+            "net_pnl": round(values["net_pnl"], 2),
+            **diagnostics(
+                trades=int(values["trades"]),
+                wins=int(values["wins"]),
+                losses=int(values["losses"]),
+                net_pnl=values["net_pnl"],
+                gross_profit=values["gross_profit"],
+                gross_loss=values["gross_loss"],
+            ),
+        }
+        for strategy_name, values in strategy_totals.items()
+    }
+    return {"windows": window_results, "results": aggregate_results}
+
+
 def run_rl_backtest(
     symbols: list[str],
     settings: Settings,
@@ -537,15 +868,42 @@ def run_rl_backtest(
     wins = 0
     losses = 0
     net_pnl = 0.0
+    gross_profit = 0.0
+    gross_loss = 0.0
     rows: list[dict[str, float | int | str | None]] = []
     log_path = Path(settings.app.log_dir) / "decision-log.jsonl"
 
+    # Load model metadata to determine training symbol order and max_symbols
+    resolved_model_path = model_path or (getattr(settings.rl, "model_path", None) if hasattr(settings, "rl") else None)
+    meta_symbols = list(symbols)
+    meta_max_symbols: int | None = None
+    meta_action_scheme = "bsh"
+    if resolved_model_path:
+        import json
+        meta_path = Path(resolved_model_path).with_suffix(".zip")
+        if meta_path.suffix != ".zip":
+            meta_path = Path(resolved_model_path)
+        meta_path = meta_path.parent / (meta_path.stem + "_meta.json")
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                meta_symbols = [s.strip().upper() for s in meta.get("symbols", symbols)]
+                meta_max_symbols = meta.get("max_symbols")
+                meta_action_scheme = str(meta.get("action_scheme", meta_action_scheme))
+            except Exception as e:
+                logger.debug("Backtest error: %s", e)
+
     rl_config = RLBacktestConfig(
-        model_path=model_path or getattr(settings.rl, "model_path", None) if hasattr(settings, "rl") else None,
-        symbols=symbols,
-        starting_cash=10_000.0,
+        model_path=resolved_model_path,
+        symbols=meta_symbols,
+        starting_cash=settings.rl.backtest_starting_cash,
         fee_per_order=settings.paper.fee_per_order,
         slippage_bps=settings.paper.slippage_bps,
+        max_shares=settings.rl.backtest_max_shares,
+        max_symbols=meta_max_symbols,
+        stop_loss_pct=settings.rl.backtest_stop_loss_pct,
+        profit_target_pct=settings.rl.backtest_profit_target_pct,
+        action_scheme=meta_action_scheme,
     )
 
     runner = RLBacktestRunner(config=rl_config)
@@ -553,58 +911,54 @@ def run_rl_backtest(
     if rl_config.model_path:
         try:
             runner.load_model()
-            expected_features = runner._model.observation_space.shape[1]
-            n_market_features = len(RLBacktestRunner.FEATURE_COLS)
-            n_portfolio_features = 5
-            actual_features = len(rl_config.symbols) * n_market_features + n_portfolio_features
-            if expected_features != actual_features:
-                print(f"Warning: RL model expects {expected_features} features ({expected_features - n_portfolio_features} symbols) but backtest uses {actual_features} features ({len(rl_config.symbols)} symbols). Skipping RL backtest.")
-                return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0, "win_rate": 0.0, "rows": rows, "rl_actions": []}
+            model_obs_space = getattr(runner._model, "observation_space", None)
+            if model_obs_space is not None and hasattr(model_obs_space, "shape") and len(model_obs_space.shape) >= 2:
+                expected_features = model_obs_space.shape[1]
+                from trading_bot.rl.features import CROSS_SYMBOL_FEATURES
+                n_market_features = len(RLBacktestRunner.FEATURE_COLS) + len(CROSS_SYMBOL_FEATURES)
+                n_portfolio_features = 5
+                expected_max = (expected_features - n_portfolio_features) // n_market_features
+                actual_max = rl_config.max_symbols or len(rl_config.symbols)
+                if rl_config.max_symbols is None and expected_max >= len(rl_config.symbols):
+                    rl_config.max_symbols = expected_max
+                    actual_max = expected_max
+                if expected_features != actual_max * n_market_features + n_portfolio_features:
+                    logger.warning("RL model expects %s features (%s max symbols) but backtest uses %s max symbols. Skipping RL backtest.", expected_features, expected_max, actual_max)
+                    return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0, "win_rate": 0.0, "rows": rows, "rl_actions": []}
         except Exception as e:
-            print(f"Warning: Failed to load RL model: {e}. Skipping RL backtest.")
+            logger.warning("Failed to load RL model: %s. Skipping RL backtest.", e)
             return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0, "win_rate": 0.0, "rows": rows, "rl_actions": []}
     else:
-        print("Warning: No RL model path specified. Setting to dummy for testing.")
+        logger.warning("No RL model path specified. Setting to dummy for testing.")
         runner.set_model(None)
 
-    for symbol in (value.strip() for value in symbols if value.strip()):
-        daily_frame = market_data.fetch_bars(
-            symbol,
-            settings.market_data.daily_period,
-            "1d",
-            start=start,
-            end=end,
+    daily_frames, intraday_frames = _fetch_rl_frames(
+        meta_symbols, settings, start, end
+    )
+
+    primary = next(
+        (
+            symbol
+            for symbol in (value.strip() for value in meta_symbols if value.strip())
+            if intraday_frames.get(symbol) is not None and len(intraday_frames[symbol]) >= 15
+        ),
+        None,
+    )
+    if primary is not None:
+        result = runner.run_backtest(
+            symbol=primary,
+            daily_frames=daily_frames,
+            intraday_frames=intraday_frames,
+            trade_symbols=symbols,
         )
-        try:
-            intraday_frame = market_data.fetch_bars(
-                symbol,
-                settings.market_data.intraday_period,
-                settings.market_data.intraday_interval,
-                start=start,
-                end=end,
-            )
-        except ValueError:
-            try:
-                intraday_frame = market_data.fetch_bars(
-                    symbol, "1y", "1h", start=start, end=end
-                )
-                print(f"Note: Using 1h data for {symbol} (5m unavailable for date range)")
-            except ValueError:
-                intraday_frame = daily_frame.copy()
-                print(f"Note: Using daily bars for {symbol} (intraday unavailable)")
-
-        intraday_frame = _filter_frame_by_date(intraday_frame, start=start, end=end)
-
-        if len(intraday_frame) < 15:
-            continue
-
-        result = runner.run_backtest(symbol, daily_frame, intraday_frame)
-        trades += result["trades"]
-        wins += result["wins"]
-        losses += result["losses"]
-        net_pnl += result["net_pnl"]
+        trades = result["trades"]
+        wins = result["wins"]
+        losses = result["losses"]
+        net_pnl = result["net_pnl"]
+        gross_profit = float(result.get("gross_profit", 0.0))
+        gross_loss = float(result.get("gross_loss", 0.0))
         rows.append({
-            "ticker": symbol,
+            "ticker": ",".join(meta_symbols),
             "trades": result["trades"],
             "wins": result["wins"],
             "losses": result["losses"],
@@ -617,7 +971,7 @@ def run_rl_backtest(
             log_path,
             {
                 "command": "backtest",
-                "ticker": symbol,
+                "ticker": ",".join(meta_symbols),
                 "strategy": "rl",
                 "trades": result["trades"],
                 "wins": result["wins"],
@@ -634,24 +988,12 @@ def run_rl_backtest(
         "losses": losses,
         "win_rate": 0.0 if trades == 0 else wins / trades,
         "net_pnl": round(net_pnl, 2),
+        "gross_profit": round(gross_profit, 2),
+        "gross_loss": round(gross_loss, 2),
         "rows": rows,
         "strategy": "rl",
     }
-    write_snapshot(
-        settings.app.backtest_summary_path,
-        {
-            "mode": "backtest",
-            "strategy": "rl",
-            "summary": {
-                "trades": summary["trades"],
-                "wins": summary["wins"],
-                "losses": summary["losses"],
-                "win_rate": summary["win_rate"],
-                "net_pnl": summary["net_pnl"],
-            },
-            "rows": rows,
-        },
-    )
+    _write_rl_summary(settings, summary, rows)
     return summary
 
 
@@ -690,12 +1032,17 @@ def run_strategy_comparison(
     results: dict[str, dict[str, Any]] = {}
 
     for strategy in strategies:
-        print(f"Running {strategy} backtest...")
+        logger.info("Running %s backtest...", strategy)
         if strategy == "rl":
             result = run_rl_backtest(symbols, settings, start=start, end=end, model_path=model_path)
         else:
-            result = run_backtest(symbols, settings, start=start, end=end)
+            import copy
+            strategy_settings = copy.deepcopy(settings)
+            if getattr(strategy_settings, "strategy", None) is not None:
+                strategy_settings.strategy.use_v3_signals = strategy == "v3"
+            result = run_backtest(symbols, strategy_settings, start=start, end=end)
             result["strategy"] = strategy
+        attach_diagnostics(result)
         results[strategy] = result
 
     comparison = {
@@ -714,6 +1061,11 @@ def run_strategy_comparison(
             "losses": result.get("losses", 0),
             "win_rate": result.get("win_rate", 0.0),
             "net_pnl": result.get("net_pnl", 0.0),
+            "avg_win": result.get("avg_win", 0.0),
+            "avg_loss": result.get("avg_loss", 0.0),
+            "expectancy": result.get("expectancy", 0.0),
+            "profit_factor": result.get("profit_factor", 0.0),
+            "pnl_per_trade": result.get("pnl_per_trade", 0.0),
         }
 
     best_pnl = max(comparison["summary"].items(), key=lambda x: x[1]["net_pnl"])

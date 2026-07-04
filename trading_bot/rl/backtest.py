@@ -7,12 +7,17 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from trading_bot.data.indicators import (
-    add_ema, add_rsi, add_sma, add_atr, add_macd,
-    add_bollinger_bands, add_atr_percent,
-)
+from trading_bot.backtest.diagnostics import diagnostics
 from trading_bot.execution.paper_broker import PaperBroker
 from trading_bot.models.portfolio import PortfolioState, Position
+from trading_bot.rl.features import (
+    CROSS_SYMBOL_FEATURES,
+    FEATURE_COLS,
+    build_cross_symbol_features,
+    build_market_feature_row,
+    build_observation,
+    build_portfolio_feature_row,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +35,11 @@ class RLBacktestConfig:
     prediction_mode: str = "deterministic"
     bar_period: str = "1y"
     bar_interval: str = "1d"
+    max_symbols: int | None = None
+    use_intraday_exit: bool = False
+    stop_loss_pct: float = 0.03
+    profit_target_pct: float = 0.03
+    action_scheme: str = "bsh"
 
 
 class RLBacktestRunner:
@@ -42,11 +52,7 @@ class RLBacktestRunner:
     - Resolves exits using the same logic as the rule-based backtest
     """
 
-    FEATURE_COLS = [
-        "close", "return_1d", "rsi_14", "ema_12", "ema_26",
-        "sma_20", "macd_line", "macd_signal", "macd_histogram",
-        "bb_percent_b", "bb_width", "atr_pct", "volume_ratio",
-    ]
+    FEATURE_COLS = FEATURE_COLS
 
     def __init__(self, config: RLBacktestConfig | None = None) -> None:
         self.config = config or RLBacktestConfig()
@@ -76,6 +82,55 @@ class RLBacktestRunner:
             self._data_cache[symbol] = daily_frame.copy()
             self._data_indices[symbol] = 0
 
+    # ------------------------------------------------------------------ #
+    #  Frame preparation                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _prepare_frames(
+        self,
+        symbol: str | None,
+        daily_frame: pd.DataFrame | None,
+        daily_frames: dict[str, pd.DataFrame] | None,
+        intraday_frame: pd.DataFrame | None,
+        intraday_frames: dict[str, pd.DataFrame] | None,
+    ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame], list[str], str, pd.DataFrame] | None:
+        """Build per-symbol frame dicts, resolve the master timeline, and validate.
+
+        Returns (frames, intra_frames, all_symbols, primary, master_frame) or
+        None if there isn't enough data to backtest.
+        """
+        frames: dict[str, pd.DataFrame] = {}
+        if daily_frames is not None:
+            frames.update({k: v for k, v in daily_frames.items() if v is not None and not v.empty})
+        if daily_frame is not None and not daily_frame.empty and symbol:
+            frames[symbol] = daily_frame
+
+        if not frames:
+            return None
+
+        intra_frames: dict[str, pd.DataFrame] = {}
+        if intraday_frames is not None:
+            intra_frames.update({k: v for k, v in intraday_frames.items() if v is not None and not v.empty})
+        if intraday_frame is not None and not intraday_frame.empty and symbol:
+            intra_frames[symbol] = intraday_frame
+
+        all_symbols = self.config.symbols
+        if not all_symbols:
+            all_symbols = list(frames.keys())
+
+        primary = symbol if symbol and symbol in frames else all_symbols[0]
+        master_frame = intra_frames.get(primary)
+        if master_frame is None:
+            master_frame = frames.get(primary)
+        if master_frame is None or len(master_frame) < self.config.observer_window + 5:
+            return None
+
+        return frames, intra_frames, all_symbols, primary, master_frame
+
+    # ------------------------------------------------------------------ #
+    #  Feature computation & observation                                  #
+    # ------------------------------------------------------------------ #
+
     def _compute_features_for_symbol(self, symbol: str) -> list[float]:
         df = self._data_cache.get(symbol)
         if df is None or df.empty:
@@ -85,121 +140,43 @@ class RLBacktestRunner:
         if idx >= len(df):
             return [0.0] * len(self.FEATURE_COLS)
 
-        window = df.iloc[:idx + 1].copy()
-        n_features = len(self.FEATURE_COLS)
-
-        window = add_ema(window, 12, "ema_12")
-        window = add_ema(window, 26, "ema_26")
-        window = add_rsi(window, 14)
-        window = add_sma(window, 20, "sma_20")
-        window = add_macd(window, 12, 26, 9)
-        window = add_bollinger_bands(window, 20, 2.0)
-        window = add_atr_percent(window, 14)
-
-        close_col = float(window["close"].iloc[-1]) if "close" in window.columns else 0.0
-        returns = 0.0
-        if len(window) >= 2:
-            prev_close = float(window["close"].iloc[-2])
-            if prev_close > 0:
-                returns = (close_col - prev_close) / prev_close
-
-        rsi = float(window["rsi_14"].iloc[-1]) if "rsi_14" in window.columns and pd.notna(window["rsi_14"].iloc[-1]) else 50.0
-        ema_12 = float(window["ema_12"].iloc[-1]) if "ema_12" in window.columns and pd.notna(window["ema_12"].iloc[-1]) else close_col
-        ema_26 = float(window["ema_26"].iloc[-1]) if "ema_26" in window.columns and pd.notna(window["ema_26"].iloc[-1]) else close_col
-        sma_20 = float(window["sma_20"].iloc[-1]) if "sma_20" in window.columns and pd.notna(window["sma_20"].iloc[-1]) else close_col
-
-        macd_line = float(window["macd_line"].iloc[-1]) if "macd_line" in window.columns and pd.notna(window["macd_line"].iloc[-1]) else 0.0
-        macd_signal = float(window["macd_signal"].iloc[-1]) if "macd_signal" in window.columns and pd.notna(window["macd_signal"].iloc[-1]) else 0.0
-        macd_hist = float(window["macd_histogram"].iloc[-1]) if "macd_histogram" in window.columns and pd.notna(window["macd_histogram"].iloc[-1]) else 0.0
-
-        bb_pct = float(window["bb_percent_b"].iloc[-1]) if "bb_percent_b" in window.columns and pd.notna(window["bb_percent_b"].iloc[-1]) else 50.0
-        bb_w = float(window["bb_width"].iloc[-1]) if "bb_width" in window.columns and pd.notna(window["bb_width"].iloc[-1]) else 0.0
-        atr_pct = float(window["atr_pct"].iloc[-1]) if "atr_pct" in window.columns and pd.notna(window["atr_pct"].iloc[-1]) else 0.0
-
-        volume = float(window["volume"].iloc[-1]) if "volume" in window.columns else 0.0
-        volume_ratio = 1.0
-        if len(window) >= 2 and "volume" in window.columns:
-            prev_vol = float(window["volume"].iloc[-2])
-            if prev_vol > 0:
-                volume_ratio = volume / prev_vol
-
-        return [
-            close_col, returns, rsi, ema_12, ema_26,
-            sma_20, macd_line, macd_signal, macd_hist,
-            bb_pct, bb_w, atr_pct, volume_ratio,
-        ]
+        return build_market_feature_row(df.iloc[: idx + 1].copy())
 
     def _build_observation(self, symbol: str, window: pd.DataFrame,
                            portfolio_state: PortfolioState) -> np.ndarray:
-        df = window.copy()
-        n_features = len(self.FEATURE_COLS)
-
-        df = add_ema(df, 12, "ema_12")
-        df = add_ema(df, 26, "ema_26")
-        df = add_rsi(df, 14)
-        df = add_sma(df, 20, "sma_20")
-        df = add_macd(df, 12, 26, 9)
-        df = add_bollinger_bands(df, 20, 2.0)
-        df = add_atr_percent(df, 14)
-
-        close_col = float(df["close"].iloc[-1]) if "close" in df.columns else 0.0
-        returns = 0.0
-        if len(df) >= 2:
-            prev_close = float(df["close"].iloc[-2])
-            if prev_close > 0:
-                returns = (close_col - prev_close) / prev_close
-
-        rsi = float(df["rsi_14"].iloc[-1]) if "rsi_14" in df.columns and pd.notna(df["rsi_14"].iloc[-1]) else 50.0
-        ema_12 = float(df["ema_12"].iloc[-1]) if "ema_12" in df.columns and pd.notna(df["ema_12"].iloc[-1]) else close_col
-        ema_26 = float(df["ema_26"].iloc[-1]) if "ema_26" in df.columns and pd.notna(df["ema_26"].iloc[-1]) else close_col
-        sma_20 = float(df["sma_20"].iloc[-1]) if "sma_20" in df.columns and pd.notna(df["sma_20"].iloc[-1]) else close_col
-
-        macd_line = float(df["macd_line"].iloc[-1]) if "macd_line" in df.columns and pd.notna(df["macd_line"].iloc[-1]) else 0.0
-        macd_signal = float(df["macd_signal"].iloc[-1]) if "macd_signal" in df.columns and pd.notna(df["macd_signal"].iloc[-1]) else 0.0
-        macd_hist = float(df["macd_histogram"].iloc[-1]) if "macd_histogram" in df.columns and pd.notna(df["macd_histogram"].iloc[-1]) else 0.0
-
-        bb_pct = float(df["bb_percent_b"].iloc[-1]) if "bb_percent_b" in df.columns and pd.notna(df["bb_percent_b"].iloc[-1]) else 50.0
-        bb_w = float(df["bb_width"].iloc[-1]) if "bb_width" in df.columns and pd.notna(df["bb_width"].iloc[-1]) else 0.0
-        atr_pct = float(df["atr_pct"].iloc[-1]) if "atr_pct" in df.columns and pd.notna(df["atr_pct"].iloc[-1]) else 0.0
-
-        volume = float(df["volume"].iloc[-1]) if "volume" in df.columns else 0.0
-        volume_ratio = 1.0
-        if len(df) >= 2 and "volume" in df.columns:
-            prev_vol = float(df["volume"].iloc[-2])
-            if prev_vol > 0:
-                volume_ratio = volume / prev_vol
-
-        row = [
-            close_col, returns, rsi, ema_12, ema_26,
-            sma_20, macd_line, macd_signal, macd_hist,
-            bb_pct, bb_w, atr_pct, volume_ratio,
-        ]
-
-        equity = max(portfolio_state.equity, 1e-8)
-        cash_ratio = portfolio_state.cash / equity
-        num_positions = len(portfolio_state.positions)
-        position_weight_sum = sum(
-            p.quantity * p.average_cost / equity
-            for p in portfolio_state.positions.values()
+        return build_observation(
+            [build_market_feature_row(window.copy())],
+            build_portfolio_feature_row(portfolio_state),
+            observer_window=self.config.observer_window,
         )
-        unrealized_pnl_pct = portfolio_state.unrealized_pnl / equity
-        realized_pnl_pct = portfolio_state.realized_pnl / equity
 
-        portfolio_features = [
-            cash_ratio, num_positions, position_weight_sum,
-            unrealized_pnl_pct, realized_pnl_pct,
-        ]
+    def _build_observation_batch(
+        self,
+        all_symbols: list[str],
+        portfolio_state: PortfolioState,
+        end_index: int,
+    ) -> np.ndarray:
+        """Build an observation from all symbol features + cross-symbol features + portfolio state."""
+        market_rows = [self._compute_features_for_symbol(sym) for sym in all_symbols]
+        cross_rows = [build_cross_symbol_features(sym, self._data_cache, end_index) for sym in all_symbols]
+        max_sym = self.config.max_symbols or len(all_symbols)
+        while len(market_rows) < max_sym:
+            market_rows.append([0.0] * len(self.FEATURE_COLS))
+            cross_rows.append([0.0] * len(self.CROSS_SYMBOL_FEATURES))
+        
+        combined_rows = []
+        for m_row, c_row in zip(market_rows[:max_sym], cross_rows[:max_sym]):
+            combined_rows.append(m_row + c_row)
+        
+        return build_observation(
+            combined_rows,
+            build_portfolio_feature_row(portfolio_state),
+            observer_window=self.config.observer_window,
+        )
 
-        all_features = row + portfolio_features
-        row_padded = [float(v) for v in all_features]
-
-        history_list = [row_padded]
-        padding_rows = self.config.observer_window - len(history_list)
-        zero_row = [0.0] * len(all_features)
-        for _ in range(padding_rows):
-            history_list.insert(0, zero_row)
-
-        return np.array(history_list[:self.config.observer_window], dtype=np.float32)
+    # ------------------------------------------------------------------ #
+    #  Model inference                                                    #
+    # ------------------------------------------------------------------ #
 
     def _predict_action(self, observation: np.ndarray) -> int:
         if self._model is None:
@@ -209,39 +186,86 @@ class RLBacktestRunner:
         action, _ = self._model.predict(observation, deterministic=deterministic)
         return int(action)
 
-    def _action_to_trade(self, action: int, symbol: str, prices: dict[str, float],
-                          broker: PaperBroker) -> tuple[str | None, float | None]:
-        if action == 0:
-            return None, None
+    # ------------------------------------------------------------------ #
+    #  Action decoding                                                    #
+    #  BSH: 1 + 3 × N symbols                                           #
+    #    0 = global HOLD                                                #
+    #    1 + sym_idx*3 + 0 = HOLD,  1 = BUY,  2 = SELL                 #
+    #  Proportion: 1 + 20 × N symbols                                   #
+    #    0 = global HOLD                                                #
+    #    1 + sym_idx*20 + dir*10 + prop_idx                             #
+    #    dir: 0=BUY, 1=SELL; prop_idx: 0-9 for 10%-100%                #
+    # ------------------------------------------------------------------ #
 
+    def _decode_action(self, action: int) -> tuple[str | None, int, float]:
+        """Return (target_symbol, direction, proportion).
+        
+        direction: 0=HOLD, 1=BUY, 2=SELL
+        proportion: fraction of cash/position to trade (1.0 for BSH)
+        """
+        if action == 0:
+            return None, 0, 1.0
         symbols = self.config.symbols
         if not symbols:
-            return None, None
+            return None, 0, 1.0
 
+        if self.config.action_scheme == "proportion":
+            return self._decode_proportion_action(action, symbols)
+        else:
+            return self._decode_bsh_action(action, symbols)
+
+    def _decode_bsh_action(self, action: int, symbols: list[str]) -> tuple[str | None, int, float]:
+        """Decode BSH action: 1 + sym_idx*3 + direction."""
         action_idx = action - 1
         symbol_idx = action_idx // 3
         direction = action_idx % 3
-
         if symbol_idx >= len(symbols):
-            return None, None
+            return None, 0, 1.0
+        return symbols[symbol_idx], direction, 1.0
 
-        if direction == 0:
-            return None, None
+    def _decode_proportion_action(self, action: int, symbols: list[str]) -> tuple[str | None, int, float]:
+        """Decode Proportion action: 1 + sym_idx*20 + dir*10 + prop_idx."""
+        PROPORTIONS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        action_idx = action - 1
+        symbol_idx = action_idx // 20
+        direction_raw = (action_idx // 10) % 2
+        prop_idx = action_idx % 10
+        
+        if symbol_idx >= len(symbols):
+            return None, 0, 1.0
+        
+        # Map: 0=BUY->1, 1=SELL->2
+        direction = 1 if direction_raw == 0 else 2
+        proportion = PROPORTIONS[prop_idx]
+        
+        return symbols[symbol_idx], direction, proportion
 
-        target_symbol = symbols[symbol_idx]
+    def _action_to_target_symbol(self, action: int, symbols: list[str]) -> str | None:
+        target, direction, _ = self._decode_action(action)
+        return target if direction != 0 else None
+
+    def _action_to_trade(self, action: int, symbol: str, prices: dict[str, float],
+                          broker: PaperBroker,
+                          trade_symbols: set[str] | None = None) -> tuple[str | None, float | None, float]:
+        target_symbol, direction, proportion = self._decode_action(action)
+        if target_symbol is None or direction == 0:
+            return None, None, 1.0
+        if trade_symbols is not None and target_symbol not in trade_symbols:
+            return None, None, 1.0
+
         price = prices.get(target_symbol)
         if price is None or price <= 0:
-            return None, None
+            return None, None, 1.0
 
         if direction == 1:
-            return "BUY", price
-        elif direction == 2:
-            current_pos = broker.positions.get(target_symbol, 0)
-            if current_pos > 0:
-                return "SELL", price
-            return None, None
+            return "BUY", price, proportion
+        if direction == 2:
+            return ("SELL", price, proportion) if broker.positions.get(target_symbol, 0) > 0 else (None, None, 1.0)
+        return None, None, 1.0
 
-        return None, None
+    # ------------------------------------------------------------------ #
+    #  Exit resolution                                                    #
+    # ------------------------------------------------------------------ #
 
     def _resolve_exit(self, intraday_frame: pd.DataFrame, entry_index: int,
                       stop_loss: float, profit_target: float) -> tuple[float, int]:
@@ -259,136 +283,208 @@ class RLBacktestRunner:
         last_idx = min(entry_index + len(after) - 1, len(intraday_frame) - 1)
         return float(intraday_frame.iloc[last_idx]["close"]), last_idx
 
-    def run_backtest(self, symbol: str, daily_frame: pd.DataFrame,
-                     intraday_frame: pd.DataFrame | None = None,
-                     starting_cash: float | None = None) -> dict[str, Any]:
-        if intraday_frame is None:
-            intraday_frame = daily_frame
+    # ------------------------------------------------------------------ #
+    #  Trade execution                                                    #
+    # ------------------------------------------------------------------ #
 
-        if len(intraday_frame) < self.config.observer_window + 5:
+    def _execute_buy(
+        self,
+        target_symbol: str,
+        entry_price: float,
+        broker: PaperBroker,
+        entry_cost_basis: dict[str, float],
+        intra_frames: dict[str, pd.DataFrame],
+        frames: dict[str, pd.DataFrame],
+        master_frame: pd.DataFrame,
+        entry_index: int,
+        proportion: float = 1.0,
+    ) -> tuple[float, int, int] | None:
+        """Execute a BUY and resolve exit. Returns (pnl, exit_index, shares) or None."""
+        affordable = int(broker.cash * proportion * 0.95 / entry_price)
+        shares = min(affordable, self.config.max_shares)
+        if shares < 1:
+            return None
+
+        entry_value = entry_price * shares
+        broker.cash -= entry_value + self.config.fee_per_order
+        broker.positions[target_symbol] = shares
+        entry_cost_basis[target_symbol] = entry_price
+
+        stop_loss = entry_price * (1.0 - self.config.stop_loss_pct)
+        profit_target = entry_price * (1.0 + self.config.profit_target_pct)
+
+        target_intraday = intra_frames.get(target_symbol)
+        if target_intraday is None:
+            target_intraday = frames.get(target_symbol)
+        if target_intraday is None:
+            target_intraday = master_frame
+        exit_price, exit_index = self._resolve_exit(
+            target_intraday, entry_index, stop_loss, profit_target
+        )
+
+        exit_value = exit_price * shares
+        trade_pnl = exit_value - entry_value - 2 * self.config.fee_per_order
+
+        broker.cash += exit_value - self.config.fee_per_order
+        broker.positions.pop(target_symbol, None)
+        entry_cost_basis.pop(target_symbol, None)
+        return trade_pnl, exit_index, shares
+
+    def _execute_sell(
+        self,
+        target_symbol: str,
+        sell_price: float,
+        broker: PaperBroker,
+        entry_cost_basis: dict[str, float],
+        prices: dict[str, float],
+        proportion: float = 1.0,
+    ) -> float | None:
+        """Execute a SELL and return the PnL, or None if no position."""
+        current_pos = broker.positions.get(target_symbol, 0)
+        if current_pos <= 0:
+            return None
+
+        sell_qty = max(1, int(current_pos * proportion))
+        if sell_qty > current_pos:
+            sell_qty = current_pos
+
+        price = prices.get(target_symbol, sell_price)
+        cost_basis = entry_cost_basis.get(target_symbol, price)
+        exit_value = price * sell_qty
+        trade_pnl = exit_value - (sell_qty * cost_basis) - self.config.fee_per_order
+
+        broker.cash += exit_value - self.config.fee_per_order
+        remaining = current_pos - sell_qty
+        if remaining <= 0:
+            broker.positions.pop(target_symbol, None)
+            entry_cost_basis.pop(target_symbol, None)
+        else:
+            broker.positions[target_symbol] = remaining
+        return trade_pnl
+
+    def _build_portfolio_state(
+        self,
+        broker: PaperBroker,
+        prices: dict[str, float],
+        entry_cost_basis: dict[str, float],
+    ) -> PortfolioState:
+        return PortfolioState(
+            cash=broker.cash,
+            equity=broker.cash + sum(
+                qty * prices.get(tkr, 0) for tkr, qty in broker.positions.items()
+            ),
+            positions={
+                tkr: Position(ticker=tkr, quantity=qty, average_cost=entry_cost_basis.get(tkr, 0))
+                for tkr, qty in broker.positions.items()
+            },
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Main entry point                                                   #
+    # ------------------------------------------------------------------ #
+
+    def run_backtest(
+        self,
+        symbol: str | None = None,
+        daily_frame: pd.DataFrame | None = None,
+        daily_frames: dict[str, pd.DataFrame] | None = None,
+        intraday_frame: pd.DataFrame | None = None,
+        intraday_frames: dict[str, pd.DataFrame] | None = None,
+        starting_cash: float | None = None,
+        trade_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
+        prepared = self._prepare_frames(
+            symbol, daily_frame, daily_frames, intraday_frame, intraday_frames,
+        )
+        if prepared is None:
             return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0, "rl_actions": []}
 
+        frames, intra_frames, all_symbols, primary, master_frame = prepared
+
+        if not self.config.use_intraday_exit:
+            intra_frames = {}
+            master_frame = frames.get(primary, master_frame)
+
         cash = starting_cash or self.config.starting_cash
-        broker = PaperBroker(starting_cash=cash, fee_per_order=self.config.fee_per_order,
-                             slippage_bps=self.config.slippage_bps)
+        broker = PaperBroker(
+            starting_cash=cash,
+            fee_per_order=self.config.fee_per_order,
+            slippage_bps=self.config.slippage_bps,
+        )
         trades = 0
         wins = 0
         losses = 0
         net_pnl = 0.0
+        gross_profit = 0.0
+        gross_loss = 0.0
         entry_blocked_until = -1
-        rl_actions = []
-
-        all_symbols = self.config.symbols
-        if not all_symbols:
-            all_symbols = [symbol]
+        rl_actions: list[dict[str, int]] = []
+        entry_cost_basis: dict[str, float] = {}
+        allowed_symbols = set(trade_symbols) if trade_symbols else None
 
         for sym in all_symbols:
-            self._data_cache[sym] = daily_frame.copy()
+            self._data_cache[sym] = frames.get(sym, frames[primary]).copy()
             self._data_indices[sym] = 0
 
-        for end_index in range(self.config.observer_window, len(intraday_frame)):
+        for end_index in range(self.config.observer_window, len(master_frame)):
             if end_index <= entry_blocked_until:
                 continue
 
-            prices = {}
+            prices: dict[str, float] = {}
             for sym in all_symbols:
                 df = self._data_cache.get(sym)
                 if df is not None and end_index < len(df):
                     prices[sym] = float(df.iloc[end_index]["close"])
 
-            portfolio_state = PortfolioState(
-                cash=broker.cash,
-                equity=broker.cash + sum(
-                    qty * prices.get(tkr, 0)
-                    for tkr, qty in broker.positions.items()
-                ),
-                positions={
-                    tkr: Position(ticker=tkr, quantity=qty, average_cost=0)
-                    for tkr, qty in broker.positions.items()
-                },
-            )
-
-            market_features = []
-            for sym in all_symbols:
-                features = self._compute_features_for_symbol(sym)
-                market_features.extend(features)
-
-            equity = max(portfolio_state.equity, 1e-8)
-            cash_ratio = portfolio_state.cash / equity
-            num_positions = len(portfolio_state.positions)
-            position_weight_sum = sum(
-                p.quantity * p.average_cost / equity
-                for p in portfolio_state.positions.values()
-            )
-            unrealized_pnl_pct = portfolio_state.unrealized_pnl / equity
-            realized_pnl_pct = portfolio_state.realized_pnl / equity
-
-            portfolio_features = [
-                cash_ratio, num_positions, position_weight_sum,
-                unrealized_pnl_pct, realized_pnl_pct,
-            ]
-
-            all_features = market_features + portfolio_features
-            n_features = len(all_features)
-
-            history_list = [all_features]
-            padding_rows = self.config.observer_window - len(history_list)
-            zero_row = [0.0] * n_features
-            for _ in range(padding_rows):
-                history_list.insert(0, zero_row)
-
-            observation = np.array(history_list[:self.config.observer_window], dtype=np.float32)
+            portfolio_state = self._build_portfolio_state(broker, prices, entry_cost_basis)
+            observation = self._build_observation_batch(all_symbols, portfolio_state, end_index)
 
             action = self._predict_action(observation)
             rl_actions.append({"step": end_index, "action": action})
 
-            trade_type, trade_price = self._action_to_trade(
-                action, symbol, prices, broker
+            trade_type, trade_price, proportion = self._action_to_trade(
+                action, primary, prices, broker, trade_symbols=allowed_symbols,
             )
 
             if trade_type == "BUY" and trade_price is not None:
-                affordable = int(broker.cash * 0.95 / trade_price)
-                shares = min(affordable, self.config.max_shares)
-                if shares >= 1:
-                    entry_price = trade_price
-                    entry_value = entry_price * shares
-                    broker.cash -= entry_value + self.config.fee_per_order
-                    broker.positions[symbol] = shares
-
-                    stop_loss = entry_price * 0.97
-                    profit_target = entry_price * 1.03
-
-                    exit_price, exit_index = self._resolve_exit(
-                        intraday_frame, end_index, stop_loss, profit_target
-                    )
-
-                    exit_value = exit_price * shares
-                    trade_pnl = exit_value - entry_value - 2 * self.config.fee_per_order
+                target_symbol = self._action_to_target_symbol(action, all_symbols)
+                if target_symbol is None:
+                    continue
+                price = prices.get(target_symbol, trade_price)
+                if price <= 0:
+                    continue
+                result = self._execute_buy(
+                    target_symbol, price, broker, entry_cost_basis,
+                    intra_frames, frames, master_frame, end_index, proportion,
+                )
+                if result is not None:
+                    trade_pnl, exit_index, _shares = result
                     net_pnl += trade_pnl
                     trades += 1
                     if trade_pnl > 0:
+                        gross_profit += trade_pnl
                         wins += 1
                     else:
+                        gross_loss += trade_pnl
                         losses += 1
-
-                    broker.cash += exit_value - self.config.fee_per_order
-                    broker.positions.pop(symbol, None)
                     entry_blocked_until = exit_index
 
             elif trade_type == "SELL" and trade_price is not None:
-                current_pos = broker.positions.get(symbol, 0)
-                if current_pos > 0:
-                    exit_value = trade_price * current_pos
-                    trade_pnl = exit_value - (current_pos * 0) - self.config.fee_per_order
+                target_symbol = self._action_to_target_symbol(action, all_symbols)
+                if target_symbol is None:
+                    continue
+                trade_pnl = self._execute_sell(
+                    target_symbol, trade_price, broker, entry_cost_basis, prices, proportion,
+                )
+                if trade_pnl is not None:
                     net_pnl += trade_pnl
                     trades += 1
                     if trade_pnl > 0:
+                        gross_profit += trade_pnl
                         wins += 1
                     else:
+                        gross_loss += trade_pnl
                         losses += 1
-
-                    broker.cash += exit_value - self.config.fee_per_order
-                    broker.positions.pop(symbol, None)
                     entry_blocked_until = end_index
 
             for sym in all_symbols:
@@ -401,5 +497,15 @@ class RLBacktestRunner:
             "losses": losses,
             "net_pnl": round(net_pnl, 2),
             "win_rate": 0.0 if trades == 0 else wins / trades,
+            "gross_profit": round(gross_profit, 2),
+            "gross_loss": round(gross_loss, 2),
             "rl_actions": rl_actions,
+            **diagnostics(
+                trades=trades,
+                wins=wins,
+                losses=losses,
+                net_pnl=net_pnl,
+                gross_profit=gross_profit,
+                gross_loss=gross_loss,
+            ),
         }

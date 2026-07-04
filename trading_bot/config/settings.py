@@ -1,4 +1,20 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+SUPPORTED_MARKET_DATA_PROVIDERS = frozenset(
+    {"alpaca", "finnhub", "polygon", "yfinance"}
+)
+
+
+def _normalize_provider_name(value: str) -> str:
+    name = str(value).strip().lower()
+    if name not in SUPPORTED_MARKET_DATA_PROVIDERS:
+        supported = ", ".join(sorted(SUPPORTED_MARKET_DATA_PROVIDERS))
+        raise ValueError(
+            f"Unsupported market data provider '{value}'. "
+            f"Supported providers: {supported}"
+        )
+    return name
 
 
 class AppSettings(BaseModel):
@@ -6,16 +22,44 @@ class AppSettings(BaseModel):
     timezone: str = "America/New_York"
     state_db_path: str = "state/trading_bot.db"
     universe_path: str = "state/universe.txt"
+    watchlist_path: str = "state/watchlist.txt"
     universe_candidates_path: str = "state/universe_candidates.json"
     log_dir: str = "logs"
+    log_level: str = "INFO"
+    log_file: str | None = None
     dashboard_summary_path: str = "state/dashboard_summary.json"
     scan_results_path: str = "state/scan_results.json"
     portfolio_summary_path: str = "state/portfolio_summary.json"
     backtest_summary_path: str = "state/backtest_summary.json"
+    tuning_overrides_path: str = "state/tuning_overrides.yaml"
+    benchmark_symbol: str | None = None
+    allow_yellow_mean_reversion: bool = False
+    min_entry_confluence_score: float = Field(default=4.0, ge=0.0, le=12.0)
+    signal_mode: str = Field(default="serial")  # "serial" or "parallel"
 
 
 class MarketDataSettings(BaseModel):
     provider: str = "yfinance"
+    providers: list[str] = Field(default_factory=list)
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _validate_provider(cls, value: str) -> str:
+        return _normalize_provider_name(value)
+
+    @field_validator("providers", mode="before")
+    @classmethod
+    def _validate_providers(cls, value: list[str] | None) -> list[str]:
+        if value is None:
+            return []
+        return [_normalize_provider_name(name) for name in value]
+
+    @property
+    def provider_stack(self) -> list[str]:
+        """Ordered list of provider names to try.  Falls back to *provider*
+        when *providers* is empty for backward compatibility."""
+        return self.providers if self.providers else [self.provider]
+
     daily_period: str = "1y"
     intraday_period: str = "5d"
     intraday_interval: str = "5m"
@@ -32,10 +76,10 @@ class ScoutSettings(BaseModel):
     screeners: list[str] = Field(
         default_factory=lambda: ["aggressive_small_caps", "small_cap_gainers"]
     )
-    min_market_cap: float = Field(default=50_000_000.0, ge=0.0)
-    max_market_cap: float = Field(default=2_000_000_000.0, gt=0.0)
-    min_price: float = Field(default=2.0, gt=0.0)
-    min_avg_dollar_volume: float = Field(default=1_000_000.0, ge=0.0)
+    min_market_cap: float = Field(default=2_000_000_000.0, ge=0.0)
+    max_market_cap: float = Field(default=50_000_000_000.0, gt=0.0)
+    min_price: float = Field(default=5.0, gt=0.0)
+    min_avg_dollar_volume: float = Field(default=5_000_000.0, ge=0.0)
     max_universe_size: int = Field(default=50, ge=1)
     max_snapshot_candidates: int = Field(default=100, ge=1)
 
@@ -53,7 +97,11 @@ class RiskSettings(BaseModel):
     # Minimum stop distance = ATR × atr_stop_multiplier.
     # Prevents 0.2–0.6% noise stops on tight consolidations
     # (the 5-bar low min() stops too close to entry on breakouts).
-    atr_stop_multiplier: float = Field(default=1.5, ge=0.5, le=5.0)
+    atr_stop_multiplier: float = Field(default=3.0, ge=0.5, le=10.0)
+    # Absolute minimum stop distance as % of entry price.
+    # Overrides both the 5-bar low and ATR floor when either
+    # produces a stop closer than this threshold. 0 = disabled.
+    min_stop_distance_pct: float = Field(default=0.0, ge=0.0, le=20.0)
     # V2.5: Portfolio heat limits
     max_portfolio_heat_pct: float = Field(default=0.03, gt=0.0, le=0.5)
     # V2.5: Sector concentration
@@ -62,6 +110,18 @@ class RiskSettings(BaseModel):
     max_consecutive_losses: int = Field(default=5, ge=0)
     # V3.1: Circuit breaker — halt on max drawdown (% from peak)
     enable_drawdown_circuit_breaker: bool = True
+    # V3.2: Ticker re-entry cooldown (minutes) — blocks re-entering a
+    # ticker after exit to prevent whipsawing. 0 disables the feature.
+    ticker_reentry_cooldown_minutes: int = Field(default=30, ge=0)
+    # V3.2: Position size multiplier for YELLOW (mean-reversion) signals.
+    # Reduces position size to limit risk on non-breakout entries.
+    yellow_allocation_pct: float = Field(default=0.5, gt=0.0, le=1.0)
+    # Phase 1: Optional fractional Kelly sizing overlay.
+    # Uses signal confidence as win-probability proxy and scales the
+    # baseline risk-model position size down to the Kelly fraction.
+    use_kelly_sizing: bool = Field(default=False)
+    kelly_fraction_scale: float = Field(default=0.5, gt=0.0, le=1.0)
+    kelly_min_position_pct: float = Field(default=0.25, gt=0.0, le=1.0)
 
 
 class SessionSettings(BaseModel):
@@ -69,11 +129,19 @@ class SessionSettings(BaseModel):
     close_minute: int = Field(default=0, ge=0, le=59)
     eod_minutes_before_close: int = Field(default=5, ge=0, le=120)
     eod_enabled: bool = True
+    time_exit_minutes: int = Field(default=0, ge=0, le=480)
 
 
 class PaperSettings(BaseModel):
     fee_per_order: float = Field(default=1.0, ge=0.0)
     slippage_bps: int = Field(default=0, ge=0)
+    dynamic_slippage_enabled: bool = Field(default=False)
+    dynamic_slippage_notional_bps_per_10k: float = Field(default=1.0, ge=0.0, le=50.0)
+    dynamic_slippage_low_price_boost_bps: float = Field(default=5.0, ge=0.0, le=50.0)
+    dynamic_slippage_max_extra_bps: float = Field(default=25.0, ge=0.0, le=100.0)
+    partial_take_profit_enabled: bool = Field(default=False)
+    partial_take_profit_fraction: float = Field(default=0.5, gt=0.0, lt=1.0)
+    partial_take_profit_min_qty: int = Field(default=2, ge=1)
 
 
 class AlertsSettings(BaseModel):
@@ -114,6 +182,18 @@ class StrategySettings(BaseModel):
     use_v3_signals: bool = Field(default=False)
     risk_tolerance: str = Field(default="medium")  # low, medium, high
     min_confidence: str = Field(default="medium")  # none, low, medium, high, very_high
+
+
+class SupermodelSettings(BaseModel):
+    support_threshold: float = Field(default=0.72, ge=0.0, le=1.0)
+    block_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+    counter_veto_weight: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class StrategyTrackerSettings(BaseModel):
+    window: int = Field(default=20, ge=1)
+    min_win_rate: float = Field(default=0.20, ge=0.0, le=1.0)
+    full_allocation_rate: float = Field(default=0.50, ge=0.0, le=1.0)
 
 
 class MonitoringSettings(BaseModel):
@@ -178,19 +258,64 @@ class RLSettings(BaseModel):
 
     Agent types: "PPO", "A2C", "SAC", "TD3", "DDPG"
     Feature sets: "standard" (19 features), "extended" (24 features)
-    Reward functions: "pnl" (raw PnL), "sharpe" (risk-adjusted), "sortino" (downside risk)
+    Reward functions: "risk_adjusted", "simple_profit", "compound_daily", "sharpe", "drawdown_penalty"
     """
 
     enabled: bool = Field(default=False)
     agent_type: str = Field(default="PPO")  # PPO, A2C, SAC, TD3, DDPG
     feature_set: str = Field(default="standard")  # standard, extended
-    reward_function: str = Field(default="sharpe")  # pnl, sharpe, sortino
+    reward_function: str = Field(default="risk_adjusted")
     model_path: str = Field(default="trained_models/rl_agent.zip")
+    model_paths: list[str] = Field(default_factory=list)
+    # Unknown symbols fail closed by default; opt in only for explicit research.
+    allow_untrained_symbol_inference: bool = Field(default=False)
+    # For opted-in symbols outside model metadata, discount confidence before thresholding.
+    untrained_confidence_threshold_multiplier: float = Field(default=0.8, gt=0.0, le=1.0)
     training_episodes: int = Field(default=100, ge=1)
     training_timesteps: int = Field(default=100000, ge=1000)
     learning_rate: float = Field(default=3e-4, gt=0.0)
     max_position_pct: float = Field(default=0.20, gt=0.0, le=1.0)
+    backtest_starting_cash: float = Field(default=10000.0, gt=0.0)
+    backtest_max_shares: int = Field(default=100, ge=1)
+    backtest_stop_loss_pct: float = Field(default=0.05, gt=0.0, lt=1.0)
+    backtest_profit_target_pct: float = Field(default=0.08, gt=0.0, lt=1.0)
     action_confidence_threshold: float = Field(default=0.5, gt=0.0, le=1.0)
+
+
+class SwarmSettings(BaseModel):
+    """Multi-agent swarm analysis configuration.
+
+    When ``enabled``, the orchestrator runs a swarm analysis on the
+    universe before generating signals. In ``signal_mode="serial"``
+    (default), the swarm acts as a read-only overlay: its committee
+    decisions are logged alongside scanner results but do not affect
+    trading behavior.
+
+    In ``signal_mode="parallel"``, the strategy models resolve consensus.
+    The swarm then acts as a bounded position-size modifier: APPROVE can
+    boost reduced entries, REJECT reduces them, both by ``swarm_weight`` ×
+    swarm_confidence and never above the risk-approved size.
+    """
+    enabled: bool = Field(default=False)
+    preset: str = Field(default="investment_committee")
+    max_workers: int = Field(default=4, ge=1, le=16)
+    swarm_weight: float = Field(default=0.3, ge=0.0, le=1.0)
+
+
+class SentimentSettings(BaseModel):
+    """Sentiment/news context configuration.
+
+    Runtime trading stays offline-first: local JSON context is consumed by
+    default, while RSS/API fetching must be explicitly enabled by operators.
+    """
+
+    enabled: bool = Field(default=True)
+    context_path: str = "state/sentiment_context.json"
+    rss_feeds: list[str] = Field(default_factory=list)
+    fetch_rss: bool = Field(default=False)
+    max_items_per_feed: int = Field(default=20, ge=1, le=100)
+    memory_enabled: bool = Field(default=False)
+    memory_db_path: str = "state/memory.db"
 
 
 class Settings(BaseModel):
@@ -203,6 +328,10 @@ class Settings(BaseModel):
     alerts: AlertsSettings = Field(default_factory=AlertsSettings)
     robinhood: RobinhoodSettings = Field(default_factory=RobinhoodSettings)
     strategy: StrategySettings = Field(default_factory=StrategySettings)
+    supermodel: SupermodelSettings = Field(default_factory=SupermodelSettings)
+    strategy_tracker: StrategyTrackerSettings = Field(default_factory=StrategyTrackerSettings)
     monitoring: MonitoringSettings = Field(default_factory=MonitoringSettings)
     counter_thesis: CounterThesisSettings = Field(default_factory=CounterThesisSettings)
     rl: RLSettings = Field(default_factory=RLSettings)
+    swarm: SwarmSettings = Field(default_factory=SwarmSettings)
+    sentiment: SentimentSettings = Field(default_factory=SentimentSettings)

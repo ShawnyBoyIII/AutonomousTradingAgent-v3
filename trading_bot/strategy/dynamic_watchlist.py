@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
 from trading_bot.strategy.market_screener import MarketScreener, ScreenResult
+from trading_bot.config.settings import ScoutSettings
 from trading_bot.strategy.news_filter import NewsFilter, RiskAssessment
 from trading_bot.strategy.sector_rotation import (
     SectorRotationAnalysis,
@@ -95,12 +96,14 @@ class DynamicWatchlist:
         watchlist_path: str = "dynamic_watchlist.json",
         max_symbols: int = 20,
         min_score: float = 5.0,
+        scout_settings: ScoutSettings | None = None,
     ) -> None:
         self.watchlist_path = Path(watchlist_path)
-        self.max_symbols = max_symbols
+        self.scout_settings = scout_settings or ScoutSettings()
+        self.max_symbols = min(max_symbols, self.scout_settings.max_universe_size)
         self.min_score = min_score
 
-        self.screener = MarketScreener()
+        self.screener = MarketScreener(min_price=self.scout_settings.min_price)
         self.news_filter = NewsFilter()
 
         self._entries: list[WatchlistEntry] = []
@@ -232,7 +235,7 @@ class DynamicWatchlist:
 
         Returns path to exported file.
         """
-        output_path = output_path or "burn-in-symbols.txt"
+        output_path = output_path or "state/universe.txt"
         path = Path(output_path)
 
         symbols = self.get_symbols()
@@ -248,6 +251,7 @@ class DynamicWatchlist:
             # No existing file to preserve — fall through and write empty file
             # so callers can still detect "no symbols configured"
 
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(symbols), encoding="utf-8")
 
         logger.info(f"Exported {len(symbols)} symbols to {path}")
@@ -408,11 +412,11 @@ def create_watchlist_from_breakouts(
 
 
 def update_burn_in_symbols(watchlist: DynamicWatchlist) -> None:
-    """Update the burn-in script's symbol file."""
+    """Update the burn-in symbol universe file."""
     symbols = watchlist.get_symbols()
 
-    # Update burn-in-symbols.txt
-    path = Path("burn-in-symbols.txt")
+    path = Path("state/universe.txt")
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(symbols), encoding="utf-8")
 
-    logger.info(f"Updated burn-in symbols: {len(symbols)} symbols")
+    logger.info(f"Updated burn-in universe: {len(symbols)} symbols")

@@ -13,8 +13,8 @@ def detect_oversold_bounce(frame: "pd.DataFrame") -> bool:
     """Detect oversold bounce signal using Bollinger Bands and RSI.
 
     Signal criteria:
-    - Price touches or crosses below lower Bollinger Band (%B <= 5)
-    - RSI below 35 (oversold but not extreme)
+    - Price touches or crosses below lower Bollinger Band (%B <= 10)
+    - RSI below 40 (oversold, captures more mean-reversion setups)
     - Bullish candlestick (close > open)
     - Volume confirmation (volume >= 80% of average)
     """
@@ -49,23 +49,24 @@ def detect_oversold_bounce(frame: "pd.DataFrame") -> bool:
     percent_b = (latest_close - bb_lower) / bb_range * 100
 
     # Criteria:
-    # 1. Price near lower band (%B <= 10)
-    # 2. RSI oversold but not dead (< 35)
-    # 3. Bullish candle (close > open)
+    # 1. Price near or below lower band (%B <= 10)
+    # 2. RSI oversold (below 40 captures more MR setups)
+    # 3. Bullish candle (close > open) OR price already below lower band
     # 4. Volume confirmation
     near_lower_band = percent_b <= 10.0
-    oversold_rsi = rsi < 35.0
+    oversold_rsi = rsi < 40.0
     bullish_candle = latest_close > latest_open
+    below_band = percent_b < 0.0
     volume_ok = latest_volume >= avg_volume * 0.8
 
-    return bool(near_lower_band and oversold_rsi and bullish_candle and volume_ok)
+    return bool(near_lower_band and oversold_rsi and (bullish_candle or below_band) and volume_ok)
 
 
 def detect_vwap_reversion(frame: "pd.DataFrame") -> bool:
     """Detect VWAP mean reversion signal.
 
     Signal criteria:
-    - Price has extended below VWAP (> 1% away)
+    - Price has extended below VWAP (> 0.5% away)
     - Showing bullish reversal candle (close > open, close in upper half)
     - Volume confirmation
     """
@@ -87,8 +88,8 @@ def detect_vwap_reversion(frame: "pd.DataFrame") -> bool:
                                vwap, latest_volume, avg_volume]):
         return False
 
-    # Price extended below VWAP (> 1%)
-    below_vwap = latest_close < vwap * 0.99
+    # Price extended below VWAP (> 0.5%)
+    below_vwap = latest_close < vwap * 0.995
 
     # Bullish candle
     bullish = latest_close > latest_open
@@ -112,7 +113,7 @@ def detect_range_bound_reversal(frame: "pd.DataFrame", lookback: int = 10) -> bo
     Signal criteria:
     - Price near recent low (within bottom 20% of lookback range)
     - Previous bar was bearish, current bar is bullish
-    - Volume spike on reversal (>= average)
+    - Volume confirmation (>= 80% of average)
     - RSI not extreme (< 40)
     """
     required_columns = {"close", "open", "high", "low", "volume", "volume_avg_5", "rsi_14"}
@@ -157,8 +158,8 @@ def detect_range_bound_reversal(frame: "pd.DataFrame", lookback: int = 10) -> bo
     prev_bearish = prev_close < prev_open
     curr_bullish = latest_close > latest_open
 
-    # Volume confirmation
-    volume_ok = latest_volume >= avg_volume
+    # Volume confirmation (>= 80% of average)
+    volume_ok = latest_volume >= avg_volume * 0.8
 
     # RSI not extreme
     rsi_ok = rsi < 40.0

@@ -1,4 +1,4 @@
-/.DS_Store
+.DS_Store
 /.codegraph/
 /.pytest_cache/
 /.venv/
@@ -10,6 +10,9 @@
 /trained_models/
 /ui/
 /.opencode/
+/Volumes/
+/gpu_run_*/
+/state/rl_logs/gpu_run_*/
 
 __pycache__/
 *.py[cod]

@@ -10,6 +10,7 @@ from trading_bot.strategy.strategy_tracker import (
     rolling_win_rate,
     strategy_summary,
 )
+from trading_bot.config.settings import StrategyTrackerSettings
 
 
 def test_record_and_read_entry(tmp_path: Path) -> None:
@@ -81,7 +82,7 @@ def test_allocation_multiplier_insufficient_data(tmp_path: Path) -> None:
 
 
 def test_allocation_multiplier_below_min_win_rate(tmp_path: Path) -> None:
-    # 20 exits, 5 wins (25%) → below min_win_rate (40%) → allocation 0
+    # 20 exits, 5 wins (25%) → above min_win_rate (20%) → half allocation
     for i in range(20):
         win = i < 5
         pnl = 10.0 if win else -10.0
@@ -98,11 +99,32 @@ def test_allocation_multiplier_below_min_win_rate(tmp_path: Path) -> None:
             timestamp=datetime(2026, 6, 1 + i),
         )
     mult = allocation_multiplier(tmp_path, "bad_strategy", window=20)
+    assert mult == 0.5
+
+
+def test_allocation_multiplier_very_low_win_rate(tmp_path: Path) -> None:
+    # 20 exits, 2 wins (10%) → below min_win_rate (20%) → allocation 0
+    for i in range(20):
+        win = i < 2
+        pnl = 10.0 if win else -10.0
+        record_exit(
+            tmp_path,
+            "terrible_strategy",
+            "SPY",
+            entry_price=100.0,
+            exit_price=100.0 + (1.0 if win else -1.0),
+            quantity=10,
+            fees=1.0,
+            pnl=pnl,
+            reason="stop",
+            timestamp=datetime(2026, 6, 1 + i),
+        )
+    mult = allocation_multiplier(tmp_path, "terrible_strategy", window=20)
     assert mult == 0.0
 
 
 def test_allocation_multiplier_half_rate(tmp_path: Path) -> None:
-    # 20 exits, 9 wins (45%) → between min (40%) and full (50%) → half
+    # 20 exits, 9 wins (45%) → below full (50%) but above min (20%) → half
     for i in range(20):
         win = i < 9
         pnl = 10.0 if win else -10.0
@@ -141,6 +163,32 @@ def test_allocation_multiplier_full_rate(tmp_path: Path) -> None:
         )
     mult = allocation_multiplier(tmp_path, "good_strategy", window=20)
     assert mult == 1.0
+
+
+def test_allocation_multiplier_uses_tracker_settings_thresholds(tmp_path: Path) -> None:
+    for i in range(4):
+        win = i < 2
+        pnl = 10.0 if win else -10.0
+        record_exit(
+            tmp_path,
+            "tunable_strategy",
+            "MSFT",
+            entry_price=200.0,
+            exit_price=200.0 + (1.0 if win else -1.0),
+            quantity=10,
+            fees=1.0,
+            pnl=pnl,
+            reason="target" if win else "stop",
+            timestamp=datetime(2026, 6, 1 + i),
+        )
+
+    mult = allocation_multiplier(
+        tmp_path,
+        "tunable_strategy",
+        settings=StrategyTrackerSettings(window=4, min_win_rate=0.5, full_allocation_rate=0.75),
+    )
+
+    assert mult == 0.5
 
 
 def test_strategy_summary_multiple_strategies(tmp_path: Path) -> None:

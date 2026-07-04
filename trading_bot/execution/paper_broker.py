@@ -9,6 +9,7 @@ class PaperBroker:
     def __init__(self, starting_cash: float, fee_per_order: float, slippage_bps: int) -> None:
         self.cash = starting_cash
         self.positions: dict[str, int] = {}
+        self.position_costs: dict[str, float] = {}
         self.fee_per_order = fee_per_order
         self.slippage_bps = slippage_bps
 
@@ -19,6 +20,7 @@ class PaperBroker:
 
         gross = fill_price * order.quantity
         current_position = self.positions.get(order.ticker, 0)
+        current_cost = self.position_costs.get(order.ticker, 0.0)
 
         if order.side == "BUY":
             next_cash = self.cash - gross - self.fee_per_order
@@ -26,12 +28,15 @@ class PaperBroker:
                 raise ValueError("insufficient cash for paper trade")
 
             next_position = current_position + order.quantity
+            total_cost = current_cost * current_position + fill_price * order.quantity
+            next_cost = total_cost / next_position if next_position > 0 else 0.0
         else:
             if current_position < order.quantity:
                 raise ValueError("insufficient position for paper sell")
 
             next_cash = self.cash + gross - self.fee_per_order
             next_position = current_position - order.quantity
+            next_cost = current_cost if next_position > 0 else 0.0
 
         fill = FillResult(
             order_id=str(uuid4()),
@@ -44,5 +49,6 @@ class PaperBroker:
 
         self.cash = next_cash
         self.positions[order.ticker] = next_position
+        self.position_costs[order.ticker] = next_cost
 
         return fill

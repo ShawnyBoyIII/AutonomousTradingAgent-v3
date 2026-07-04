@@ -1,51 +1,72 @@
 app:
   timezone: "America/New_York"
   state_db_path: "state/burn_in.db"
-  log_dir: "logs/burn_in"
+  log_dir: "logs"
   portfolio_summary_path: "state/burn_in/portfolio_summary.json"
   scan_results_path: "state/burn_in/scan_results.json"
+  allow_yellow_mean_reversion: true
+  min_entry_confluence_score: 4.0
+  signal_mode: "parallel"
 
 market_data:
-  provider: "alpaca"
+  provider: yfinance
   daily_period: "1y"
   intraday_period: "5d"
   intraday_interval: "5m"
   max_data_age_hours: 72
-  max_data_age_minutes: 30
+  max_data_age_minutes: 120
   validate_data: true
 
 risk:
   max_risk_per_trade_pct: 0.01
   max_daily_risk_pct: 0.03
-  max_daily_orders: 150
-  max_ticker_allocation_pct: 0.20
+  max_daily_orders: 30
+  max_ticker_allocation_pct: 0.15
   min_reward_risk_ratio: 2.0
   use_atr_sizing: true
   atr_period: 14
-  atr_multiplier: 2.0
-  atr_stop_multiplier: 1.5
+  atr_multiplier: 2.5
+  atr_stop_multiplier: 3.0
+  min_stop_distance_pct: 5.0
   max_portfolio_heat_pct: 0.03
   max_consecutive_losses: 5
   enable_drawdown_circuit_breaker: true
+  ticker_reentry_cooldown_minutes: 30
+  yellow_allocation_pct: 0.5
 
 strategy:
   use_v3_signals: true
-  risk_tolerance: "medium"
-  min_confidence: "medium"
+  risk_tolerance: "high"
+  min_confidence: "low"
 
 counter_thesis:
+  enabled: false
+
+rl:
+  enabled: false
+
+swarm:
   enabled: true
-  block_on_severity: "high"
-  aggregate_block_threshold: 0.6
-  exit_on_block: true
+  preset: "investment_committee"
+  max_workers: 4
+  swarm_weight: 0.3
+
+sentiment:
+  enabled: true
+  context_path: "state/sentiment_context.json"
+  fetch_rss: false
+  rss_feeds: []
+  memory_enabled: true
+  memory_db_path: "state/memory.db"
 
 session:
   eod_enabled: true
   eod_minutes_before_close: 5
+  time_exit_minutes: 120
 
 paper:
   fee_per_order: 1.0
-  slippage_bps: 0
+  slippage_bps: 5
 
 alerts:
   slack_webhook_url: ""

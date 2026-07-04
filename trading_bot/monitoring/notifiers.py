@@ -64,6 +64,8 @@ class WebhookNotifier:
 
     def _post_webhook(self, payload: dict) -> bool:
         """Post payload to webhook URL."""
+        if self.webhook_url is None:
+            return False
         try:
             data = json.dumps(payload).encode("utf-8")
             headers = {
@@ -71,7 +73,7 @@ class WebhookNotifier:
                 "User-Agent": "TradingBot/1.0",
             }
             request = Request(
-                self.webhook_url,  # type: ignore[arg-type]
+                self.webhook_url,
                 data=data,
                 headers=headers,
                 method="POST",

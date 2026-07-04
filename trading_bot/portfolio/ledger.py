@@ -26,7 +26,7 @@ class PortfolioLedger:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=self.busy_timeout_ms / 1000.0)
         if self.busy_timeout_ms > 0:
-            conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
+            conn.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
         return conn
 
     def _execute_write(self, statement: str, params: tuple) -> None:
@@ -76,8 +76,11 @@ class PortfolioLedger:
             try:
                 conn.execute("ALTER TABLE orders ADD COLUMN pnl REAL DEFAULT 0")
             except sqlite3.OperationalError:
-                # Column already exists — expected on tables created with the
-                # schema above. Safe to ignore.
+                pass
+            # Migration: add strategy_tag column for trade attribution.
+            try:
+                conn.execute("ALTER TABLE orders ADD COLUMN strategy_tag TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
                 pass
             conn.execute(
                 """
@@ -161,12 +164,12 @@ class PortfolioLedger:
             (state.model_dump_json(),),
         )
 
-    def record_fill(self, fill: FillResult, side: str, realized_pnl: float = 0.0) -> None:
+    def record_fill(self, fill: FillResult, side: str, realized_pnl: float = 0.0, strategy_tag: str = "") -> None:
         self.initialize()
         self._execute_write(
             """
-            INSERT INTO orders (id, ticker, side, quantity, fill_price, fees, filled_at, pnl)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO orders (id, ticker, side, quantity, fill_price, fees, filled_at, pnl, strategy_tag)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 fill.order_id,
@@ -177,22 +180,25 @@ class PortfolioLedger:
                 fill.fees,
                 fill.filled_at.isoformat(),
                 float(realized_pnl),
+                strategy_tag,
             ),
         )
 
     def list_order_rows(self) -> list[dict[str, object]]:
         self.initialize()
         with self._connect() as conn:
+            table_info = conn.execute("PRAGMA table_info(orders)").fetchall()
+            has_tag = any(r[1] == "strategy_tag" for r in table_info)
+            cols = "id, ticker, side, quantity, fill_price, fees, filled_at, pnl"
+            if has_tag:
+                cols += ", strategy_tag"
             rows = conn.execute(
-                """
-                SELECT id, ticker, side, quantity, fill_price, fees, filled_at, pnl
-                FROM orders
-                ORDER BY filled_at ASC, id ASC
-                """
+                f"SELECT {cols} FROM orders ORDER BY filled_at ASC, id ASC"
             ).fetchall()
 
-        return [
-            {
+        results = []
+        for row in rows:
+            d: dict[str, object] = {
                 "id": row[0],
                 "ticker": row[1],
                 "side": row[2],
@@ -202,8 +208,11 @@ class PortfolioLedger:
                 "filled_at": row[6],
                 "pnl": row[7] if row[7] is not None else 0.0,
             }
-            for row in rows
-        ]
+            tag = (row[8] if len(row) > 8 and row[8] else "") if has_tag else ""
+            if tag:
+                d["strategy_tag"] = tag
+            results.append(d)
+        return results
 
     def get_consecutive_losses(self) -> int:
         """Count consecutive SELL losses from most recent order backward.

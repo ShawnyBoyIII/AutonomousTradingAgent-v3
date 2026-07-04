@@ -23,3 +23,4 @@ class PortfolioState(BaseModel):
     positions: dict[str, Position] = Field(default_factory=dict)
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
+    last_exited_at: dict[str, str] = Field(default_factory=dict)

@@ -37,13 +37,21 @@ def _interval_to_ttl_seconds(interval: str) -> int:
     return 300
 
 
-def _make_cache_key(symbol: str, period: str, interval: str, start: str | None, end: str | None) -> str:
+def _make_cache_key(
+    symbol: str,
+    period: str,
+    interval: str,
+    start: str | None,
+    end: str | None,
+    namespace: str | None = None,
+) -> str:
     s = symbol.upper().strip()
     p = period.strip().lower()
     i = interval.strip().lower()
     st = start.strip().lower() if start else ""
     en = end.strip().lower() if end else ""
-    return f"{s}:{p}:{i}:{st}:{en}"
+    ns = namespace.strip().lower() if namespace else ""
+    return f"{ns}:{s}:{p}:{i}:{st}:{en}"
 
 
 class MarketDataCache:
@@ -93,8 +101,16 @@ class MarketDataCache:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def get(self, symbol: str, period: str, interval: str, start: str | None = None, end: str | None = None) -> pd.DataFrame | None:
-        key = _make_cache_key(symbol, period, interval, start, end)
+    def get(
+        self,
+        symbol: str,
+        period: str,
+        interval: str,
+        start: str | None = None,
+        end: str | None = None,
+        namespace: str | None = None,
+    ) -> pd.DataFrame | None:
+        key = _make_cache_key(symbol, period, interval, start, end, namespace)
         with self._lock:
             conn = self._connect()
             try:
@@ -108,8 +124,17 @@ class MarketDataCache:
             finally:
                 conn.close()
 
-    def put(self, symbol: str, period: str, interval: str, data: pd.DataFrame, start: str | None = None, end: str | None = None) -> None:
-        key = _make_cache_key(symbol, period, interval, start, end)
+    def put(
+        self,
+        symbol: str,
+        period: str,
+        interval: str,
+        data: pd.DataFrame,
+        start: str | None = None,
+        end: str | None = None,
+        namespace: str | None = None,
+    ) -> None:
+        key = _make_cache_key(symbol, period, interval, start, end, namespace)
         ttl = _interval_to_ttl_seconds(interval)
         now = datetime.now(timezone.utc)
         expires = now + timedelta(seconds=ttl)
@@ -210,13 +235,14 @@ class MarketDataCache:
         if df.empty:
             return json.dumps({"empty": True})
 
-        def _convert_value(v):
+        def _convert_value(v: Any) -> Any:
             if isinstance(v, (pd.Timestamp, datetime)):
                 return v.isoformat() if hasattr(v, "isoformat") else str(v)
             return v
 
+        # Optimization: use itertuples(index=False) which is much faster than iterrows
         data = []
-        for _, row in df.iterrows():
+        for row in df.itertuples(index=False, name=None):
             data.append([_convert_value(v) for v in row])
 
         index_data = []

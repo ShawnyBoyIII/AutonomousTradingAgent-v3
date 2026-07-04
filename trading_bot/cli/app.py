@@ -1,16 +1,21 @@
 import json
 from datetime import datetime
+from typing import Any
 import math
 from pathlib import Path
 import time
 import logging
 
+import pandas as pd
 import typer
+import yaml
 
 logger = logging.getLogger(__name__)
 
 from trading_bot.config.loader import load_settings
-from trading_bot.data.indicators import add_atr
+from trading_bot.config.settings import Settings
+from trading_bot.data.indicators import add_atr, add_rsi
+from trading_bot.logging_config import configure_from_settings
 from trading_bot.execution.paper_broker import PaperBroker
 from trading_bot.models.order import OrderRequest
 from trading_bot.models.portfolio import PortfolioState
@@ -26,18 +31,31 @@ from trading_bot.runtime import alerts as runtime_alerts
 from trading_bot.runtime import session as runtime_session
 from trading_bot.runtime.decision_log import append_decision_event
 from trading_bot.runtime.latency import frame_last_timestamp, is_stale
+from trading_bot.runtime.position_exit import (
+    fill_partial_take_profit_position as _shared_fill_partial_take_profit_position,
+    fill_sell_position as _shared_fill_sell_position,
+    portfolio_state_after_sell as _shared_portfolio_state_after_sell,
+)
 from trading_bot.runtime.snapshots import read_recent_decision_rows, write_snapshot
 from trading_bot.scout import build_scout_candidates
+from trading_bot.rl.utils import rl_model_meta_path, rl_model_symbols
 from trading_bot.strategy.trailing_stop import next_trailing_stop
 
 app = typer.Typer(help="Paper-trading CLI for stocks and ETFs.")
 
 
-def now_in_zone(timezone: str):
+def _repo_script_path(script_name: str) -> Path:
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / script_name
+    if not script_path.exists():
+        raise FileNotFoundError(f"script not found: {script_path}")
+    return script_path
+
+
+def now_in_zone(timezone: str) -> datetime:
     return runtime_session.now_in_zone(timezone)
 
 
-def should_eod_exit(now: datetime, settings):
+def should_eod_exit(now: datetime, settings: Settings) -> bool:
     return runtime_session.should_eod_exit(now, settings)
 
 
@@ -57,6 +75,7 @@ def main(
         if env_path:
             config_path = Path(env_path)
     ctx.obj = load_settings(config_path)
+    configure_from_settings(ctx.obj)
 
 
 @app.command()
@@ -126,6 +145,8 @@ def scan_universe(
         if universe_path is None
         else _read_universe_symbols(path)
     )
+    # Always merge watchlist into the symbol set
+    symbols = _merge_symbols(symbols, _read_universe_symbols(Path(ctx.obj.app.watchlist_path)))
     if not symbols:
         typer.echo(f"universe=empty path={path}")
         typer.echo("alerts=0")
@@ -360,12 +381,12 @@ def backtest(
             )
     elif compare:
         from trading_bot.backtest.runner import run_strategy_comparison
-        default_model = "state/rl_logs/PPO_final.zip"
         strategies = ["v2.5", "v3"]
         model_path = None
-        if ctx.obj.rl.enabled and Path(default_model).exists():
+        configured_model = getattr(ctx.obj.rl, "model_path", None)
+        if ctx.obj.rl.enabled and configured_model and Path(configured_model).exists():
             strategies.append("rl")
-            model_path = default_model
+            model_path = configured_model
         comparison = run_strategy_comparison(parsed_symbols, ctx.obj, start=start, end=end, strategies=strategies, model_path=model_path)
         typer.echo("STRATEGY COMPARISON")
         typer.echo("=" * 60)
@@ -373,6 +394,7 @@ def backtest(
             typer.echo(f"\n{strat.upper()}:")
             typer.echo(f"  trades={result['trades']} wins={result['wins']} losses={result['losses']}")
             typer.echo(f"  win_rate={result['win_rate']:.2f} net_pnl={result['net_pnl']:.2f}")
+            typer.echo(f"  {_format_backtest_diagnostics(result)}")
         typer.echo(f"\nBest P&L: {comparison['best_pnl_strategy']}")
         typer.echo(f"Best Win Rate: {comparison['best_winrate_strategy']}")
     elif strategy:
@@ -590,6 +612,23 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
     ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
     state = ledger.ensure_portfolio_state()
 
+    # Idempotency guard: skip exits for tickers recently sold by a concurrent
+    # process.  Two manage-positions processes can read the same stale state and
+    # both try to sell the same ticker — this prevents duplicate fills.
+    _EXIT_COOLDOWN_SECONDS = 120  # 2-minute window after a sell
+
+    def _recently_existed(ticker: str) -> bool:
+        ts = state.last_exited_at.get(ticker)
+        if not ts:
+            return False
+        try:
+            exited_at = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            return False
+        if exited_at.tzinfo is None:
+            exited_at = exited_at.replace(tzinfo=manage_now.tzinfo)
+        return (manage_now - exited_at).total_seconds() < _EXIT_COOLDOWN_SECONDS
+
     # V2.5: Check kill switch
     allowed, reason = check_kill_switch_before_trade(ledger)
     if not allowed:
@@ -611,14 +650,32 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
     lines: list[str] = []
     actions = 0
     skipped_stale = 0
+    state_changed = False
     exit_events: list[dict[str, object]] = []
     for ticker, position in sorted(state.positions.items()):
         # Use intraday bars for responsive trailing stop management
-        frame = market_data.fetch_bars(
-            ticker,
-            ctx.obj.market_data.intraday_period,
-            ctx.obj.market_data.intraday_interval,
-        )
+        try:
+            frame = market_data.fetch_bars(
+                ticker,
+                ctx.obj.market_data.intraday_period,
+                ctx.obj.market_data.intraday_interval,
+                settings=ctx.obj.market_data,
+            )
+        except Exception as exc:
+            skipped_stale += 1
+            append_decision_event(
+                log_path,
+                {
+                    "command": "manage-positions",
+                    "ticker": ticker,
+                    "status": "SKIP",
+                    "reason": "market data fetch failed",
+                    "error": str(exc),
+                    "managed_at": manage_now.isoformat(),
+                },
+            )
+            lines.append(f"{ticker} SKIP reason=market-data-fetch-failed")
+            continue
         last_timestamp = frame_last_timestamp(frame)
         last_price: float | None = None
         if not frame.empty and "close" in frame.columns:
@@ -634,7 +691,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
                     "reason": "stale market data",
                     "last_timestamp": last_timestamp.isoformat() if last_timestamp else None,
                     "managed_at": manage_now.isoformat(),
-                    "max_age_hours": ctx.obj.market_data.max_data_age_hours,
+                    "max_age_minutes": ctx.obj.market_data.max_data_age_minutes,
                 },
             )
             lines.append(
@@ -655,10 +712,21 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
             )
             lines.append(f"{ticker} SKIP reason=stale-data last=unknown")
             continue
+        # Idempotency: skip if another process already sold this ticker
+        if _recently_existed(ticker):
+            lines.append(f"{ticker} SKIP recently-exited-cooldown")
+            continue
+        min_stop_pct = ctx.obj.risk.min_stop_distance_pct
+        if min_stop_pct > 0 and position.stop_loss is not None:
+            min_stop = round(position.average_cost * (1.0 - min_stop_pct / 100.0), 4)
+            if position.stop_loss > min_stop:
+                state.positions[ticker] = position.model_copy(update={"stop_loss": min_stop})
+                position = state.positions[ticker]
+                state_changed = True
         if eod_active:
             state, event, line = _fill_sell_position(
                 ticker, position, "eod", manage_now, last_price,
-                broker, ledger, state, log_path,
+                broker, ledger, state, log_path, frame,
             )
             append_decision_event(log_path, event)
             exit_events.append(event)
@@ -668,7 +736,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
         if position.stop_loss is not None and last_price <= position.stop_loss:
             state, event, line = _fill_sell_position(
                 ticker, position, "stop", manage_now, last_price,
-                broker, ledger, state, log_path,
+                broker, ledger, state, log_path, frame,
             )
             append_decision_event(log_path, event)
             exit_events.append(event)
@@ -676,15 +744,48 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
             lines.append(line)
             continue
         if position.profit_target is not None and last_price >= position.profit_target:
-            state, event, line = _fill_sell_position(
-                ticker, position, "target", manage_now, last_price,
-                broker, ledger, state, log_path,
-            )
+            if (
+                ctx.obj.paper.partial_take_profit_enabled
+                and not getattr(position, "partial_profit_taken", False)
+                and position.quantity >= ctx.obj.paper.partial_take_profit_min_qty
+            ):
+                state, event, line = _shared_fill_partial_take_profit_position(
+                    ticker=ticker,
+                    position=position,
+                    submitted_at=manage_now,
+                    last_price=last_price,
+                    broker=broker,
+                    ledger=ledger,
+                    state=state,
+                    log_path=log_path,
+                    fraction=ctx.obj.paper.partial_take_profit_fraction,
+                )
+            else:
+                state, event, line = _fill_sell_position(
+                    ticker, position, "target", manage_now, last_price,
+                    broker, ledger, state, log_path, frame,
+                )
             append_decision_event(log_path, event)
             exit_events.append(event)
             actions += 1
             lines.append(line)
             continue
+        time_exit_m = ctx.obj.session.time_exit_minutes
+        if time_exit_m > 0 and position.entry_at is not None:
+            entry_at = position.entry_at
+            if entry_at.tzinfo is None:
+                entry_at = entry_at.replace(tzinfo=manage_now.tzinfo)
+            held = (manage_now - entry_at).total_seconds() / 60.0
+            if held >= time_exit_m:
+                state, event, line = _fill_sell_position(
+                    ticker, position, f"time_exit_{int(held)}m", manage_now, last_price,
+                    broker, ledger, state, log_path, frame,
+                )
+                append_decision_event(log_path, event)
+                exit_events.append(event)
+                actions += 1
+                lines.append(line)
+                continue
         # V3: Counter-thesis exit — original BUY thesis broken, exit early.
         # Priority: EOD > stop > target > counter-thesis > trailing stop.
         counter_exit = _maybe_counter_thesis_exit(
@@ -734,6 +835,9 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
             f"{ticker} qty={position.quantity} "
             f"avg={position.average_cost:.2f} last={last_price:.2f}"
         )
+    if state_changed:
+        ledger.save_portfolio_state(state)
+        ledger.record_equity_snapshot(state, timestamp=manage_now)
     typer.echo(
         f"positions={len(state.positions)} actions={actions} skipped={skipped_stale}"
     )
@@ -898,6 +1002,140 @@ def paper_audit(ctx: typer.Context) -> None:
         raise typer.Exit(code=1)
 
 
+@app.command(name="trade-attribution")
+def trade_attribution(ctx: typer.Context) -> None:
+    """Show P&L breakdown by ticker: entries, exits, and strategy tags."""
+    from datetime import datetime as dt
+    import json as json_module
+
+    ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
+    orders = ledger.list_order_rows()
+    decision_log_path = Path(ctx.obj.app.log_dir) / "decision-log.jsonl"
+
+    def sentiment_bucket(score: object) -> str:
+        try:
+            numeric = float(score)
+        except (TypeError, ValueError):
+            return "unknown"
+        if numeric >= 0.35:
+            return "bullish"
+        if numeric <= -0.35:
+            return "bearish"
+        return "neutral"
+
+    buy_sentiment_events: dict[str, list[str]] = {}
+    if decision_log_path.exists():
+        for raw_line in decision_log_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                event = json_module.loads(line)
+            except json_module.JSONDecodeError:
+                continue
+            if event.get("command") != "paper-trade" or event.get("status") != "FILLED":
+                continue
+            ticker = str(event.get("ticker", "") or "").upper()
+            if not ticker:
+                continue
+            buy_sentiment_events.setdefault(ticker, []).append(
+                sentiment_bucket(event.get("swarm_sentiment_score"))
+            )
+
+    buy_sentiment_by_order_id: dict[str, str] = {}
+    buy_order_rows = sorted(
+        [o for o in orders if o["side"] == "BUY"],
+        key=lambda row: (str(row.get("filled_at", "")), str(row.get("id", ""))),
+    )
+    for buy in buy_order_rows:
+        ticker = str(buy.get("ticker", "") or "").upper()
+        bucket = str(buy.get("swarm_sentiment_bucket", "") or "unknown")
+        queued = buy_sentiment_events.get(ticker, [])
+        if bucket == "unknown" and queued:
+            bucket = queued.pop(0)
+        buy_sentiment_by_order_id[str(buy.get("id", ""))] = bucket
+
+    last_buy: dict[str, dict] = {}
+    sells: list[dict] = []
+    for o in orders:
+        if o["side"] == "BUY":
+            last_buy[o["ticker"]] = o
+        else:
+            sells.append(o)
+
+    print(f'{"Ticker":8} {"Strategy":24} {"Buy@":>9} {"Sell@":>9} {"Qty":>5} {"P&L":>10} {"Ret%":>7} {"Held":>8}')
+    print("-" * 90)
+    total_pnl = 0.0
+    win_pnl = 0.0
+    loss_pnl = 0.0
+    wins = 0
+    losses = 0
+    strategy_pnl: dict[str, float] = {}
+    strategy_count: dict[str, int] = {}
+    sentiment_pnl: dict[str, float] = {}
+    sentiment_count: dict[str, int] = {}
+    prior_buys: dict[str, list[dict]] = {}
+    for o in orders:
+        if o["side"] == "BUY":
+            prior_buys.setdefault(o["ticker"], []).append(o)
+    for s in sorted(sells, key=lambda x: x.get("filled_at", "")):
+        t = s["ticker"]
+        pnl = float(s.get("pnl", 0.0) or 0.0)
+        b = None
+        s_at = s.get("filled_at", "")
+        if t in prior_buys:
+            for i, candidate in enumerate(reversed(prior_buys[t])):
+                if candidate.get("filled_at", "") < s_at:
+                    b = candidate
+                    actual_idx = len(prior_buys[t]) - 1 - i
+                    prior_buys[t].pop(actual_idx)
+                    break
+        buy_price = b["fill_price"] if b else 0.0
+        sell_price = s["fill_price"]
+        ret = (sell_price - buy_price) / max(buy_price, 0.01) * 100 if buy_price > 0 else 0.0
+        held = "N/A"
+        b_at = b.get("filled_at", "") if b else ""
+        if b_at and s_at:
+            try:
+                d = dt.fromisoformat(s_at) - dt.fromisoformat(b_at)
+                held = f"{int(d.total_seconds()//60)}m"
+            except (ValueError, TypeError):
+                pass
+        tag = s.get("strategy_tag", "") or (b.get("strategy_tag", "") if b else "") or "unknown"
+        sentiment = buy_sentiment_by_order_id.get(str(b.get("id", "")), "unknown") if b else "unknown"
+        print(f"{t:8} {tag[:24]:24} {buy_price:9.2f} {sell_price:9.2f} {s['quantity']:5} {pnl:10.2f} {ret:7.2f}% {held:>8}")
+        total_pnl += pnl
+        if pnl > 0:
+            wins += 1
+            win_pnl += pnl
+        else:
+            losses += 1
+            loss_pnl += abs(pnl)
+        strategy_pnl[tag] = strategy_pnl.get(tag, 0.0) + pnl
+        strategy_count[tag] = strategy_count.get(tag, 0) + 1
+        sentiment_pnl[sentiment] = sentiment_pnl.get(sentiment, 0.0) + pnl
+        sentiment_count[sentiment] = sentiment_count.get(sentiment, 0) + 1
+    print("-" * 90)
+    print(f'{"":8} {"TOTAL":24} {"":9} {"":9} {"":5} {total_pnl:10.2f}')
+    wl = wins + losses
+    if wl > 0:
+        print(f"\nWins: {wins}, Losses: {losses}, Win rate: {wins/wl*100:.0f}%")
+        pf = "inf" if loss_pnl == 0 else f"{win_pnl / loss_pnl:.2f}"
+        print(f"Profit factor: {pf}")
+    if strategy_pnl:
+        print(f"\n{'Strategy':30} {'Trades':>7} {'P&L':>10}")
+        print("-" * 50)
+        for tag in sorted(strategy_pnl, key=lambda k: strategy_pnl[k]):
+            print(f"{tag[:30]:30} {strategy_count[tag]:7} {strategy_pnl[tag]:10.2f}")
+    if sentiment_pnl:
+        print(f"\n{'Swarm Sentiment':30} {'Trades':>7} {'P&L':>10}")
+        print("-" * 50)
+        for bucket in ("bullish", "neutral", "bearish", "unknown"):
+            if bucket not in sentiment_pnl:
+                continue
+            print(f"{bucket[:30]:30} {sentiment_count[bucket]:7} {sentiment_pnl[bucket]:10.2f}")
+
+
 def _build_portfolio_view(state: PortfolioState, settings) -> dict[str, object]:
     latest_prices = _fetch_latest_prices(sorted(state.positions), settings)
     position_rows: list[dict[str, object]] = []
@@ -1021,6 +1259,88 @@ def _parse_symbols(values: list[str]) -> list[str]:
     return parsed_symbols
 
 
+def _merge_symbols(*groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for raw_symbol in group:
+            symbol = raw_symbol.upper().strip()
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                merged.append(symbol)
+    return merged
+
+
+def _format_backtest_diagnostics(result: dict) -> str:
+    return (
+        f"avg_win={result.get('avg_win', 0.0):.2f} "
+        f"avg_loss={result.get('avg_loss', 0.0):.2f} "
+        f"expectancy={result.get('expectancy', 0.0):.2f} "
+        f"profit_factor={result.get('profit_factor', 0.0):.2f} "
+        f"pnl_per_trade={result.get('pnl_per_trade', 0.0):.2f}"
+    )
+
+
+def _format_paper_confidence_gate(result: dict, starting_cash: float = 10_000.0) -> str:
+    rl = result.get("results", {}).get("rl", {})
+    windows = result.get("windows", [])
+    window_count = len(windows)
+    positive_windows = sum(
+        1
+        for window in windows
+        if window.get("results", {}).get("rl", {}).get("net_pnl", 0.0) > 0
+    )
+    required_positive = max(1, math.ceil(window_count * 0.6)) if window_count else 1
+    pnl_target = starting_cash * 0.05
+    checks = {
+        "trades>=10": int(rl.get("trades", 0)) >= 10,
+        f"net_pnl>={pnl_target:.0f}": float(rl.get("net_pnl", 0.0)) >= pnl_target,
+        "profit_factor>=1.20": float(rl.get("profit_factor", 0.0)) >= 1.20,
+        "positive_windows>=60pct": positive_windows >= required_positive,
+    }
+    verdict = "PASS" if all(checks.values()) else "FAIL"
+    failed = [name for name, passed in checks.items() if not passed]
+    suffix = "" if not failed else f" failed={','.join(failed)}"
+    return (
+        f"PAPER CONFIDENCE: {verdict} "
+        f"rl_trades={int(rl.get('trades', 0))} "
+        f"rl_net_pnl=${float(rl.get('net_pnl', 0.0)):.2f} "
+        f"rl_profit_factor={float(rl.get('profit_factor', 0.0)):.2f} "
+        f"positive_windows={positive_windows}/{window_count}{suffix}"
+    )
+
+
+def _load_rl_model_meta(path: Path) -> tuple[Path, dict[str, object], list[str]]:
+    meta_path = rl_model_meta_path(path)
+    meta: dict[str, object] = {}
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    symbols = [str(value).upper() for value in meta.get("symbols", [])]
+    return meta_path, meta, symbols
+
+
+def _resolve_rl_symbols(raw_symbols: str | None, fallback_symbol: str) -> list[str]:
+    parsed = _parse_symbols([raw_symbols or fallback_symbol])
+    if not parsed:
+        return [fallback_symbol.upper().strip()]
+    return [symbol.upper().strip() for symbol in parsed]
+
+
+def _validate_rl_model_symbols(path: Path, requested_symbols: list[str]) -> list[str]:
+    model_symbols = rl_model_symbols(path)
+    if not model_symbols:
+        typer.echo(f"RL model metadata missing or empty: {rl_model_meta_path(path)}")
+        raise typer.Exit(code=1)
+    missing = [symbol for symbol in requested_symbols if symbol not in model_symbols]
+    if missing:
+        typer.echo(
+            f"RL model not trained for {','.join(missing)} "
+            f"(trained_symbols={','.join(model_symbols)})"
+        )
+        raise typer.Exit(code=1)
+    return model_symbols
+
+
 def _build_universe_file(settings) -> dict[str, object]:
     from trading_bot.data import market_data
 
@@ -1030,22 +1350,22 @@ def _build_universe_file(settings) -> dict[str, object]:
         screeners=settings.scout.screeners,
     )
     scout_result = build_scout_candidates(rows, settings.scout)
-    included_symbols = scout_result["included_symbols"]
+    included_symbols = scout_result.included_symbols
     lines = [
         " ".join(
             [
-                str(candidate["rank"]),
-                str(candidate["ticker"]),
-                f"score={float(candidate['scout_score']):.2f}",
-                f"price={float(candidate['price'] or 0.0):.2f}",
-                f"market_cap={int(candidate['market_cap'] or 0)}",
-                f"avg_dollar_volume={float(candidate['avg_dollar_volume']):.2f}",
-                f"source_hits={int(candidate['source_hits'])}",
-                f"reasons={'; '.join(candidate['reasons'])}",
+                str(candidate.rank),
+                str(candidate.ticker),
+                f"score={float(candidate.scout_score):.2f}",
+                f"price={float(candidate.price or 0.0):.2f}",
+                f"market_cap={int(candidate.market_cap or 0)}",
+                f"avg_dollar_volume={float(candidate.avg_dollar_volume):.2f}",
+                f"source_hits={int(candidate.source_hits)}",
+                f"reasons={'; '.join(candidate.reasons)}",
             ]
         )
-        for candidate in scout_result["candidates"]
-        if candidate["included"]
+        for candidate in scout_result.candidates
+        if candidate.included
     ]
 
     path = Path(settings.app.universe_path)
@@ -1055,19 +1375,20 @@ def _build_universe_file(settings) -> dict[str, object]:
     tmp_path.replace(path)
 
     snapshot_limit = max(settings.scout.max_universe_size, settings.scout.max_snapshot_candidates)
+    scout_dump = scout_result.model_dump()
     write_snapshot(
         settings.app.universe_candidates_path,
         {
             "mode": "universe",
-            "summary": scout_result["summary"],
-            "candidates": scout_result["candidates"][:snapshot_limit],
+            "summary": scout_dump["summary"],
+            "candidates": scout_dump["candidates"][:snapshot_limit],
         },
     )
     lines.append(
-        f"summary candidates={scout_result['summary']['candidates']} "
-        f"included={scout_result['summary']['included']} "
-        f"excluded={scout_result['summary']['excluded']} "
-        f"errors={scout_result['summary']['errors']} path={path}"
+        f"summary candidates={scout_result.summary.candidates} "
+        f"included={scout_result.summary.included} "
+        f"excluded={scout_result.summary.excluded} "
+        f"errors={scout_result.summary.errors} path={path}"
     )
     return {"lines": lines, "symbols": included_symbols}
 
@@ -1085,19 +1406,19 @@ def _read_universe_symbols(path: Path) -> list[str]:
 
 
 def _read_ranked_universe_symbols(settings) -> list[str]:
+    from trading_bot.models.scout import UniverseCandidatesSnapshot
+
     snapshot = _load_json_snapshot(Path(settings.app.universe_candidates_path))
-    candidates = snapshot.get("candidates", [])
-    if isinstance(candidates, list):
+    if snapshot:
+        parsed = UniverseCandidatesSnapshot.model_validate(snapshot)
         ranked = [
-            row
-            for row in candidates
-            if isinstance(row, dict)
-            and row.get("included") is True
-            and str(row.get("ticker", "")).strip()
+            candidate
+            for candidate in parsed.candidates
+            if candidate.included and candidate.ticker.strip()
         ]
         if ranked:
-            ranked.sort(key=lambda row: int(row.get("rank") or 999999))
-            return [str(row["ticker"]).strip() for row in ranked]
+            ranked.sort(key=lambda candidate: candidate.rank or 999999)
+            return [candidate.ticker.strip() for candidate in ranked]
     return _read_universe_symbols(Path(settings.app.universe_path))
 
 
@@ -1217,7 +1538,7 @@ def _maybe_counter_thesis_exit(
 
     new_state, event, line = _fill_sell_position(
         ticker, position, "counter-thesis", manage_now, last_price,
-        broker, ledger, state, log_path,
+        broker, ledger, state, log_path, frame,
     )
     event["counter_thesis"] = result.to_dict()
     return new_state, event, line
@@ -1233,65 +1554,56 @@ def _fill_sell_position(
     ledger,
     state,
     log_path,
+    bars=None,
 ) -> tuple:
-    """Submit a market SELL order, record the fill, and update portfolio state.
+    """Submit a market SELL order, record the fill, and update portfolio state."""
+    exit_rsi = None
+    exit_atr = None
+    hold_duration = None
+    exit_strategy = None
 
-    Returns ``(new_state, event_dict, line_text)`` so the caller can append
-    the event to its own exit_events / lines / actions counters.
-    """
-    fill = broker.submit_order(
-        OrderRequest(
-            ticker=ticker,
-            side="SELL",
-            order_type="market",
-            quantity=position.quantity,
-            submitted_at=submitted_at,
-        ),
-        market_price=last_price,
-    )
-    realized_pnl = (fill.fill_price - position.average_cost) * fill.quantity - fill.fees
-    ledger.record_fill(fill, side="SELL", realized_pnl=realized_pnl)
-    new_state = _portfolio_state_after_sell(
-        previous_state=state,
+    if bars is not None and not bars.empty:
+        try:
+            bar_copy = bars.copy()
+            bar_copy = add_rsi(bar_copy, period=14)
+            rsi_val = bar_copy["rsi_14"].iloc[-1] if "rsi_14" in bar_copy.columns else None
+            if rsi_val is not None and not (isinstance(rsi_val, float) and pd.isna(rsi_val)):
+                exit_rsi = float(rsi_val)
+        except (KeyError, ValueError):
+            exit_rsi = None
+        try:
+            bar_copy = bars.copy()
+            bar_copy = add_atr(bar_copy, period=14)
+            atr_val = bar_copy["atr_14"].iloc[-1] if "atr_14" in bar_copy.columns else None
+            if atr_val is not None and not (isinstance(atr_val, float) and pd.isna(atr_val)):
+                exit_atr = float(atr_val)
+        except (KeyError, ValueError):
+            exit_atr = None
+
+    if position.entry_at is not None:
+        entry_at = position.entry_at
+        if entry_at.tzinfo is None:
+            entry_at = entry_at.replace(tzinfo=submitted_at.tzinfo or timezone.utc)
+        hold_duration = (submitted_at - entry_at).total_seconds() / 60.0
+
+    exit_strategy = getattr(position, "strategy_tag", None)
+
+    return _shared_fill_sell_position(
         ticker=ticker,
-        fill_price=fill.fill_price,
-        fill_fees=fill.fees,
+        position=position,
+        reason=reason,
+        submitted_at=submitted_at,
+        last_price=last_price,
         broker=broker,
+        ledger=ledger,
+        state=state,
+        log_path=log_path,
+        exit_rsi=exit_rsi,
+        exit_atr=exit_atr,
+        hold_duration_minutes=hold_duration,
+        exit_strategy=exit_strategy,
+        exit_reason=reason,
     )
-    ledger.save_portfolio_state(new_state)
-    ledger.record_equity_snapshot(new_state, timestamp=fill.filled_at)
-    event = {
-        "command": "manage-positions",
-        "ticker": ticker,
-        "status": "FILLED",
-        "reason": reason,
-        "quantity": fill.quantity,
-        "fill_price": fill.fill_price,
-        "cash": new_state.cash,
-    }
-    line = (
-        f"{ticker} FILLED reason={reason} qty={fill.quantity} "
-        f"price={fill.fill_price:.2f} cash={new_state.cash:.2f}"
-    )
-
-    strategy_tag = getattr(position, "strategy_tag", "")
-    if strategy_tag:
-        from trading_bot.strategy.strategy_tracker import record_exit as _rec_exit
-
-        _rec_exit(
-            log_path.parent,
-            strategy_tag,
-            ticker,
-            position.average_cost,
-            fill.fill_price,
-            fill.quantity,
-            fill.fees,
-            realized_pnl,
-            reason,
-            submitted_at,
-        )
-
-    return new_state, event, line
 
 
 def _paper_broker_from_state(state: PortfolioState, settings) -> PaperBroker:
@@ -1299,6 +1611,10 @@ def _paper_broker_from_state(state: PortfolioState, settings) -> PaperBroker:
         starting_cash=state.cash,
         fee_per_order=settings.paper.fee_per_order,
         slippage_bps=settings.paper.slippage_bps,
+        dynamic_slippage_enabled=settings.paper.dynamic_slippage_enabled,
+        dynamic_slippage_notional_bps_per_10k=settings.paper.dynamic_slippage_notional_bps_per_10k,
+        dynamic_slippage_low_price_boost_bps=settings.paper.dynamic_slippage_low_price_boost_bps,
+        dynamic_slippage_max_extra_bps=settings.paper.dynamic_slippage_max_extra_bps,
     )
     broker.positions = {
         ticker: position.quantity
@@ -1349,6 +1665,7 @@ def _update_trailing_stop(
             position.ticker,
             settings.market_data.daily_period,
             "1d",
+            settings=settings.market_data,
         )
         atr_frame = add_atr(daily_frame, period=14, column_name="atr_14")
         atr_series = atr_frame["atr_14"].dropna()
@@ -1375,28 +1692,18 @@ def _update_trailing_stop(
 def _portfolio_state_after_sell(
     previous_state: PortfolioState,
     ticker: str,
+    sold_quantity: int,
     fill_price: float,
     fill_fees: float,
     broker: PaperBroker,
 ) -> PortfolioState:
-    exited_position = previous_state.positions[ticker]
-    positions = {
-        symbol: previous_state.positions[symbol].model_copy(update={"quantity": quantity})
-        for symbol, quantity in broker.positions.items()
-        if quantity > 0 and symbol in previous_state.positions
-    }
-    realized_delta = (
-        (fill_price - exited_position.average_cost) * exited_position.quantity
-    ) - fill_fees
-    equity = broker.cash + sum(
-        position.quantity * position.average_cost for position in positions.values()
-    )
-    return PortfolioState(
-        cash=round(broker.cash, 2),
-        equity=round(equity, 2),
-        positions=positions,
-        realized_pnl=round(previous_state.realized_pnl + realized_delta, 2),
-        unrealized_pnl=0.0,
+    return _shared_portfolio_state_after_sell(
+        previous_state=previous_state,
+        ticker=ticker,
+        sold_quantity=sold_quantity,
+        fill_price=fill_price,
+        fill_fees=fill_fees,
+        broker=broker,
     )
 
 
@@ -1426,31 +1733,74 @@ def _try_fetch_bars(symbol: str, settings, market_data) -> "pd.DataFrame | None"
             symbol,
             settings.market_data.intraday_period,
             settings.market_data.intraday_interval,
+            settings=settings.market_data,
         )
     except Exception:
         frame = None
     if frame is not None and not frame.empty:
         return frame
     try:
-        frame = market_data.fetch_bars(symbol, "1mo", "1d")
+        frame = market_data.fetch_bars(symbol, "1mo", "1d", settings=settings.market_data)
     except Exception:
         return None
     return frame
 
 
 def _format_scan_summary(summary: dict[str, object]) -> str:
-    return " ".join(
-        [
-            "summary",
-            f"symbols={summary['symbols']}",
-            f"approved={summary['approved']}",
-            f"green={summary['green']}",
-            f"yellow={summary['yellow']}",
-            f"rejected={summary['rejected']}",
-            f"no_signal={summary['no_signal']}",
-            f"errors={summary['errors']}",
-        ]
-    )
+    parts = [
+        "summary",
+        f"symbols={summary['symbols']}",
+        f"approved={summary['approved']}",
+        f"green={summary['green']}",
+        f"yellow={summary['yellow']}",
+        f"rejected={summary['rejected']}",
+        f"no_signal={summary['no_signal']}",
+        f"errors={summary['errors']}",
+    ]
+    if "rl_buy" in summary:
+        parts.extend(
+            [
+                f"rl_buy={summary['rl_buy']}",
+                f"rl_hold={summary['rl_hold']}",
+                f"rl_sell={summary['rl_sell']}",
+                f"rl_unsupported={summary.get('rl_unsupported', 0)}",
+                f"rl_avg_conf={summary.get('rl_avg_confidence', 0.0)}",
+            ]
+        )
+    if summary.get("swarm_enabled"):
+        parts.extend(
+            [
+                f"swarm_approved={summary.get('swarm_approved', 0)}",
+                f"swarm_rejected={summary.get('swarm_rejected', 0)}",
+                f"swarm_hold={summary.get('swarm_hold', 0)}",
+            ]
+        )
+        if "swarm_sentiment_evidence" in summary:
+            parts.extend(
+                [
+                    f"swarm_sentiment_evidence={summary.get('swarm_sentiment_evidence', 0)}",
+                    f"swarm_sentiment_bullish={summary.get('swarm_sentiment_bullish', 0)}",
+                    f"swarm_sentiment_bearish={summary.get('swarm_sentiment_bearish', 0)}",
+                ]
+            )
+    if "parallel_buy" in summary:
+        parts.extend(
+            [
+                f"parallel_buy={summary['parallel_buy']}",
+                f"parallel_sell={summary['parallel_sell']}",
+                f"parallel_no_trade={summary['parallel_no_trade']}",
+            ]
+        )
+    if "supermodel_support" in summary:
+        parts.extend(
+            [
+                f"supermodel_support={summary['supermodel_support']}",
+                f"supermodel_caution={summary['supermodel_caution']}",
+                f"supermodel_block={summary['supermodel_block']}",
+                f"supermodel_no_signal={summary['supermodel_no_signal']}",
+            ]
+        )
+    return " ".join(parts)
 
 
 def _format_doctor(settings) -> str:
@@ -1462,12 +1812,21 @@ def _format_doctor(settings) -> str:
     ]
     ready_snapshots = sum(1 for path in snapshots if Path(path).exists())
 
-    provider = getattr(settings.market_data, "provider", "yfinance")
-    provider_ok = "ok"
-    if provider == "alpaca":
-        import os
-        if not os.environ.get("APCA_API_KEY_ID") or not os.environ.get("APCA_API_SECRET_KEY"):
-            provider_ok = "missing APCA_API_KEY_ID/APCA_API_SECRET_KEY"
+    providers = list(getattr(settings.market_data, "provider_stack", []) or ["yfinance"])
+    provider = ",".join(providers)
+    provider_statuses: list[str] = []
+    for provider_name in providers:
+        provider_ok = "ok"
+        if provider_name == "alpaca":
+            import os
+            if not os.environ.get("APCA_API_KEY_ID") or not os.environ.get("APCA_API_SECRET_KEY"):
+                provider_ok = "missing APCA_API_KEY_ID/APCA_API_SECRET_KEY"
+        elif provider_name == "polygon":
+            import os
+            if not os.environ.get("POLYGON_API_KEY"):
+                provider_ok = "missing POLYGON_API_KEY"
+        provider_statuses.append(f"{provider_name}:{provider_ok}")
+    provider_auth = ",".join(provider_statuses)
 
     return " ".join(
         [
@@ -1477,7 +1836,7 @@ def _format_doctor(settings) -> str:
             f"log_dir={_exists_label(settings.app.log_dir)}",
             f"snapshots={ready_snapshots}/{len(snapshots)}",
             f"provider={provider}",
-            f"provider_auth={provider_ok}",
+            f"provider_auth={provider_auth}",
         ]
     )
 
@@ -1592,6 +1951,34 @@ def strategy_health(
             f"{r['recent_wins']:>5} {r['recent_losses']:>6} "
             f"{r['recent_win_rate']:>7.1%} {r['recent_net_pnl']:>8.2f} {alloc_label:>6}"
         )
+
+
+@app.command(name="tune")
+def tune(
+    ctx: typer.Context,
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview overrides without writing them."),
+) -> None:
+    """Generate safe burn-in tuning overrides from recent paper results."""
+    from trading_bot.learning.tuning_overrides import (
+        propose_tuning_overrides,
+        write_tuning_overrides,
+    )
+
+    proposal = propose_tuning_overrides(
+        Path(ctx.obj.app.log_dir),
+        ctx.obj,
+        Path(ctx.obj.app.scan_results_path),
+    )
+    rendered = yaml.safe_dump(proposal, sort_keys=False).strip()
+    if dry_run:
+        typer.echo("DRY RUN")
+        typer.echo(rendered)
+        return
+
+    output_path = Path(ctx.obj.app.tuning_overrides_path)
+    write_tuning_overrides(output_path, proposal)
+    typer.echo(f"Wrote tuning overrides to {output_path}")
+    typer.echo(rendered)
 
 
 @app.command(name="drawdown")
@@ -1750,6 +2137,7 @@ def risk_report(ctx: typer.Context) -> None:
     # 2. VaR
     typer.echo("--- Value at Risk ---")
     tickers = sorted(t for t, p in state.positions.items() if p.quantity > 0)
+    latest_prices: dict[str, float] = {}
     if tickers:
         latest_prices = _fetch_latest_prices(tickers, settings)
         price_history: dict[str, list[float]] = {}
@@ -1757,9 +2145,11 @@ def risk_report(ctx: typer.Context) -> None:
             try:
                 bars = fetch_bars(ticker, period="1y", interval="1d", settings=settings.market_data)
                 if not bars.empty:
-                    price_history[ticker] = [float(c) for c in bars["Close"].tolist()]
-            except Exception:
-                pass
+                    close_column = "close" if "close" in bars.columns else ("Close" if "Close" in bars.columns else None)
+                    if close_column is not None:
+                        price_history[ticker] = [float(c) for c in bars[close_column].tolist()]
+            except Exception as e:
+                logger.debug("Error in CLI: %s", e)
 
         position_values: dict[str, float] = {}
         for ticker, position in state.positions.items():
@@ -1801,18 +2191,32 @@ def risk_report(ctx: typer.Context) -> None:
             typer.echo("Need 2+ open positions for correlation analysis.")
         typer.echo("")
 
-        # 5. Real-time PnL alerts
-        typer.echo("--- PnL Alerts ---")
-        snapshot = calculate_realtime_pnl(ledger, latest_prices)
-        pnl_alerts = check_pnl_alerts(snapshot)
-        if pnl_alerts:
-            for alert in pnl_alerts:
-                level_icon = "🔴" if alert["level"] == "critical" else "🟡"
-                typer.echo(f"{level_icon} [{alert['type']}] {alert['message']}")
-        else:
-            typer.echo("No active PnL alerts.")
     else:
         typer.echo("No open positions — skipping VaR, correlation, stress tests.")
+
+    # 5. Real-time PnL / trade quality
+    typer.echo("--- PnL Alerts ---")
+    snapshot = calculate_realtime_pnl(ledger, latest_prices)
+    typer.echo(
+        " ".join(
+            [
+                f"closed_trades={snapshot.closed_trades}",
+                f"win_rate={snapshot.win_rate_pct:.1f}%",
+                f"profit_factor={snapshot.profit_factor:.2f}",
+            ]
+        )
+    )
+    pnl_alerts = check_pnl_alerts(snapshot)
+    if pnl_alerts:
+        for alert in pnl_alerts:
+            level_icon = "🔴" if alert["level"] == "critical" else "🟡"
+            typer.echo(f"{level_icon} [{alert['type']}] {alert['message']}")
+    else:
+        typer.echo("No active PnL alerts.")
+    if snapshot.strategy_pnl:
+        typer.echo("Top Strategy Attribution:")
+        for strategy_tag, pnl in sorted(snapshot.strategy_pnl.items(), key=lambda item: item[1], reverse=True)[:5]:
+            typer.echo(f"  {strategy_tag}: {pnl:+.2f}")
 
     typer.echo("")
     typer.echo("=" * 60)
@@ -1873,7 +2277,7 @@ def _exists_label(path: str) -> str:
     return "ok" if Path(path).exists() else "missing"
 
 
-def _robinhood_boundary(settings):
+def _robinhood_boundary(settings: Settings) -> "RobinhoodBrokerBoundary":
     from trading_bot.brokers.robinhood.boundary import RobinhoodBrokerBoundary
 
     return RobinhoodBrokerBoundary(settings)
@@ -2073,6 +2477,107 @@ def reconcile_positions_cmd(
         typer.echo(f"\nBroker Only: {', '.join(result.broker_only)}")
 
 
+@app.command(name="v3-debug")
+def v3_debug(
+    ctx: typer.Context,
+    symbols: str = typer.Option(
+        "",
+        "--symbols",
+        help="Comma-separated symbols to debug the V3 strategy selector against.",
+    ),
+) -> None:
+    """Debug why the V3 strategy selector approves or rejects each symbol.
+
+    Shows regime detection, setup search results, confluence scores,
+    confidence thresholds, and the final decision for each symbol.
+    """
+    from trading_bot.config.settings import Settings
+    from trading_bot.data import market_data
+    from trading_bot.runtime.orchestrator import _drop_trailing_zero_volume_bars
+    from trading_bot.strategy.strategy_selector import StrategySelector
+    from trading_bot.strategy.market_regime import detect_market_regime, should_trade_regime, get_recommended_strategy
+    from trading_bot.strategy.setup_rules import identify_intraday_setup, is_valid_mean_reversion_setup
+    from trading_bot.strategy.mean_reversion import identify_mean_reversion_setup
+    from trading_bot.data.indicators import add_ema, add_sma, add_atr, add_rsi, add_bollinger_bands, add_vwap
+
+    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not symbol_list:
+        typer.echo("Usage: v3-debug --symbols AAPL,MSFT,EBS")
+        raise typer.Exit(code=1)
+
+    settings = ctx.obj
+    for sym in symbol_list:
+        print(f"\n{'='*60}")
+        print(f"  {sym}")
+        print(f"{'='*60}")
+
+        daily, daily_ok = market_data.fetch_and_validate_bars(sym, settings.market_data.daily_period, "1d", settings.market_data)
+        if not daily_ok.valid:
+            print(f"  DAILY FAIL: {daily_ok.reason}")
+            continue
+
+        intraday, intra_ok = market_data.fetch_and_validate_bars(sym, settings.market_data.intraday_period, settings.market_data.intraday_interval, settings.market_data)
+        if not intra_ok.valid:
+            print(f"  INTRADAY FAIL: {intra_ok.reason}")
+            continue
+
+        daily = daily.copy()
+        daily = add_ema(daily, period=20, column_name="ema_20")
+        daily = add_sma(daily, period=50, column_name="sma_50")
+        daily = add_atr(daily, period=settings.risk.atr_period)
+        daily = add_bollinger_bands(daily, period=20)
+
+        regime, metrics = detect_market_regime(daily)
+        rec_strat = get_recommended_strategy(regime)
+        can_trade = should_trade_regime(regime, settings.strategy.risk_tolerance)
+        print(f"  Regime: {regime.value} (ADX={metrics.adx:.1f}, vol_pct={metrics.volatility_percentile:.0%})")
+        print(f"  Recommended: {rec_strat} | Trade OK: {can_trade}")
+
+        intraday = _drop_trailing_zero_volume_bars(intraday).copy()
+        intraday["volume_avg_5"] = intraday["volume"].rolling(5).mean()
+        intraday = add_atr(intraday, period=settings.risk.atr_period)
+        intraday = add_rsi(intraday, period=14)
+        intraday = add_bollinger_bands(intraday, period=20)
+        intraday = add_vwap(intraday)
+
+        last = intraday.iloc[-1]
+        close = float(last.get("close", 0))
+        rsi = float(last.get("rsi_14", 0))
+        bb_l = float(last.get("bb_lower", 0))
+        bb_u = float(last.get("bb_upper", 0))
+        vol = float(last.get("volume", 0))
+        avg_vol = float(last.get("volume_avg_5", 0))
+        bb_pct = (close - bb_l) / (bb_u - bb_l) * 100 if bb_u > bb_l else 0
+        print(f"  Last bar: close={close:.2f} RSI={rsi:.1f} %B={bb_pct:.1f} vol={vol:.0f}/{avg_vol:.0f}")
+
+        trend_setup = identify_intraday_setup(intraday)
+        mr_setup = identify_mean_reversion_setup(intraday)
+        mr_frame = is_valid_mean_reversion_setup(intraday)
+        print(f"  Trend setup: {trend_setup or 'NONE'}")
+        print(f"  MR setup:   {mr_setup or 'NONE'}")
+        print(f"  MR frame:   {mr_frame}")
+
+        if can_trade:
+            selector = StrategySelector(risk_tolerance=settings.strategy.risk_tolerance)
+            selector.min_confidence = settings.strategy.min_confidence
+            selector.atr_stop_multiplier = settings.risk.atr_stop_multiplier
+            selector.min_stop_distance_pct = settings.risk.min_stop_distance_pct
+            selection = selector.select_strategy(sym, daily, intraday)
+
+            print(f"  Decision: should_trade={selection.should_trade}")
+            print(f"  Strategy: {selection.strategy_type} | Setup: {selection.setup_name}")
+            if selection.signal_score:
+                s = selection.signal_score
+                print(f"  Score: {s.total_score:.1f}/12 conf={s.confidence} (need {settings.strategy.min_confidence})")
+                print(f"    technical={s.technical_score} volume={s.volume_score} trend={s.trend_score}")
+                print(f"    momentum={s.momentum_score} regime_align={s.regime_alignment} factors={s.factor_score}")
+            print(f"  Reason: {selection.reason}")
+            if selection.should_trade:
+                print(f"  Entry={selection.entry_price} stop={selection.stop_loss} target={selection.profit_target}")
+        else:
+            print(f"  BLOCKED: regime not tradeable at tolerance={settings.strategy.risk_tolerance}")
+
+
 @app.command(name="counter-thesis")
 def counter_thesis(
     ctx: typer.Context,
@@ -2134,7 +2639,7 @@ def discover_symbols(
     ctx: typer.Context,
     mode: str = typer.Option("breakout", "--mode", help="Discovery mode: breakout, mean-reversion, gap-up"),
     max_symbols: int = typer.Option(20, "--max", help="Maximum symbols to return"),
-    export: bool = typer.Option(False, "--export", help="Export to burn-in symbols file"),
+    export: bool = typer.Option(False, "--export", help="Export to configured universe file"),
 ) -> None:
     """Dynamically discover trading candidates based on market conditions."""
     from trading_bot.strategy.dynamic_watchlist import DynamicWatchlist
@@ -2143,11 +2648,11 @@ def discover_symbols(
     typer.echo(f"Discovering symbols (mode: {mode})...")
     typer.echo("=" * 50)
 
-    watchlist = DynamicWatchlist(max_symbols=max_symbols)
+    watchlist = DynamicWatchlist(max_symbols=max_symbols, scout_settings=ctx.obj.scout)
 
-    def data_provider(symbol: str):
+    def data_provider(symbol: str) -> pd.DataFrame | None:
         try:
-            return fetch_bars(symbol, interval="1d", period="1mo")
+            return fetch_bars(symbol, interval="1d", period="1mo", settings=ctx.obj.market_data)
         except Exception:
             return None
 
@@ -2167,7 +2672,7 @@ def discover_symbols(
         typer.echo("No symbols passed screening criteria.")
 
     if export:
-        export_path = watchlist.export_for_burn_in()
+        export_path = watchlist.export_for_burn_in(ctx.obj.app.universe_path)
         typer.echo(f"\nExported {len(watchlist.get_symbols())} symbols to {export_path}")
 
 
@@ -2187,7 +2692,7 @@ def sector_analysis_cmd(ctx: typer.Context) -> None:
     typer.echo("Fetching sector data...")
     for symbol in list(SECTOR_ETFS.keys())[:5]:  # Demo: just first 5
         try:
-            frame = fetch_bars(symbol, interval="1d", period="3mo")
+            frame = fetch_bars(symbol, interval="1d", period="3mo", settings=ctx.obj.market_data)
             if frame is not None:
                 sector_data[symbol] = frame
                 typer.echo(f"  ✓ {symbol}")
@@ -2196,10 +2701,10 @@ def sector_analysis_cmd(ctx: typer.Context) -> None:
 
     # Fetch SPY for relative strength
     try:
-        spy_data = fetch_bars("SPY", interval="1d", period="3mo")
+        spy_data = fetch_bars("SPY", interval="1d", period="3mo", settings=ctx.obj.market_data)
         typer.echo("  ✓ SPY (benchmark)")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Error in CLI: %s", e)
 
     if len(sector_data) < 3:
         typer.echo("")
@@ -2256,7 +2761,7 @@ def screen_market(
     typer.echo("Screening symbols...")
     for symbol in universe:
         try:
-            frame = fetch_bars(symbol, interval="1d", period="1mo")
+            frame = fetch_bars(symbol, interval="1d", period="1mo", settings=ctx.obj.market_data)
             if frame is not None and len(frame) >= 20:
                 result = screener.screen_symbol(symbol, frame)
                 results.append(result)
@@ -2289,6 +2794,7 @@ def rl_train(
     agent: str = typer.Option("PPO", "--agent", help="DRL agent type (PPO, A2C, DQN)"),
     timesteps: int = typer.Option(50000, "--timesteps", help="Total training timesteps"),
     learning_rate: float = typer.Option(3e-4, "--learning-rate", help="Learning rate"),
+    seed: int | None = typer.Option(None, "--seed", help="Random seed for reproducible training"),
     output_dir: str = typer.Option("state/rl_logs", "--output-dir", help="Output directory for model"),
     evaluate: bool = typer.Option(False, "--evaluate", help="Evaluate trained model instead of training"),
     eval_episodes: int = typer.Option(10, "--eval-episodes", help="Number of evaluation episodes"),
@@ -2313,6 +2819,8 @@ def rl_train(
         "--output-dir", output_dir,
         "--verbose", str(verbose),
     ]
+    if seed is not None:
+        argv.extend(["--seed", str(seed)])
 
     if train_symbols:
         argv.extend(["--train-symbols", train_symbols])
@@ -2352,3 +2860,2398 @@ def rl_eval(
     from scripts.train_rl import main as train_main
     exit_code = train_main()
     raise typer.Exit(code=exit_code)
+
+
+@app.command(name="rl-benchmark")
+def rl_benchmark(
+    ctx: typer.Context,
+    symbol: str = typer.Option("AAPL", "--symbol", help="Single symbol to benchmark"),
+    symbols: str | None = typer.Option(None, "--symbols", help="Comma-separated symbols to benchmark"),
+    start: str | None = typer.Option(None, "--start", help="Inclusive start date in YYYY-MM-DD format."),
+    end: str | None = typer.Option(None, "--end", help="Inclusive end date in YYYY-MM-DD format."),
+    model_path: str | None = typer.Option(None, "--model-path", help="Override RL model path"),
+) -> None:
+    """Run apples-to-apples V2.5 vs V3 vs RL benchmark."""
+    from trading_bot.backtest.runner import run_strategy_comparison
+
+    requested_symbols = _resolve_rl_symbols(symbols, symbol)
+    resolved_model_path = model_path or getattr(ctx.obj.rl, "model_path", None)
+    path = Path(resolved_model_path) if resolved_model_path else None
+    if path is None or not path.exists():
+        typer.echo("RL benchmark requires an existing model path. Set rl.model_path or pass --model-path.")
+        raise typer.Exit(code=1)
+    _validate_rl_model_symbols(path, requested_symbols)
+
+    try:
+        comparison = run_strategy_comparison(
+            requested_symbols,
+            ctx.obj,
+            start=start,
+            end=end,
+            strategies=["v2.5", "v3", "rl"],
+            model_path=str(path),
+        )
+    except ValueError as exc:
+        typer.echo(f"market data unavailable: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    typer.echo("RL BENCHMARK")
+    typer.echo("=" * 60)
+    typer.echo(f"symbols={','.join(requested_symbols)} model_path={path}")
+    for strat, result in comparison["results"].items():
+        typer.echo(f"\n{strat.upper()}:")
+        typer.echo(f"  trades={result['trades']} wins={result['wins']} losses={result['losses']}")
+        typer.echo(f"  win_rate={result['win_rate']:.2f} net_pnl={result['net_pnl']:.2f}")
+        typer.echo(f"  {_format_backtest_diagnostics(result)}")
+    typer.echo(f"\nBest P&L: {comparison['best_pnl_strategy']}")
+    typer.echo(f"Best Win Rate: {comparison['best_winrate_strategy']}")
+
+
+@app.command(name="rl-model-info")
+def rl_model_info(
+    ctx: typer.Context,
+    model_path: str | None = typer.Option(None, "--model-path", help="Override RL model path"),
+) -> None:
+    """Show active RL model coverage without fetching market data."""
+    resolved_model_path = model_path or getattr(ctx.obj.rl, "model_path", None)
+    if not resolved_model_path:
+        typer.echo("RL model path is not configured.")
+        raise typer.Exit(code=1)
+
+    path = Path(resolved_model_path)
+    if not path.exists():
+        typer.echo(f"RL model missing: {path}")
+        raise typer.Exit(code=1)
+
+    meta_path, meta, symbols = _load_rl_model_meta(path)
+    typer.echo(f"model_path={path}")
+    typer.echo(f"metadata_path={meta_path if meta_path.exists() else 'missing'}")
+    typer.echo(f"agent={meta.get('agent', getattr(ctx.obj.rl, 'agent_type', 'unknown'))}")
+    typer.echo(f"symbols={','.join(symbols) if symbols else 'unknown'}")
+    typer.echo(f"max_symbols={meta.get('max_symbols', 'unknown')}")
+    typer.echo(f"seed={meta.get('seed', 'unknown')}")
+    typer.echo(f"reward_scheme={meta.get('reward_scheme', getattr(ctx.obj.rl, 'reward_function', 'unknown'))}")
+    if symbols:
+        typer.echo(f"supported_scan=./tradebot-local scan --symbols {','.join(symbols)} --summary --why")
+
+
+@app.command(name="rl-scan-plan")
+def rl_scan_plan(
+    ctx: typer.Context,
+    model_path: str | None = typer.Option(None, "--model-path", help="Override RL model path"),
+) -> None:
+    """Show the safe scan plan for the active RL model."""
+    resolved_model_path = model_path or getattr(ctx.obj.rl, "model_path", None)
+    if not resolved_model_path:
+        typer.echo("RL model path is not configured.")
+        raise typer.Exit(code=1)
+
+    path = Path(resolved_model_path)
+    if not path.exists():
+        typer.echo(f"RL model missing: {path}")
+        raise typer.Exit(code=1)
+
+    meta_path, _meta, symbols = _load_rl_model_meta(path)
+    typer.echo("RL SCAN PLAN")
+    typer.echo(f"model_path={path}")
+    typer.echo(f"metadata_path={meta_path if meta_path.exists() else 'missing'}")
+    typer.echo(f"symbols={','.join(symbols) if symbols else 'unknown'}")
+    if not symbols:
+        typer.echo("status=blocked_missing_metadata")
+        typer.echo("next=write model metadata with trained symbols before scanning")
+    else:
+        typer.echo("status=ready")
+        typer.echo(f"command=./tradebot-local scan --symbols {','.join(symbols)} --summary --why")
+
+
+@app.command(name="rl-walkforward")
+def rl_walkforward(
+    ctx: typer.Context,
+    symbol: str = typer.Option("AAPL", "--symbol", help="Single symbol to benchmark"),
+    symbols: str | None = typer.Option(None, "--symbols", help="Comma-separated symbols to benchmark"),
+    start: str | None = typer.Option(None, "--start", help="Inclusive start date in YYYY-MM-DD format."),
+    end: str | None = typer.Option(None, "--end", help="Inclusive end date in YYYY-MM-DD format."),
+    windows: int = typer.Option(5, "--windows", help="Number of sequential windows"),
+    model_path: str | None = typer.Option(None, "--model-path", help="Override RL model path"),
+) -> None:
+    """Run fixed-model sequential V2.5 vs V3 vs RL windows."""
+    from trading_bot.backtest.runner import run_rl_walk_forward
+
+    requested_symbols = _resolve_rl_symbols(symbols, symbol)
+    resolved_model_path = model_path or getattr(ctx.obj.rl, "model_path", None)
+    path = Path(resolved_model_path) if resolved_model_path else None
+    if path is None or not path.exists():
+        typer.echo("RL walk-forward requires an existing model path. Set rl.model_path or pass --model-path.")
+        raise typer.Exit(code=1)
+    _validate_rl_model_symbols(path, requested_symbols)
+
+    try:
+        result = run_rl_walk_forward(
+            requested_symbols,
+            ctx.obj,
+            start=start,
+            end=end,
+            windows=windows,
+            model_path=str(path),
+        )
+    except ValueError as exc:
+        typer.echo(f"market data unavailable: {exc}")
+        raise typer.Exit(code=1) from exc
+    typer.echo("RL FIXED-MODEL WALK-FORWARD")
+    typer.echo("=" * 60)
+    typer.echo(f"symbols={','.join(requested_symbols)} model_path={path} windows={windows}")
+    for window in result["windows"]:
+        typer.echo(f"\nWINDOW {window['window']}: {window['start']} -> {window['end']}")
+        for strategy_name, strategy_result in window["results"].items():
+            typer.echo(
+                f"  {strategy_name.upper()}: trades={strategy_result['trades']} "
+                f"wins={strategy_result['wins']} losses={strategy_result['losses']} "
+                f"win_rate={strategy_result['win_rate']:.2f} net_pnl={strategy_result['net_pnl']:.2f}"
+            )
+            typer.echo(f"    {_format_backtest_diagnostics(strategy_result)}")
+        typer.echo(f"  best_pnl={window['best_pnl_strategy']} best_win_rate={window['best_winrate_strategy']}")
+
+    typer.echo("\nTOTALS:")
+    for strategy_name, strategy_result in result["results"].items():
+        typer.echo(
+            f"  {strategy_name.upper()}: trades={strategy_result['trades']} "
+            f"wins={strategy_result['wins']} losses={strategy_result['losses']} "
+            f"win_rate={strategy_result['win_rate']:.2f} net_pnl={strategy_result['net_pnl']:.2f}"
+        )
+        typer.echo(f"    {_format_backtest_diagnostics(strategy_result)}")
+    typer.echo(f"\n{_format_paper_confidence_gate(result, ctx.obj.rl.backtest_starting_cash)}")
+
+
+@app.command()
+def db_history(
+    ctx: typer.Context,
+    ticker: str | None = typer.Option(None, "--ticker", help="Filter by ticker"),
+    since: str | None = typer.Option(None, "--since", help="Start date (YYYY-MM-DD)"),
+    swarm_sentiment: str | None = typer.Option(None, "--swarm-sentiment", help="Filter trades by stored swarm sentiment bucket (bullish|neutral|bearish|unknown)"),
+    limit: int = typer.Option(50, "--limit", help="Max rows to return"),
+) -> None:
+    """Query scan results and trades from the database."""
+    from datetime import datetime
+
+    from trading_bot.db.session import get_session, make_session_factory
+    from trading_bot.db.repositories import get_scan_results, get_trades
+
+    engine = None
+    try:
+        from trading_bot.db.session import init_db
+        engine = init_db(ctx.obj)
+        session_factory = make_session_factory(engine)
+        session = get_session(session_factory)
+
+        try:
+            if ticker:
+                typer.echo(f"SCAN RESULTS for {ticker.upper()}")
+                typer.echo("=" * 60)
+                results = get_scan_results(session, ticker=ticker.upper(), since=datetime.fromisoformat(since) if since else None, limit=limit)
+                for r in results:
+                    typer.echo(f"  {r.timestamp} {r.ticker} {r.action} conf={r.confidence:.3f} strategy={r.strategy_tag}")
+
+                typer.echo(f"\nTRADES for {ticker.upper()}")
+                typer.echo("=" * 60)
+                trades = get_trades(
+                    session,
+                    ticker=ticker.upper(),
+                    since=datetime.fromisoformat(since) if since else None,
+                    swarm_sentiment_bucket=(swarm_sentiment.lower() if swarm_sentiment else None),
+                    limit=limit,
+                )
+                for t in trades:
+                    pnl_str = f" pnl={t.pnl:.2f}" if t.pnl is not None else ""
+                    sentiment_str = f" sentiment={t.swarm_sentiment_bucket}" if getattr(t, "swarm_sentiment_bucket", None) else ""
+                    typer.echo(f"  {t.filled_at} {t.ticker} {t.side} qty={t.quantity} @${t.entry_price:.2f}{pnl_str}{sentiment_str}")
+            else:
+                typer.echo("RECENT SCAN RESULTS")
+                typer.echo("=" * 60)
+                results = get_scan_results(session, since=datetime.fromisoformat(since) if since else None, limit=limit)
+                for r in results:
+                    typer.echo(f"  {r.timestamp} {r.ticker} {r.action} conf={r.confidence:.3f} strategy={r.strategy_tag}")
+
+                typer.echo(f"\nRECENT TRADES")
+                typer.echo("=" * 60)
+                trades = get_trades(
+                    session,
+                    since=datetime.fromisoformat(since) if since else None,
+                    swarm_sentiment_bucket=(swarm_sentiment.lower() if swarm_sentiment else None),
+                    limit=limit,
+                )
+                for t in trades:
+                    pnl_str = f" pnl={t.pnl:.2f}" if t.pnl is not None else ""
+                    sentiment_str = f" sentiment={t.swarm_sentiment_bucket}" if getattr(t, "swarm_sentiment_bucket", None) else ""
+                    typer.echo(f"  {t.filled_at} {t.ticker} {t.side} qty={t.quantity} @${t.entry_price:.2f}{pnl_str}{sentiment_str}")
+        finally:
+            session.close()
+    finally:
+        if engine:
+            engine.dispose()
+
+
+@app.command(name="supermodel-report")
+def supermodel_report(
+    ctx: typer.Context,
+    since: str | None = typer.Option(None, "--since", help="Start date (YYYY-MM-DD)"),
+    limit: int = typer.Option(500, "--limit", help="Max scan rows to inspect"),
+) -> None:
+    """Summarize persisted supermodel scan decisions."""
+    from collections import Counter
+    from datetime import datetime
+
+    from trading_bot.db.session import get_session, init_db, make_session_factory
+    from trading_bot.db.repositories import get_scan_results, get_trades
+
+    engine = init_db(ctx.obj)
+    session = get_session(make_session_factory(engine))
+    try:
+        rows = get_scan_results(
+            session,
+            since=datetime.fromisoformat(since) if since else None,
+            limit=limit,
+        )
+        trades = get_trades(
+            session,
+            since=datetime.fromisoformat(since) if since else None,
+            limit=limit,
+        )
+    finally:
+        session.close()
+        engine.dispose()
+
+    counts: Counter[str] = Counter()
+    actions: Counter[tuple[str, str]] = Counter()
+    hold_reasons: Counter[tuple[str, str]] = Counter()
+    swarm_pairs: Counter[tuple[str, str]] = Counter()
+    consensus_pairs: Counter[tuple[str, str]] = Counter()
+    swarm_handoff_rows = 0
+    scores: dict[str, list[float]] = {}
+    missing = 0
+    for row in rows:
+        decision, score = _scan_row_supermodel(row)
+        if not decision:
+            missing += 1
+            continue
+        counts[decision] += 1
+        actions[(decision, row.action)] += 1
+        if row.action == "HOLD":
+            for reason in _scan_row_reasons(row):
+                hold_reasons[(decision, reason)] += 1
+        swarm_decision = _scan_row_swarm_decision(row)
+        if swarm_decision:
+            swarm_pairs[(swarm_decision, decision)] += 1
+        if _scan_row_swarm_handoff(row):
+            swarm_handoff_rows += 1
+        details = _scan_row_details(row)
+        if details and details.get("signal_mode") == "parallel":
+            consensus = str(details.get("consensus") or "")
+            if consensus:
+                consensus_pairs[(consensus, decision)] += 1
+        if score is not None:
+            scores.setdefault(decision, []).append(score)
+
+    typer.echo("SUPERMODEL REPORT")
+    typer.echo(f"scan_rows={len(rows)} stack_rows={sum(counts.values())} missing_stack={missing}")
+    for decision in ("support", "caution", "block", "no_signal"):
+        total = counts[decision]
+        if not total:
+            continue
+        values = scores.get(decision, [])
+        avg_score = sum(values) / len(values) if values else 0.0
+        typer.echo(
+            f"{decision} count={total} "
+            f"buy={actions[(decision, 'BUY')]} hold={actions[(decision, 'HOLD')]} "
+            f"avg_score={avg_score:.2f}"
+        )
+    if hold_reasons:
+        typer.echo("SCAN HOLD REASONS")
+        for (decision, reason), total in sorted(hold_reasons.items()):
+            typer.echo(f"{decision} reason={reason} count={total}")
+    if swarm_pairs:
+        typer.echo("SWARM ALIGNMENT")
+        typer.echo(f"swarm_handoff_rows={swarm_handoff_rows}")
+        for (swarm_decision, stack_decision), total in sorted(swarm_pairs.items()):
+            typer.echo(
+                f"swarm={swarm_decision} stack={stack_decision} count={total}"
+            )
+    if consensus_pairs:
+        typer.echo("PARALLEL CONSENSUS")
+        for (consensus, stack_decision), total in sorted(consensus_pairs.items()):
+            typer.echo(f"consensus={consensus} stack={stack_decision} count={total}")
+
+    trade_counts: Counter[str] = Counter()
+    trade_pnl: Counter[str] = Counter()
+    trade_wins: Counter[str] = Counter()
+    trade_losses: Counter[str] = Counter()
+    trade_open_counts: Counter[str] = Counter()
+    trade_pairs: Counter[tuple[str, str]] = Counter()
+    trade_pair_pnl: Counter[tuple[str, str]] = Counter()
+    trade_pair_wins: Counter[tuple[str, str]] = Counter()
+    trade_pair_losses: Counter[tuple[str, str]] = Counter()
+    trade_pair_open_counts: Counter[tuple[str, str]] = Counter()
+    trade_consensus: Counter[tuple[str, str]] = Counter()
+    trade_consensus_pnl: Counter[tuple[str, str]] = Counter()
+    trade_consensus_wins: Counter[tuple[str, str]] = Counter()
+    trade_consensus_losses: Counter[tuple[str, str]] = Counter()
+    trade_consensus_open_counts: Counter[tuple[str, str]] = Counter()
+    open_trades = 0
+    for trade in trades:
+        decision = _trade_stack_decision(trade)
+        if not decision:
+            continue
+        if trade.pnl is None:
+            open_trades += 1
+            trade_open_counts[decision] += 1
+            swarm_decision = _trade_swarm_decision(trade)
+            if swarm_decision:
+                trade_pair_open_counts[(swarm_decision, decision)] += 1
+            consensus = _trade_consensus(trade)
+            if consensus:
+                trade_consensus_open_counts[(consensus, decision)] += 1
+            continue
+        trade_counts[decision] += 1
+        pnl = float(trade.pnl)
+        trade_pnl[decision] += pnl
+        if pnl > 0:
+            trade_wins[decision] += 1
+        elif pnl < 0:
+            trade_losses[decision] += 1
+        swarm_decision = _trade_swarm_decision(trade)
+        if swarm_decision:
+            trade_pairs[(swarm_decision, decision)] += 1
+            trade_pair_pnl[(swarm_decision, decision)] += pnl
+            if pnl > 0:
+                trade_pair_wins[(swarm_decision, decision)] += 1
+            elif pnl < 0:
+                trade_pair_losses[(swarm_decision, decision)] += 1
+        consensus = _trade_consensus(trade)
+        if consensus:
+            trade_consensus[(consensus, decision)] += 1
+            trade_consensus_pnl[(consensus, decision)] += pnl
+            if pnl > 0:
+                trade_consensus_wins[(consensus, decision)] += 1
+            elif pnl < 0:
+                trade_consensus_losses[(consensus, decision)] += 1
+    if trade_counts or open_trades:
+        typer.echo("TRADE OUTCOMES")
+        typer.echo(f"closed_stack_trades={sum(trade_counts.values())} open_stack_trades={open_trades}")
+        if not trade_counts and open_trades:
+            typer.echo(
+                "outcome_confidence=INSUFFICIENT reason=no_closed_stack_trades "
+                "message=paper validation needs realized exits before win-rate/P&L are meaningful"
+            )
+        for decision in ("support", "caution", "block", "no_signal"):
+            total = trade_counts[decision]
+            open_total = trade_open_counts[decision]
+            if not total and not open_total:
+                continue
+            avg_pnl = trade_pnl[decision] / total if total else 0.0
+            win_rate = trade_wins[decision] / total if total else 0.0
+            typer.echo(
+                f"{decision} closed={total} net_pnl={trade_pnl[decision]:.2f} "
+                f"avg_pnl={avg_pnl:.2f} win_rate={win_rate:.2f} "
+                f"wins={trade_wins[decision]} losses={trade_losses[decision]} open={open_total}"
+            )
+        trade_pair_keys = set(trade_pairs) | set(trade_pair_open_counts)
+        for swarm_decision, stack_decision in sorted(trade_pair_keys):
+            total = trade_pairs[(swarm_decision, stack_decision)]
+            open_total = trade_pair_open_counts[(swarm_decision, stack_decision)]
+            win_rate = trade_pair_wins[(swarm_decision, stack_decision)] / total if total else 0.0
+            typer.echo(
+                f"swarm={swarm_decision} stack={stack_decision} closed={total} "
+                f"net_pnl={trade_pair_pnl[(swarm_decision, stack_decision)]:.2f} "
+                f"win_rate={win_rate:.2f} wins={trade_pair_wins[(swarm_decision, stack_decision)]} "
+                f"losses={trade_pair_losses[(swarm_decision, stack_decision)]} open={open_total}"
+            )
+        consensus_keys = set(trade_consensus) | set(trade_consensus_open_counts)
+        for consensus, stack_decision in sorted(consensus_keys):
+            total = trade_consensus[(consensus, stack_decision)]
+            open_total = trade_consensus_open_counts[(consensus, stack_decision)]
+            win_rate = trade_consensus_wins[(consensus, stack_decision)] / total if total else 0.0
+            typer.echo(
+                f"consensus={consensus} stack={stack_decision} closed={total} "
+                f"net_pnl={trade_consensus_pnl[(consensus, stack_decision)]:.2f} "
+                f"win_rate={win_rate:.2f} wins={trade_consensus_wins[(consensus, stack_decision)]} "
+                f"losses={trade_consensus_losses[(consensus, stack_decision)]} open={open_total}"
+            )
+
+
+def _scan_row_supermodel(row) -> tuple[str | None, float | None]:
+    details = _scan_row_details(row)
+    if not details:
+        return None, None
+    decision = details.get("supermodel_decision")
+    if not decision:
+        return None, None
+    try:
+        score = float(details.get("supermodel_score"))
+    except (TypeError, ValueError):
+        score = None
+    return str(decision), score
+
+
+def _scan_row_swarm_decision(row) -> str | None:
+    details = _scan_row_details(row)
+    if not details:
+        return None
+    decision = details.get("swarm_decision")
+    return _normalize_swarm_decision(decision) if decision else None
+
+
+def _scan_row_swarm_handoff(row) -> str | None:
+    details = _scan_row_details(row)
+    if not details:
+        return None
+    handoff = details.get("swarm_handoff")
+    return str(handoff) if handoff else None
+
+
+def _scan_row_reasons(row) -> list[str]:
+    if not row.reasons:
+        return []
+    try:
+        reasons = json.loads(row.reasons)
+    except (TypeError, ValueError):
+        return []
+    if isinstance(reasons, list):
+        return [str(reason) for reason in reasons if str(reason)]
+    return []
+
+
+def _scan_row_details(row) -> dict[str, Any] | None:
+    if not row.details:
+        return None
+    try:
+        details = json.loads(row.details)
+    except (TypeError, ValueError):
+        return None
+    return details if isinstance(details, dict) else None
+
+
+def _trade_stack_decision(trade) -> str | None:
+    tag = getattr(trade, "strategy_tag", None)
+    if not tag:
+        return None
+    for part in str(tag).split("|"):
+        if part.startswith("stack:"):
+            return part.split(":", 1)[1] or None
+    return None
+
+
+def _trade_swarm_decision(trade) -> str | None:
+    tag = getattr(trade, "strategy_tag", None)
+    if not tag:
+        return None
+    for part in str(tag).split("|"):
+        if part.startswith("swarm:"):
+            value = part.split(":", 1)[1]
+            return _normalize_swarm_decision(value) if value else None
+    return None
+
+
+def _trade_consensus(trade) -> str | None:
+    tag = getattr(trade, "strategy_tag", None)
+    if not tag:
+        return None
+    for part in str(tag).split("|"):
+        if part.startswith("consensus:"):
+            return part.split(":", 1)[1] or None
+    return None
+
+
+def _normalize_swarm_decision(decision: object) -> str:
+    value = str(decision).lower()
+    if value in {"hold_for_more_info", "hold_for_more_in"}:
+        return "hold"
+    return value
+
+
+@app.command(name="db-features")
+def db_features(
+    ctx: typer.Context,
+    ticker: str | None = typer.Option(None, "--ticker", help="Filter by ticker"),
+    since: str | None = typer.Option(None, "--since", help="Start date (YYYY-MM-DD)"),
+    status: str | None = typer.Option(None, "--status", help="Filter by status (APPROVED, REJECTED, etc.)"),
+    action: str | None = typer.Option(None, "--action", help="Filter by action (BUY, HOLD, SELL)"),
+    regime: str | None = typer.Option(None, "--regime", help="Filter by market regime (trending_up, trending_down, mean_reversion, high_volatility, sideways)"),
+    sentiment: str | None = typer.Option(None, "--sentiment", help="Filter by swarm sentiment bucket (bullish|neutral|bearish|unknown)"),
+    quality: str | None = typer.Option(None, "--quality", help="Filter by signal quality (GREEN, YELLOW, RED)"),
+    strategy: str | None = typer.Option(None, "--strategy", help="Filter by strategy tag"),
+    limit: int = typer.Option(100, "--limit", help="Max rows to return"),
+    summary: bool = typer.Option(False, "--summary", help="Show aggregate summary statistics"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+) -> None:
+    """Query scan_features table from the database."""
+    from datetime import datetime
+    from collections import Counter
+
+    from trading_bot.db.session import get_session, init_db, make_session_factory
+    from trading_bot.db.repositories import get_scan_features
+
+    engine = None
+    try:
+        from trading_bot.db.session import init_db
+        engine = init_db(ctx.obj)
+        session_factory = make_session_factory(engine)
+        session = get_session(session_factory)
+
+        try:
+            features = get_scan_features(
+                session,
+                ticker=ticker.upper() if ticker else None,
+                since=datetime.fromisoformat(since) if since else None,
+                limit=limit,
+                status=status,
+                action=action,
+                market_regime=regime,
+                swarm_sentiment_bucket=sentiment,
+                quality=quality,
+                strategy_tag=strategy,
+            )
+
+            if json_output:
+                import json as json_module
+                rows = []
+                for f in features:
+                    rows.append({
+                        "id": f.id,
+                        "timestamp": f.timestamp.isoformat() if f.timestamp else None,
+                        "ticker": f.ticker,
+                        "status": f.status,
+                        "action": f.action,
+                        "confidence": f.confidence,
+                        "quality": f.quality,
+                        "freshness": f.freshness,
+                        "market_age_minutes": f.market_age_minutes,
+                        "market_regime": f.market_regime,
+                        "strategy_tag": f.strategy_tag,
+                        "consensus": f.consensus,
+                        "v3_total_score": f.v3_total_score,
+                        "supermodel_score": f.supermodel_score,
+                        "swarm_confidence": f.swarm_confidence,
+                        "swarm_sentiment_score": f.swarm_sentiment_score,
+                        "swarm_sentiment_confidence": f.swarm_sentiment_confidence,
+                        "mtf_aligned": f.mtf_aligned,
+                        "entry_volume_ratio": f.entry_volume_ratio,
+                        "entry_range_ratio": f.entry_range_ratio,
+                        "adaptive_rr": f.adaptive_rr,
+                    })
+                typer.echo(json_module.dumps(rows, default=str, indent=2))
+                return
+
+            typer.echo(f"SCAN FEATURES ({len(features)} rows)")
+            typer.echo("=" * 120)
+            typer.echo(
+                f"{'Timestamp':<22} {'Ticker':>6} {'Status':>10} {'Action':>6} "
+                f"{'Conf':>6} {'Quality':>8} {'Regime':<20} {'Strategy':<20}"
+            )
+            typer.echo("-" * 120)
+            for f in features:
+                ts = f.timestamp.strftime("%Y-%m-%d %H:%M:%S") if f.timestamp else "N/A"
+                conf_str = f"{f.confidence:.3f}" if f.confidence is not None else "N/A"
+                typer.echo(
+                    f"  {ts:<20} {f.ticker:>6} {f.status:>10} {f.action:>6} "
+                    f"{conf_str:>6} {f.quality or '':>8} {f.market_regime or '':<20} {f.strategy_tag or '':<20}"
+                )
+
+            if summary and features:
+                typer.echo(f"\nSUMMARY")
+                typer.echo("=" * 120)
+
+                status_counts = Counter(f.status for f in features)
+                typer.echo(f"\nStatus distribution:")
+                for s, c in sorted(status_counts.items()):
+                    typer.echo(f"  {s}: {c}")
+
+                action_counts = Counter(f.action for f in features)
+                typer.echo(f"\nAction distribution:")
+                for a, c in sorted(action_counts.items()):
+                    typer.echo(f"  {a}: {c}")
+
+                regime_counts = Counter(f.market_regime for f in features if f.market_regime)
+                typer.echo(f"\nRegime distribution:")
+                for r, c in sorted(regime_counts.items()):
+                    typer.echo(f"  {r}: {c}")
+
+                quality_counts = Counter(f.quality for f in features if f.quality)
+                typer.echo(f"\nQuality distribution:")
+                for q, c in sorted(quality_counts.items()):
+                    typer.echo(f"  {q}: {c}")
+
+                sentiment_scores = [f.swarm_sentiment_score for f in features if f.swarm_sentiment_score is not None]
+                if sentiment_scores:
+                    avg_sentiment = sum(sentiment_scores) / len(sentiment_scores)
+                    bullish = sum(1 for s in sentiment_scores if s >= 0.35)
+                    bearish = sum(1 for s in sentiment_scores if s <= -0.35)
+                    neutral = len(sentiment_scores) - bullish - bearish
+                    typer.echo(f"\nSwarm Sentiment ({len(sentiment_scores)} records):")
+                    typer.echo(f"  avg={avg_sentiment:.3f} bullish={bullish} neutral={neutral} bearish={bearish}")
+
+                v3_scores = [f.v3_total_score for f in features if f.v3_total_score is not None]
+                if v3_scores:
+                    avg_v3 = sum(v3_scores) / len(v3_scores)
+                    typer.echo(f"\nV3 Total Score: avg={avg_v3:.3f} min={min(v3_scores):.3f} max={max(v3_scores):.3f} n={len(v3_scores)}")
+
+                supermodel_scores = [f.supermodel_score for f in features if f.supermodel_score is not None]
+                if supermodel_scores:
+                    avg_sm = sum(supermodel_scores) / len(supermodel_scores)
+                    typer.echo(f"\nSupermodel Score: avg={avg_sm:.3f} min={min(supermodel_scores):.3f} max={max(supermodel_scores):.3f} n={len(supermodel_scores)}")
+
+                strategy_counts = Counter(f.strategy_tag for f in features if f.strategy_tag)
+                typer.echo(f"\nStrategy distribution:")
+                for st, c in sorted(strategy_counts.items(), key=lambda x: -x[1])[:10]:
+                    typer.echo(f"  {st}: {c}")
+
+                typer.echo(f"\nTotal: {len(features)} scan features")
+        finally:
+            session.close()
+    finally:
+        if engine:
+            engine.dispose()
+
+
+@app.command()
+def db_portfolio(
+    ctx: typer.Context,
+    since: str | None = typer.Option(None, "--since", help="Start date (YYYY-MM-DD)"),
+    limit: int = typer.Option(20, "--limit", help="Max snapshots to return"),
+) -> None:
+    """Show portfolio snapshots from the database."""
+    from datetime import datetime
+
+    from trading_bot.db.session import get_session, make_session_factory
+    from trading_bot.db.repositories import create_snapshot, get_open_positions, get_snapshots
+
+    engine = None
+    try:
+        from trading_bot.db.session import init_db
+        engine = init_db(ctx.obj)
+        session_factory = make_session_factory(engine)
+        session = get_session(session_factory)
+
+        try:
+            typer.echo("PORTFOLIO SNAPSHOTS")
+            typer.echo("=" * 80)
+            typer.echo(f"{'Timestamp':<22} {'Equity':>12} {'Cash':>12} {'Unrealized':>12} {'Positions':>10}")
+            typer.echo("-" * 80)
+
+            snapshots = get_snapshots(session, since=datetime.fromisoformat(since) if since else None, limit=limit)
+            for s in snapshots:
+                typer.echo(f"  {s.timestamp:<20} ${s.equity:>11,.2f} ${s.cash:>11,.2f} ${s.unrealized_pnl:>11,.2f} {s.num_positions:>8}")
+
+            typer.echo("\nOPEN POSITIONS")
+            typer.echo("=" * 60)
+            positions = get_open_positions(session)
+            if positions:
+                for p in positions:
+                    typer.echo(f"  {p.ticker} qty={p.quantity} avg_cost=${p.average_cost:.2f}")
+            else:
+                typer.echo("  (no open positions)")
+        finally:
+            session.close()
+    finally:
+        if engine:
+            engine.dispose()
+
+
+@app.command()
+def db_trades(
+    ctx: typer.Context,
+    ticker: str | None = typer.Option(None, "--ticker", help="Filter by ticker"),
+    since: str | None = typer.Option(None, "--since", help="Start date (YYYY-MM-DD)"),
+    limit: int = typer.Option(50, "--limit", help="Max trades to return"),
+) -> None:
+    """List trades from the database."""
+    from datetime import datetime
+
+    from trading_bot.db.session import get_session, make_session_factory
+    from trading_bot.db.repositories import get_open_trades, get_trades
+
+    engine = None
+    try:
+        from trading_bot.db.session import init_db
+        engine = init_db(ctx.obj)
+        session_factory = make_session_factory(engine)
+        session = get_session(session_factory)
+
+        try:
+            if ticker:
+                typer.echo(f"TRADES for {ticker.upper()}")
+                typer.echo("=" * 80)
+                typer.echo(f"{'Timestamp':<22} {'Side':>6} {'Qty':>5} {'Entry':>10} {'Exit':>10} {'P&L':>10} {'Status':>10}")
+                typer.echo("-" * 80)
+                trades = get_trades(session, ticker=ticker.upper(), since=datetime.fromisoformat(since) if since else None, limit=limit)
+            else:
+                typer.echo("ALL TRADES")
+                typer.echo("=" * 80)
+                typer.echo(f"{'Timestamp':<22} {'Ticker':>6} {'Side':>6} {'Qty':>5} {'Entry':>10} {'Exit':>10} {'P&L':>10} {'Status':>10}")
+                typer.echo("-" * 80)
+                trades = get_trades(session, since=datetime.fromisoformat(since) if since else None, limit=limit)
+
+            for t in trades:
+                exit_str = f"${t.exit_price:.2f}" if t.exit_price else "-"
+                pnl_str = f"${t.pnl:.2f}" if t.pnl is not None else "-"
+                ticker_str = t.ticker
+                typer.echo(f"  {t.filled_at:<20} {ticker_str:>6} {t.side:>6} {t.quantity:>5} ${t.entry_price:>9,.2f} {exit_str:>10} {pnl_str:>10} {t.status:>10}")
+
+            typer.echo(f"\nTotal: {len(trades)} trades")
+        finally:
+            session.close()
+    finally:
+        if engine:
+            engine.dispose()
+
+
+@app.command()
+def swarm(
+    ctx: typer.Context,
+    preset: str = typer.Option(
+        "investment_committee",
+        "--preset",
+        help="Swarm preset to use (investment_committee, quant_desk, risk_committee, etc.).",
+    ),
+    symbols: list[str] = typer.Option(
+        ...,
+        "--symbols",
+        help="Symbols to analyze.",
+    ),
+    max_workers: int = typer.Option(
+        3,
+        "--max-workers",
+        help="Maximum concurrent workers.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output results as JSON.",
+    ),
+) -> None:
+    """Run a multi-agent swarm analysis."""
+    import json as json_module
+
+    from trading_bot.swarm.engine import SwarmEngine
+    from trading_bot.swarm.workers import WORKER_CLASSES
+    from trading_bot.data.market_data import fetch_and_validate_bars
+    from trading_bot.portfolio.ledger import PortfolioLedger
+
+    parsed_symbols = _parse_symbols(symbols)
+    settings = ctx.obj
+
+    typer.echo(f"Swarm Analysis: preset='{preset}', symbols={parsed_symbols}")
+    typer.echo("=" * 80)
+
+    engine = SwarmEngine(preset_name=preset, max_concurrent=max_workers)
+    engine.setup_workers(WORKER_CLASSES)
+
+    # Fetch market data for all symbols
+    market_data = {}
+    for ticker in parsed_symbols:
+        daily_frame, valid = fetch_and_validate_bars(
+            ticker,
+            settings.market_data.daily_period,
+            "1d",
+            settings.market_data,
+        )
+        if valid.valid and daily_frame is not None and not daily_frame.empty:
+            market_data[ticker] = daily_frame
+        else:
+            typer.echo(f"  ⚠ {ticker}: data validation failed - {valid.reason}")
+
+    if not market_data:
+        typer.echo("No valid market data fetched. Aborting.")
+        return
+
+    typer.echo(f"  ✓ Fetched data for {len(market_data)}/{len(parsed_symbols)} symbols")
+    typer.echo()
+
+    # Run swarm
+    state = PortfolioLedger(Path(settings.app.state_db_path)).ensure_portfolio_state()
+    summary = engine.run(
+        symbols=parsed_symbols,
+        market_data=market_data,
+        portfolio_state=state.model_dump(),
+        vote_log_path=Path(settings.app.log_dir) / "worker_votes.jsonl",
+    )
+
+    if json_output:
+        typer.echo(json_module.dumps(summary, default=str, indent=2))
+    else:
+        # Print worker statuses
+        typer.echo("Worker Results:")
+        typer.echo("-" * 80)
+        decisions = summary.get("decisions", {}) if isinstance(summary, dict) else summary.decisions
+        for ticker, decision in decisions.items():
+            if isinstance(decision, dict):
+                typer.echo(f"\n{ticker}:")
+                typer.echo(f"  Decision: {decision.get('action', 'N/A')} (confidence: {decision.get('confidence', 0):.2f})")
+                typer.echo(f"  Votes: {decision.get('votes_for', 0)} for, {decision.get('votes_against', 0)} against, {decision.get('votes_abstain', 0)} abstain")
+                typer.echo(f"  Rationale: {decision.get('key_rationale', 'N/A')}")
+                risk_factors = decision.get('risk_factors', [])
+                if risk_factors:
+                    typer.echo(f"  Risks:")
+                    for risk in risk_factors[:5]:
+                        typer.echo(f"    - {risk}")
+            else:
+                typer.echo(f"\n{ticker}:")
+                typer.echo(f"  Decision: {decision.action} (confidence: {decision.confidence:.2f})")
+                typer.echo(f"  Votes: {decision.votes_for} for, {decision.votes_against} against, {decision.votes_abstain} abstain")
+                typer.echo(f"  Rationale: {decision.key_rationale}")
+                if decision.risk_factors:
+                    typer.echo(f"  Risks:")
+                    for risk in decision.risk_factors[:5]:
+                        typer.echo(f"    - {risk}")
+            typer.echo()
+
+        exec_time = summary.get("execution_time_seconds", 0) if isinstance(summary, dict) else summary.execution_time_seconds
+        completed = summary.get("completed_workers", 0) if isinstance(summary, dict) else summary.completed_workers
+        total = summary.get("total_workers", 0) if isinstance(summary, dict) else summary.total_workers
+        typer.echo(f"Execution time: {exec_time:.1f}s")
+        typer.echo(f"Workers: {completed}/{total} completed")
+
+
+@app.command()
+def attribution(
+    ctx: typer.Context,
+    symbols: list[str] = typer.Option(
+        ...,
+        "--symbols",
+        help="Symbols to run attribution on.",
+    ),
+    start: str = typer.Option(None, "--start", help="Start date (YYYY-MM-DD)."),
+    end: str = typer.Option(None, "--end", help="End date (YYYY-MM-DD)."),
+    benchmark: str = typer.Option("SPY", "--benchmark", help="Benchmark ticker for beta calculation."),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """Run post-backtest attribution analysis."""
+    from trading_bot.backtest.runner import run_backtest
+    from trading_bot.backtest.attribution import run_attribution
+    from trading_bot.data import market_data
+
+    parsed_symbols = [s.upper().strip() for s in symbols]
+    settings = ctx.obj
+
+    typer.echo(f"Backtest Attribution: symbols={parsed_symbols}")
+    typer.echo("=" * 80)
+
+    # Run backtest first
+    typer.echo("\nRunning backtest...")
+    result = run_backtest(parsed_symbols, settings, start=start, end=end)
+
+    # Fetch benchmark data
+    benchmark_data = None
+    try:
+        benchmark_data = market_data.fetch_bars(
+            benchmark,
+            settings.market_data.daily_period,
+            "1d",
+            start=start,
+            end=end,
+            settings=settings.market_data,
+        )
+    except Exception as e:
+        typer.echo(f"  ⚠ Could not fetch benchmark data: {e}")
+
+    # Run attribution
+    typer.echo("\nRunning attribution analysis...")
+    attribution = run_attribution(result, benchmark_data=benchmark_data)
+
+    if json_output:
+        import json as json_module
+        typer.echo(json_module.dumps(attribution, default=str, indent=2))
+    else:
+        # Print trade-level attribution
+        trade_attr = attribution.get("trade_level_attribution", {})
+        typer.echo("\nTrade-Level Attribution:")
+        typer.echo("-" * 80)
+        typer.echo(f"Total Trades: {trade_attr.get('total_trades', 0)}")
+        typer.echo(f"Total P&L: ${trade_attr.get('total_pnl', 0):,.2f}")
+        typer.echo(f"Win Rate: {trade_attr.get('win_rate', 0):.1f}%")
+        typer.echo(f"Top Contributor: {trade_attr.get('top_contributor', 'N/A')}")
+        typer.echo(f"Worst Contributor: {trade_attr.get('worst_contributor', 'N/A')}")
+
+        # Ticker contributions
+        typer.echo("\nTicker Contributions:")
+        typer.echo(f"{'Ticker':<10} {'Trades':>8} {'P&L':>12} {'Contrib%':>10} {'Win%':>8}")
+        typer.echo("-" * 50)
+        for tc in trade_attr.get("ticker_contributions", []):
+            typer.echo(
+                f"{tc['ticker']:<10} {tc['trades']:>8} "
+                f"${tc['net_pnl']:>10,.2f} {tc['contribution_pct']:>9.1f}% "
+                f"{tc['win_rate']:>7.1f}%"
+            )
+
+        # Winner/loser analysis
+        wl = attribution.get("winner_loser_analysis", {})
+        typer.echo("\nWinner/Loser Analysis:")
+        typer.echo("-" * 80)
+        typer.echo(f"Avg Win: ${wl.get('avg_win', 0):,.2f}")
+        typer.echo(f"Avg Loss: ${wl.get('avg_loss', 0):,.2f}")
+        typer.echo(f"Win/Loss Ratio: {wl.get('win_loss_ratio', 0):.2f}")
+        typer.echo(f"Profit Factor: {wl.get('profit_factor', 0):.2f}")
+        typer.echo(f"Expectancy: ${wl.get('expectancy', 0):,.2f}")
+
+        # Beta regression
+        beta = attribution.get("beta_regression", {})
+        if beta and "beta" in beta:
+            typer.echo("\nBeta Regression:")
+            typer.echo("-" * 80)
+            typer.echo(f"Beta: {beta.get('beta', 0):.3f}")
+            typer.echo(f"Alpha: {beta.get('alpha', 0):.4f}")
+            typer.echo(f"Sharpe Ratio: {beta.get('sharpe_ratio', 0):.2f}")
+            typer.echo(f"Interpretation: {beta.get('interpretation', '')}")
+
+        # Monte Carlo
+        mc = attribution.get("monte_carlo", {})
+        if mc and "probability_of_profit" in mc:
+            typer.echo("\nMonte Carlo Simulation:")
+            typer.echo("-" * 80)
+            typer.echo(f"Simulations: {mc.get('num_simulations', 0):,}")
+            typer.echo(f"Probability of Profit: {mc.get('probability_of_profit', 0):.1%}")
+            typer.echo(f"Mean P&L: ${mc.get('simulated_mean_pnl', 0):,.2f}")
+            typer.echo(f"Max Drawdown: ${mc.get('max_drawdown_simulation', 0):,.2f}")
+            ci = mc.get("confidence_intervals", {})
+            for key, val in ci.items():
+                typer.echo(f"{key}: ${val.get('lower', 0):,.2f} to ${val.get('upper', 0):,.2f}")
+            typer.echo(f"Interpretation: {mc.get('interpretation', '')}")
+
+
+@app.command()
+def alpha_bench(
+    ctx: typer.Context,
+    zoo: str = typer.Option(
+        "all",
+        "--zoo",
+        help="Factor zoo to bench (qlib, kakushadze, gtja, academic, all).",
+    ),
+    symbols: list[str] = typer.Option(
+        None,
+        "--symbols",
+        help="Symbols to fetch data for benching.",
+    ),
+    lookback: int = typer.Option(
+        60,
+        "--lookback",
+        help="Lookback period for IC calculation (days).",
+    ),
+    strict: bool = typer.Option(
+        False,
+        "--strict",
+        help="Run strict benching with OOS split and random control.",
+    ),
+    compare: list[str] = typer.Option(
+        None,
+        "--compare",
+        help="Compare specific factors by name.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output results as JSON.",
+    ),
+) -> None:
+    """Benchmark alpha factors from the factor zoo."""
+    import json as json_module
+
+    from trading_bot.factors import AlphaFactorRegistry, AlphaZoo
+    from trading_bot.factors.bench import bench_alpha, bench_zoo, compare_alphas, bench_strict
+    from trading_bot.data.market_data import fetch_and_validate_bars
+
+    settings = ctx.obj
+    parsed_symbols = _parse_symbols(symbols) if symbols else ["SPY"]
+    parsed_compare = _parse_symbols(compare) if compare else None
+
+    typer.echo(f"Alpha Factor Benching")
+    typer.echo("=" * 80)
+    typer.echo(f"Symbols: {parsed_symbols}")
+    typer.echo(f"Lookback: {lookback} days")
+    typer.echo()
+
+    # Fetch market data
+    all_frames: dict[str, pd.DataFrame] = {}
+    for ticker in parsed_symbols:
+        daily_frame, valid = fetch_and_validate_bars(
+            ticker,
+            settings.market_data.daily_period,
+            "1d",
+            settings.market_data,
+        )
+        if valid.valid and daily_frame is not None and not daily_frame.empty:
+            all_frames[ticker] = daily_frame
+        else:
+            typer.echo(f"  ⚠ {ticker}: data validation failed - {valid.reason}")
+
+    if not all_frames:
+        typer.echo("No valid market data fetched. Aborting.")
+        return
+
+    # Use first symbol as primary
+    primary_ticker = list(all_frames.keys())[0]
+    frame = all_frames[primary_ticker]
+
+    typer.echo(f"Using data for: {primary_ticker} ({len(frame)} bars)")
+    typer.echo()
+
+    results: dict[str, Any] = {}
+
+    if parsed_compare:
+        # Compare specific factors
+        typer.echo("Comparing factors:")
+        typer.echo("-" * 80)
+        comparison = compare_alphas(
+            parsed_compare,
+            frame,
+            lookback=lookback,
+            sort_by="ic_ir",
+        )
+        results["comparison"] = comparison
+
+        if not json_output:
+            typer.echo(f"\nFactors compared: {comparison['factors_compared']}")
+            typer.echo(f"Sort by: {comparison['sort_by']}")
+            typer.echo(f"\n{'Factor':<40} {'IC IR':>8} {'IC Mean':>10} {'IC+ %':>8} {'Category':<20}")
+            typer.echo("-" * 90)
+            for r in comparison.get("results", []):
+                typer.echo(
+                    f"{r['factor_name']:<40} {r['ic_ir']:>8.4f} "
+                    f"{r['ic_mean']:>10.4f} {r['ic_positive_ratio']:>7.1%} "
+                    f"{r['category']:<20}"
+                )
+
+    elif zoo != "all":
+        # Bench specific zoo
+        try:
+            zoo_enum = AlphaZoo(zoo)
+        except ValueError:
+            typer.echo(f"Invalid zoo: '{zoo}'. Use: qlib, kakushadze, gtja, academic")
+            return
+
+        typer.echo(f"Benching zoo: {zoo}")
+        typer.echo("-" * 80)
+        zoo_results = bench_zoo(zoo_enum, frame, lookback=lookback)
+        results["zoo"] = zoo_results
+
+        if not json_output and "aggregate" in zoo_results:
+            agg = zoo_results["aggregate"]
+            typer.echo(f"\nAggregate Statistics:")
+            typer.echo(f"  Factors: {agg['n_factors']}")
+            typer.echo(f"  Avg IC Mean: {agg['avg_ic_mean']:.4f}")
+            typer.echo(f"  Avg IC IR: {agg['avg_ic_ir']:.4f}")
+            typer.echo(f"  Avg IC+ Ratio: {agg['avg_ic_positive_ratio']:.1%}")
+            typer.echo(f"  Best IC IR: {agg['best_ic_ir']:.4f}")
+            typer.echo(f"  Worst IC IR: {agg['worst_ic_ir']:.4f}")
+
+            if zoo_results.get("factors"):
+                typer.echo(f"\n{'Factor':<40} {'IC IR':>8} {'IC Mean':>10} {'IC+ %':>8} {'Category':<20} {'Status':<10}")
+                typer.echo("-" * 100)
+                for f in zoo_results["factors"]:
+                    typer.echo(
+                        f"{f['factor_name']:<40} {f['ic_ir']:>8.4f} "
+                        f"{f['ic_mean']:>10.4f} {f['ic_positive_ratio']:>7.1%} "
+                        f"{f['category']:<20} {f['categorization']:<10}"
+                    )
+
+    else:
+        # Bench all zoos
+        typer.echo("Benching all factor zoos:")
+        typer.echo("-" * 80)
+        for zoo_name in AlphaZoo:
+            typer.echo(f"\n--- {zoo_name.value.upper()} ---")
+            zoo_results = bench_zoo(zoo_name, frame, lookback=lookback)
+            results[f"zoo_{zoo_name.value}"] = zoo_results
+
+            if not json_output and "aggregate" in zoo_results:
+                agg = zoo_results["aggregate"]
+                typer.echo(f"  Factors: {agg['n_factors']}, Avg IC IR: {agg['avg_ic_ir']:.4f}")
+                for f in zoo_results.get("factors", [])[:5]:
+                    typer.echo(
+                        f"    {f['factor_name']:<35} IC IR: {f['ic_ir']:>7.4f}  ({f['categorization']})"
+                    )
+
+    if strict:
+        # Run strict benching on top factors
+        typer.echo("\n\nStrict Benching (OOS + Random Control):")
+        typer.echo("=" * 80)
+        if parsed_compare:
+            for name in parsed_compare[:5]:
+                factor = AlphaFactorRegistry.get(name)
+                if factor:
+                    strict_result = bench_strict(factor, frame, lookback=lookback)
+                    results[f"strict_{name}"] = strict_result
+
+                    if not json_output:
+                        typer.echo(f"\n{factor}:")
+                        is_result = strict_result.get("in_sample", {})
+                        oos_result = strict_result.get("out_of_sample", {})
+                        overfit = strict_result.get("overfitting_check", {})
+                        typer.echo(f"  In-Sample IC IR: {is_result.get('ic_ir', 0):.4f}")
+                        typer.echo(f"  Out-of-Sample IC IR: {oos_result.get('ic_ir', 0):.4f}")
+                        typer.echo(f"  Overfitting: {overfit.get('verdict', 'N/A')} ({overfit.get('degradation_pct', 0):.1f}% degradation)")
+        else:
+            # Bench top factor from each zoo
+            for zoo_name in AlphaZoo:
+                factors = AlphaFactorRegistry.get_by_zoo(zoo_name)
+                if factors:
+                    factor = factors[0]
+                    strict_result = bench_strict(factor, frame, lookback=lookback)
+                    results[f"strict_{zoo_name.value}"] = strict_result
+
+                    if not json_output:
+                        typer.echo(f"\n{factor.zoo.value.upper()} - {factor}:")
+                        is_result = strict_result.get("in_sample", {})
+                        oos_result = strict_result.get("out_of_sample", {})
+                        overfit = strict_result.get("overfitting_check", {})
+                        typer.echo(f"  In-Sample IC IR: {is_result.get('ic_ir', 0):.4f}")
+                        typer.echo(f"  Out-of-Sample IC IR: {oos_result.get('ic_ir', 0):.4f}")
+                        typer.echo(f"  Overfitting: {overfit.get('verdict', 'N/A')} ({overfit.get('degradation_pct', 0):.1f}% degradation)")
+
+    if json_output:
+        typer.echo(json_module.dumps(results, default=str, indent=2))
+
+
+@app.command()
+def research_autopilot(
+    ctx: typer.Context,
+    action: str = typer.Option(
+        "run",
+        "--action",
+        help="Action: create, run, stats, cycles, or bench-to-hypothesis.",
+    ),
+    title: str = typer.Option(
+        "",
+        "--title",
+        help="Hypothesis title (required for create).",
+    ),
+    description: str = typer.Option(
+        "",
+        "--description",
+        help="Hypothesis description (required for create).",
+    ),
+    category: str = typer.Option(
+        "custom",
+        "--category",
+        help="Hypothesis category: factor_tweak, parameter_optimization, regime_dependent, cross_asset, risk_management, entry_exit, position_sizing, custom.",
+    ),
+    symbols: list[str] = typer.Option(
+        [],
+        "--symbols",
+        help="Symbols to test.",
+    ),
+    start_date: str = typer.Option(
+        "2024-01-01",
+        "--start",
+        help="Backtest start date.",
+    ),
+    end_date: str = typer.Option(
+        "2025-06-01",
+        "--end",
+        help="Backtest end date.",
+    ),
+    max_cycles: int = typer.Option(
+        10,
+        "--max-cycles",
+        help="Maximum research cycles to run.",
+    ),
+    benching_results: str = typer.Option(
+        "",
+        "--benching",
+        help="JSON string of benching results for auto-generating hypotheses.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output results as JSON.",
+    ),
+) -> None:
+    """Research autopilot: hypothesis → backtest → evaluate → learn loop."""
+    import json as json_module
+
+    from trading_bot.research.engine import ResearchEngine
+    from trading_bot.research.models import (
+        HypothesisCategory,
+        HypothesisStatus,
+    )
+    from trading_bot.research.store import ResearchStore
+
+    store = ResearchStore()
+    engine = ResearchEngine(store)
+    results: dict[str, Any] = {}
+
+    if action == "create":
+        if not title or not description:
+            typer.echo("Error: --title and --description required for create")
+            return
+
+        try:
+            cat = HypothesisCategory(category)
+        except ValueError:
+            typer.echo(f"Invalid category: {category}")
+            return
+
+        parsed_symbols = _parse_symbols(symbols) if symbols else []
+        hypothesis = engine.create_hypothesis(
+            title=title,
+            description=description,
+            category=cat,
+            parameters={
+                "symbols": parsed_symbols,
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+        )
+        results["hypothesis"] = {
+            "id": hypothesis.id,
+            "title": hypothesis.title,
+            "status": hypothesis.status.value,
+            "category": hypothesis.category.value,
+        }
+        typer.echo(f"Created hypothesis: {hypothesis.id}")
+        typer.echo(f"  Title: {hypothesis.title}")
+        typer.echo(f"  Description: {hypothesis.description}")
+        typer.echo(f"  Category: {hypothesis.category.value}")
+        typer.echo(f"  Status: {hypothesis.status.value}")
+
+    elif action == "run":
+        pending = store.list_hypotheses(
+            status=HypothesisStatus.PENDING, limit=max_cycles
+        )
+        if not pending:
+            typer.echo("No pending hypotheses to run.")
+            return
+
+        typer.echo(f"Running {len(pending)} pending hypothesis(es)...")
+
+        def _backtest_fn(hyp: Any) -> dict[str, Any]:
+            params = hyp.parameters
+            syms = _parse_symbols(params.get("symbols", []))
+            if not syms:
+                return {
+                    "total_return": 0.0,
+                    "win_rate": 0.0,
+                    "sharpe_ratio": 0.0,
+                    "max_drawdown": 0.0,
+                    "total_trades": 0,
+                    "profit_factor": 0.0,
+                    "avg_trade_pnl": 0.0,
+                }
+            from trading_bot.backtest.runner import run_backtest
+            bt_result = run_backtest(syms, params.get("start_date", start_date), params.get("end_date", end_date), ctx.obj)
+            return {
+                "total_return": bt_result.get("total_return", 0.0),
+                "win_rate": bt_result.get("win_rate", 0.0),
+                "sharpe_ratio": bt_result.get("sharpe_ratio", 0.0),
+                "max_drawdown": bt_result.get("max_drawdown", 0.0),
+                "total_trades": bt_result.get("total_trades", 0),
+                "profit_factor": bt_result.get("profit_factor", 0.0),
+                "avg_trade_pnl": bt_result.get("avg_trade_pnl", 0.0),
+                "metrics": bt_result,
+            }
+
+        cycles = engine.run_pending_hypotheses(_backtest_fn, max_cycles=max_cycles)
+        results["cycles"] = []
+        for cycle in cycles:
+            cycle_data = {
+                "cycle_id": cycle.cycle_id,
+                "hypothesis": cycle.hypothesis.title if cycle.hypothesis else None,
+                "status": cycle.hypothesis.status.value if cycle.hypothesis else None,
+                "evaluation": cycle.evaluation,
+            }
+            if cycle.experiment_result:
+                cycle_data["experiment"] = {
+                    "win_rate": cycle.experiment_result.win_rate,
+                    "sharpe_ratio": cycle.experiment_result.sharpe_ratio,
+                    "max_drawdown": cycle.experiment_result.max_drawdown,
+                    "total_trades": cycle.experiment_result.total_trades,
+                }
+            results["cycles"].append(cycle_data)
+
+        typer.echo(f"\nCompleted {len(cycles)} cycle(s):")
+        for cycle in cycles:
+            status = cycle.hypothesis.status.value if cycle.hypothesis else "unknown"
+            typer.echo(f"  {cycle.hypothesis.title if cycle.hypothesis else 'N/A'} -> {status}")
+            typer.echo(f"    {cycle.evaluation}")
+
+    elif action == "stats":
+        stats = engine.get_stats()
+        results["stats"] = stats
+        if json_output:
+            typer.echo(json_module.dumps(results, default=str, indent=2))
+        else:
+            typer.echo("Research Statistics:")
+            typer.echo(f"  Total hypotheses: {stats.get('total_hypotheses', 0)}")
+            typer.echo(f"  Pending: {stats.get('pending_count', 0)}")
+            typer.echo(f"  Running: {stats.get('running_count', 0)}")
+            typer.echo(f"  Passed: {stats.get('passed_count', 0)}")
+            typer.echo(f"  Failed: {stats.get('failed_count', 0)}")
+            typer.echo(f"  Inconclusive: {stats.get('inconclusive_count', 0)}")
+            typer.echo(f"  Total experiments: {stats.get('total_experiments', 0)}")
+            typer.echo(f"  Total cycles: {stats.get('total_cycles', 0)}")
+            typer.echo(f"  Avg win rate: {stats.get('avg_win_rate', 0):.1%}")
+            typer.echo(f"  Avg Sharpe: {stats.get('avg_sharpe_ratio', 0):.2f}")
+
+    elif action == "cycles":
+        cycles = engine.list_cycles(limit=max_cycles)
+        results["cycles"] = []
+        for cycle in cycles:
+            cycle_data = {
+                "cycle_id": cycle.cycle_id,
+                "hypothesis": cycle.hypothesis.title if cycle.hypothesis else None,
+                "status": cycle.hypothesis.status.value if cycle.hypothesis else None,
+                "evaluation": cycle.evaluation,
+                "completed_at": cycle.completed_at.isoformat(),
+            }
+            if cycle.experiment_result:
+                cycle_data["experiment"] = {
+                    "win_rate": cycle.experiment_result.win_rate,
+                    "sharpe_ratio": cycle.experiment_result.sharpe_ratio,
+                    "max_drawdown": cycle.experiment_result.max_drawdown,
+                    "total_trades": cycle.experiment_result.total_trades,
+                }
+            results["cycles"].append(cycle_data)
+
+        if json_output:
+            typer.echo(json_module.dumps(results, default=str, indent=2))
+        else:
+            typer.echo(f"Recent research cycles ({len(cycles)}):")
+            for cycle in cycles:
+                status = cycle.hypothesis.status.value if cycle.hypothesis else "unknown"
+                typer.echo(f"  {cycle.cycle_id}: {cycle.hypothesis.title if cycle.hypothesis else 'N/A'} -> {status}")
+
+    elif action == "bench-to-hypothesis":
+        if not benching_results:
+            typer.echo("Error: --benching JSON string required")
+            return
+
+        try:
+            bench_data = json_module.loads(benching_results)
+        except json_module.JSONDecodeError:
+            typer.echo("Error: invalid JSON for --benching")
+            return
+
+        hypotheses = engine.auto_generate_hypotheses_from_benching(bench_data)
+        results["hypotheses"] = [
+            {
+                "id": h.id,
+                "title": h.title,
+                "category": h.category.value,
+                "status": h.status.value,
+            }
+            for h in hypotheses
+        ]
+        typer.echo(f"Generated {len(hypotheses)} hypotheses from benching results:")
+        for h in hypotheses:
+            typer.echo(f"  {h.id}: {h.title} ({h.category.value})")
+
+    else:
+        typer.echo(f"Unknown action: {action}. Use: create, run, stats, cycles, bench-to-hypothesis")
+
+    if json_output and action not in ("stats", "cycles"):
+        typer.echo(json_module.dumps(results, default=str, indent=2))
+
+
+@app.command()
+def memory(
+    ctx: typer.Context,
+    action: str = typer.Option(
+        "store",
+        "--action",
+        help="Action: store, recall, search, stats, list, or clear.",
+    ),
+    title: str = typer.Option(
+        "",
+        "--title",
+        help="Memory title (required for store).",
+    ),
+    content: str = typer.Option(
+        "",
+        "--content",
+        help="Memory content (required for store).",
+    ),
+    memory_type: str = typer.Option(
+        "custom",
+        "--type",
+        help="Memory type: research_finding, hypothesis_result, trading_insight, pattern_recognition, parameter_tuning, risk_observation, custom.",
+    ),
+    search: str = typer.Option(
+        "",
+        "--search",
+        help="Search text for recall or search actions.",
+    ),
+    tags: str = typer.Option(
+        "",
+        "--tags",
+        help="Comma-separated tags for filtering.",
+    ),
+    symbols: str = typer.Option(
+        "",
+        "--symbols",
+        help="Comma-separated symbols for context.",
+    ),
+    max_results: int = typer.Option(
+        10,
+        "--max-results",
+        help="Maximum results to return.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output results as JSON.",
+    ),
+) -> None:
+    """Persistent memory: store, recall, and search trading insights."""
+    import json as json_module
+
+    from trading_bot.memory.models import MemoryType
+    from trading_bot.memory.retriever import MemoryRetriever
+    from trading_bot.memory.store import MemoryStore
+
+    store = MemoryStore()
+    retriever = MemoryRetriever(store)
+    results: dict[str, Any] = {}
+
+    if action == "store":
+        if not title or not content:
+            typer.echo("Error: --title and --content required for store")
+            return
+
+        try:
+            mtype = MemoryType(memory_type)
+        except ValueError:
+            typer.echo(f"Invalid type: {memory_type}")
+            return
+
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+        symbol_list = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else []
+
+        if mtype == MemoryType.TRADING_INSIGHT:
+            memory_entry = retriever.store_trading_insight(
+                title=title,
+                content=content,
+                symbols=symbol_list,
+                tags=tag_list,
+            )
+        else:
+            from trading_bot.memory.models import MemoryEntry
+            entry = MemoryEntry(
+                memory_type=mtype,
+                title=title,
+                content=content,
+                tags=tag_list,
+            )
+            row_id = store.save_memory(entry)
+            entry.id = row_id
+            memory_entry = entry
+
+        results["memory"] = {
+            "id": memory_entry.id,
+            "title": memory_entry.title,
+            "type": memory_entry.memory_type.value,
+            "relevance": memory_entry.relevance_score,
+        }
+        typer.echo(f"Stored memory: {memory_entry.id}")
+        typer.echo(f"  Title: {memory_entry.title}")
+        typer.echo(f"  Type: {memory_entry.memory_type.value}")
+        typer.echo(f"  Relevance: {memory_entry.relevance_score:.2f}")
+
+    elif action == "recall":
+        symbol_list = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else []
+        memories = retriever.recall_for_context(
+            context=search,
+            symbols=symbol_list if symbol_list else None,
+            max_results=max_results,
+        )
+        results["memories"] = [
+            {
+                "id": m.id,
+                "title": m.title,
+                "type": m.memory_type.value,
+                "relevance": m.relevance_score,
+                "content": m.content[:200],
+                "tags": m.tags,
+            }
+            for m in memories
+        ]
+        typer.echo(f"Recalled {len(memories)} memory(ies):")
+        for m in memories:
+            typer.echo(f"  [{m.memory_type.value}] {m.title} (relevance: {m.relevance_score:.2f})")
+
+    elif action == "search":
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+        query_type = MemoryType(memory_type) if memory_type != "custom" else None
+
+        from trading_bot.memory.models import MemoryQuery
+        query = MemoryQuery(
+            search_text=search,
+            memory_type=query_type,
+            tags=tag_list,
+            limit=max_results,
+            sort_by="relevance",
+        )
+        memories = store.query_memories(query)
+        results["memories"] = [
+            {
+                "id": m.id,
+                "title": m.title,
+                "type": m.memory_type.value,
+                "relevance": m.relevance_score,
+                "content": m.content[:200],
+                "tags": m.tags,
+            }
+            for m in memories
+        ]
+        typer.echo(f"Found {len(memories)} memory(ies):")
+        for m in memories:
+            typer.echo(f"  [{m.memory_type.value}] {m.title} (relevance: {m.relevance_score:.2f})")
+
+    elif action == "stats":
+        stats = retriever.get_stats()
+        results["stats"] = {
+            "total_memories": stats.total_memories,
+            "by_type": stats.by_type,
+            "recent_7d": stats.recent_count_7d,
+            "recent_30d": stats.recent_count_30d,
+            "avg_relevance": stats.avg_relevance,
+            "tag_count": stats.tag_count,
+        }
+        if json_output:
+            typer.echo(json_module.dumps(results, default=str, indent=2))
+        else:
+            typer.echo("Memory Statistics:")
+            typer.echo(f"  Total memories: {stats.total_memories}")
+            typer.echo(f"  By type: {json_module.dumps(stats.by_type)}")
+            typer.echo(f"  Recent (7d): {stats.recent_count_7d}")
+            typer.echo(f"  Recent (30d): {stats.recent_count_30d}")
+            typer.echo(f"  Avg relevance: {stats.avg_relevance:.2f}")
+            typer.echo(f"  Unique tags: {stats.tag_count}")
+
+    elif action == "list":
+        query_type = MemoryType(memory_type) if memory_type != "custom" else None
+        memories = retriever.list_memories(memory_type=query_type, limit=max_results)
+        results["memories"] = [
+            {
+                "id": m.id,
+                "title": m.title,
+                "type": m.memory_type.value,
+                "relevance": m.relevance_score,
+                "created_at": m.created_at.isoformat(),
+            }
+            for m in memories
+        ]
+        if json_output:
+            typer.echo(json_module.dumps(results, default=str, indent=2))
+        else:
+            typer.echo(f"Recent memories ({len(memories)}):")
+            for m in memories:
+                typer.echo(f"  [{m.memory_type.value}] {m.title} ({m.created_at.strftime('%Y-%m-%d')})")
+
+    elif action == "clear":
+        count = store.clear_all()
+        typer.echo(f"Cleared {count} memory(ies).")
+        results["cleared"] = count
+
+    else:
+        typer.echo(f"Unknown action: {action}. Use: store, recall, search, stats, list, clear")
+
+    if json_output and action not in ("stats",):
+        typer.echo(json_module.dumps(results, default=str, indent=2))
+
+
+@app.command()
+def bench_weights(
+    ctx: typer.Context,
+    action: str = typer.Option(
+        "update",
+        "--action",
+        help="Action: update, show, set, or reset.",
+    ),
+    benching_results: str = typer.Option(
+        "",
+        "--benching",
+        help="JSON string of benching results for updating weights.",
+    ),
+    factor_name: str = typer.Option(
+        "",
+        "--factor",
+        help="Factor name (required for set action).",
+    ),
+    weight: float = typer.Option(
+        0.0,
+        "--weight",
+        help="Weight value (required for set action).",
+    ),
+    min_ic_ir: float = typer.Option(
+        0.1,
+        "--min-ic-ir",
+        help="Minimum IC IR to consider a factor viable.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output results as JSON.",
+    ),
+) -> None:
+    """Manage alpha factor benching weights for persistent scanner scoring."""
+    import json as json_module
+
+    from trading_bot.research.benching_weights import BenchingWeightsManager
+
+    manager = BenchingWeightsManager()
+    results: dict[str, Any] = {}
+
+    if action == "update":
+        if not benching_results:
+            typer.echo("Error: --benching JSON string required")
+            return
+
+        try:
+            bench_data = json_module.loads(benching_results)
+        except json_module.JSONDecodeError:
+            typer.echo("Error: invalid JSON for --benching")
+            return
+
+        updated = manager.update_from_benching(bench_data, min_ic_ir=min_ic_ir)
+        stats = manager.get_stats()
+        results["updated"] = updated
+        results["stats"] = stats
+        typer.echo(f"Updated {updated} benching weight(s)")
+        typer.echo(f"  Total factors: {stats['total_factors']}")
+        typer.echo(f"  Avg weight: {stats['avg_weight']:.4f}")
+        typer.echo(f"  Max weight: {stats['max_weight']:.4f}")
+
+    elif action == "show":
+        stats = manager.get_stats()
+        results["stats"] = stats
+        if json_output:
+            typer.echo(json_module.dumps(results, default=str, indent=2))
+        else:
+            typer.echo("Benching Weights:")
+            typer.echo(f"  Total factors: {stats['total_factors']}")
+            typer.echo(f"  Avg weight: {stats['avg_weight']:.4f}")
+            typer.echo(f"  Max weight: {stats['max_weight']:.4f}")
+            typer.echo(f"  Min weight: {stats['min_weight']:.4f}")
+            if stats.get("weights"):
+                typer.echo(f"\n{'Factor':<40} {'Weight':>8}")
+                typer.echo("-" * 50)
+                for name, w in stats["weights"].items():
+                    typer.echo(f"{name:<40} {w:>8.4f}")
+
+    elif action == "set":
+        if not factor_name:
+            typer.echo("Error: --factor required for set action")
+            return
+        manager.set_weight(factor_name, weight)
+        typer.echo(f"Set weight for {factor_name}: {weight:.4f}")
+        results["factor"] = factor_name
+        results["weight"] = weight
+
+    elif action == "reset":
+        manager.reset()
+        typer.echo("Reset all benching weights")
+        results["reset"] = True
+
+    else:
+        typer.echo(f"Unknown action: {action}. Use: update, show, set, reset")
+
+    if json_output and action not in ("show",):
+        typer.echo(json_module.dumps(results, default=str, indent=2))
+
+
+@app.command(name="rl-compare")
+def rl_compare(
+    ctx: typer.Context,
+    symbols: list[str] = typer.Option(
+        None,
+        "--symbols",
+        help="Symbols to compare models on. Defaults to all trained symbols.",
+    ),
+    model_path: str | None = typer.Option(
+        None,
+        "--model-path",
+        help="Primary RL model path (used as fallback for V3 comparison).",
+    ),
+    start: str | None = typer.Option(
+        None,
+        "--start",
+        help="Inclusive start date in YYYY-MM-DD format.",
+    ),
+    end: str | None = typer.Option(
+        None,
+        "--end",
+        help="Inclusive end date in YYYY-MM-DD format.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output results as JSON.",
+    ),
+) -> None:
+    """Compare multiple RL models using ensemble inference.
+
+    Discovers all PPO models in state/rl_logs, runs parallel backtests,
+    and shows side-by-side comparison with V2.5/V3 baselines.
+    """
+    import json as json_module
+
+    from trading_bot.rl.ensemble import discover_rl_models, RLEnsemble
+    from trading_bot.backtest.runner import run_strategy_comparison
+    from trading_bot.data import market_data
+
+    parsed_symbols = _parse_symbols(symbols) if symbols else []
+    settings = ctx.obj
+    rl_dir = settings.rl.model_dir if hasattr(settings.rl, "model_dir") else "state/rl_logs"
+
+    models = discover_rl_models(rl_dir)
+    if not models:
+        typer.echo("No RL models found in rl_dir. Train a model first with rl-train.")
+        raise typer.Exit(code=1)
+
+    typer.echo("RL MODEL COMPARISON")
+    typer.echo("=" * 70)
+    typer.echo(f"Discovered {len(models)} model(s):")
+    for m in models:
+        typer.echo(f"  - {m}")
+
+    # Load ensemble
+    ensemble = RLEnsemble(models)
+    loaded = ensemble.load()
+    typer.echo(f"Loaded {len(loaded)}/{len(models)} models")
+    if not loaded:
+        typer.echo("No models could be loaded. Check model files.")
+        raise typer.Exit(code=1)
+
+    # Resolve symbols
+    if not parsed_symbols:
+        all_symbols: set[str] = set()
+        for path in models:
+            from trading_bot.rl.utils import rl_model_symbols
+            meta_symbols = rl_model_symbols(path) or []
+            all_symbols.update(s.upper() for s in meta_symbols)
+        parsed_symbols = sorted(all_symbols) if all_symbols else ["AAPL"]
+    typer.echo(f"Symbols: {','.join(parsed_symbols)}")
+    typer.echo("")
+
+    # Run backtest comparison
+    strategies = ["v2.5", "v3"]
+    for model_path_str in models:
+        model_name = Path(model_path_str).name
+        try:
+            result = run_strategy_comparison(
+                parsed_symbols,
+                settings,
+                start=start,
+                end=end,
+                strategies=["rl"],
+                model_path=model_path_str,
+            )
+            strategies.append(model_name)
+        except Exception as e:
+            typer.echo(f"  Warning: backtest failed for {model_name}: {e}")
+
+    try:
+        comparison = run_strategy_comparison(
+            parsed_symbols,
+            settings,
+            start=start,
+            end=end,
+            strategies=strategies,
+            model_path=models[0] if models else None,
+        )
+    except ValueError as exc:
+        typer.echo(f"Market data unavailable: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if json_output:
+        typer.echo(json_module.dumps(comparison, default=str, indent=2))
+    else:
+        typer.echo("STRATEGY COMPARISON")
+        typer.echo("=" * 70)
+        for strat, result in comparison["results"].items():
+            typer.echo(f"\n{strat.upper()}:")
+            typer.echo(f"  trades={result['trades']} wins={result['wins']} losses={result['losses']}")
+            typer.echo(f"  win_rate={result['win_rate']:.2f} net_pnl={result['net_pnl']:.2f}")
+            typer.echo(f"  {_format_backtest_diagnostics(result)}")
+        typer.echo(f"\nBest P&L: {comparison['best_pnl_strategy']}")
+        typer.echo(f"Best Win Rate: {comparison['best_winrate_strategy']}")
+
+        # Ensemble summary
+        typer.echo(f"\nENSEMBLE: {ensemble.model_count} models loaded")
+        typer.echo(f"  Models: {', '.join(ensemble.model_names)}")
+
+
+@app.command(name="rl-retrain")
+def rl_retrain(
+    ctx: typer.Context,
+    symbols: str = typer.Option(
+        "",
+        "--symbols",
+        help="Comma-separated symbols to retrain on. If empty, discovers from scanner.",
+    ),
+    train_symbols: str = typer.Option(
+        "",
+        "--train-symbols",
+        help="Existing trained symbols to keep. If empty, uses symbols above.",
+    ),
+    agent: str = typer.Option(
+        "PPO",
+        "--agent",
+        help="DRL agent type (PPO, A2C, DQN).",
+    ),
+    timesteps: int = typer.Option(
+        50000,
+        "--timesteps",
+        help="Total training timesteps.",
+    ),
+    episodes: int = typer.Option(
+        100,
+        "--episodes",
+        help="Number of training episodes.",
+    ),
+    learning_rate: float = typer.Option(
+        3e-4,
+        "--learning-rate",
+        help="Learning rate.",
+    ),
+    seed: int | None = typer.Option(
+        None,
+        "--seed",
+        help="Random seed for reproducible training.",
+    ),
+    output_dir: str = typer.Option(
+        "state/rl_logs",
+        "--output-dir",
+        help="Output directory for trained model.",
+    ),
+    discover: bool = typer.Option(
+        False,
+        "--discover",
+        help="Auto-discover untrained symbols from scanner before training.",
+    ),
+    max_symbols: int | None = typer.Option(
+        None,
+        "--max-symbols",
+        help="Fixed observation symbol capacity. Increases input layer size.",
+    ),
+    verbose: int = typer.Option(
+        1,
+        "--verbose",
+        help="Verbosity level (0=quiet, 1=normal, 2=debug).",
+    ),
+) -> None:
+    """Discover untrained symbols and retrain RL model.
+
+    With --discover: runs a quick scan, identifies symbols not covered by
+    any existing model, and trains a new model covering all symbols.
+
+    Without --discover: uses --symbols directly for training.
+    """
+    import sys
+    import os
+
+    # Discover mode: run scanner to find untrained symbols
+    discovered_symbols: list[str] = []
+    if discover:
+        typer.echo("Discovering untrained symbols from scanner...")
+        from trading_bot.rl.ensemble import discover_rl_models, load_discovered_symbols
+        from trading_bot.rl.utils import rl_model_symbols
+
+        rl_dir = output_dir
+        existing_models = discover_rl_models(rl_dir)
+        all_trained: set[str] = set()
+        for model_path in existing_models:
+            meta_symbols = rl_model_symbols(model_path) or []
+            all_trained.update(s.upper() for s in meta_symbols)
+        typer.echo(f"  Existing models cover: {','.join(sorted(all_trained)) if all_trained else 'none'}")
+
+        # Run a quick scan to find candidates
+        try:
+            from trading_bot.runtime.orchestrator import run_scan
+            # Scan a broad universe
+            universe_candidates = ["SPY", "QQQ", "IWM", "DIA"]
+            # Add sector ETFs
+            sector_etfs = ["XLF", "XLK", "XLE", "XLV", "XLI", "XLP", "XLU", "XLRE", "GLD", "TLT"]
+            scan_symbols = universe_candidates + sector_etfs
+
+            scan_result = run_scan(scan_symbols, ctx.obj, include_details=False)
+            approved = [
+                row["ticker"].upper()
+                for row in scan_result.get("candidates", [])
+                if row.get("status") == "APPROVED" and row.get("quality") == "GREEN"
+            ]
+            untrained = [s for s in approved if s not in all_trained]
+            discovered_symbols = untrained if untrained else approved
+            typer.echo(f"  Approved candidates: {','.join(approved) if approved else 'none'}")
+            typer.echo(f"  Untrained: {','.join(discovered_symbols) if discovered_symbols else 'none'}")
+        except Exception as e:
+            typer.echo(f"  Warning: discovery scan failed: {e}")
+            typer.echo("  Falling back to default symbols.")
+            discovered_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA"]
+
+    # Resolve symbols
+    if discovered_symbols:
+        symbols = ",".join(discovered_symbols)
+    elif not train_symbols and not symbols:
+        symbols = "AAPL"
+
+    # Build argv for train_rl.py
+    argv = [
+        "train_rl.py",
+        "--symbols", symbols or "AAPL",
+        "--agent", agent,
+        "--timesteps", str(timesteps),
+        "--episodes", str(episodes),
+        "--learning-rate", str(learning_rate),
+        "--output-dir", output_dir,
+        "--verbose", str(verbose),
+    ]
+    if seed is not None:
+        argv.extend(["--seed", str(seed)])
+    if max_symbols is not None:
+        argv.extend(["--max-symbols", str(max_symbols)])
+    if train_symbols:
+        argv.extend(["--train-symbols", train_symbols])
+
+    sys.argv = argv
+    os.environ.setdefault("CONFIG_PATH", str(ctx.obj.app.config_path) if hasattr(ctx.obj.app, "config_path") and ctx.obj.app.config_path else "config.yaml")
+
+    from scripts.train_rl import main as train_main
+    exit_code = train_main()
+    if exit_code == 0 and discovered_symbols:
+        from trading_bot.rl.ensemble import save_discovered_symbols
+        save_discovered_symbols(discovered_symbols)
+        typer.echo(f"\nSaved discovered symbols to state/rl_logs/discovered_symbols.txt")
+    raise typer.Exit(code=exit_code)
+
+
+@app.command(name="rl-update-model")
+def rl_update_model(
+    ctx: typer.Context,
+    model_path: str = typer.Option(
+        ...,
+        "--model-path",
+        help="Path to the trained model .zip file.",
+    ),
+    config_path: str | None = typer.Option(
+        None,
+        "--config-path",
+        help="Override config path for updating model_path.",
+    ),
+) -> None:
+    """Update the active RL model path in the config file.
+
+    Writes the model path into the config so that scanner/paper-trade
+    use the specified model for RL signals.
+    """
+    from pathlib import Path as _Path
+    import yaml
+
+    resolved_path = _Path(model_path)
+    if not resolved_path.exists():
+        typer.echo(f"Model file not found: {resolved_path}")
+        raise typer.Exit(code=1)
+
+    # Determine config path
+    config_file = config_path
+    if config_file is None:
+        config_file = ctx.obj.app.config_path if hasattr(ctx.obj.app, "config_path") else "config.yaml"
+
+    config_file = _Path(config_file)
+    if not config_file.exists():
+        typer.echo(f"Config file not found: {config_file}")
+        raise typer.Exit(code=1)
+
+    try:
+        config = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as e:
+        typer.echo(f"Failed to parse config: {e}")
+        raise typer.Exit(code=1) from e
+
+    # Ensure rl section exists
+    if "rl" not in config:
+        config["rl"] = {}
+    config["rl"]["model_path"] = str(resolved_path)
+
+    config_file.write_text(yaml.dump(config, default_flow_style=False), encoding="utf-8")
+    typer.echo(f"Updated model_path in {config_file}: {resolved_path}")
+    typer.echo(f"  Set rl.model_path = {resolved_path}")
+
+
+@app.command(name="supermodel")
+def supermodel(
+    ctx: typer.Context,
+    symbols: str = typer.Option(
+        "",
+        "--symbols",
+        help="Comma-separated symbols to train. If empty, discovers from burn-in.",
+    ),
+    epochs: int = typer.Option(
+        100,
+        "--epochs",
+        help="Number of training episodes (default: 100).",
+    ),
+    timesteps: int = typer.Option(
+        50000,
+        "--timesteps",
+        help="Total training timesteps (default: 50000).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Preview what would happen without training.",
+    ),
+    db_path: str = typer.Option(
+        "state/burn_in.db",
+        "--db-path",
+        help="Path to burn-in database (default: state/burn_in.db).",
+    ),
+    rl_dir: str = typer.Option(
+        "state/rl_logs",
+        "--rl-dir",
+        help="RL models directory (default: state/rl_logs).",
+    ),
+    output_dir: str = typer.Option(
+        "state/rl_logs/supermodel",
+        "--output-dir",
+        help="Output directory for supermodel ensemble (default: state/rl_logs/supermodel).",
+    ),
+) -> None:
+    """Run daily supermodel retraining pipeline.
+
+    Collects live burn-in data, retrains RL models, and builds an ensemble
+    of the best-performing models for daily inference.
+
+    Steps:
+      1. Load burn-in statistics from database
+      2. Discover training symbols from burn-in data
+      3. Evaluate existing models
+      4. Train new supermodel
+      5. Build ensemble of all models
+    """
+    import subprocess
+    import sys
+
+    try:
+        script_path = _repo_script_path("daily_supermodel.py")
+    except FileNotFoundError as exc:
+        typer.echo(f"Supermodel pipeline script not found: {exc}")
+        raise typer.Exit(code=1)
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--db-path", db_path,
+        "--rl-dir", rl_dir,
+        "--output-dir", output_dir,
+        "--epochs", str(epochs),
+        "--timesteps", str(timesteps),
+    ]
+
+    if dry_run:
+        cmd.append("--dry-run")
+
+    if symbols:
+        cmd.extend(["--symbols", symbols])
+
+    typer.echo("DAILY SUPERMODEL PIPELINE")
+    typer.echo("=" * 60)
+    typer.echo(f"  DB: {db_path}")
+    typer.echo(f"  RL Dir: {rl_dir}")
+    typer.echo(f"  Output: {output_dir}")
+    typer.echo(f"  Epochs: {epochs}")
+    typer.echo(f"  Timesteps: {timesteps}")
+    if dry_run:
+        typer.echo("  Mode: DRY RUN")
+    if symbols:
+        typer.echo(f"  Symbols: {symbols}")
+    typer.echo("")
+    typer.echo("Running pipeline...")
+    typer.echo("-" * 60)
+
+    result = subprocess.run(cmd, capture_output=False)
+
+    if result.returncode == 0:
+        typer.echo("-" * 60)
+        typer.echo("Pipeline complete!")
+    else:
+        typer.echo("-" * 60)
+        typer.echo(f"Pipeline failed with exit code {result.returncode}")
+        raise typer.Exit(code=result.returncode)
+
+
+@app.command(name="live-data")
+def live_data(
+    ctx: typer.Context,
+    watch: bool = typer.Option(
+        False,
+        "--watch",
+        help="Continuously monitor for new trades",
+    ),
+    buffer: bool = typer.Option(
+        False,
+        "--buffer",
+        help="Show current replay buffer statistics",
+    ),
+    db_path: str = typer.Option(
+        "state/burn_in.db",
+        "--db-path",
+        help="Path to burn-in database (default: state/burn_in.db).",
+    ),
+    buffer_path: str = typer.Option(
+        "state/rl_logs/replay_buffer.jsonl",
+        "--buffer-path",
+        help="Path to replay buffer file (default: state/rl_logs/replay_buffer.jsonl).",
+    ),
+    interval: int = typer.Option(
+        300,
+        "--interval",
+        help="Watch interval in seconds (default: 300).",
+    ),
+) -> None:
+    """Collect live trade data for continual RL model training.
+
+    Monitors burn-in trades and collects market data + outcomes to build
+    a replay buffer for continual learning.
+
+    Modes:
+      - Default: Collect new trades once
+      - --watch: Continuously monitor for new trades
+      - --buffer: Show replay buffer statistics
+    """
+    import subprocess
+    import sys
+
+    try:
+        script_path = _repo_script_path("live_data_collector.py")
+    except FileNotFoundError as exc:
+        typer.echo(f"Live data collector script not found: {exc}")
+        raise typer.Exit(code=1)
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--db-path", db_path,
+        "--buffer-path", buffer_path,
+    ]
+
+    if watch:
+        cmd.append("--watch")
+        cmd.extend(["--interval", str(interval)])
+    elif buffer:
+        cmd.append("--buffer")
+
+    typer.echo("LIVE DATA COLLECTOR")
+    typer.echo("=" * 60)
+    typer.echo(f"  DB: {db_path}")
+    typer.echo(f"  Buffer: {buffer_path}")
+    if watch:
+        typer.echo(f"  Mode: WATCH (interval={interval}s)")
+    elif buffer:
+        typer.echo("  Mode: BUFFER STATS")
+    else:
+        typer.echo("  Mode: COLLECT ONCE")
+    typer.echo("")
+
+    result = subprocess.run(cmd, capture_output=False)
+
+    if result.returncode != 0:
+        raise typer.Exit(code=result.returncode)
+
+
+@app.command(name="cache-data")
+def cache_data(
+    ctx: typer.Context,
+    symbols: str = typer.Option(
+        "",
+        "--symbols",
+        help="Comma-separated symbols to cache (default: watchlist)",
+    ),
+    period: str = typer.Option(
+        "1y",
+        "--period",
+        help="Data period (default: 1y)",
+    ),
+    interval: str = typer.Option(
+        "1d",
+        "--interval",
+        help="Data interval (default: 1d)",
+    ),
+    watchlist_path: str = typer.Option(
+        "state/watchlist.txt",
+        "--watchlist-path",
+        help="Path to watchlist file (default: state/watchlist.txt)",
+    ),
+    output_dir: str = typer.Option(
+        "state/market_data_cache",
+        "--output-dir",
+        help="Directory to save cached data (default: state/market_data_cache)",
+    ),
+) -> None:
+    """Download and cache historical market data for watchlist symbols.
+
+    Pre-downloads data so RL training and backtesting can run without
+    network calls. Data is saved as CSV files in the output directory.
+    """
+    from pathlib import Path
+
+    from trading_bot.data import market_data
+    from trading_bot.runtime.watchlist import read_watchlist
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Resolve symbols
+    if symbols:
+        symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    else:
+        symbol_list = read_watchlist(watchlist_path)
+
+    if not symbol_list:
+        typer.echo("No symbols to cache.")
+        raise typer.Exit(code=1)
+
+    typer.echo("CACHE DATA")
+    typer.echo("=" * 60)
+    typer.echo(f"  Symbols: {len(symbol_list)}")
+    typer.echo(f"  Period:  {period}")
+    typer.echo(f"  Interval: {interval}")
+    typer.echo(f"  Output:  {output_path}")
+    typer.echo("")
+
+    success = 0
+    failed = 0
+
+    for ticker in symbol_list:
+        cache_file = output_path / f"{ticker}.csv"
+        if cache_file.exists():
+            typer.echo(f"  {ticker} SKIP (already cached)")
+            success += 1
+            continue
+
+        try:
+            typer.echo(f"  {ticker} downloading...", nl=False)
+            df = market_data.fetch_bars(
+                ticker,
+                period=period,
+                interval=interval,
+                settings=ctx.obj.market_data,
+            )
+
+            if df.empty:
+                typer.echo(f" FAILED (no data)")
+                failed += 1
+                continue
+
+            df.to_csv(cache_file)
+            typer.echo(f" OK ({len(df)} bars)")
+            success += 1
+
+        except Exception as e:
+            typer.echo(f" FAILED ({e})")
+            failed += 1
+
+    typer.echo("")
+    typer.echo(f"Done: {success} cached, {failed} failed")
+    typer.echo(f"Data saved to: {output_path}")
+
+
+@app.command(name="auto-retrain")
+def auto_retrain(
+    ctx: typer.Context,
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Preview what would happen without training",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Force retrain regardless of new symbols",
+    ),
+    universe_path: str = typer.Option(
+        "state/universe.txt",
+        "--universe-path",
+        help="Path to universe file (default: state/universe.txt).",
+    ),
+    watchlist_path: str = typer.Option(
+        "state/watchlist.txt",
+        "--watchlist-path",
+        help="Path to watchlist file (default: state/watchlist.txt).",
+    ),
+    rl_dir: str = typer.Option(
+        "state/rl_logs",
+        "--rl-dir",
+        help="RL models directory (default: state/rl_logs).",
+    ),
+    output_dir: str = typer.Option(
+        "state/rl_logs/supermodel",
+        "--output-dir",
+        help="Output directory for trained model (default: state/rl_logs/supermodel).",
+    ),
+    epochs: int = typer.Option(
+        100,
+        "--epochs",
+        help="Number of training episodes (default: 100).",
+    ),
+    timesteps: int = typer.Option(
+        50000,
+        "--timesteps",
+        help="Total timesteps to train (default: 50000).",
+    ),
+) -> None:
+    """Auto-retrain RL model when new symbols are detected.
+
+    Checks if new symbols have been added to the universe/watchlist that aren't
+    covered by any existing RL model, and triggers retraining if needed.
+
+    This ensures that any symbol added to the watchlist or universe can be
+    traded by the RL agent after a retrain cycle.
+    """
+    import subprocess
+    import sys
+
+    try:
+        script_path = _repo_script_path("auto_retrain_trigger.py")
+    except FileNotFoundError as exc:
+        typer.echo(f"Auto-retrain script not found: {exc}")
+        raise typer.Exit(code=1)
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--universe-path", universe_path,
+        "--watchlist-path", watchlist_path,
+        "--rl-dir", rl_dir,
+        "--output-dir", output_dir,
+        "--epochs", str(epochs),
+        "--timesteps", str(timesteps),
+    ]
+
+    if dry_run:
+        cmd.append("--dry-run")
+    if force:
+        cmd.append("--force")
+
+    typer.echo("AUTO-RETRAIN TRIGGER")
+    typer.echo("=" * 60)
+    typer.echo(f"  Universe: {universe_path}")
+    typer.echo(f"  Watchlist: {watchlist_path}")
+    typer.echo(f"  RL Dir: {rl_dir}")
+    typer.echo(f"  Output: {output_dir}")
+    typer.echo(f"  Epochs: {epochs}")
+    typer.echo(f"  Timesteps: {timesteps}")
+    if dry_run:
+        typer.echo("  Mode: DRY RUN")
+    if force:
+        typer.echo("  Mode: FORCE RETRAIN")
+    typer.echo("")
+    typer.echo("Checking for new symbols...")
+    typer.echo("-" * 60)
+
+    result = subprocess.run(cmd, capture_output=False)
+
+    if result.returncode == 0:
+        typer.echo("-" * 60)
+        typer.echo("Auto-retrain check complete!")
+    else:
+        typer.echo("-" * 60)
+        typer.echo(f"Auto-retrain failed with exit code {result.returncode}")
+        raise typer.Exit(code=result.returncode)

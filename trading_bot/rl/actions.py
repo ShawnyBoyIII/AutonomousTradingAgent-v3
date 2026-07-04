@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any
@@ -9,6 +10,8 @@ import numpy as np
 
 from trading_bot.execution.paper_broker import PaperBroker
 from trading_bot.models.order import OrderRequest
+
+logger = logging.getLogger(__name__)
 
 
 class ActionScheme(ABC):
@@ -90,8 +93,8 @@ class BSHActionScheme(ActionScheme):
         )
         try:
             self._broker.submit_order(order, price)
-        except ValueError:
-            pass
+        except ValueError as e:
+            logger.debug("Order skipped: %s", e)
 
     def _sell(self, symbol: str, price: float, quantity: int) -> None:
         if self._broker is None:
@@ -106,8 +109,8 @@ class BSHActionScheme(ActionScheme):
         )
         try:
             self._broker.submit_order(order, price)
-        except ValueError:
-            pass
+        except ValueError as e:
+            logger.debug("Order skipped: %s", e)
 
 
 class ProportionActionScheme(ActionScheme):
@@ -176,8 +179,8 @@ class ProportionActionScheme(ActionScheme):
         )
         try:
             self._broker.submit_order(order, price)
-        except ValueError:
-            pass
+        except ValueError as e:
+            logger.debug("Order skipped: %s", e)
 
     def _sell(self, symbol: str, price: float, quantity: int) -> None:
         if self._broker is None:
@@ -192,5 +195,5 @@ class ProportionActionScheme(ActionScheme):
         )
         try:
             self._broker.submit_order(order, price)
-        except ValueError:
-            pass
+        except ValueError as e:
+            logger.debug("Order skipped: %s", e)
