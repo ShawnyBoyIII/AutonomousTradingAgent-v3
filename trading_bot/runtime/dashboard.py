@@ -505,11 +505,11 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
         closed_positions = []
 
     kill_banner = (
-        '<div class="banner kill-active" id="kill-banner">KILL SWITCH ACTIVE - trading halted '
-        '<button class="btn" onclick="toggleKillSwitch(\'resume\')">Resume Trading</button></div>'
+        '<div class="banner kill-active" id="kill-banner" role="alert">KILL SWITCH ACTIVE - trading halted '
+        '<button class="btn" onclick="toggleKillSwitch(\'resume\')" aria-label="Resume all trading activity">Resume Trading</button></div>'
         if kill.get("active")
-        else '<div class="banner kill-inactive" id="kill-banner">Kill switch: inactive (trading enabled) '
-             '<button class="btn kill-halt" onclick="toggleKillSwitch(\'halt\')">HALT Trading</button></div>'
+        else '<div class="banner kill-inactive" id="kill-banner" role="status">Kill switch: inactive (trading enabled) '
+             '<button class="btn kill-halt" onclick="toggleKillSwitch(\'halt\')" aria-label="Halt all trading activity">HALT Trading</button></div>'
     )
 
     return f"""<!doctype html>
@@ -519,254 +519,40 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
   <meta http-equiv="refresh" content="30">
   <title>Autonomous Trading Agent - Live</title>
   <style>
-    :root {{
-      --bg-primary: #0d1117;
-      --bg-secondary: #161b22;
-      --bg-tertiary: #1c2128;
-      --border-color: #30363d;
-      --text-primary: #e6edf3;
-      --text-secondary: #8b949e;
-      --accent-blue: #58a6ff;
-      --accent-green: #3fb950;
-      --accent-red: #f85149;
-      --accent-yellow: #d29922;
-      --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
-    }}
-    
-    * {{ box-sizing: border-box; }}
-    
-    body {{
-      margin: 24px;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
-      background: var(--bg-primary);
-      color: var(--text-primary);
-      line-height: 1.5;
-      -webkit-font-smoothing: antialiased;
-    }}
-    
-    h1 {{
-      margin: 0 0 16px;
-      font-size: 28px;
-      font-weight: 700;
-      letter-spacing: -0.5px;
-      background: linear-gradient(135deg, var(--accent-blue), var(--accent-green));
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      background-clip: text;
-    }}
-    
-    h2 {{
-      margin: 0 0 16px;
-      font-size: 20px;
-      font-weight: 600;
-      color: var(--text-primary);
-      padding-bottom: 8px;
-      border-bottom: 1px solid var(--border-color);
-    }}
-    
-    .grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 16px;
-      margin: 20px 0;
-    }}
-    
-    .card {{
-      background: var(--bg-secondary);
-      border: 1px solid var(--border-color);
-      border-radius: 12px;
-      padding: 16px;
-      box-shadow: var(--card-shadow);
-      transition: transform 0.2s ease, box-shadow 0.2s ease;
-    }}
-    
-    .card:hover {{
-      transform: translateY(-2px);
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
-    }}
-    
-    .label {{
-      color: var(--text-secondary);
-      font-size: 12px;
-      font-weight: 500;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      margin-bottom: 6px;
-    }}
-    
-    .value {{
-      font-size: 28px;
-      margin-top: 4px;
-      font-weight: 700;
-      font-variant-numeric: tabular-nums;
-    }}
-    
-    .value.positive {{ color: var(--accent-green); }}
-    .value.negative {{ color: var(--accent-red); }}
-    
-    .banner {{
-      padding: 12px 16px;
-      border-radius: 8px;
-      margin: 16px 0;
-      font-weight: 600;
-      font-size: 14px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }}
-    
-    .kill-active {{
-      background: linear-gradient(135deg, var(--accent-red), #da3633);
-      color: #fff;
-    }}
-    
-    .kill-inactive {{
-      background: var(--bg-secondary);
-      color: var(--text-secondary);
-      border: 1px solid var(--border-color);
-    }}
-    
-    table {{
-      width: 100%;
-      border-collapse: separate;
-      border-spacing: 0;
-      margin: 12px 0 24px;
-      font-size: 13px;
-    }}
-    
-    .data-table {{
-      width: 100%;
-      border-collapse: separate;
-      border-spacing: 0;
-      margin: 12px 0 24px;
-      font-size: 13px;
-    }}
-    
-    th {{
-      color: var(--text-secondary);
-      font-weight: 600;
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      padding: 12px 8px;
-      text-align: left;
-      border-bottom: 2px solid var(--border-color);
-      background: var(--bg-tertiary);
-    }}
-    
-    td {{
-      border-bottom: 1px solid var(--border-color);
-      padding: 10px 8px;
-      text-align: left;
-      vertical-align: middle;
-      font-variant-numeric: tabular-nums;
-    }}
-    
-    tr:hover td {{
-      background: var(--bg-tertiary);
-    }}
-    
-    .GREEN, .APPROVED, .FILLED {{ color: var(--accent-green); font-weight: 600; }}
-    .YELLOW {{ color: var(--accent-yellow); font-weight: 600; }}
-    .REJECTED, .NO_SIGNAL {{ color: var(--accent-red); font-weight: 600; }}
-    
-    .timestamp {{
-      color: var(--text-secondary);
-      margin-bottom: 16px;
-      font-size: 12px;
-      font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
-    }}
-    
-    .two-col {{
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 24px;
-    }}
-    
-    @media (max-width: 900px) {{
-      .two-col {{ grid-template-columns: 1fr; }}
-      .grid {{ grid-template-columns: repeat(2, 1fr); }}
-    }}
-    
-    .badge {{
-      display: inline-block;
-      padding: 3px 8px;
-      border-radius: 12px;
-      font-size: 11px;
-      font-weight: 600;
-      background: var(--bg-tertiary);
-      border: 1px solid var(--border-color);
-      font-variant-numeric: tabular-nums;
-    }}
-    
-    .feed {{
-      max-height: 500px;
-      overflow-y: auto;
-      background: var(--bg-secondary);
-      border: 1px solid var(--border-color);
-      border-radius: 8px;
-      padding: 12px;
-    }}
-    
-    .feed::-webkit-scrollbar {{
-      width: 8px;
-    }}
-    
-    .feed::-webkit-scrollbar-track {{
-      background: var(--bg-primary);
-      border-radius: 4px;
-    }}
-    
-    .feed::-webkit-scrollbar-thumb {{
-      background: var(--border-color);
-      border-radius: 4px;
-    }}
-    
-    .feed::-webkit-scrollbar-thumb:hover {{
-      background: var(--text-secondary);
-    }}
-    
-    .btn {{
-      cursor: pointer;
-      padding: 8px 16px;
-      border: none;
-      border-radius: 6px;
-      font-weight: 600;
-      font-size: 13px;
-      margin-left: 12px;
-      transition: all 0.2s ease;
-      font-family: inherit;
-    }}
-    
-    .btn:hover {{ opacity: 0.9; transform: scale(1.02); }}
-    .btn:active {{ transform: scale(0.98); }}
-    
-    .kill-halt {{
-      background: var(--accent-red);
-      color: #fff;
-    }}
-    
-    #kill-banner button {{
-      background: var(--accent-green);
-      color: #fff;
-      margin-left: 16px;
-    }}
-    
-    .pnl-positive {{ color: var(--accent-green); font-weight: 700; }}
-    .pnl-negative {{ color: var(--accent-red); font-weight: 700; }}
-    
-    .regime-badge {{
-      display: inline-block;
-      padding: 6px 16px;
-      border-radius: 20px;
-      font-size: 14px;
-      font-weight: 700;
-      margin: 4px 0;
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
-    }}
-    
-    .regime-high_volatility {{ background: var(--accent-red); color: #fff; }}
-    .regime-strong_uptrend {{ background: var(--accent-green); color: #fff; }}
+    body {{ margin: 24px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #101418; color: #e6edf3; }}
+    h1, h2 {{ margin: 0 0 12px; }}
+    h2 {{ margin-top: 24px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 16px 0; }}
+    .card {{ background: #18202a; border: 1px solid #2f3b48; border-radius: 10px; padding: 14px; }}
+    .label {{ color: #8b949e; font-size: 12px; }}
+    .value {{ font-size: 24px; margin-top: 4px; }}
+    .value.positive {{ color: #3fb950; }}
+    .value.negative {{ color: #f85149; }}
+    .banner {{ padding: 8px 12px; border-radius: 6px; margin: 12px 0; font-weight: bold; }}
+    .kill-active {{ background: #f85149; color: #fff; }}
+    .kill-inactive {{ background: #18202a; color: #8b949e; border: 1px solid #2f3b48; }}
+    table {{ width: 100%; border-collapse: collapse; margin: 8px 0 20px; }}
+    th, td {{ border-bottom: 1px solid #2f3b48; padding: 8px; text-align: left; vertical-align: top; }}
+    th {{ color: #8b949e; }}
+    .GREEN, .APPROVED, .FILLED {{ color: #3fb950; }}
+    .YELLOW {{ color: #d29922; }}
+    .REJECTED, .NO_SIGNAL {{ color: #f85149; }}
+    .timestamp {{ color: #8b949e; margin-bottom: 16px; font-size: 12px; }}
+    .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
+    @media (max-width: 900px) {{ .two-col {{ grid-template-columns: 1fr; }} }}
+    .badge {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; background: #18202a; }}
+    .feed {{ max-height: 480px; overflow-y: auto; }}
+    .btn {{ cursor: pointer; padding: 6px 14px; border: none; border-radius: 6px; font-weight: bold; font-size: 13px; margin-left: 12px; transition: opacity 0.2s, outline 0.2s; }}
+    .btn:hover:not(:disabled) {{ opacity: 0.85; }}
+    .btn:disabled {{ cursor: not-allowed; opacity: 0.5; }}
+    .btn:focus-visible {{ outline: 2px solid #58a6ff; outline-offset: 2px; }}
+    .kill-halt {{ background: #f85149; color: #fff; }}
+    #kill-banner button {{ background: #238636; color: #fff; }}
+    .pnl-positive {{ color: #3fb950; }}
+    .pnl-negative {{ color: #f85149; }}
+    .regime-badge {{ display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: bold; margin: 4px 0; }}
+    .regime-high_volatility {{ background: #f85149; color: #fff; }}
+    .regime-strong_uptrend {{ background: #3fb950; color: #fff; }}
     .regime-weak_uptrend {{ background: #238636; color: #fff; }}
     .regime-range_bound {{ background: var(--accent-yellow); color: #000; }}
     .regime-weak_downtrend {{ background: #a45e00; color: #fff; }}
@@ -1074,7 +860,13 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
 
   async function toggleKillSwitch(action) {{
     const btn = document.querySelector('#kill-banner button');
-    if (btn) btn.disabled = true;
+    let originalText = '';
+    if (btn) {{
+      originalText = btn.innerHTML;
+      btn.disabled = true;
+      btn.setAttribute('aria-busy', 'true');
+      btn.innerHTML = action === 'halt' ? 'Halting... ⏳' : 'Resuming... ⏳';
+    }}
     try {{
       const resp = await fetch('/api/kill-switch', {{
         method: 'POST',
@@ -1086,11 +878,11 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
         location.reload();
       }} else {{
         alert('Failed: ' + (data.error || 'unknown error'));
-        if (btn) btn.disabled = false;
+        if (btn) {{ btn.disabled = false; btn.innerHTML = originalText; }}
       }}
     }} catch (e) {{
       alert('Network error: ' + e.message);
-      if (btn) btn.disabled = false;
+      if (btn) {{ btn.disabled = false; btn.innerHTML = originalText; }}
     }}
   }}
 
@@ -1871,8 +1663,8 @@ def _render_performance_section(
   <div class="chart-container">
     <div class="chart-row">
       <div class="chart-box">
-        <div class="label">Trade Distribution</div>
-        <div class="bar-container">
+        <div class="label" id="trade-dist-label">Trade Distribution</div>
+        <div class="bar-container" role="img" aria-label="Trade Distribution: {wins} wins and {losses} losses">
           <div class="bar-win" style="width: {win_pct:.1f}%" title="{wins} wins ({win_pct:.1f}%)"></div>
           <div class="bar-loss" style="width: {loss_pct:.1f}%" title="{losses} losses ({loss_pct:.1f}%)"></div>
         </div>
@@ -1883,9 +1675,9 @@ def _render_performance_section(
       </div>
 
       <div class="chart-box">
-        <div class="label">Win Rate Gauge</div>
-        <div class="gauge-container">
-          <svg viewBox="0 0 150 80">
+        <div class="label" id="win-rate-label">Win Rate Gauge</div>
+        <div class="gauge-container" role="img" aria-label="Win Rate Gauge: {win_rate:.1%}">
+          <svg viewBox="0 0 150 80" aria-hidden="true">
             <defs>
               <linearGradient id="gaugeGradient" x1="0%" y1="0%" x2="100%" y2="0%">
                 <stop offset="0%" style="stop-color:#f85149"/>
@@ -1903,13 +1695,13 @@ def _render_performance_section(
       </div>
 
       <div class="chart-box">
-        <div class="label">Average Trade P&L</div>
-        <div class="pnl-distribution">
+        <div class="label" id="avg-pnl-label">Average Trade P&L</div>
+        <div class="pnl-distribution" role="img" aria-label="Average Trade P&L: win is {_money(avg_win)}, loss is {_money(avg_loss)}">
           <div class="pnl-bar positive" style="height: {min(abs(avg_win) * 5, 100):.0f}px">
-            <div class="pnl-label">Win</div>
+            <div class="pnl-label" aria-hidden="true">Win</div>
           </div>
           <div class="pnl-bar negative" style="height: {min(abs(avg_loss) * 5, 100):.0f}px">
-            <div class="pnl-label">Loss</div>
+            <div class="pnl-label" aria-hidden="true">Loss</div>
           </div>
         </div>
         <div style="text-align: center; margin-top: 25px; font-size: 12px;">
