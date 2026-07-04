@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -73,7 +75,13 @@ class TestSwarmEngineSetup:
     def test_workers_have_correct_names(self):
         engine = SwarmEngine(preset_name="investment_committee")
         engine.setup_workers(WORKER_CLASSES)
-        expected_names = {"technical_analyst", "fundamental_analyst", "risk_manager", "macro_strategist"}
+        expected_names = {
+            "technical_analyst",
+            "fundamental_analyst",
+            "sentiment_analyst",
+            "risk_manager",
+            "macro_strategist",
+        }
         assert set(engine.workers.keys()) == expected_names
 
 
@@ -365,6 +373,38 @@ class TestSwarmEngineAggregation:
         total = decision.votes_for + decision.votes_against + decision.votes_abstain
         assert total == decision.total_workers
 
+    def test_aggregation_uses_accuracy_weights(self):
+        class VoteWorker(BaseSwarmWorker):
+            def execute(self, symbols, market_data, portfolio_state=None, **kwargs):
+                action = self.config.description
+                return WorkerResult(
+                    worker_name=self.config.name,
+                    preset=self.config.preset,
+                    state=WorkerState.DONE,
+                    ticker_results={
+                        "AAPL": {
+                            "ticker": "AAPL",
+                            "action": action,
+                            "confidence": 0.7,
+                            "worker_name": self.config.name,
+                            "preset": self.config.preset,
+                            "reasons": [f"{action} reason"],
+                            "metadata": {},
+                        }
+                    },
+                )
+
+        engine = SwarmEngine(preset_name="investment_committee")
+        engine.workers = {
+            "light_seller": VoteWorker(WorkerConfig(name="light_seller", preset="test", description="SELL", accuracy_weight=0.8)),
+            "heavy_buyer": VoteWorker(WorkerConfig(name="heavy_buyer", preset="test", description="BUY", accuracy_weight=1.2)),
+        }
+
+        decision = engine.run(["AAPL"], {"AAPL": _make_dataframe()}).decisions["AAPL"]
+
+        assert decision.action == "BUY"
+        assert decision.confidence == 0.6
+
     def test_aggregation_with_no_workers(self):
         engine = SwarmEngine(preset_name="investment_committee")
         engine.setup_workers({})
@@ -374,6 +414,43 @@ class TestSwarmEngineAggregation:
         decision = summary.decisions["AAPL"]
         assert decision.action == "HOLD"
         assert decision.confidence == 0.0
+
+    def test_run_writes_worker_vote_log_when_path_provided(self, tmp_path: Path):
+        class VoteWorker(BaseSwarmWorker):
+            def execute(self, symbols, market_data, portfolio_state=None, **kwargs):
+                action = self.config.description
+                return WorkerResult(
+                    worker_name=self.config.name,
+                    preset=self.config.preset,
+                    state=WorkerState.DONE,
+                    ticker_results={
+                        "AAPL": {
+                            "ticker": "AAPL",
+                            "action": action,
+                            "confidence": 0.7,
+                            "worker_name": self.config.name,
+                            "preset": self.config.preset,
+                            "reasons": [f"{action} reason"],
+                            "metadata": {},
+                        }
+                    },
+                )
+
+        engine = SwarmEngine(preset_name="investment_committee")
+        engine.workers = {
+            "buyer": VoteWorker(WorkerConfig(name="buyer", preset="test", description="BUY", accuracy_weight=1.2)),
+            "seller": VoteWorker(WorkerConfig(name="seller", preset="test", description="SELL", accuracy_weight=0.8)),
+        }
+        vote_log = tmp_path / "worker_votes.jsonl"
+
+        engine.run(["AAPL"], {"AAPL": _make_dataframe()}, vote_log_path=vote_log)
+
+        lines = vote_log.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+        payloads = [json.loads(line) for line in lines]
+        assert payloads[0]["ticker"] == "AAPL"
+        assert {payload["worker_name"] for payload in payloads} == {"buyer", "seller"}
+        assert {payload["accuracy_weight"] for payload in payloads} == {1.2, 0.8}
 
 
 class TestSwarmEngineEdgeCases:

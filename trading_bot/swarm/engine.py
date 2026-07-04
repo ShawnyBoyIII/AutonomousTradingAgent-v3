@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import json
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from trading_bot.swarm.base import BaseSwarmWorker, WorkerConfig, WorkerResult, WorkerState
@@ -35,6 +37,29 @@ class SwarmEngine:
         self.results: dict[str, WorkerResult] = {}
         self.run_summary: SwarmRunSummary | None = None
         self._lock = threading.Lock()
+
+    def _log_worker_vote(
+        self,
+        vote_log_path: Path,
+        *,
+        ticker: str,
+        worker_name: str,
+        action: str,
+        confidence: float,
+        accuracy_weight: float,
+    ) -> None:
+        vote_log_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "preset": self.preset_name,
+            "ticker": ticker,
+            "worker_name": worker_name,
+            "action": action,
+            "confidence": round(confidence, 4),
+            "accuracy_weight": round(accuracy_weight, 4),
+        }
+        with vote_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
 
     def setup_workers(self, worker_classes: dict[str, type[BaseSwarmWorker]]) -> None:
         """Initialize workers from a preset configuration.
@@ -228,7 +253,9 @@ class SwarmEngine:
         )
 
         # Aggregate decisions
-        self.run_summary.decisions = self._aggregate_decisions(symbols)
+        vote_log = kwargs.get("vote_log_path")
+        vote_log_path = Path(vote_log) if vote_log else None
+        self.run_summary.decisions = self._aggregate_decisions(symbols, vote_log_path=vote_log_path)
 
         logger.info(
             "Swarm run %s completed in %.1fs: %d done, %d failed, %d blocked",
@@ -244,6 +271,7 @@ class SwarmEngine:
     def _aggregate_decisions(
         self,
         symbols: list[str],
+        vote_log_path: Path | None = None,
     ) -> dict[str, CommitteeDecision]:
         """Aggregate worker results into committee decisions per symbol."""
         decisions: dict[str, CommitteeDecision] = {}
@@ -252,15 +280,20 @@ class SwarmEngine:
             votes_for = 0
             votes_against = 0
             votes_abstain = 0
+            weighted_for = 0.0
+            weighted_against = 0.0
+            weighted_abstain = 0.0
             rationales: list[str] = []
             risk_factors: list[str] = []
             supporting_signals: list[SignalVote] = []
             opposing_signals: list[SignalVote] = []
 
             for worker_name in self.workers:
+                worker_weight = float(self.workers[worker_name].config.accuracy_weight)
                 result = self.results.get(worker_name)
                 if result is None or symbol not in result.ticker_results:
                     votes_abstain += 1
+                    weighted_abstain += worker_weight
                     continue
 
                 ticker_result = result.ticker_results[symbol]
@@ -286,14 +319,28 @@ class SwarmEngine:
 
                 if action == "BUY":
                     votes_for += 1
+                    weighted_for += worker_weight
                     if signal_vote is not None:
                         supporting_signals.append(signal_vote)
                 elif action == "SELL":
                     votes_against += 1
+                    weighted_against += worker_weight
                     if signal_vote is not None:
                         opposing_signals.append(signal_vote)
                 else:
                     votes_abstain += 1
+                    weighted_abstain += worker_weight
+
+                if vote_log_path is not None:
+                    logged_confidence = signal_vote.confidence if signal_vote is not None else 0.0
+                    self._log_worker_vote(
+                        vote_log_path,
+                        ticker=symbol,
+                        worker_name=worker_name,
+                        action=action,
+                        confidence=logged_confidence,
+                        accuracy_weight=worker_weight,
+                    )
 
                 if rationale:
                     rationales.append(f"{worker_name}: {', '.join(rationale)}")
@@ -306,18 +353,19 @@ class SwarmEngine:
 
             # Determine committee decision
             total_votes = votes_for + votes_against + votes_abstain
-            if total_votes == 0:
+            total_weight = weighted_for + weighted_against + weighted_abstain
+            if total_weight == 0:
                 action = "HOLD"
                 confidence = 0.0
-            elif votes_for > votes_against:
+            elif weighted_for > weighted_against:
                 action = "BUY"
-                confidence = votes_for / total_votes
-            elif votes_against > votes_for:
+                confidence = weighted_for / total_weight
+            elif weighted_against > weighted_for:
                 action = "SELL"
-                confidence = votes_against / total_votes
+                confidence = weighted_against / total_weight
             else:
                 action = "HOLD"
-                confidence = votes_abstain / total_votes if total_votes > 0 else 0.0
+                confidence = weighted_abstain / total_weight if total_weight > 0 else 0.0
 
             key_rationale = rationales[0] if rationales else "No worker verdicts"
 

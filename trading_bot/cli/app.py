@@ -8,12 +8,13 @@ import logging
 
 import pandas as pd
 import typer
+import yaml
 
 logger = logging.getLogger(__name__)
 
 from trading_bot.config.loader import load_settings
 from trading_bot.config.settings import Settings
-from trading_bot.data.indicators import add_atr
+from trading_bot.data.indicators import add_atr, add_rsi
 from trading_bot.logging_config import configure_from_settings
 from trading_bot.execution.paper_broker import PaperBroker
 from trading_bot.models.order import OrderRequest
@@ -30,6 +31,11 @@ from trading_bot.runtime import alerts as runtime_alerts
 from trading_bot.runtime import session as runtime_session
 from trading_bot.runtime.decision_log import append_decision_event
 from trading_bot.runtime.latency import frame_last_timestamp, is_stale
+from trading_bot.runtime.position_exit import (
+    fill_partial_take_profit_position as _shared_fill_partial_take_profit_position,
+    fill_sell_position as _shared_fill_sell_position,
+    portfolio_state_after_sell as _shared_portfolio_state_after_sell,
+)
 from trading_bot.runtime.snapshots import read_recent_decision_rows, write_snapshot
 from trading_bot.scout import build_scout_candidates
 from trading_bot.rl.utils import rl_model_meta_path, rl_model_symbols
@@ -720,7 +726,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
         if eod_active:
             state, event, line = _fill_sell_position(
                 ticker, position, "eod", manage_now, last_price,
-                broker, ledger, state, log_path,
+                broker, ledger, state, log_path, frame,
             )
             append_decision_event(log_path, event)
             exit_events.append(event)
@@ -730,7 +736,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
         if position.stop_loss is not None and last_price <= position.stop_loss:
             state, event, line = _fill_sell_position(
                 ticker, position, "stop", manage_now, last_price,
-                broker, ledger, state, log_path,
+                broker, ledger, state, log_path, frame,
             )
             append_decision_event(log_path, event)
             exit_events.append(event)
@@ -738,10 +744,27 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
             lines.append(line)
             continue
         if position.profit_target is not None and last_price >= position.profit_target:
-            state, event, line = _fill_sell_position(
-                ticker, position, "target", manage_now, last_price,
-                broker, ledger, state, log_path,
-            )
+            if (
+                ctx.obj.paper.partial_take_profit_enabled
+                and not getattr(position, "partial_profit_taken", False)
+                and position.quantity >= ctx.obj.paper.partial_take_profit_min_qty
+            ):
+                state, event, line = _shared_fill_partial_take_profit_position(
+                    ticker=ticker,
+                    position=position,
+                    submitted_at=manage_now,
+                    last_price=last_price,
+                    broker=broker,
+                    ledger=ledger,
+                    state=state,
+                    log_path=log_path,
+                    fraction=ctx.obj.paper.partial_take_profit_fraction,
+                )
+            else:
+                state, event, line = _fill_sell_position(
+                    ticker, position, "target", manage_now, last_price,
+                    broker, ledger, state, log_path, frame,
+                )
             append_decision_event(log_path, event)
             exit_events.append(event)
             actions += 1
@@ -756,7 +779,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
             if held >= time_exit_m:
                 state, event, line = _fill_sell_position(
                     ticker, position, f"time_exit_{int(held)}m", manage_now, last_price,
-                    broker, ledger, state, log_path,
+                    broker, ledger, state, log_path, frame,
                 )
                 append_decision_event(log_path, event)
                 exit_events.append(event)
@@ -983,9 +1006,54 @@ def paper_audit(ctx: typer.Context) -> None:
 def trade_attribution(ctx: typer.Context) -> None:
     """Show P&L breakdown by ticker: entries, exits, and strategy tags."""
     from datetime import datetime as dt
+    import json as json_module
 
     ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
     orders = ledger.list_order_rows()
+    decision_log_path = Path(ctx.obj.app.log_dir) / "decision-log.jsonl"
+
+    def sentiment_bucket(score: object) -> str:
+        try:
+            numeric = float(score)
+        except (TypeError, ValueError):
+            return "unknown"
+        if numeric >= 0.35:
+            return "bullish"
+        if numeric <= -0.35:
+            return "bearish"
+        return "neutral"
+
+    buy_sentiment_events: dict[str, list[str]] = {}
+    if decision_log_path.exists():
+        for raw_line in decision_log_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                event = json_module.loads(line)
+            except json_module.JSONDecodeError:
+                continue
+            if event.get("command") != "paper-trade" or event.get("status") != "FILLED":
+                continue
+            ticker = str(event.get("ticker", "") or "").upper()
+            if not ticker:
+                continue
+            buy_sentiment_events.setdefault(ticker, []).append(
+                sentiment_bucket(event.get("swarm_sentiment_score"))
+            )
+
+    buy_sentiment_by_order_id: dict[str, str] = {}
+    buy_order_rows = sorted(
+        [o for o in orders if o["side"] == "BUY"],
+        key=lambda row: (str(row.get("filled_at", "")), str(row.get("id", ""))),
+    )
+    for buy in buy_order_rows:
+        ticker = str(buy.get("ticker", "") or "").upper()
+        bucket = str(buy.get("swarm_sentiment_bucket", "") or "unknown")
+        queued = buy_sentiment_events.get(ticker, [])
+        if bucket == "unknown" and queued:
+            bucket = queued.pop(0)
+        buy_sentiment_by_order_id[str(buy.get("id", ""))] = bucket
 
     last_buy: dict[str, dict] = {}
     sells: list[dict] = []
@@ -1004,6 +1072,8 @@ def trade_attribution(ctx: typer.Context) -> None:
     losses = 0
     strategy_pnl: dict[str, float] = {}
     strategy_count: dict[str, int] = {}
+    sentiment_pnl: dict[str, float] = {}
+    sentiment_count: dict[str, int] = {}
     prior_buys: dict[str, list[dict]] = {}
     for o in orders:
         if o["side"] == "BUY":
@@ -1032,6 +1102,7 @@ def trade_attribution(ctx: typer.Context) -> None:
             except (ValueError, TypeError):
                 pass
         tag = s.get("strategy_tag", "") or (b.get("strategy_tag", "") if b else "") or "unknown"
+        sentiment = buy_sentiment_by_order_id.get(str(b.get("id", "")), "unknown") if b else "unknown"
         print(f"{t:8} {tag[:24]:24} {buy_price:9.2f} {sell_price:9.2f} {s['quantity']:5} {pnl:10.2f} {ret:7.2f}% {held:>8}")
         total_pnl += pnl
         if pnl > 0:
@@ -1042,6 +1113,8 @@ def trade_attribution(ctx: typer.Context) -> None:
             loss_pnl += abs(pnl)
         strategy_pnl[tag] = strategy_pnl.get(tag, 0.0) + pnl
         strategy_count[tag] = strategy_count.get(tag, 0) + 1
+        sentiment_pnl[sentiment] = sentiment_pnl.get(sentiment, 0.0) + pnl
+        sentiment_count[sentiment] = sentiment_count.get(sentiment, 0) + 1
     print("-" * 90)
     print(f'{"":8} {"TOTAL":24} {"":9} {"":9} {"":5} {total_pnl:10.2f}')
     wl = wins + losses
@@ -1054,6 +1127,13 @@ def trade_attribution(ctx: typer.Context) -> None:
         print("-" * 50)
         for tag in sorted(strategy_pnl, key=lambda k: strategy_pnl[k]):
             print(f"{tag[:30]:30} {strategy_count[tag]:7} {strategy_pnl[tag]:10.2f}")
+    if sentiment_pnl:
+        print(f"\n{'Swarm Sentiment':30} {'Trades':>7} {'P&L':>10}")
+        print("-" * 50)
+        for bucket in ("bullish", "neutral", "bearish", "unknown"):
+            if bucket not in sentiment_pnl:
+                continue
+            print(f"{bucket[:30]:30} {sentiment_count[bucket]:7} {sentiment_pnl[bucket]:10.2f}")
 
 
 def _build_portfolio_view(state: PortfolioState, settings) -> dict[str, object]:
@@ -1458,7 +1538,7 @@ def _maybe_counter_thesis_exit(
 
     new_state, event, line = _fill_sell_position(
         ticker, position, "counter-thesis", manage_now, last_price,
-        broker, ledger, state, log_path,
+        broker, ledger, state, log_path, frame,
     )
     event["counter_thesis"] = result.to_dict()
     return new_state, event, line
@@ -1474,102 +1554,56 @@ def _fill_sell_position(
     ledger,
     state,
     log_path,
+    bars=None,
 ) -> tuple:
-    """Submit a market SELL order, record the fill, and update portfolio state.
+    """Submit a market SELL order, record the fill, and update portfolio state."""
+    exit_rsi = None
+    exit_atr = None
+    hold_duration = None
+    exit_strategy = None
 
-    Returns ``(new_state, event_dict, line_text)`` so the caller can append
-    the event to its own exit_events / lines / actions counters.
-    """
-    fill = broker.submit_order(
-        OrderRequest(
-            ticker=ticker,
-            side="SELL",
-            order_type="market",
-            quantity=position.quantity,
-            submitted_at=submitted_at,
-        ),
-        market_price=last_price,
-    )
-    realized_pnl = (fill.fill_price - position.average_cost) * fill.quantity - fill.fees
-    ledger.record_fill(fill, side="SELL", realized_pnl=realized_pnl, strategy_tag=position.strategy_tag)
-
-    try:
-        from trading_bot.db.session import init_db, make_session_factory, get_session
-        from trading_bot.db.repositories import update_trade_exit, close_position
-        from trading_bot.db.models import Trade
-        from sqlalchemy import select
-        cfg = load_settings()
-        engine = init_db(cfg)
-        session_factory = make_session_factory(engine)
-        session = get_session(session_factory)
+    if bars is not None and not bars.empty:
         try:
-            trade = session.execute(
-                select(Trade).where(
-                    Trade.ticker == ticker.upper(),
-                    Trade.status == "FILLED",
-                )
-            ).scalars().order_by(Trade.filled_at.desc()).first()
-            if trade:
-                try:
-                    update_trade_exit(
-                        session=session,
-                        trade_id=trade.id,
-                        exit_price=fill.fill_price,
-                        exit_fees=fill.fees,
-                        pnl=realized_pnl,
-                    )
-                except ValueError:
-                    pass  # trade was concurrently closed, skip
-            close_position(session, ticker.upper())
-        finally:
-            session.close()
-            engine.dispose()
-    except Exception:
-        logger.debug("Failed to persist sell trade to database")
-    new_state = _portfolio_state_after_sell(
-        previous_state=state,
+            bar_copy = bars.copy()
+            bar_copy = add_rsi(bar_copy, period=14)
+            rsi_val = bar_copy["rsi_14"].iloc[-1] if "rsi_14" in bar_copy.columns else None
+            if rsi_val is not None and not (isinstance(rsi_val, float) and pd.isna(rsi_val)):
+                exit_rsi = float(rsi_val)
+        except (KeyError, ValueError):
+            exit_rsi = None
+        try:
+            bar_copy = bars.copy()
+            bar_copy = add_atr(bar_copy, period=14)
+            atr_val = bar_copy["atr_14"].iloc[-1] if "atr_14" in bar_copy.columns else None
+            if atr_val is not None and not (isinstance(atr_val, float) and pd.isna(atr_val)):
+                exit_atr = float(atr_val)
+        except (KeyError, ValueError):
+            exit_atr = None
+
+    if position.entry_at is not None:
+        entry_at = position.entry_at
+        if entry_at.tzinfo is None:
+            entry_at = entry_at.replace(tzinfo=submitted_at.tzinfo or timezone.utc)
+        hold_duration = (submitted_at - entry_at).total_seconds() / 60.0
+
+    exit_strategy = getattr(position, "strategy_tag", None)
+
+    return _shared_fill_sell_position(
         ticker=ticker,
-        fill_price=fill.fill_price,
-        fill_fees=fill.fees,
+        position=position,
+        reason=reason,
+        submitted_at=submitted_at,
+        last_price=last_price,
         broker=broker,
+        ledger=ledger,
+        state=state,
+        log_path=log_path,
+        exit_rsi=exit_rsi,
+        exit_atr=exit_atr,
+        hold_duration_minutes=hold_duration,
+        exit_strategy=exit_strategy,
+        exit_reason=reason,
     )
-    # Record exit timestamp for idempotency guard against concurrent sells
-    new_state.last_exited_at = dict(state.last_exited_at)
-    new_state.last_exited_at[ticker] = fill.filled_at.isoformat()
-    ledger.save_portfolio_state(new_state)
-    ledger.record_equity_snapshot(new_state, timestamp=fill.filled_at)
-    event = {
-        "command": "manage-positions",
-        "ticker": ticker,
-        "status": "FILLED",
-        "reason": reason,
-        "quantity": fill.quantity,
-        "fill_price": fill.fill_price,
-        "cash": new_state.cash,
-    }
-    line = (
-        f"{ticker} FILLED reason={reason} qty={fill.quantity} "
-        f"price={fill.fill_price:.2f} cash={new_state.cash:.2f}"
-    )
-
-    strategy_tag = getattr(position, "strategy_tag", "")
-    if strategy_tag:
-        from trading_bot.strategy.strategy_tracker import record_exit as _rec_exit
-
-        _rec_exit(
-            log_path.parent,
-            strategy_tag,
-            ticker,
-            position.average_cost,
-            fill.fill_price,
-            fill.quantity,
-            fill.fees,
-            realized_pnl,
-            reason,
-            submitted_at,
-        )
-
-    return new_state, event, line
 
 
 def _paper_broker_from_state(state: PortfolioState, settings) -> PaperBroker:
@@ -1577,6 +1611,10 @@ def _paper_broker_from_state(state: PortfolioState, settings) -> PaperBroker:
         starting_cash=state.cash,
         fee_per_order=settings.paper.fee_per_order,
         slippage_bps=settings.paper.slippage_bps,
+        dynamic_slippage_enabled=settings.paper.dynamic_slippage_enabled,
+        dynamic_slippage_notional_bps_per_10k=settings.paper.dynamic_slippage_notional_bps_per_10k,
+        dynamic_slippage_low_price_boost_bps=settings.paper.dynamic_slippage_low_price_boost_bps,
+        dynamic_slippage_max_extra_bps=settings.paper.dynamic_slippage_max_extra_bps,
     )
     broker.positions = {
         ticker: position.quantity
@@ -1654,28 +1692,18 @@ def _update_trailing_stop(
 def _portfolio_state_after_sell(
     previous_state: PortfolioState,
     ticker: str,
+    sold_quantity: int,
     fill_price: float,
     fill_fees: float,
     broker: PaperBroker,
 ) -> PortfolioState:
-    exited_position = previous_state.positions[ticker]
-    positions = {
-        symbol: previous_state.positions[symbol].model_copy(update={"quantity": quantity})
-        for symbol, quantity in broker.positions.items()
-        if quantity > 0 and symbol in previous_state.positions
-    }
-    realized_delta = (
-        (fill_price - exited_position.average_cost) * exited_position.quantity
-    ) - fill_fees
-    equity = broker.cash + sum(
-        position.quantity * position.average_cost for position in positions.values()
-    )
-    return PortfolioState(
-        cash=round(broker.cash, 2),
-        equity=round(equity, 2),
-        positions=positions,
-        realized_pnl=round(previous_state.realized_pnl + realized_delta, 2),
-        unrealized_pnl=0.0,
+    return _shared_portfolio_state_after_sell(
+        previous_state=previous_state,
+        ticker=ticker,
+        sold_quantity=sold_quantity,
+        fill_price=fill_price,
+        fill_fees=fill_fees,
+        broker=broker,
     )
 
 
@@ -1747,6 +1775,14 @@ def _format_scan_summary(summary: dict[str, object]) -> str:
                 f"swarm_hold={summary.get('swarm_hold', 0)}",
             ]
         )
+        if "swarm_sentiment_evidence" in summary:
+            parts.extend(
+                [
+                    f"swarm_sentiment_evidence={summary.get('swarm_sentiment_evidence', 0)}",
+                    f"swarm_sentiment_bullish={summary.get('swarm_sentiment_bullish', 0)}",
+                    f"swarm_sentiment_bearish={summary.get('swarm_sentiment_bearish', 0)}",
+                ]
+            )
     if "parallel_buy" in summary:
         parts.extend(
             [
@@ -1917,6 +1953,34 @@ def strategy_health(
         )
 
 
+@app.command(name="tune")
+def tune(
+    ctx: typer.Context,
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview overrides without writing them."),
+) -> None:
+    """Generate safe burn-in tuning overrides from recent paper results."""
+    from trading_bot.learning.tuning_overrides import (
+        propose_tuning_overrides,
+        write_tuning_overrides,
+    )
+
+    proposal = propose_tuning_overrides(
+        Path(ctx.obj.app.log_dir),
+        ctx.obj,
+        Path(ctx.obj.app.scan_results_path),
+    )
+    rendered = yaml.safe_dump(proposal, sort_keys=False).strip()
+    if dry_run:
+        typer.echo("DRY RUN")
+        typer.echo(rendered)
+        return
+
+    output_path = Path(ctx.obj.app.tuning_overrides_path)
+    write_tuning_overrides(output_path, proposal)
+    typer.echo(f"Wrote tuning overrides to {output_path}")
+    typer.echo(rendered)
+
+
 @app.command(name="drawdown")
 def drawdown(ctx: typer.Context) -> None:
     """Show drawdown analysis from equity history."""
@@ -2073,6 +2137,7 @@ def risk_report(ctx: typer.Context) -> None:
     # 2. VaR
     typer.echo("--- Value at Risk ---")
     tickers = sorted(t for t, p in state.positions.items() if p.quantity > 0)
+    latest_prices: dict[str, float] = {}
     if tickers:
         latest_prices = _fetch_latest_prices(tickers, settings)
         price_history: dict[str, list[float]] = {}
@@ -2080,7 +2145,9 @@ def risk_report(ctx: typer.Context) -> None:
             try:
                 bars = fetch_bars(ticker, period="1y", interval="1d", settings=settings.market_data)
                 if not bars.empty:
-                    price_history[ticker] = [float(c) for c in bars["Close"].tolist()]
+                    close_column = "close" if "close" in bars.columns else ("Close" if "Close" in bars.columns else None)
+                    if close_column is not None:
+                        price_history[ticker] = [float(c) for c in bars[close_column].tolist()]
             except Exception as e:
                 logger.debug("Error in CLI: %s", e)
 
@@ -2124,18 +2191,32 @@ def risk_report(ctx: typer.Context) -> None:
             typer.echo("Need 2+ open positions for correlation analysis.")
         typer.echo("")
 
-        # 5. Real-time PnL alerts
-        typer.echo("--- PnL Alerts ---")
-        snapshot = calculate_realtime_pnl(ledger, latest_prices)
-        pnl_alerts = check_pnl_alerts(snapshot)
-        if pnl_alerts:
-            for alert in pnl_alerts:
-                level_icon = "🔴" if alert["level"] == "critical" else "🟡"
-                typer.echo(f"{level_icon} [{alert['type']}] {alert['message']}")
-        else:
-            typer.echo("No active PnL alerts.")
     else:
         typer.echo("No open positions — skipping VaR, correlation, stress tests.")
+
+    # 5. Real-time PnL / trade quality
+    typer.echo("--- PnL Alerts ---")
+    snapshot = calculate_realtime_pnl(ledger, latest_prices)
+    typer.echo(
+        " ".join(
+            [
+                f"closed_trades={snapshot.closed_trades}",
+                f"win_rate={snapshot.win_rate_pct:.1f}%",
+                f"profit_factor={snapshot.profit_factor:.2f}",
+            ]
+        )
+    )
+    pnl_alerts = check_pnl_alerts(snapshot)
+    if pnl_alerts:
+        for alert in pnl_alerts:
+            level_icon = "🔴" if alert["level"] == "critical" else "🟡"
+            typer.echo(f"{level_icon} [{alert['type']}] {alert['message']}")
+    else:
+        typer.echo("No active PnL alerts.")
+    if snapshot.strategy_pnl:
+        typer.echo("Top Strategy Attribution:")
+        for strategy_tag, pnl in sorted(snapshot.strategy_pnl.items(), key=lambda item: item[1], reverse=True)[:5]:
+            typer.echo(f"  {strategy_tag}: {pnl:+.2f}")
 
     typer.echo("")
     typer.echo("=" * 60)
@@ -2567,7 +2648,7 @@ def discover_symbols(
     typer.echo(f"Discovering symbols (mode: {mode})...")
     typer.echo("=" * 50)
 
-    watchlist = DynamicWatchlist(max_symbols=max_symbols)
+    watchlist = DynamicWatchlist(max_symbols=max_symbols, scout_settings=ctx.obj.scout)
 
     def data_provider(symbol: str) -> pd.DataFrame | None:
         try:
@@ -2946,6 +3027,7 @@ def db_history(
     ctx: typer.Context,
     ticker: str | None = typer.Option(None, "--ticker", help="Filter by ticker"),
     since: str | None = typer.Option(None, "--since", help="Start date (YYYY-MM-DD)"),
+    swarm_sentiment: str | None = typer.Option(None, "--swarm-sentiment", help="Filter trades by stored swarm sentiment bucket (bullish|neutral|bearish|unknown)"),
     limit: int = typer.Option(50, "--limit", help="Max rows to return"),
 ) -> None:
     """Query scan results and trades from the database."""
@@ -2971,10 +3053,17 @@ def db_history(
 
                 typer.echo(f"\nTRADES for {ticker.upper()}")
                 typer.echo("=" * 60)
-                trades = get_trades(session, ticker=ticker.upper(), since=datetime.fromisoformat(since) if since else None, limit=limit)
+                trades = get_trades(
+                    session,
+                    ticker=ticker.upper(),
+                    since=datetime.fromisoformat(since) if since else None,
+                    swarm_sentiment_bucket=(swarm_sentiment.lower() if swarm_sentiment else None),
+                    limit=limit,
+                )
                 for t in trades:
                     pnl_str = f" pnl={t.pnl:.2f}" if t.pnl is not None else ""
-                    typer.echo(f"  {t.filled_at} {t.ticker} {t.side} qty={t.quantity} @${t.entry_price:.2f}{pnl_str}")
+                    sentiment_str = f" sentiment={t.swarm_sentiment_bucket}" if getattr(t, "swarm_sentiment_bucket", None) else ""
+                    typer.echo(f"  {t.filled_at} {t.ticker} {t.side} qty={t.quantity} @${t.entry_price:.2f}{pnl_str}{sentiment_str}")
             else:
                 typer.echo("RECENT SCAN RESULTS")
                 typer.echo("=" * 60)
@@ -2984,10 +3073,16 @@ def db_history(
 
                 typer.echo(f"\nRECENT TRADES")
                 typer.echo("=" * 60)
-                trades = get_trades(session, since=datetime.fromisoformat(since) if since else None, limit=limit)
+                trades = get_trades(
+                    session,
+                    since=datetime.fromisoformat(since) if since else None,
+                    swarm_sentiment_bucket=(swarm_sentiment.lower() if swarm_sentiment else None),
+                    limit=limit,
+                )
                 for t in trades:
                     pnl_str = f" pnl={t.pnl:.2f}" if t.pnl is not None else ""
-                    typer.echo(f"  {t.filled_at} {t.ticker} {t.side} qty={t.quantity} @${t.entry_price:.2f}{pnl_str}")
+                    sentiment_str = f" sentiment={t.swarm_sentiment_bucket}" if getattr(t, "swarm_sentiment_bucket", None) else ""
+                    typer.echo(f"  {t.filled_at} {t.ticker} {t.side} qty={t.quantity} @${t.entry_price:.2f}{pnl_str}{sentiment_str}")
         finally:
             session.close()
     finally:
@@ -3272,6 +3367,150 @@ def _normalize_swarm_decision(decision: object) -> str:
     return value
 
 
+@app.command(name="db-features")
+def db_features(
+    ctx: typer.Context,
+    ticker: str | None = typer.Option(None, "--ticker", help="Filter by ticker"),
+    since: str | None = typer.Option(None, "--since", help="Start date (YYYY-MM-DD)"),
+    status: str | None = typer.Option(None, "--status", help="Filter by status (APPROVED, REJECTED, etc.)"),
+    action: str | None = typer.Option(None, "--action", help="Filter by action (BUY, HOLD, SELL)"),
+    regime: str | None = typer.Option(None, "--regime", help="Filter by market regime (trending_up, trending_down, mean_reversion, high_volatility, sideways)"),
+    sentiment: str | None = typer.Option(None, "--sentiment", help="Filter by swarm sentiment bucket (bullish|neutral|bearish|unknown)"),
+    quality: str | None = typer.Option(None, "--quality", help="Filter by signal quality (GREEN, YELLOW, RED)"),
+    strategy: str | None = typer.Option(None, "--strategy", help="Filter by strategy tag"),
+    limit: int = typer.Option(100, "--limit", help="Max rows to return"),
+    summary: bool = typer.Option(False, "--summary", help="Show aggregate summary statistics"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+) -> None:
+    """Query scan_features table from the database."""
+    from datetime import datetime
+    from collections import Counter
+
+    from trading_bot.db.session import get_session, init_db, make_session_factory
+    from trading_bot.db.repositories import get_scan_features
+
+    engine = None
+    try:
+        from trading_bot.db.session import init_db
+        engine = init_db(ctx.obj)
+        session_factory = make_session_factory(engine)
+        session = get_session(session_factory)
+
+        try:
+            features = get_scan_features(
+                session,
+                ticker=ticker.upper() if ticker else None,
+                since=datetime.fromisoformat(since) if since else None,
+                limit=limit,
+                status=status,
+                action=action,
+                market_regime=regime,
+                swarm_sentiment_bucket=sentiment,
+                quality=quality,
+                strategy_tag=strategy,
+            )
+
+            if json_output:
+                import json as json_module
+                rows = []
+                for f in features:
+                    rows.append({
+                        "id": f.id,
+                        "timestamp": f.timestamp.isoformat() if f.timestamp else None,
+                        "ticker": f.ticker,
+                        "status": f.status,
+                        "action": f.action,
+                        "confidence": f.confidence,
+                        "quality": f.quality,
+                        "freshness": f.freshness,
+                        "market_age_minutes": f.market_age_minutes,
+                        "market_regime": f.market_regime,
+                        "strategy_tag": f.strategy_tag,
+                        "consensus": f.consensus,
+                        "v3_total_score": f.v3_total_score,
+                        "supermodel_score": f.supermodel_score,
+                        "swarm_confidence": f.swarm_confidence,
+                        "swarm_sentiment_score": f.swarm_sentiment_score,
+                        "swarm_sentiment_confidence": f.swarm_sentiment_confidence,
+                        "mtf_aligned": f.mtf_aligned,
+                        "entry_volume_ratio": f.entry_volume_ratio,
+                        "entry_range_ratio": f.entry_range_ratio,
+                        "adaptive_rr": f.adaptive_rr,
+                    })
+                typer.echo(json_module.dumps(rows, default=str, indent=2))
+                return
+
+            typer.echo(f"SCAN FEATURES ({len(features)} rows)")
+            typer.echo("=" * 120)
+            typer.echo(
+                f"{'Timestamp':<22} {'Ticker':>6} {'Status':>10} {'Action':>6} "
+                f"{'Conf':>6} {'Quality':>8} {'Regime':<20} {'Strategy':<20}"
+            )
+            typer.echo("-" * 120)
+            for f in features:
+                ts = f.timestamp.strftime("%Y-%m-%d %H:%M:%S") if f.timestamp else "N/A"
+                conf_str = f"{f.confidence:.3f}" if f.confidence is not None else "N/A"
+                typer.echo(
+                    f"  {ts:<20} {f.ticker:>6} {f.status:>10} {f.action:>6} "
+                    f"{conf_str:>6} {f.quality or '':>8} {f.market_regime or '':<20} {f.strategy_tag or '':<20}"
+                )
+
+            if summary and features:
+                typer.echo(f"\nSUMMARY")
+                typer.echo("=" * 120)
+
+                status_counts = Counter(f.status for f in features)
+                typer.echo(f"\nStatus distribution:")
+                for s, c in sorted(status_counts.items()):
+                    typer.echo(f"  {s}: {c}")
+
+                action_counts = Counter(f.action for f in features)
+                typer.echo(f"\nAction distribution:")
+                for a, c in sorted(action_counts.items()):
+                    typer.echo(f"  {a}: {c}")
+
+                regime_counts = Counter(f.market_regime for f in features if f.market_regime)
+                typer.echo(f"\nRegime distribution:")
+                for r, c in sorted(regime_counts.items()):
+                    typer.echo(f"  {r}: {c}")
+
+                quality_counts = Counter(f.quality for f in features if f.quality)
+                typer.echo(f"\nQuality distribution:")
+                for q, c in sorted(quality_counts.items()):
+                    typer.echo(f"  {q}: {c}")
+
+                sentiment_scores = [f.swarm_sentiment_score for f in features if f.swarm_sentiment_score is not None]
+                if sentiment_scores:
+                    avg_sentiment = sum(sentiment_scores) / len(sentiment_scores)
+                    bullish = sum(1 for s in sentiment_scores if s >= 0.35)
+                    bearish = sum(1 for s in sentiment_scores if s <= -0.35)
+                    neutral = len(sentiment_scores) - bullish - bearish
+                    typer.echo(f"\nSwarm Sentiment ({len(sentiment_scores)} records):")
+                    typer.echo(f"  avg={avg_sentiment:.3f} bullish={bullish} neutral={neutral} bearish={bearish}")
+
+                v3_scores = [f.v3_total_score for f in features if f.v3_total_score is not None]
+                if v3_scores:
+                    avg_v3 = sum(v3_scores) / len(v3_scores)
+                    typer.echo(f"\nV3 Total Score: avg={avg_v3:.3f} min={min(v3_scores):.3f} max={max(v3_scores):.3f} n={len(v3_scores)}")
+
+                supermodel_scores = [f.supermodel_score for f in features if f.supermodel_score is not None]
+                if supermodel_scores:
+                    avg_sm = sum(supermodel_scores) / len(supermodel_scores)
+                    typer.echo(f"\nSupermodel Score: avg={avg_sm:.3f} min={min(supermodel_scores):.3f} max={max(supermodel_scores):.3f} n={len(supermodel_scores)}")
+
+                strategy_counts = Counter(f.strategy_tag for f in features if f.strategy_tag)
+                typer.echo(f"\nStrategy distribution:")
+                for st, c in sorted(strategy_counts.items(), key=lambda x: -x[1])[:10]:
+                    typer.echo(f"  {st}: {c}")
+
+                typer.echo(f"\nTotal: {len(features)} scan features")
+        finally:
+            session.close()
+    finally:
+        if engine:
+            engine.dispose()
+
+
 @app.command()
 def db_portfolio(
     ctx: typer.Context,
@@ -3432,6 +3671,7 @@ def swarm(
         symbols=parsed_symbols,
         market_data=market_data,
         portfolio_state=state.model_dump(),
+        vote_log_path=Path(settings.app.log_dir) / "worker_votes.jsonl",
     )
 
     if json_output:

@@ -18,6 +18,7 @@ from trading_bot.strategy.supermodel import (
     _verdict_from_score,
     build_stacked_signal,
 )
+from trading_bot.config.settings import SupermodelSettings
 
 
 # ---------------------------------------------------------------------------
@@ -178,15 +179,16 @@ def test_swarm_approve_creates_agent_layer() -> None:
     assert swarm.verdict == "support"
 
 
-def test_swarm_reject_blocks() -> None:
+def test_swarm_reject_is_caution_not_block() -> None:
     signal = build_stacked_signal(
         "AAPL",
         FakeSignal(confidence=0.9),
         {"swarm_decision": "REJECT", "swarm_confidence": 0.9},
     )
     swarm = [l for l in signal.layers if l.name == "swarm"][0]
-    assert swarm.verdict == "block"
-    assert signal.decision == "block"
+    assert swarm.verdict == "caution"
+    assert swarm.score == 0.35
+    assert signal.decision != "block"
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +232,18 @@ def test_counter_block_takes_precedence_over_confidence() -> None:
     assert counter.verdict == "block"
 
 
+def test_counter_block_can_be_softened_by_supermodel_settings() -> None:
+    signal = build_stacked_signal(
+        "AAPL",
+        FakeSignal(confidence=0.9),
+        {"counter_thesis_block": True},
+        settings=SupermodelSettings(counter_veto_weight=0.0),
+    )
+
+    assert signal.decision == "support"
+    assert signal.score == pytest.approx(0.9)
+
+
 # ---------------------------------------------------------------------------
 # decision logic
 # ---------------------------------------------------------------------------
@@ -245,14 +259,20 @@ def test_decision_support_at_threshold() -> None:
     assert _decision_from_layers(0.72, layers) == "support"
 
 
+def test_decision_thresholds_can_be_configured() -> None:
+    layers = [_layer("a", 0.61, "caution")]
+    settings = SupermodelSettings(support_threshold=0.6, block_threshold=0.2)
+    assert _decision_from_layers(0.61, layers, settings=settings) == "support"
+
+
 def test_decision_caution_at_threshold() -> None:
-    layers = [_layer("a", 0.5, "caution")]
-    assert _decision_from_layers(0.5, layers) == "caution"
+    layers = [_layer("a", 0.3, "caution")]
+    assert _decision_from_layers(0.3, layers) == "caution"
 
 
 def test_decision_block_when_score_below_threshold() -> None:
-    layers = [_layer("a", 0.4, "block")]
-    assert _decision_from_layers(0.4, layers) == "block"
+    layers = [_layer("a", 0.29, "block")]
+    assert _decision_from_layers(0.29, layers) == "block"
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +287,9 @@ def test_decision_block_when_score_below_threshold() -> None:
         (0.72, "support"),
         (0.71, "caution"),
         (0.5, "caution"),
-        (0.49, "block"),
+        (0.35, "caution"),
+        (0.3, "caution"),
+        (0.29, "block"),
         (0.0, "block"),
     ],
 )
@@ -365,7 +387,7 @@ def test_combined_layers_low_confidence_blocks() -> None:
     )
     # setup=0.3, v3=2/12=0.166, counter=0.3 -> avg ~ 0.255 -> block
     assert signal.decision == "block"
-    assert signal.score < 0.5
+    assert signal.score < 0.3
 
 
 def test_missing_signal_attributes_default_to_zero() -> None:

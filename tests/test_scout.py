@@ -2,6 +2,14 @@ from trading_bot.config.settings import ScoutSettings
 from trading_bot.scout import build_scout_candidates
 
 
+def test_scout_settings_default_to_mid_cap_band() -> None:
+    settings = ScoutSettings()
+
+    assert settings.min_market_cap == 2_000_000_000.0
+    assert settings.max_market_cap == 50_000_000_000.0
+    assert settings.min_price == 5.0
+
+
 def test_build_scout_candidates_merges_duplicates_and_ranks_stably() -> None:
     settings = ScoutSettings(max_universe_size=10, max_snapshot_candidates=10)
     rows = [
@@ -9,30 +17,30 @@ def test_build_scout_candidates_merges_duplicates_and_ranks_stably() -> None:
             "symbol": "DUPE",
             "quoteType": "EQUITY",
             "exchange": "NYQ",
-            "marketCap": 500_000_000,
+            "marketCap": 5_000_000_000,
             "regularMarketPrice": 10.0,
-            "averageDailyVolume3Month": 200_000,
-            "dayVolume": 500_000,
+            "averageDailyVolume3Month": 600_000,
+            "dayVolume": 1_500_000,
             "source": "aggressive_small_caps",
         },
         {
             "symbol": "DUPE",
             "quoteType": "EQUITY",
             "exchange": "NYQ",
-            "marketCap": 500_000_000,
+            "marketCap": 5_000_000_000,
             "regularMarketPrice": 10.0,
-            "averageDailyVolume3Month": 200_000,
-            "dayVolume": 400_000,
+            "averageDailyVolume3Month": 600_000,
+            "dayVolume": 1_400_000,
             "source": "small_cap_gainers",
         },
         {
             "symbol": "SLOW",
             "quoteType": "EQUITY",
             "exchange": "NYQ",
-            "marketCap": 1_500_000_000,
+            "marketCap": 12_000_000_000,
             "regularMarketPrice": 8.0,
-            "averageDailyVolume3Month": 150_000,
-            "dayVolume": 120_000,
+            "averageDailyVolume3Month": 700_000,
+            "dayVolume": 900_000,
             "source": "aggressive_small_caps",
         },
     ]

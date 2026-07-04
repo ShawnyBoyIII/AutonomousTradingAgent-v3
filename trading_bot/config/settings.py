@@ -31,6 +31,7 @@ class AppSettings(BaseModel):
     scan_results_path: str = "state/scan_results.json"
     portfolio_summary_path: str = "state/portfolio_summary.json"
     backtest_summary_path: str = "state/backtest_summary.json"
+    tuning_overrides_path: str = "state/tuning_overrides.yaml"
     benchmark_symbol: str | None = None
     allow_yellow_mean_reversion: bool = False
     min_entry_confluence_score: float = Field(default=4.0, ge=0.0, le=12.0)
@@ -75,10 +76,10 @@ class ScoutSettings(BaseModel):
     screeners: list[str] = Field(
         default_factory=lambda: ["aggressive_small_caps", "small_cap_gainers"]
     )
-    min_market_cap: float = Field(default=50_000_000.0, ge=0.0)
-    max_market_cap: float = Field(default=2_000_000_000.0, gt=0.0)
-    min_price: float = Field(default=2.0, gt=0.0)
-    min_avg_dollar_volume: float = Field(default=1_000_000.0, ge=0.0)
+    min_market_cap: float = Field(default=2_000_000_000.0, ge=0.0)
+    max_market_cap: float = Field(default=50_000_000_000.0, gt=0.0)
+    min_price: float = Field(default=5.0, gt=0.0)
+    min_avg_dollar_volume: float = Field(default=5_000_000.0, ge=0.0)
     max_universe_size: int = Field(default=50, ge=1)
     max_snapshot_candidates: int = Field(default=100, ge=1)
 
@@ -115,6 +116,12 @@ class RiskSettings(BaseModel):
     # V3.2: Position size multiplier for YELLOW (mean-reversion) signals.
     # Reduces position size to limit risk on non-breakout entries.
     yellow_allocation_pct: float = Field(default=0.5, gt=0.0, le=1.0)
+    # Phase 1: Optional fractional Kelly sizing overlay.
+    # Uses signal confidence as win-probability proxy and scales the
+    # baseline risk-model position size down to the Kelly fraction.
+    use_kelly_sizing: bool = Field(default=False)
+    kelly_fraction_scale: float = Field(default=0.5, gt=0.0, le=1.0)
+    kelly_min_position_pct: float = Field(default=0.25, gt=0.0, le=1.0)
 
 
 class SessionSettings(BaseModel):
@@ -128,6 +135,13 @@ class SessionSettings(BaseModel):
 class PaperSettings(BaseModel):
     fee_per_order: float = Field(default=1.0, ge=0.0)
     slippage_bps: int = Field(default=0, ge=0)
+    dynamic_slippage_enabled: bool = Field(default=False)
+    dynamic_slippage_notional_bps_per_10k: float = Field(default=1.0, ge=0.0, le=50.0)
+    dynamic_slippage_low_price_boost_bps: float = Field(default=5.0, ge=0.0, le=50.0)
+    dynamic_slippage_max_extra_bps: float = Field(default=25.0, ge=0.0, le=100.0)
+    partial_take_profit_enabled: bool = Field(default=False)
+    partial_take_profit_fraction: float = Field(default=0.5, gt=0.0, lt=1.0)
+    partial_take_profit_min_qty: int = Field(default=2, ge=1)
 
 
 class AlertsSettings(BaseModel):
@@ -168,6 +182,18 @@ class StrategySettings(BaseModel):
     use_v3_signals: bool = Field(default=False)
     risk_tolerance: str = Field(default="medium")  # low, medium, high
     min_confidence: str = Field(default="medium")  # none, low, medium, high, very_high
+
+
+class SupermodelSettings(BaseModel):
+    support_threshold: float = Field(default=0.72, ge=0.0, le=1.0)
+    block_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+    counter_veto_weight: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class StrategyTrackerSettings(BaseModel):
+    window: int = Field(default=20, ge=1)
+    min_win_rate: float = Field(default=0.20, ge=0.0, le=1.0)
+    full_allocation_rate: float = Field(default=0.50, ge=0.0, le=1.0)
 
 
 class MonitoringSettings(BaseModel):
@@ -276,6 +302,22 @@ class SwarmSettings(BaseModel):
     swarm_weight: float = Field(default=0.3, ge=0.0, le=1.0)
 
 
+class SentimentSettings(BaseModel):
+    """Sentiment/news context configuration.
+
+    Runtime trading stays offline-first: local JSON context is consumed by
+    default, while RSS/API fetching must be explicitly enabled by operators.
+    """
+
+    enabled: bool = Field(default=True)
+    context_path: str = "state/sentiment_context.json"
+    rss_feeds: list[str] = Field(default_factory=list)
+    fetch_rss: bool = Field(default=False)
+    max_items_per_feed: int = Field(default=20, ge=1, le=100)
+    memory_enabled: bool = Field(default=False)
+    memory_db_path: str = "state/memory.db"
+
+
 class Settings(BaseModel):
     app: AppSettings = Field(default_factory=AppSettings)
     market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
@@ -286,7 +328,10 @@ class Settings(BaseModel):
     alerts: AlertsSettings = Field(default_factory=AlertsSettings)
     robinhood: RobinhoodSettings = Field(default_factory=RobinhoodSettings)
     strategy: StrategySettings = Field(default_factory=StrategySettings)
+    supermodel: SupermodelSettings = Field(default_factory=SupermodelSettings)
+    strategy_tracker: StrategyTrackerSettings = Field(default_factory=StrategyTrackerSettings)
     monitoring: MonitoringSettings = Field(default_factory=MonitoringSettings)
     counter_thesis: CounterThesisSettings = Field(default_factory=CounterThesisSettings)
     rl: RLSettings = Field(default_factory=RLSettings)
     swarm: SwarmSettings = Field(default_factory=SwarmSettings)
+    sentiment: SentimentSettings = Field(default_factory=SentimentSettings)

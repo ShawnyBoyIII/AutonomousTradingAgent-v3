@@ -78,6 +78,33 @@ def _load_live_trading_override(settings: Settings) -> None:
     settings.app.live_trading_enabled = False
 
 
+def _load_tuning_overrides(settings: Settings, base_dir: Path) -> None:
+    override_path = Path(_resolve_relative_value(settings.app.tuning_overrides_path, base_dir))
+    settings.app.tuning_overrides_path = str(override_path)
+    if not override_path.exists():
+        return
+
+    config_text = override_path.read_text(encoding="utf-8")
+    _validate_credentials_not_in_config(config_text)
+    loaded = yaml.safe_load(config_text) or {}
+    if not isinstance(loaded, dict):
+        return
+
+    allowed: dict[str, set[str]] = {
+        "supermodel": {"support_threshold", "block_threshold", "counter_veto_weight"},
+        "strategy_tracker": {"window", "min_win_rate", "full_allocation_rate"},
+    }
+
+    for section_name, field_names in allowed.items():
+        section_values = loaded.get(section_name)
+        if not isinstance(section_values, dict):
+            continue
+        target = getattr(settings, section_name)
+        for field_name in field_names:
+            if field_name in section_values:
+                setattr(target, field_name, section_values[field_name])
+
+
 def load_settings(config_path: Path | None = None) -> Settings:
     """
     Load settings from YAML config file.
@@ -106,14 +133,15 @@ def load_settings(config_path: Path | None = None) -> Settings:
         raw = loaded
 
     settings = Settings.model_validate(raw)
+    base_dir = path.resolve().parent
     
     # Load environment overrides (credentials, etc.)
     _load_env_overrides(settings)
+    _load_tuning_overrides(settings, base_dir)
     
     # CRITICAL SAFETY: Live trading only via environment + confirmation
     _load_live_trading_override(settings)
 
-    base_dir = path.resolve().parent
     settings.app.state_db_path = _resolve_relative_value(settings.app.state_db_path, base_dir)
     settings.app.universe_path = _resolve_relative_value(settings.app.universe_path, base_dir)
     settings.app.universe_candidates_path = _resolve_relative_value(
@@ -134,5 +162,14 @@ def load_settings(config_path: Path | None = None) -> Settings:
     )
     settings.app.backtest_summary_path = _resolve_relative_value(
         settings.app.backtest_summary_path, base_dir
+    )
+    settings.app.tuning_overrides_path = _resolve_relative_value(
+        settings.app.tuning_overrides_path, base_dir
+    )
+    settings.sentiment.context_path = _resolve_relative_value(
+        settings.sentiment.context_path, base_dir
+    )
+    settings.sentiment.memory_db_path = _resolve_relative_value(
+        settings.sentiment.memory_db_path, base_dir
     )
     return settings

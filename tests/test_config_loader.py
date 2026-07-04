@@ -251,3 +251,57 @@ def test_load_settings_resolves_relative_paths_from_config_directory(tmp_path: P
     assert settings.app.dashboard_summary_path == str(
         (config_dir / "state/dashboard_summary.json").resolve()
     )
+
+
+def test_load_settings_resolves_sentiment_paths_from_config_directory(tmp_path: Path) -> None:
+    config_dir = tmp_path / "nested"
+    config_dir.mkdir()
+    config_file = config_dir / "config.yaml"
+    config_file.write_text(
+        "sentiment:\n"
+        "  context_path: state/sentiment.json\n"
+        "  memory_db_path: state/sentiment_memory.db\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_file)
+
+    assert settings.sentiment.context_path == str((config_dir / "state/sentiment.json").resolve())
+    assert settings.sentiment.memory_db_path == str(
+        (config_dir / "state/sentiment_memory.db").resolve()
+    )
+
+
+def test_load_settings_applies_tuning_overrides_without_touching_structural_fields(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        "  live_trading_enabled: true\n"
+        "market_data:\n"
+        "  provider: yfinance\n"
+        "risk:\n"
+        "  max_ticker_allocation_pct: 0.15\n",
+        encoding="utf-8",
+    )
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "tuning_overrides.yaml").write_text(
+        "app:\n"
+        "  live_trading_enabled: true\n"
+        "risk:\n"
+        "  max_ticker_allocation_pct: 0.99\n"
+        "supermodel:\n"
+        "  block_threshold: 0.22\n"
+        "strategy_tracker:\n"
+        "  min_win_rate: 0.3\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_file)
+
+    assert settings.app.live_trading_enabled is False
+    assert settings.risk.max_ticker_allocation_pct == 0.15
+    assert settings.supermodel.block_threshold == 0.22
+    assert settings.strategy_tracker.min_win_rate == 0.3

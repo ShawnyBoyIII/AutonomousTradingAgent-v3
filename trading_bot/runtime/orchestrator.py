@@ -15,14 +15,20 @@ from trading_bot.data.indicators import add_atr, add_bollinger_bands, add_ema, a
 from trading_bot.execution.fills import apply_slippage
 from trading_bot.execution.order_manager import submit_signal_as_order
 from trading_bot.execution.paper_broker import PaperBroker
+from trading_bot.models.order import OrderRequest
 from trading_bot.models.portfolio import PortfolioState, Position
 from trading_bot.models.signal import TradeSignal
 from trading_bot.portfolio.ledger import PortfolioLedger
 from trading_bot.portfolio.performance import compute_portfolio_heat, compute_unrealized_pnl
+from trading_bot.risk.correlation import compute_portfolio_correlation
 from trading_bot.runtime.decision_log import append_decision_event
 from trading_bot.runtime.snapshots import write_snapshot
 from trading_bot.risk.risk_manager import evaluate_signal
 from trading_bot.strategy.intraday_signal_engine import generate_recent_signal_with_reason
+from trading_bot.strategy.signal_quality import (
+    adapt_signal_to_volatility_regime,
+    evaluate_signal_quality,
+)
 from trading_bot.strategy.supermodel import build_stacked_signal
 from trading_bot.rl.utils import rl_model_meta_path, rl_model_symbols
 
@@ -68,6 +74,69 @@ def _sector_concentration_exceeded(ticker: str, state, settings, pending_value: 
     return None
 
 
+def _extract_close_history(frame: pd.DataFrame) -> list[float]:
+    for column in ("close", "Close"):
+        if column in frame.columns:
+            values = []
+            for raw_value in frame[column].tolist():
+                try:
+                    value = float(raw_value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(value) and value > 0:
+                    values.append(value)
+            return values
+    return []
+
+
+def _correlation_context_for_candidate(
+    ticker: str,
+    state: PortfolioState,
+    settings: Settings,
+    history_cache: dict[str, list[float]],
+) -> tuple[float | None, float | None]:
+    tracked_tickers = sorted({ticker, *(symbol for symbol, pos in state.positions.items() if pos.quantity > 0)})
+    if len(tracked_tickers) < 2:
+        return None, None
+
+    price_history: dict[str, list[float]] = {}
+    for symbol in tracked_tickers:
+        history = history_cache.get(symbol)
+        if history is None:
+            try:
+                frame = market_data.fetch_bars(
+                    symbol,
+                    period="3mo",
+                    interval="1d",
+                    settings=settings.market_data,
+                )
+            except Exception as exc:
+                logger.debug("correlation history unavailable symbol=%s error=%s", symbol, exc)
+                history = []
+            else:
+                history = _extract_close_history(frame)
+            history_cache[symbol] = history
+        if history:
+            price_history[symbol] = history
+
+    candidate_positions = dict(state.positions)
+    if ticker not in candidate_positions:
+        candidate_positions[ticker] = Position(
+            ticker=ticker,
+            quantity=1,
+            average_cost=1.0,
+        )
+
+    result = compute_portfolio_correlation(
+        candidate_positions,
+        price_history,
+        max_avg_correlation=settings.monitoring.max_avg_correlation,
+    )
+    if result.pair_count == 0:
+        return None, settings.monitoring.max_avg_correlation
+    return result.avg_correlation, settings.monitoring.max_avg_correlation
+
+
 def _recently_exited(ticker: str, state, cooldown_minutes: int) -> bool:
     ts = state.last_exited_at.get(ticker)
     if not ts:
@@ -87,10 +156,11 @@ def run_scan(
 ) -> dict[str, object]:
     ledger = PortfolioLedger(Path(settings.app.state_db_path))
     state = ledger.ensure_portfolio_state()
-    approved_results: list[tuple[float, str]] = []
+    approved_results: list[tuple[dict[str, object], str]] = []
     other_results: list[str] = []
     candidate_rows: list[dict[str, object]] = []
     open_tickers = set(state.positions)
+    correlation_history_cache: dict[str, list[float]] = {}
     log_path = Path(settings.app.log_dir) / "decision-log.jsonl"
     rl_action_counts = {"hold": 0, "buy": 0, "sell": 0}
     rl_confidence_total = 0.0
@@ -169,7 +239,14 @@ def run_scan(
                 if settings.swarm.enabled and symbol in swarm_results:
                     swarm_decision = swarm_results[symbol]
                     _augment_details_with_swarm(details, swarm_decision)
-                details.update(build_stacked_signal(symbol, signal, details).to_details())
+                details.update(
+                    build_stacked_signal(
+                        symbol,
+                        signal,
+                        details,
+                        settings=settings.supermodel,
+                    ).to_details()
+                )
                 if details.get("signal_mode") == "parallel" and details.get("consensus") in parallel_counts:
                     parallel_counts[str(details["consensus"])] += 1
                 detail_text = _format_scan_details(details) if include_details else ""
@@ -197,7 +274,7 @@ def run_scan(
             if settings.swarm.enabled and symbol in swarm_results:
                 swarm_decision = swarm_results[symbol]
                 _augment_details_with_swarm(details, swarm_decision)
-            stacked = build_stacked_signal(symbol, signal, details)
+            stacked = build_stacked_signal(symbol, signal, details, settings=settings.supermodel)
             details.update(stacked.to_details())
             detail_text = _format_scan_details(details) if include_details else ""
             if stacked.decision == "block":
@@ -232,6 +309,12 @@ def run_scan(
 
             # V2.5: Fetch ATR for volatility-adjusted sizing
             atr = _fetch_atr(symbol, settings) if settings.risk.use_atr_sizing else None
+            avg_correlation, max_avg_correlation = _correlation_context_for_candidate(
+                symbol,
+                state,
+                settings,
+                correlation_history_cache,
+            )
 
             decision = evaluate_signal(
                 signal=signal,
@@ -241,6 +324,8 @@ def run_scan(
                 atr=atr,
                 risk_settings=settings.risk,
                 counter_thesis=counter_result,
+                avg_correlation=avg_correlation,
+                max_avg_correlation=max_avg_correlation,
             )
             if not decision.approved:
                 append_decision_event(
@@ -269,38 +354,12 @@ def run_scan(
                 continue
 
             open_tickers.add(symbol)
+            market_age = _market_data_age(signal.timestamp)
             market_status = _market_data_status(
-                signal.timestamp, settings.market_data.intraday_interval,
+                signal.timestamp,
+                settings.market_data.intraday_interval,
                 max_age_minutes=settings.market_data.max_data_age_minutes,
             )
-            if market_status == "stale":
-                append_decision_event(
-                    log_path,
-                    {
-                        "command": "scan",
-                        "ticker": symbol,
-                        "status": "REJECTED",
-                        "reason": "stale market data",
-                        **_paper_evidence_fields(details),
-                    },
-                )
-                market_age = _market_data_age(signal.timestamp)
-                other_results.append(f"{symbol} REJECTED stale market data age={market_age}")
-                row = {
-                    "ticker": symbol,
-                    "status": "REJECTED",
-                    "reason": "stale market data",
-                }
-                _attach_supermodel_row_fields(row, details)
-                if settings.swarm.enabled and symbol in swarm_results:
-                    swarm_decision = swarm_results[symbol]
-                    _attach_swarm_row_fields(row, swarm_decision)
-                if include_details:
-                    row["details"] = details
-                candidate_rows.append(row)
-                continue
-
-            market_age = _market_data_age(signal.timestamp)
             quality = _scan_quality(details)
             append_decision_event(
                 log_path,
@@ -318,27 +377,6 @@ def run_scan(
                     ),
                     **_paper_evidence_fields(details),
                 },
-            )
-            approved_results.append(
-                (
-                    signal.confidence,
-                    f"{symbol} APPROVED "
-                    f"quality={quality} "
-                    f"status={market_status} "
-                    f"age={market_age} "
-                    f"ts={signal.timestamp.isoformat()} "
-                    f"last={signal.entry_price:.2f} "
-                    f"qty={decision.position_size} "
-                    f"rr={signal.risk_reward_ratio:.2f} "
-                    f"conf={signal.confidence:.2f} "
-                    f"risk=${decision.dollar_risk:.2f} "
-                    f"alloc={(signal.entry_price * decision.position_size) / state.equity:.2f} "
-                    f"entry={signal.entry_price:.2f} "
-                    f"stop={signal.stop_loss:.2f} "
-                    f"target={signal.profit_target:.2f} "
-                    f"reasons={'; '.join(signal.reasons)}"
-                    f"{detail_text}",
-                )
             )
             row = {
                 "ticker": symbol,
@@ -368,6 +406,27 @@ def run_scan(
             if include_details:
                 row["details"] = details
             candidate_rows.append(row)
+            approved_results.append(
+                (
+                    row,
+                    f"{symbol} APPROVED "
+                    f"quality={quality} "
+                    f"status={market_status} "
+                    f"age={market_age} "
+                    f"ts={signal.timestamp.isoformat()} "
+                    f"last={signal.entry_price:.2f} "
+                    f"qty={decision.position_size} "
+                    f"rr={signal.risk_reward_ratio:.2f} "
+                    f"conf={signal.confidence:.2f} "
+                    f"risk=${decision.dollar_risk:.2f} "
+                    f"alloc={(signal.entry_price * decision.position_size) / state.equity:.2f} "
+                    f"entry={signal.entry_price:.2f} "
+                    f"stop={signal.stop_loss:.2f} "
+                    f"target={signal.profit_target:.2f} "
+                    f"reasons={'; '.join(signal.reasons)}"
+                    f"{detail_text}",
+                )
+            )
         except Exception as exc:
             error_evidence: dict[str, object] = {}
             if settings.swarm.enabled and symbol in swarm_results:
@@ -388,11 +447,8 @@ def run_scan(
             row.update(error_evidence)
             candidate_rows.append(row)
 
-    approved_results.sort(key=lambda item: item[0], reverse=True)
-    candidate_rows.sort(
-        key=lambda row: float(row.get("confidence", -1.0)),
-        reverse=True,
-    )
+    approved_results.sort(key=lambda item: _scan_row_sort_key(item[0]), reverse=True)
+    candidate_rows.sort(key=_scan_row_sort_key, reverse=True)
     lines = [value for _, value in approved_results] + other_results
     summary = {
         "symbols": len([value for value in symbols if value.strip()]),
@@ -411,6 +467,25 @@ def run_scan(
             "swarm_rejected": sum(1 for d in swarm_decisions if d == "REJECT"),
             "swarm_hold": sum(1 for d in swarm_decisions if d in ("HOLD", "HOLD_FOR_MORE_INFO")),
         })
+        sentiment_rows = [
+            row for row in candidate_rows if row.get("swarm_sentiment_score") is not None
+        ]
+        if sentiment_rows:
+            summary.update(
+                {
+                    "swarm_sentiment_evidence": len(sentiment_rows),
+                    "swarm_sentiment_bullish": sum(
+                        1
+                        for row in sentiment_rows
+                        if float(row.get("swarm_sentiment_score", 0.0) or 0.0) >= 0.35
+                    ),
+                    "swarm_sentiment_bearish": sum(
+                        1
+                        for row in sentiment_rows
+                        if float(row.get("swarm_sentiment_score", 0.0) or 0.0) <= -0.35
+                    ),
+                }
+            )
     if getattr(settings, "rl", None) is not None and settings.rl.enabled:
         summary.update(
             {
@@ -470,6 +545,7 @@ def _augment_details_with_swarm(details: dict[str, object], swarm_decision: Any)
     handoff = _swarm_handoff(swarm_decision)
     if handoff:
         details["swarm_handoff"] = handoff
+    details.update(_swarm_sentiment_fields(swarm_decision))
 
 
 def _attach_swarm_row_fields(row: dict[str, object], swarm_decision: Any) -> None:
@@ -480,6 +556,7 @@ def _attach_swarm_row_fields(row: dict[str, object], swarm_decision: Any) -> Non
     handoff = _swarm_handoff(swarm_decision)
     if handoff:
         row["swarm_handoff"] = handoff
+    row.update(_swarm_sentiment_fields(swarm_decision))
 
 
 def _swarm_handoff(swarm_decision: Any) -> str | None:
@@ -488,6 +565,77 @@ def _swarm_handoff(swarm_decision: Any) -> str | None:
         if text.startswith("risk_manager handoff:"):
             return text
     return None
+
+
+def _swarm_sentiment_fields(swarm_decision: Any) -> dict[str, object]:
+    signal = _swarm_sentiment_signal(swarm_decision)
+    if signal is None:
+        return {}
+    metadata = signal.metadata if hasattr(signal, "metadata") and isinstance(signal.metadata, dict) else {}
+    fields: dict[str, object] = {
+        "swarm_sentiment_action": signal.action,
+        "swarm_sentiment_confidence": round(signal.confidence, 2),
+    }
+    sentiment_score = _finite_float(metadata.get("sentiment_score"))
+    if sentiment_score is not None:
+        fields["swarm_sentiment_score"] = round(sentiment_score, 4)
+    news_count = metadata.get("news_count")
+    if isinstance(news_count, int):
+        fields["swarm_sentiment_news_count"] = news_count
+    source = metadata.get("source")
+    if source:
+        fields["swarm_sentiment_source"] = str(source)
+    return fields
+
+
+def _swarm_sentiment_signal(swarm_decision: Any) -> Any | None:
+    for collection_name in ("supporting_signals", "opposing_signals"):
+        for signal in getattr(swarm_decision, collection_name, []) or []:
+            if getattr(signal, "worker_name", "") == "sentiment_analyst":
+                return signal
+    return None
+
+
+def _swarm_sentiment_size_multiplier(swarm_decision: Any) -> float:
+    signal = _swarm_sentiment_signal(swarm_decision)
+    if signal is None:
+        return 1.0
+    metadata = signal.metadata if hasattr(signal, "metadata") and isinstance(signal.metadata, dict) else {}
+    sentiment_score = _finite_float(metadata.get("sentiment_score"))
+    if sentiment_score is None:
+        return 1.0
+    bounded_score = max(-1.0, min(1.0, sentiment_score))
+    # Sentiment is a secondary nudge only: cap impact to +/-15%.
+    return max(0.85, min(1.15, 1.0 + (bounded_score * 0.15)))
+
+
+def _swarm_sentiment_result_suffix(details: dict[str, object] | None) -> str:
+    if not isinstance(details, dict):
+        return ""
+    multiplier = _finite_float(details.get("swarm_sentiment_size_multiplier"))
+    if multiplier is None or abs(multiplier - 1.0) < 1e-9:
+        return ""
+    score = _finite_float(details.get("swarm_sentiment_score"))
+    action = details.get("swarm_sentiment_action")
+    parts = [f"sent_mult={multiplier:.2f}"]
+    if action is not None:
+        parts.append(f"sent_action={action}")
+    if score is not None:
+        parts.append(f"sent_score={score:.2f}")
+    return " " + " ".join(parts)
+
+
+def _swarm_sentiment_bucket(details: dict[str, object] | None) -> str:
+    if not isinstance(details, dict):
+        return ""
+    score = _finite_float(details.get("swarm_sentiment_score"))
+    if score is None:
+        return ""
+    if score >= 0.35:
+        return "bullish"
+    if score <= -0.35:
+        return "bearish"
+    return "neutral"
 
 
 def _run_swarm_overlay(
@@ -503,6 +651,7 @@ def _run_swarm_overlay(
     try:
         from trading_bot.swarm.engine import SwarmEngine
         from trading_bot.swarm.workers import WORKER_CLASSES
+        from trading_bot.sentiment import load_sentiment_context
 
         engine = SwarmEngine(
             preset_name=settings.swarm.preset,
@@ -533,11 +682,38 @@ def _run_swarm_overlay(
         if not frames:
             return {}
 
+        sentiment_context: dict[str, object] = load_sentiment_context(settings, list(frames.keys()))
+        try:
+            vix_frame = market_data.fetch_bars(
+                symbol="^VIX",
+                period=settings.market_data.daily_period,
+                interval="1d",
+                settings=settings.market_data,
+            )
+            if vix_frame is not None and not vix_frame.empty and "close" in vix_frame.columns:
+                vix_level = _finite_float(vix_frame.iloc[-1].get("close"))
+                if vix_level is not None and "vix" not in sentiment_context:
+                    sentiment_context["vix"] = vix_level
+        except Exception:
+            logger.debug("VIX context fetch failed for swarm overlay")
+
+        memory_store = None
+        if settings.sentiment.memory_enabled and _sentiment_context_has_evidence(sentiment_context):
+            try:
+                from trading_bot.memory.store import MemoryStore
+
+                memory_store = MemoryStore(settings.sentiment.memory_db_path)
+            except Exception:
+                logger.debug("Sentiment memory store unavailable")
+
         # Run swarm analysis
         run_summary = engine.run(
             symbols=list(frames.keys()),
             market_data=frames,
             portfolio_state=portfolio_state,
+            sentiment_context=sentiment_context,
+            memory_store=memory_store,
+            vote_log_path=Path(settings.app.log_dir) / "worker_votes.jsonl",
         )
 
         # Extract per-ticker decisions
@@ -552,6 +728,20 @@ def _run_swarm_overlay(
         return {}
 
 
+def _sentiment_context_has_evidence(context: dict[str, object]) -> bool:
+    if not context:
+        return False
+    if context.get("vix") is not None or isinstance(context.get("breadth"), dict):
+        return True
+    tickers = context.get("tickers")
+    if not isinstance(tickers, dict):
+        return False
+    for ticker_context in tickers.values():
+        if isinstance(ticker_context, dict) and ticker_context.get("news"):
+            return True
+    return False
+
+
 def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = False) -> list[str]:
     ledger = PortfolioLedger(Path(settings.app.state_db_path))
     state = ledger.ensure_portfolio_state()
@@ -559,6 +749,10 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
         starting_cash=state.cash,
         fee_per_order=settings.paper.fee_per_order,
         slippage_bps=settings.paper.slippage_bps,
+        dynamic_slippage_enabled=settings.paper.dynamic_slippage_enabled,
+        dynamic_slippage_notional_bps_per_10k=settings.paper.dynamic_slippage_notional_bps_per_10k,
+        dynamic_slippage_low_price_boost_bps=settings.paper.dynamic_slippage_low_price_boost_bps,
+        dynamic_slippage_max_extra_bps=settings.paper.dynamic_slippage_max_extra_bps,
     )
     broker.positions = {
         ticker: position.quantity for ticker, position in state.positions.items()
@@ -566,6 +760,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
     results: list[str] = []
     log_path = Path(settings.app.log_dir) / "decision-log.jsonl"
     open_tickers = set(state.positions)
+    correlation_history_cache: dict[str, list[float]] = {}
 
     # V2.5: Calculate portfolio heat before trading
     portfolio_heat = _calculate_portfolio_heat(state, settings)
@@ -654,7 +849,14 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 if symbol in swarm_results:
                     swarm_decision = swarm_results[symbol]
                     _augment_details_with_swarm(details, swarm_decision)
-                details.update(build_stacked_signal(symbol, signal, details).to_details())
+                details.update(
+                    build_stacked_signal(
+                        symbol,
+                        signal,
+                        details,
+                        settings=settings.supermodel,
+                    ).to_details()
+                )
                 append_decision_event(
                     log_path,
                     {
@@ -673,7 +875,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
             if symbol in swarm_results:
                 swarm_decision = swarm_results[symbol]
                 _augment_details_with_swarm(details, swarm_decision)
-            stacked = build_stacked_signal(symbol, signal, details)
+            stacked = build_stacked_signal(symbol, signal, details, settings=settings.supermodel)
             details.update(stacked.to_details())
             if stacked.decision == "block":
                 append_decision_event(
@@ -687,21 +889,6 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                     },
                 )
                 results.append(f"{symbol} REJECTED supermodel block score={stacked.score:.2f}")
-                continue
-
-            if _market_data_status(signal.timestamp, settings.market_data.intraday_interval,
-                                  max_age_minutes=settings.market_data.max_data_age_minutes) == "stale":
-                append_decision_event(
-                    log_path,
-                    {
-                        "command": "paper-trade",
-                        "ticker": symbol,
-                        "status": "REJECTED",
-                        "reason": "stale market data",
-                        **_paper_evidence_fields(details),
-                    },
-                )
-                results.append(f"{symbol} REJECTED stale market data")
                 continue
 
             # RL signals bypass the rule-based quality filter; the model itself
@@ -738,7 +925,11 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
 
             strategy_tag = getattr(signal, "strategy_tag", "")
             if strategy_tag:
-                alloc = _alloc_mult(Path(settings.app.log_dir), strategy_tag)
+                alloc = _alloc_mult(
+                    Path(settings.app.log_dir),
+                    strategy_tag,
+                    settings=settings.strategy_tracker,
+                )
                 if alloc == 0.0:
                     append_decision_event(
                         log_path,
@@ -774,6 +965,13 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                     results.append(f"{symbol} REJECTED low confluence {conf_score:.1f}<{min_conf}")
                     continue
 
+            avg_correlation, max_avg_correlation = _correlation_context_for_candidate(
+                symbol,
+                state,
+                settings,
+                correlation_history_cache,
+            )
+
             decision = evaluate_signal(
                 signal=signal,
                 account_equity=state.equity,
@@ -782,6 +980,8 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 atr=atr,
                 risk_settings=settings.risk,
                 counter_thesis=counter_result,
+                avg_correlation=avg_correlation,
+                max_avg_correlation=max_avg_correlation,
             )
             if not decision.approved:
                 append_decision_event(
@@ -812,14 +1012,19 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
             if details.get("is_half_size"):
                 decision.position_size = max(1, int(decision.position_size * 0.5))
 
-            if settings.swarm.enabled and settings.swarm.swarm_weight > 0 and symbol in swarm_results:
+            if settings.swarm.enabled and symbol in swarm_results:
                 swarm_decision = swarm_results[symbol]
-                swarm_conf = getattr(swarm_decision, "confidence", 0.0)
-                swarm_adjust = settings.swarm.swarm_weight * swarm_conf
-                if getattr(swarm_decision, "decision", "") == "APPROVE":
-                    decision.position_size = max(1, int(decision.position_size * (1.0 + swarm_adjust)))
-                elif getattr(swarm_decision, "decision", "") == "REJECT":
-                    decision.position_size = max(1, int(decision.position_size * max(0.1, 1.0 - swarm_adjust)))
+                if settings.swarm.swarm_weight > 0:
+                    swarm_conf = getattr(swarm_decision, "confidence", 0.0)
+                    swarm_adjust = settings.swarm.swarm_weight * swarm_conf
+                    if getattr(swarm_decision, "decision", "") == "APPROVE":
+                        decision.position_size = max(1, int(decision.position_size * (1.0 + swarm_adjust)))
+                    elif getattr(swarm_decision, "decision", "") == "REJECT":
+                        decision.position_size = max(1, int(decision.position_size * max(0.1, 1.0 - swarm_adjust)))
+                sentiment_multiplier = _swarm_sentiment_size_multiplier(swarm_decision)
+                details["swarm_sentiment_size_multiplier"] = round(sentiment_multiplier, 4)
+                if sentiment_multiplier != 1.0:
+                    decision.position_size = max(1, int(decision.position_size * sentiment_multiplier))
             if decision.position_size > risk_approved_size:
                 decision.position_size = risk_approved_size
                 details["position_size_capped"] = "risk_approved"
@@ -844,10 +1049,15 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 results.append(f"{symbol} REJECTED sector concentration: {sector_reason}")
                 continue
 
-            estimated_fill_price = apply_slippage(
+            estimated_fill_price = broker.estimate_fill_price(
+                OrderRequest(
+                    ticker=symbol,
+                    side="BUY",
+                    order_type="market",
+                    quantity=decision.position_size,
+                    submitted_at=signal.timestamp,
+                ),
                 signal.entry_price,
-                broker.slippage_bps,
-                "BUY",
             )
             estimated_total_cost = (estimated_fill_price * decision.position_size) + broker.fee_per_order
             if broker.cash < estimated_total_cost:
@@ -880,6 +1090,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 results.append(
                     f"{symbol} DRY_RUN qty={decision.position_size} "
                     f"price={estimated_fill_price:.2f} cash_after={broker.cash - estimated_total_cost:.2f}"
+                    f"{_swarm_sentiment_result_suffix(details)}"
                 )
                 continue
 
@@ -909,7 +1120,12 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 continue
 
             strategy_tag = _trade_strategy_tag(signal, details) or ""
-            ledger.record_fill(fill, side="BUY", strategy_tag=strategy_tag)
+            ledger.record_fill(
+                fill,
+                side="BUY",
+                strategy_tag=strategy_tag,
+                swarm_sentiment_bucket=_swarm_sentiment_bucket(details),
+            )
             _persist_trade_to_db(fill, signal, settings, details)
             updated_state = _portfolio_state_from_broker(
                 broker,
@@ -949,6 +1165,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
             )
             results.append(
                 f"{symbol} FILLED qty={fill.quantity} price={fill.fill_price:.2f} cash={state.cash:.2f}"
+                f"{_swarm_sentiment_result_suffix(details)}"
             )
         except Exception as exc:
             append_decision_event(
@@ -984,21 +1201,16 @@ def _build_parallel_signal_result(symbol: str, settings: Settings) -> tuple[Trad
     """
     source_votes: list[dict] = []
 
-    rl_sig: TradeSignal | None = None
     v3_sig: TradeSignal | None = None
     v25_sig: TradeSignal | None = None
-    rl_details: dict = {}
     v3_details: dict = {}
     v25_details: dict = {}
 
-    rl_enabled = getattr(settings, "rl", None) is not None and settings.rl.enabled
     v3_enabled = getattr(settings, "strategy", None) is not None and settings.strategy.use_v3_signals
-
-    if rl_enabled:
-        rl_sig, rl_reason, rl_details = _build_rl_signal_result(symbol, settings)
 
     shared_daily = None
     shared_intraday = None
+    shared_hourly = None
     daily_frame, daily_valid = market_data.fetch_and_validate_bars(
         symbol, settings.market_data.daily_period, "1d", settings.market_data,
     )
@@ -1018,6 +1230,7 @@ def _build_parallel_signal_result(symbol: str, settings: Settings) -> tuple[Trad
             intraday_frame = add_bollinger_bands(intraday_frame, period=20, std_dev=2.0)
             intraday_frame = add_vwap(intraday_frame)
             shared_intraday = intraday_frame
+            shared_hourly = _fetch_hourly_alignment_frame(symbol, settings)
             from trading_bot.strategy.intraday_signal_engine import generate_recent_signal_with_reason
             v25_sig, v25_reason = generate_recent_signal_with_reason(
                 symbol, daily_frame, intraday_frame,
@@ -1039,47 +1252,12 @@ def _build_parallel_signal_result(symbol: str, settings: Settings) -> tuple[Trad
         v3_sig, v3_reason, v3_details = _build_v3_signal_result(symbol, settings)
 
     for source, sig, details, cond in [
-        ("rl", rl_sig, rl_details, rl_enabled),
         ("v3", v3_sig, v3_details, v3_enabled),
         ("v2.5", v25_sig, v25_details, True),
     ]:
         if not cond:
             continue
-        detail_action = None
-        detail_confidence = 0.0
-        skip_from_consensus = False
-        if source == "rl":
-            rl_action = details.get("rl_action")
-            rl_untrained = details.get("rl_untrained_symbol", False)
-            rl_conf = float(details.get("rl_confidence", 0.0) or 0.0)
-            effective_conf = float(details.get("rl_effective_confidence", rl_conf))
-            threshold = settings.rl.action_confidence_threshold if hasattr(settings.rl, "action_confidence_threshold") else 0.4
-            if rl_action == 2:
-                detail_action = "SELL"
-                detail_confidence = rl_conf
-            elif rl_action == 0:
-                detail_action = "HOLD"
-                detail_confidence = rl_conf
-                # Skip RL from consensus when it's effectively untrained:
-                # all models agree HOLD with confidence below threshold,
-                # and the symbol is not in any trained model's set.
-                # This lets V3+V2.5 consensus fire without RL blocking.
-                if rl_untrained and effective_conf < threshold:
-                    skip_from_consensus = True
-
-        if skip_from_consensus:
-            source_votes.append({
-                "source": source,
-                "action": "SKIPPED",
-                "confidence": 0.0,
-            })
-        elif detail_action == "SELL":
-            source_votes.append({
-                "source": source,
-                "action": "SELL",
-                "confidence": detail_confidence,
-            })
-        elif sig is not None and hasattr(sig, "action") and sig.action == "BUY":
+        if sig is not None and hasattr(sig, "action") and sig.action == "BUY":
             conf = getattr(sig, "confidence", 0.0)
             source_votes.append({
                 "source": source,
@@ -1093,12 +1271,6 @@ def _build_parallel_signal_result(symbol: str, settings: Settings) -> tuple[Trad
                 "source": source,
                 "action": "SELL",
                 "confidence": float(getattr(sig, "confidence", 0.0)),
-            })
-        elif detail_action == "HOLD":
-            source_votes.append({
-                "source": source,
-                "action": "HOLD",
-                "confidence": detail_confidence,
             })
         else:
             source_votes.append({
@@ -1123,7 +1295,6 @@ def _build_parallel_signal_result(symbol: str, settings: Settings) -> tuple[Trad
     details: dict[str, object] = {
         **v25_details,
         **v3_details,
-        **rl_details,
         "source_votes": public_votes,
         "signal_mode": "parallel",
     }
@@ -1143,7 +1314,16 @@ def _build_parallel_signal_result(symbol: str, settings: Settings) -> tuple[Trad
         details["consensus_votes"] = vote_count
         details["is_full_size"] = True
         signal = _copy_signal_with_confidence(best["signal"], best["confidence"])
-        return signal, f"parallel consensus ({len(buy_votes)}/{vote_count})", details
+        return _apply_phase1_signal_quality(
+            symbol,
+            signal,
+            f"parallel consensus ({len(buy_votes)}/{vote_count})",
+            details,
+            daily_frame=shared_daily,
+            intraday_frame=shared_intraday,
+            hourly_frame=shared_hourly,
+            settings=settings,
+        )
 
     if len(buy_votes) == 1:
         vote = buy_votes[0]
@@ -1152,7 +1332,16 @@ def _build_parallel_signal_result(symbol: str, settings: Settings) -> tuple[Trad
         details["consensus_votes"] = vote_count
         details["is_half_size"] = True
         signal = _copy_signal_with_confidence(vote["signal"], vote["confidence"])
-        return signal, f"parallel single-source ({vote['source']})", details
+        return _apply_phase1_signal_quality(
+            symbol,
+            signal,
+            f"parallel single-source ({vote['source']})",
+            details,
+            daily_frame=shared_daily,
+            intraday_frame=shared_intraday,
+            hourly_frame=shared_hourly,
+            settings=settings,
+        )
 
     source_list = ", ".join(v["source"] for v in active_votes)
     details["consensus"] = "NO_TRADE"
@@ -1173,7 +1362,72 @@ def _copy_signal_with_confidence(signal: TradeSignal, confidence: float) -> Trad
         reasons=list(signal.reasons),
         strategy_tag=getattr(signal, "strategy_tag", ""),
         timestamp=signal.timestamp,
+        quality=getattr(signal, "quality", "GREEN"),
     )
+
+
+def _fetch_hourly_alignment_frame(symbol: str, settings: Settings) -> pd.DataFrame | None:
+    try:
+        hourly_frame, hourly_valid = market_data.fetch_and_validate_bars(
+            symbol,
+            "3mo",
+            "1h",
+            settings.market_data,
+        )
+    except Exception as exc:
+        logger.debug("hourly alignment fetch failed symbol=%s error=%s", symbol, exc)
+        return None
+    if not hourly_valid.valid or hourly_frame.empty:
+        return None
+    hourly_frame = _drop_trailing_zero_volume_bars(hourly_frame)
+    hourly_frame = add_ema(hourly_frame, period=20, column_name="ema_20")
+    hourly_frame = add_sma(hourly_frame, period=50, column_name="sma_50")
+    return hourly_frame
+
+
+def _apply_phase1_signal_quality(
+    symbol: str,
+    signal: TradeSignal | None,
+    reason: str,
+    details: dict,
+    *,
+    daily_frame: pd.DataFrame | None,
+    intraday_frame: pd.DataFrame | None,
+    hourly_frame: pd.DataFrame | None,
+    settings: Settings,
+    setup_name: str | None = None,
+) -> tuple[TradeSignal | None, str, dict]:
+    if signal is None or daily_frame is None or intraday_frame is None:
+        return signal, reason, details
+
+    signal_intraday_frame = _frame_through_timestamp(intraday_frame, signal.timestamp)
+    signal_hourly_frame = (
+        _frame_through_timestamp(hourly_frame, signal.timestamp)
+        if hourly_frame is not None
+        else None
+    )
+    verdict = evaluate_signal_quality(
+        daily_frame=daily_frame,
+        hourly_frame=signal_hourly_frame,
+        intraday_frame=signal_intraday_frame,
+        signal=signal,
+        setup_name=setup_name,
+        quality=str(details.get("quality", getattr(signal, "quality", ""))),
+    )
+    details.update(verdict.to_details())
+    if not verdict.passed:
+        return None, f"signal quality rejected: {verdict.reason}", details
+
+    adapted_signal = adapt_signal_to_volatility_regime(
+        signal,
+        daily_frame,
+        signal_intraday_frame,
+        settings.risk,
+    )
+    details["adaptive_stop_loss"] = round(adapted_signal.stop_loss, 4)
+    details["adaptive_profit_target"] = round(adapted_signal.profit_target, 4)
+    details["adaptive_rr"] = round(adapted_signal.risk_reward_ratio, 4)
+    return adapted_signal, reason, details
 
 
 def _build_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal | None, str, dict]:
@@ -1184,7 +1438,9 @@ def _build_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal |
     # If RL is enabled but the symbol isn't trained, fall through to V3.
     if getattr(settings, "rl", None) is not None and settings.rl.enabled:
         result = _build_rl_signal_result(symbol, settings)
-        if result[0] is not None or "rl_trained_symbols" not in result[2]:
+        if result[0] is not None:
+            return _apply_phase1_to_existing_signal(symbol, result[0], result[1], result[2], settings)
+        if "rl_trained_symbols" not in result[2]:
             return result
 
     if getattr(settings, "strategy", None) is not None and settings.strategy.use_v3_signals:
@@ -1229,7 +1485,66 @@ def _build_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal |
     if settings.app.allow_yellow_mean_reversion:
         from trading_bot.strategy.setup_rules import is_valid_mean_reversion_setup
         details["is_mean_reversion"] = is_valid_mean_reversion_setup(intraday_frame)
-    return signal, reason, details
+    hourly_frame = _fetch_hourly_alignment_frame(symbol, settings)
+    return _apply_phase1_signal_quality(
+        symbol,
+        signal,
+        reason,
+        details,
+        daily_frame=daily_frame,
+        intraday_frame=detail_frame,
+        hourly_frame=hourly_frame,
+        settings=settings,
+    )
+
+
+def _apply_phase1_to_existing_signal(
+    symbol: str,
+    signal: TradeSignal,
+    reason: str,
+    details: dict,
+    settings: Settings,
+) -> tuple[TradeSignal | None, str, dict]:
+    daily_frame, daily_valid = market_data.fetch_and_validate_bars(
+        symbol,
+        settings.market_data.daily_period,
+        "1d",
+        settings.market_data,
+    )
+    if not daily_valid.valid:
+        return None, f"daily data validation failed: {daily_valid.reason}", details
+
+    intraday_frame, intraday_valid = market_data.fetch_and_validate_bars(
+        symbol,
+        settings.market_data.intraday_period,
+        settings.market_data.intraday_interval,
+        settings.market_data,
+    )
+    if not intraday_valid.valid:
+        return None, f"intraday data validation failed: {intraday_valid.reason}", details
+
+    daily_frame = add_ema(daily_frame, period=20, column_name="ema_20")
+    daily_frame = add_sma(daily_frame, period=50, column_name="sma_50")
+    intraday_frame = _drop_trailing_zero_volume_bars(intraday_frame)
+    intraday_frame = intraday_frame.copy()
+    intraday_frame["volume_avg_5"] = intraday_frame["volume"].rolling(5).mean()
+    intraday_frame = add_atr(intraday_frame, period=settings.risk.atr_period)
+    intraday_frame = add_rsi(intraday_frame, period=14)
+    intraday_frame = add_bollinger_bands(intraday_frame, period=20, std_dev=2.0)
+    intraday_frame = add_vwap(intraday_frame)
+    details.update(_scan_details(daily_frame, intraday_frame))
+    details["quality"] = getattr(signal, "quality", "GREEN")
+    hourly_frame = _fetch_hourly_alignment_frame(symbol, settings)
+    return _apply_phase1_signal_quality(
+        symbol,
+        signal,
+        reason,
+        details,
+        daily_frame=daily_frame,
+        intraday_frame=intraday_frame,
+        hourly_frame=hourly_frame,
+        settings=settings,
+    )
 
 
 def _build_rl_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal | None, str, dict]:
@@ -1529,10 +1844,15 @@ def _build_v3_signal_result(
 
     # detect_market_regime requires ema_20, sma_50, atr_14, and bb_* on daily frame.
     daily_frame = daily_frame.copy()
-    daily_frame = add_ema(daily_frame, period=20, column_name="ema_20")
-    daily_frame = add_sma(daily_frame, period=50, column_name="sma_50")
-    daily_frame = add_atr(daily_frame, period=settings.risk.atr_period)
-    daily_frame = add_bollinger_bands(daily_frame, period=20)
+    if "ema_20" not in daily_frame.columns:
+        daily_frame = add_ema(daily_frame, period=20, column_name="ema_20")
+    if "sma_50" not in daily_frame.columns:
+        daily_frame = add_sma(daily_frame, period=50, column_name="sma_50")
+    atr_column = f"atr_{settings.risk.atr_period}"
+    if atr_column not in daily_frame.columns:
+        daily_frame = add_atr(daily_frame, period=settings.risk.atr_period)
+    if "bb_width" not in daily_frame.columns:
+        daily_frame = add_bollinger_bands(daily_frame, period=20)
     intraday_frame = _drop_trailing_zero_volume_bars(intraday_frame)
     intraday_frame = intraday_frame.copy()
     intraday_frame["volume_avg_5"] = intraday_frame["volume"].rolling(5).mean()
@@ -1569,7 +1889,18 @@ def _build_v3_signal_result(
     details["quality"] = signal.quality
     if settings.app.allow_yellow_mean_reversion:
         details["is_mean_reversion"] = selection.strategy_type == "mean_reversion"
-    return signal, "v3 approved", details
+    hourly_frame = _fetch_hourly_alignment_frame(symbol, settings)
+    return _apply_phase1_signal_quality(
+        symbol,
+        signal,
+        "v3 approved",
+        details,
+        daily_frame=daily_frame,
+        intraday_frame=intraday_frame,
+        hourly_frame=hourly_frame,
+        settings=settings,
+        setup_name=selection.setup_name,
+    )
 
 
 def _drop_trailing_zero_volume_bars(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1671,6 +2002,22 @@ def _format_scan_details(details: dict[str, object]) -> str:
         if value is not None:
             parts.append(f"{key}={value}")
 
+    for key in (
+        "mtf_aligned",
+        "mtf_required",
+        "mtf_regime",
+        "entry_volume_ratio",
+        "entry_range_ratio",
+        "adaptive_rr",
+    ):
+        value = details.get(key)
+        if value is not None:
+            parts.append(f"{key}={value}")
+    if details.get("mtf_passed") is not None:
+        parts.append(f"mtf_passed={details.get('mtf_passed')}")
+    if details.get("entry_timing_passed") is not None:
+        parts.append(f"entry_timing_passed={details.get('entry_timing_passed')}")
+
     # V3: counter-thesis summary surfaced in scan --why output.
     for key in (
         "counter_thesis_severity",
@@ -1696,6 +2043,15 @@ def _format_scan_details(details: dict[str, object]) -> str:
             f"swarm={details.get('swarm_decision')}"
             f":{details.get('swarm_confidence')}"
         )
+    for key in (
+        "swarm_sentiment_action",
+        "swarm_sentiment_confidence",
+        "swarm_sentiment_score",
+        "swarm_sentiment_news_count",
+    ):
+        value = details.get(key)
+        if value is not None:
+            parts.append(f"{key}={value}")
     if details.get("swarm_handoff"):
         parts.append(f"swarm_handoff={str(details.get('swarm_handoff')).replace(' ', '_')}")
 
@@ -1719,6 +2075,33 @@ def _scan_quality(details: dict[str, float | int]) -> str:
     ):
         return "GREEN"
     return "YELLOW"
+
+
+def _scan_row_sort_key(row: dict[str, object]) -> tuple[int, int, int, float, float, float, float, float]:
+    status_order = {
+        "APPROVED": 3,
+        "REJECTED": 2,
+        "NO_SIGNAL": 1,
+        "ERROR": 0,
+    }
+    quality_order = {"GREEN": 2, "YELLOW": 1}
+    freshness_order = {"fresh": 2, "stale": 1}
+    details = row.get("details")
+    detail_map = details if isinstance(details, dict) else {}
+    relative_volume = _finite_float(
+        detail_map.get("entry_volume_ratio", detail_map.get("volume_ratio"))
+    ) or 0.0
+    sentiment_score = _finite_float(row.get("swarm_sentiment_score")) or 0.0
+    return (
+        status_order.get(str(row.get("status", "")), -1),
+        quality_order.get(str(row.get("quality", "")), 0),
+        freshness_order.get(str(row.get("freshness", "")), 0),
+        relative_volume,
+        sentiment_score,
+        float(row.get("rr", 0.0) or 0.0),
+        float(row.get("confidence", -1.0) or -1.0),
+        -float(row.get("risk", 0.0) or 0.0),
+    )
 
 
 def _daily_loss_limit_hit(state: PortfolioState, settings: Settings) -> bool:
@@ -1795,9 +2178,44 @@ def _ensure_aware(dt: datetime) -> datetime:
     return dt
 
 
+def _is_us_market_open(now: datetime | None = None) -> bool:
+    """Return True when the NYSE/NASDAQ are currently in regular trading hours.
+
+    Uses US Eastern timezone.  Market hours are Monday-Friday 09:30-16:00 ET.
+    Returns False on weekends and outside those hours.
+    """
+    if now is None:
+        now = _scan_now(datetime.now(timezone.utc))
+    # Convert to US Eastern
+    try:
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+    except ImportError:
+        import pytz
+        et = pytz.timezone("America/New_York")
+    et_now = now.astimezone(et)
+
+    # Weekend check (0=Monday, 6=Sunday)
+    if et_now.weekday() >= 5:
+        return False
+
+    hour = et_now.hour
+    minute = et_now.minute
+    time_minutes = hour * 60 + minute
+
+    # Market open 09:30 (570), close 16:00 (960)
+    return 570 <= time_minutes < 960
+
+
 def _market_data_status(signal_timestamp: datetime, interval: str, max_age_minutes: int = 30) -> str:
     signal_timestamp = _ensure_aware(signal_timestamp)
     age = _scan_now(signal_timestamp) - signal_timestamp
+    # When the market is closed and data is roughly one trading day old
+    # (12-24 hours), treat it as fresh — data from yesterday's close is
+    # acceptable.  Short-age data (e.g. 40 min) is still checked against
+    # the normal threshold so we don't silently accept stale intraday bars.
+    if not _is_us_market_open() and timedelta(hours=12) <= age <= timedelta(hours=24):
+        return "fresh"
     return "stale" if age > timedelta(minutes=max_age_minutes) else "fresh"
 
 
@@ -1977,7 +2395,7 @@ def _calculate_portfolio_heat(state: PortfolioState, settings: Settings) -> floa
 def _persist_scan_results_to_db(candidate_rows: list[dict], settings: Settings) -> None:
     try:
         from trading_bot.db.session import init_db, make_session_factory, get_session
-        from trading_bot.db.repositories import upsert_scan_result
+        from trading_bot.db.repositories import upsert_scan_feature, upsert_scan_result
         engine = init_db(settings)
         session_factory = make_session_factory(engine)
         session = get_session(session_factory)
@@ -1999,7 +2417,7 @@ def _persist_scan_results_to_db(candidate_rows: list[dict], settings: Settings) 
                     if isinstance(details_dict, dict):
                         score = details_dict.get("v3_total_score")
                         strategy_tag = details_dict.get("rl_agent_type") or details_dict.get("v3_strategy")
-                    upsert_scan_result(
+                    scan_result = upsert_scan_result(
                         session=session,
                         ticker=ticker.upper(),
                         action=action,
@@ -2009,9 +2427,10 @@ def _persist_scan_results_to_db(candidate_rows: list[dict], settings: Settings) 
                         reasons=reasons,
                         details=details_dict,
                     )
+                    _persist_scan_feature_row(session, scan_result.id, row, action, confidence, strategy_tag)
                 elif status == "NO_SIGNAL":
                     reason = row.get("reason", "no signal")
-                    upsert_scan_result(
+                    scan_result = upsert_scan_result(
                         session=session,
                         ticker=ticker.upper(),
                         action="HOLD",
@@ -2019,9 +2438,10 @@ def _persist_scan_results_to_db(candidate_rows: list[dict], settings: Settings) 
                         reasons=[str(reason)],
                         details=_scan_row_details_for_persistence(row),
                     )
+                    _persist_scan_feature_row(session, scan_result.id, row, "HOLD", 0.0, None)
                 elif status == "REJECTED":
                     reason = row.get("reason", "rejected")
-                    upsert_scan_result(
+                    scan_result = upsert_scan_result(
                         session=session,
                         ticker=ticker.upper(),
                         action="HOLD",
@@ -2029,6 +2449,7 @@ def _persist_scan_results_to_db(candidate_rows: list[dict], settings: Settings) 
                         reasons=[str(reason)],
                         details=_scan_row_details_for_persistence(row),
                     )
+                    _persist_scan_feature_row(session, scan_result.id, row, "HOLD", 0.0, None)
                 elif status == "ERROR":
                     error = row.get("error", "unknown error")
                     upsert_scan_result(
@@ -2043,6 +2464,59 @@ def _persist_scan_results_to_db(candidate_rows: list[dict], settings: Settings) 
             engine.dispose()
     except Exception:
         logger.debug("Failed to persist scan results to database")
+
+
+def _persist_scan_feature_row(
+    session,
+    scan_result_id: int,
+    row: dict,
+    action: str,
+    confidence: float,
+    strategy_tag: str | None,
+) -> None:
+    from trading_bot.db.repositories import upsert_scan_feature
+
+    details = _scan_row_details_for_persistence(row) or {}
+    upsert_scan_feature(
+        session=session,
+        scan_result_id=scan_result_id,
+        ticker=str(row.get("ticker", "")).upper(),
+        status=str(row.get("status", "")),
+        action=action,
+        confidence=confidence,
+        quality=str(row.get("quality", "")) or None,
+        freshness=str(row.get("freshness", "")) or None,
+        market_age_minutes=_market_age_minutes(row.get("age")),
+        market_regime=str(details.get("mtf_regime", details.get("v3_regime", ""))) or None,
+        strategy_tag=strategy_tag,
+        consensus=str(details.get("consensus", "")) or None,
+        v3_total_score=_finite_float(details.get("v3_total_score")),
+        supermodel_score=_finite_float(row.get("supermodel_score", details.get("supermodel_score"))),
+        swarm_confidence=_finite_float(row.get("swarm_confidence", details.get("swarm_confidence"))),
+        swarm_sentiment_score=_finite_float(row.get("swarm_sentiment_score", details.get("swarm_sentiment_score"))),
+        swarm_sentiment_confidence=_finite_float(row.get("swarm_sentiment_confidence", details.get("swarm_sentiment_confidence"))),
+        mtf_aligned=_safe_int(details.get("mtf_aligned")),
+        entry_volume_ratio=_finite_float(details.get("entry_volume_ratio")),
+        entry_range_ratio=_finite_float(details.get("entry_range_ratio")),
+        adaptive_rr=_finite_float(details.get("adaptive_rr")),
+    )
+
+
+def _market_age_minutes(value: object) -> int | None:
+    text = str(value or "").strip().lower()
+    if text.endswith("m"):
+        try:
+            return int(text[:-1])
+        except ValueError:
+            return None
+    return None
+
+
+def _safe_int(value: object) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _scan_row_details_for_persistence(row: dict) -> dict | None:
@@ -2089,6 +2563,17 @@ def _persist_trade_to_db(
                 profit_target=signal.profit_target if signal else None,
                 fees=fill.fees,
                 strategy_tag=strategy_tag,
+                swarm_sentiment_bucket=_swarm_sentiment_bucket(details),
+                signal_quality=(str(details.get("quality", "")) if isinstance(details, dict) else None) or None,
+                market_regime=(str(details.get("mtf_regime", details.get("v3_regime", ""))) if isinstance(details, dict) else None) or None,
+                supermodel_decision=(str(details.get("supermodel_decision", "")) if isinstance(details, dict) else None) or None,
+                swarm_decision=(str(details.get("swarm_decision", "")) if isinstance(details, dict) else None) or None,
+                consensus=(str(details.get("consensus", "")) if isinstance(details, dict) else None) or None,
+                swarm_sentiment_score=_finite_float(details.get("swarm_sentiment_score")) if isinstance(details, dict) else None,
+                swarm_sentiment_confidence=_finite_float(details.get("swarm_sentiment_confidence")) if isinstance(details, dict) else None,
+                entry_volume_ratio=_finite_float(details.get("entry_volume_ratio")) if isinstance(details, dict) else None,
+                entry_range_ratio=_finite_float(details.get("entry_range_ratio")) if isinstance(details, dict) else None,
+                adaptive_rr=_finite_float(details.get("adaptive_rr")) if isinstance(details, dict) else None,
                 status="FILLED",
             )
             upsert_position(
@@ -2169,6 +2654,20 @@ def _paper_evidence_fields(details: dict | None) -> dict[str, object]:
             "swarm_decision",
             "swarm_confidence",
             "swarm_handoff",
+            "swarm_sentiment_action",
+            "swarm_sentiment_confidence",
+            "swarm_sentiment_score",
+            "swarm_sentiment_news_count",
+            "swarm_sentiment_source",
+            "swarm_sentiment_size_multiplier",
+            "mtf_aligned",
+            "mtf_required",
+            "mtf_passed",
+            "mtf_regime",
+            "entry_timing_passed",
+            "entry_volume_ratio",
+            "entry_range_ratio",
+            "adaptive_rr",
         )
         if key in details
     }

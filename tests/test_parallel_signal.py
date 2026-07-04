@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import builtins
 import json
-from datetime import datetime, timezone
+from datetime import datetime
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 from unittest.mock import MagicMock, patch
 
 from trading_bot.config.settings import AppSettings, CounterThesisSettings, RiskSettings, Settings, StrategySettings, RLSettings
@@ -18,7 +20,7 @@ def _trade_signal(ticker="AAPL", action="BUY", confidence=0.75, tag="v3-trend_fo
         entry_price=50.0,
         stop_loss=48.0,
         profit_target=54.0,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime(2026, 7, 2, 10, 0, tzinfo=ZoneInfo("America/New_York")),
         confidence=confidence,
         strategy_tag=tag,
         risk_reward_ratio=2.0,
@@ -36,24 +38,70 @@ def _settings_parallel():
 
 
 class TestParallelSignalConsensus:
-    def test_two_sources_buy_returns_full_size(self, tmp_path):
+    def test_parallel_mode_ignores_rl_votes(self, tmp_path):
         settings = _settings_parallel()
         settings.rl.enabled = True
         settings.app.state_db_path = str(tmp_path / "state.db")
         settings.app.log_dir = str(tmp_path)
         (tmp_path / "state.db").write_text("")
-        (tmp_path / "decision-log.jsonl").write_text("")
 
-        rl_sig = _trade_signal(confidence=0.6, tag="rl_PPO")
-        v3_sig = _trade_signal(confidence=0.9, tag="v3-trend_following")
+        rl_sig = _trade_signal(confidence=0.95, tag="rl_PPO")
 
         with patch(
             "trading_bot.runtime.orchestrator._build_rl_signal_result",
-            return_value=(rl_sig, "rl ok", {}),
+            return_value=(rl_sig, "rl ok", {"rl_action": 1, "rl_confidence": 0.95}),
         ), patch(
             "trading_bot.runtime.orchestrator._build_v3_signal_result",
+            return_value=(None, "v3 none", {}),
+        ), patch(
+            "trading_bot.runtime.orchestrator.market_data.fetch_and_validate_bars",
+        ) as m_fetch:
+            m_fetch.return_value = (None, SimpleNamespace(valid=False))
+            from trading_bot.runtime.orchestrator import _build_signal_result
+
+            signal, reason, details = _build_signal_result("AAPL", settings)
+
+        assert signal is None
+        assert details["consensus"] == "NO_TRADE"
+        assert "vote_rl" not in details
+
+    def test_two_sources_buy_returns_full_size(self, tmp_path):
+        settings = _settings_parallel()
+        settings.rl.enabled = False
+        settings.app.state_db_path = str(tmp_path / "state.db")
+        settings.app.log_dir = str(tmp_path)
+        (tmp_path / "state.db").write_text("")
+        (tmp_path / "decision-log.jsonl").write_text("")
+
+        v3_sig = _trade_signal(confidence=0.9, tag="v3-trend_following")
+        v25_sig = _trade_signal(confidence=0.6, tag="daily_breakout_v1")
+
+        with patch(
+            "trading_bot.runtime.orchestrator._build_v3_signal_result",
             return_value=(v3_sig, "v3 ok", {}),
+        ), patch(
+            "trading_bot.runtime.orchestrator.market_data.fetch_and_validate_bars",
+        ) as m_fetch, patch(
+            "trading_bot.runtime.orchestrator._fetch_hourly_alignment_frame",
+            return_value=None,
+        ), patch(
+            "trading_bot.strategy.intraday_signal_engine.generate_recent_signal_with_reason",
+            return_value=(v25_sig, "v25 ok"),
+        ), patch(
+            "trading_bot.runtime.orchestrator._apply_phase1_signal_quality",
+            side_effect=lambda symbol, signal, reason, details, **kwargs: (signal, reason, details),
         ):
+            frame = __import__("pandas").DataFrame(
+                {
+                    "timestamp": __import__("pandas").date_range("2026-06-01", periods=30, freq="D"),
+                    "open": [100.0] * 30,
+                    "high": [101.0] * 30,
+                    "low": [99.0] * 30,
+                    "close": [100.0] * 30,
+                    "volume": [1_000_000] * 30,
+                }
+            )
+            m_fetch.return_value = (frame, SimpleNamespace(valid=True))
             with patch("trading_bot.safety.kill_switch.check_kill_switch_before_trade", return_value=(True, "")), \
                  patch("trading_bot.safety.circuit_breaker.check_circuit_breakers", return_value=(True, "")), \
                  patch("trading_bot.runtime.orchestrator.PortfolioLedger") as m_ledger_cls:
@@ -66,7 +114,7 @@ class TestParallelSignalConsensus:
 
         assert signal is not None
         assert details["consensus"] == "BUY"
-        assert details["consensus_count"] == 2
+        assert details["consensus_count"] >= 2
         assert details.get("is_full_size") is True
 
     def test_single_source_buy_returns_half_size(self, tmp_path):
@@ -82,7 +130,10 @@ class TestParallelSignalConsensus:
         with patch(
             "trading_bot.runtime.orchestrator._build_v3_signal_result",
             return_value=(v3_sig, "v3 ok", {}),
-        ):
+        ), patch(
+            "trading_bot.runtime.orchestrator.market_data.fetch_and_validate_bars",
+        ) as m_fetch:
+            m_fetch.return_value = (None, SimpleNamespace(valid=False))
             with patch("trading_bot.safety.kill_switch.check_kill_switch_before_trade", return_value=(True, "")), \
                  patch("trading_bot.safety.circuit_breaker.check_circuit_breakers", return_value=(True, "")), \
                  patch("trading_bot.runtime.orchestrator.PortfolioLedger") as m_ledger_cls:
@@ -125,10 +176,10 @@ class TestParallelSignalConsensus:
                 from trading_bot.runtime.orchestrator import _build_signal_result
                 signal, reason, details = _build_signal_result("AAPL", settings)
 
-        assert signal is None
-        assert details["consensus"] == "SELL"
+        assert signal is not None
+        assert details["consensus"] == "BUY"
 
-    def test_rl_sell_details_veto_when_rl_returns_no_trade_signal(self, tmp_path):
+    def test_rl_sell_details_are_ignored_when_parallel_consensus_runs(self, tmp_path):
         settings = _settings_parallel()
         settings.rl.enabled = True
         settings.app.state_db_path = str(tmp_path / "state.db")
@@ -151,10 +202,9 @@ class TestParallelSignalConsensus:
             from trading_bot.runtime.orchestrator import _build_signal_result
             signal, reason, details = _build_signal_result("AAPL", settings)
 
-        assert signal is None
-        assert reason == "parallel veto: SELL from rl"
-        assert details["consensus"] == "SELL"
-        assert details["vote_rl"] == "SELL:0.82"
+        assert signal is not None
+        assert details["consensus"] == "BUY"
+        assert "vote_rl" not in details
 
     def test_no_buy_votes_returns_no_trade(self, tmp_path):
         settings = _settings_parallel()
@@ -188,11 +238,11 @@ class TestParallelSignalConsensus:
         settings.app.log_dir = str(tmp_path)
         (tmp_path / "state.db").write_text("")
 
-        rl_sig = _trade_signal(confidence=0.7, tag="rl_PPO")
+        v3_sig = _trade_signal(confidence=0.7, tag="v3-trend_following")
 
         with patch(
-            "trading_bot.runtime.orchestrator._build_rl_signal_result",
-            return_value=(rl_sig, "rl ok", {}),
+            "trading_bot.runtime.orchestrator._build_v3_signal_result",
+            return_value=(v3_sig, "v3 ok", {}),
         ):
             with patch("trading_bot.safety.kill_switch.check_kill_switch_before_trade", return_value=(True, "")), \
                  patch("trading_bot.safety.circuit_breaker.check_circuit_breakers", return_value=(True, "")), \
@@ -206,7 +256,8 @@ class TestParallelSignalConsensus:
 
         assert "source_votes" in details
         votes = details["source_votes"]
-        assert any(v["source"] == "rl" and v["action"] == "BUY" for v in votes)
+        assert any(v["source"] == "v3" and v["action"] == "BUY" for v in votes)
+        assert not any(v["source"] == "rl" for v in votes)
         json.dumps(details)
 
     def test_source_details_are_preserved_for_stack_scoring(self, tmp_path):
@@ -230,13 +281,11 @@ class TestParallelSignalConsensus:
             signal, reason, details = _build_signal_result("AAPL", settings)
 
         assert signal is not None
-        assert details["rl_action"] == 1
-        assert details["rl_confidence"] == 0.7
         assert details["v3_total_score"] == 9.6
         from trading_bot.strategy.supermodel import build_stacked_signal
         stacked = build_stacked_signal("AAPL", signal, details)
         assert "v3:support:0.80" in stacked.to_details()["supermodel_layers"]
-        assert "rl:caution:0.70" in stacked.to_details()["supermodel_layers"]
+        assert "rl:" not in stacked.to_details()["supermodel_layers"]
 
     def test_scan_summary_counts_parallel_consensus_without_details(self, tmp_path):
         state_db = tmp_path / "state.db"

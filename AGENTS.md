@@ -15,7 +15,7 @@ Critical context for OpenCode sessions.
 **Target**: Profit factor > 1.3 over 100 closed trades on paper with $100K starting capital.
 
 - Burn-in runs daily via `./scripts/auto-burn-in.sh`
-- Parallel signal mode (RL ensemble + V3 + V2.5 + Swarm consensus)
+- Parallel signal mode is V3 + V2.5 consensus; Swarm is a bounded size modifier; RL is not in the active burn-in vote path
 - 5% minimum stop distance on 5-minute bars (intraday noise protection)
 - 15% max per ticker, $100K capital
 - Confidence gates auto-halt at PF < 0.8 after 50+ trades
@@ -45,10 +45,10 @@ Never use bare `tradebot` on PATH—it may resolve to a stale global install.
 
 ## Safety Constraints (Hard Rules)
 
-1. **Paper-only by default** - `live_trading_enabled` forced `False` in `config/loader.py:75`
+1. **Paper-only by default** - `live_trading_enabled` forced `False` in `config/loader.py`
 2. **Never modify tests** when fixing bugs - tests are source of truth
 3. **All tests must be network-free** - monkeypatch `fetch_bars`, use `monkeypatch` fixtures
-4. **Position sizing capped at 20%** - `max_ticker_allocation_pct=0.20`
+4. **Position sizing capped at 15% in burn-in** - `burn-in-config.yaml` sets `max_ticker_allocation_pct=0.15`
 5. **Kill switch blocks all trading** - integrated at entry points before any logic
 6. **No hardcoded credentials** - loader rejects config files with passwords/api keys
 7. **Robinhood is MCP-only** - no direct auth; boundary subclasses `BrokerAdapter`, reads operator-synced JSON snapshots
@@ -139,8 +139,13 @@ market_data:
 
 # Burn-in automation
 ./scripts/auto-burn-in.sh
+./tradebot-local tune --dry-run
+./tradebot-local tune
 tail -f logs/burn_in/decision-log.jsonl
 ```
+
+- `./tradebot-local tune` writes `state/tuning_overrides.yaml`; loader applies only allowlisted supermodel + strategy-tracker fields and still forces `live_trading_enabled=false`
+- Swarm worker votes are logged to `logs/worker_votes.jsonl`; use this file for future per-worker weight tuning
 
 ---
 
@@ -209,7 +214,7 @@ Fail-fast: stops on first validation error.
 - **Test count:** 1853 passing, 0 failures
 - **V2.5 complete:** ATR sizing, validation, kill switches, burn-in
 - **V3 wired:** Regime detection, confluence scoring, counter-thesis (entry + exit + backtest)
-- **Parallel signal mode:** Default — RL + V3 + V2.5 + Swarm consensus
+- **Parallel signal mode:** Burn-in uses V3 + V2.5 consensus with Swarm size modification
 - **MR detection relaxed (2026-07-02):** RSI < 40 (was 35), VWAP 0.5% (was 1%), range vol 80% (was 100%)
-- **RL disabled:** Burn-in runs V3 + Swarm only; RL produced 0 winning trades
+- **RL disabled in burn-in:** RL commands remain available for offline experiments, but the active burn-in vote path ignores RL
 - **Phase D active:** Running paper burn-in with dynamic watchlist

@@ -404,6 +404,26 @@ run_rl_compare() {
     fi
 }
 
+# Function to refresh tuning overrides from recent paper results
+run_nightly_tuning() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] 🧠 Running nightly tuning..."
+
+    local tune_output
+    tune_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" tune 2>&1)
+    local status=$?
+
+    if [ $status -ne 0 ]; then
+        echo "[$timestamp] ⚠️  Nightly tuning failed"
+        echo "$tune_output" >> "$LOG_DIR/tuning.log"
+        return 0
+    fi
+
+    echo "$tune_output" >> "$LOG_DIR/tuning.log"
+    echo "[$timestamp] ✅ Nightly tuning complete"
+    return 0
+}
+
 # Function to scan and trade
 scan_and_trade() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
@@ -683,6 +703,7 @@ while true; do
             run_discovery "midday"
         else
             run_discovery "daily"
+            run_nightly_tuning
         fi
         load_symbols
     fi

@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
 from trading_bot.strategy.market_screener import MarketScreener, ScreenResult
+from trading_bot.config.settings import ScoutSettings
 from trading_bot.strategy.news_filter import NewsFilter, RiskAssessment
 from trading_bot.strategy.sector_rotation import (
     SectorRotationAnalysis,
@@ -95,12 +96,14 @@ class DynamicWatchlist:
         watchlist_path: str = "dynamic_watchlist.json",
         max_symbols: int = 20,
         min_score: float = 5.0,
+        scout_settings: ScoutSettings | None = None,
     ) -> None:
         self.watchlist_path = Path(watchlist_path)
-        self.max_symbols = max_symbols
+        self.scout_settings = scout_settings or ScoutSettings()
+        self.max_symbols = min(max_symbols, self.scout_settings.max_universe_size)
         self.min_score = min_score
 
-        self.screener = MarketScreener()
+        self.screener = MarketScreener(min_price=self.scout_settings.min_price)
         self.news_filter = NewsFilter()
 
         self._entries: list[WatchlistEntry] = []
