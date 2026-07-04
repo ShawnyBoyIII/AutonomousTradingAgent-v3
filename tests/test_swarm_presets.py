@@ -23,9 +23,10 @@ class TestGetPreset:
 
     def test_get_investment_committee(self):
         configs = get_preset("investment_committee")
-        assert len(configs) == 4
+        assert len(configs) == 5
         names = [c.name for c in configs]
         assert "technical_analyst" in names
+        assert "sentiment_analyst" in names
         assert "risk_manager" in names
 
     def test_get_quant_desk(self):
@@ -105,6 +106,7 @@ class TestWorkerDependencies:
         risk_mgr = next(c for c in configs if c.name == "risk_manager")
         assert "technical_analyst" in risk_mgr.depends_on
         assert "fundamental_analyst" in risk_mgr.depends_on
+        assert "sentiment_analyst" in risk_mgr.depends_on
 
     def test_quant_desk_quant_risk_depends_on_others(self):
         configs = get_preset("quant_desk")
@@ -131,8 +133,8 @@ class TestWorkerDependencies:
 class TestDirectConstants:
     """Direct access to preset constants."""
 
-    def test_investment_committee_has_four_workers(self):
-        assert len(INVESTMENT_COMMITTEE) == 4
+    def test_investment_committee_has_five_workers(self):
+        assert len(INVESTMENT_COMMITTEE) == 5
 
     def test_quant_desk_has_four_workers(self):
         assert len(QUANT_DESK) == 4
