@@ -407,9 +407,9 @@ def _check_regime_misalignment(
     if context.regime == MarketRegime.HIGH_VOLATILITY:
         return CounterThesisFinding(
             check_name="regime_misalignment",
-            severity="high",
+            severity="medium",
             description=f"high-volatility regime ({context.regime.value})",
-            weight=SEVERITY_WEIGHTS["high"],
+            weight=SEVERITY_WEIGHTS["medium"],
         )
     if context.regime == MarketRegime.WEAK_DOWNTREND:
         return CounterThesisFinding(

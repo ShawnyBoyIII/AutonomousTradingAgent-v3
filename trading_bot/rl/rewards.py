@@ -9,6 +9,10 @@ class RewardScheme(ABC):
     @abstractmethod
     def compute_reward(self, current_net_worth: float, previous_net_worth: float) -> float: ...
 
+    def reset(self) -> None:
+        """Optional reset hook for stateful reward schemes."""
+        return None
+
 
 class SimpleProfitReward(RewardScheme):
     """Raw profit reward: change in net worth.
@@ -198,3 +202,43 @@ class PositionDurationBonus(RewardScheme):
 
         bonus = self.base_bonus * min(self._consecutive, self.max_consecutive)
         return step_return + bonus
+
+
+class CompositeReward(RewardScheme):
+    """Weighted composition of multiple reward schemes.
+
+    Lets training combine base return rewards with anti-drawdown and
+    anti-whipsaw shaping while keeping one stable interface.
+    """
+
+    def __init__(self, components: list[tuple[RewardScheme, float]]) -> None:
+        self.components = components
+
+    def reset(self) -> None:
+        for scheme, _ in self.components:
+            scheme.reset()
+
+    def compute_reward(self, current_net_worth: float, previous_net_worth: float) -> float:
+        total = 0.0
+        for scheme, weight in self.components:
+            total += scheme.compute_reward(current_net_worth, previous_net_worth) * weight
+        return total
+
+
+class Phase3Reward(CompositeReward):
+    """Phase 3 default RL reward.
+
+    Mixes normalized returns with drawdown and whipsaw penalties plus a small
+    position-duration bonus so the agent is nudged toward cleaner, more durable
+    trades instead of noisy churn.
+    """
+
+    def __init__(self, reward_scale: float = 100.0) -> None:
+        super().__init__(
+            components=[
+                (RiskAdjustedReward(reward_scale=reward_scale), 1.0),
+                (DrawdownPenaltyReward(reward_scale=reward_scale, penalty_weight=1.5), 0.35),
+                (WhipsawPenaltyReward(window=5, penalty_scale=3.0), 0.5),
+                (PositionDurationBonus(base_bonus=0.0002, max_consecutive=15), 0.25),
+            ]
+        )

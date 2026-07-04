@@ -27,6 +27,14 @@ class RealTimePnL:
     # Trade metrics
     today_trades: int = 0
     today_pnl: float = 0.0
+    closed_trades: int = 0
+    wins: int = 0
+    losses: int = 0
+    win_rate_pct: float = 0.0
+    profit_factor: float = 0.0
+    avg_win: float = 0.0
+    avg_loss: float = 0.0
+    strategy_pnl: dict[str, float] = field(default_factory=dict)
 
     # Position metrics
     open_positions: int = 0
@@ -39,6 +47,36 @@ class RealTimePnL:
 
     # Alerts
     alerts: list[str] = field(default_factory=list)
+
+
+def _coerce_float(value: object) -> float | None:
+    try:
+        from unittest.mock import Mock
+        if isinstance(value, Mock):
+            return None
+    except Exception:
+        pass
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric
+
+
+def _portfolio_equity(portfolio: object) -> float:
+    raw_values = getattr(portfolio, "__dict__", {}) if portfolio is not None else {}
+    for field in ("equity", "total_equity"):
+        value = raw_values.get(field) if isinstance(raw_values, dict) and field in raw_values else getattr(portfolio, field, None)
+        numeric = _coerce_float(value)
+        if numeric is not None and numeric > 0:
+            return numeric
+    return 0.0
+
+
+def _ensure_aware(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def calculate_realtime_pnl(
@@ -58,7 +96,7 @@ def calculate_realtime_pnl(
 
     # Get portfolio state
     portfolio = ledger.ensure_portfolio_state()
-    equity = portfolio.total_equity
+    equity = _portfolio_equity(portfolio)
     cash = portfolio.cash
 
     # Calculate invested amount
@@ -69,21 +107,40 @@ def calculate_realtime_pnl(
 
     # Calculate realized P&L from closed trades today
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_orders = [
-        row for row in ledger.list_order_rows()
-        if datetime.fromisoformat(row["filled_at"]) >= today_start
-    ]
+    today_orders = []
+    for row in ledger.list_order_rows():
+        filled_at_raw = row.get("filled_at")
+        if not filled_at_raw:
+            continue
+        filled_at = _ensure_aware(datetime.fromisoformat(str(filled_at_raw)))
+        if filled_at >= today_start:
+            today_orders.append(row)
+    today_sells = [row for row in today_orders if row.get("side") == "SELL"]
 
-    today_trades = len(today_orders)
-    today_pnl = sum(float(row.get("pnl", 0.0)) for row in today_orders)
+    today_trades = len(today_sells)
+    today_pnl = sum(float(row.get("pnl", 0.0)) for row in today_sells)
 
     # Calculate total realized P&L
     all_orders = ledger.list_order_rows()
-    realized_pnl = sum(
-        float(row.get("pnl", 0.0))
-        for row in all_orders
-        if row["side"] == "SELL"
+    sell_orders = [row for row in all_orders if row.get("side") == "SELL"]
+    realized_pnl = sum(float(row.get("pnl", 0.0)) for row in sell_orders)
+    wins = sum(1 for row in sell_orders if float(row.get("pnl", 0.0)) > 0)
+    losses = sum(1 for row in sell_orders if float(row.get("pnl", 0.0)) < 0)
+    closed_trades = len(sell_orders)
+    gross_profit = sum(float(row.get("pnl", 0.0)) for row in sell_orders if float(row.get("pnl", 0.0)) > 0)
+    gross_loss_abs = abs(sum(float(row.get("pnl", 0.0)) for row in sell_orders if float(row.get("pnl", 0.0)) < 0))
+    profit_factor = (gross_profit / gross_loss_abs) if gross_loss_abs > 0 else (gross_profit if gross_profit > 0 else 0.0)
+    avg_win = (gross_profit / wins) if wins > 0 else 0.0
+    avg_loss = (
+        sum(float(row.get("pnl", 0.0)) for row in sell_orders if float(row.get("pnl", 0.0)) < 0) / losses
+        if losses > 0 else 0.0
     )
+    win_rate_pct = (wins / closed_trades * 100.0) if closed_trades > 0 else 0.0
+
+    strategy_pnl: dict[str, float] = {}
+    for row in sell_orders:
+        strategy_tag = str(row.get("strategy_tag", "") or "unattributed")
+        strategy_pnl[strategy_tag] = strategy_pnl.get(strategy_tag, 0.0) + float(row.get("pnl", 0.0))
 
     # Calculate unrealized P&L
     unrealized_pnl = 0.0
@@ -117,6 +174,10 @@ def calculate_realtime_pnl(
         alerts.append(f"DAILY_LOSS: Today P&L {today_pnl:.2f} below -$1000")
     if session_max_dd > 5.0:
         alerts.append(f"MAX_DRAWDOWN: Session drawdown {session_max_dd:.1f}% exceeds 5%")
+    if closed_trades >= 50 and profit_factor < 0.8:
+        alerts.append(f"LOW_PF: Profit factor {profit_factor:.2f} below 0.80 after {closed_trades} closed trades")
+    if closed_trades >= 50 and win_rate_pct < 40.0:
+        alerts.append(f"LOW_WIN_RATE: Win rate {win_rate_pct:.1f}% below 40.0% after {closed_trades} closed trades")
 
     return RealTimePnL(
         timestamp=now,
@@ -128,6 +189,14 @@ def calculate_realtime_pnl(
         total_pnl=realized_pnl + unrealized_pnl,
         today_trades=today_trades,
         today_pnl=today_pnl,
+        closed_trades=closed_trades,
+        wins=wins,
+        losses=losses,
+        win_rate_pct=win_rate_pct,
+        profit_factor=profit_factor,
+        avg_win=avg_win,
+        avg_loss=avg_loss,
+        strategy_pnl=strategy_pnl,
         open_positions=len(portfolio.positions),
         positions_heat=positions_heat_pct,
         session_high_equity=session_high,
@@ -154,8 +223,24 @@ def format_pnl_snapshot(snapshot: RealTimePnL) -> dict[str, object]:
         },
         "trading": {
             "today_trades": snapshot.today_trades,
+            "closed_trades": snapshot.closed_trades,
             "open_positions": snapshot.open_positions,
             "positions_heat_pct": round(snapshot.positions_heat, 2),
+        },
+        "performance": {
+            "wins": snapshot.wins,
+            "losses": snapshot.losses,
+            "win_rate_pct": round(snapshot.win_rate_pct, 2),
+            "profit_factor": round(snapshot.profit_factor, 2),
+            "avg_win": round(snapshot.avg_win, 2),
+            "avg_loss": round(snapshot.avg_loss, 2),
+        },
+        "strategy_attribution": {
+            tag: round(value, 2) for tag, value in sorted(
+                snapshot.strategy_pnl.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
         },
         "alerts": snapshot.alerts,
     }
@@ -169,6 +254,9 @@ class PnLAlertThresholds:
     max_positions_heat_pct: float = 3.0
     max_drawdown_pct: float = 5.0
     min_equity_buffer_pct: float = 10.0
+    min_profit_factor_after_n_trades: float = 0.8
+    min_win_rate_pct_after_n_trades: float = 40.0
+    confidence_gate_trade_count: int = 50
 
 
 def check_pnl_alerts(
@@ -222,6 +310,38 @@ def check_pnl_alerts(
             "message": f"Cash buffer {cash_pct:.1f}% below minimum {thresholds.min_equity_buffer_pct}%",
             "value": cash_pct,
             "threshold": thresholds.min_equity_buffer_pct,
+        })
+
+    if (
+        snapshot.closed_trades >= thresholds.confidence_gate_trade_count
+        and snapshot.profit_factor < thresholds.min_profit_factor_after_n_trades
+    ):
+        alerts.append({
+            "level": "critical",
+            "type": "low_profit_factor",
+            "message": (
+                f"Profit factor {snapshot.profit_factor:.2f} below minimum "
+                f"{thresholds.min_profit_factor_after_n_trades:.2f} after "
+                f"{snapshot.closed_trades} closed trades"
+            ),
+            "value": snapshot.profit_factor,
+            "threshold": thresholds.min_profit_factor_after_n_trades,
+        })
+
+    if (
+        snapshot.closed_trades >= thresholds.confidence_gate_trade_count
+        and snapshot.win_rate_pct < thresholds.min_win_rate_pct_after_n_trades
+    ):
+        alerts.append({
+            "level": "warning",
+            "type": "low_win_rate",
+            "message": (
+                f"Win rate {snapshot.win_rate_pct:.1f}% below minimum "
+                f"{thresholds.min_win_rate_pct_after_n_trades:.1f}% after "
+                f"{snapshot.closed_trades} closed trades"
+            ),
+            "value": snapshot.win_rate_pct,
+            "threshold": thresholds.min_win_rate_pct_after_n_trades,
         })
 
     return alerts

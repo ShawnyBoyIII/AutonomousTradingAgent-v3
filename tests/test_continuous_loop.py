@@ -492,3 +492,126 @@ class TestIdempotencyGuard:
             "AAPL price=105.00 qty=10 stop_widened 99.0000->97.0000 highest_high=105.00"
         ]
         assert ledger.load_portfolio_state().positions["AAPL"].stop_loss == 97.0
+
+    def test_manage_positions_executes_exit_and_persists_realized_pnl(self, monkeypatch, tmp_path):
+        import types
+
+        import pandas as pd
+
+        from trading_bot.config.settings import Settings
+        from trading_bot.models.portfolio import PortfolioState, Position
+        from trading_bot.portfolio.ledger import PortfolioLedger
+        from trading_bot.runtime import continuous_loop
+
+        settings = Settings(app={"state_db_path": str(tmp_path / "state.db"), "log_dir": str(tmp_path)})
+        settings.session.eod_enabled = False
+        settings.paper.fee_per_order = 1.0
+        settings.paper.slippage_bps = 0
+        ledger = PortfolioLedger(tmp_path / "state.db")
+        ledger.save_portfolio_state(
+            PortfolioState(
+                cash=9_000.0,
+                equity=10_000.0,
+                positions={
+                    "AAPL": Position(
+                        ticker="AAPL",
+                        quantity=10,
+                        average_cost=100.0,
+                        profit_target=108.0,
+                        strategy_tag="v3-trend_following",
+                    )
+                },
+            )
+        )
+        frame = pd.DataFrame(
+            {"close": [110.0], "high": [110.0], "low": [109.0], "volume": [1000]},
+            index=pd.DatetimeIndex([pd.Timestamp.now(tz="UTC")]),
+        )
+
+        monkeypatch.setattr(
+            continuous_loop.market_data,
+            "fetch_and_validate_bars",
+            lambda *args, **kwargs: (frame, types.SimpleNamespace(valid=True, reason="")),
+        )
+        monkeypatch.setattr(
+            "trading_bot.safety.kill_switch.check_kill_switch_before_trade",
+            lambda ledger: (True, ""),
+        )
+        monkeypatch.setattr(
+            "trading_bot.safety.circuit_breaker.check_circuit_breakers",
+            lambda ledger, settings: (True, ""),
+        )
+
+        result = continuous_loop._run_manage_positions_once(settings, ledger)
+
+        assert result["actions"] == 1
+        assert result["exit_events"][0]["ticker"] == "AAPL"
+        state = ledger.load_portfolio_state()
+        assert state is not None
+        assert state.positions == {}
+        assert state.cash == 10099.0
+        assert state.realized_pnl == 99.0
+
+        orders = ledger.list_order_rows()
+        assert len(orders) == 1
+        assert orders[0]["side"] == "SELL"
+        assert orders[0]["pnl"] == 99.0
+
+    def test_manage_positions_scales_out_partial_target(self, monkeypatch, tmp_path):
+        import types
+
+        import pandas as pd
+
+        from trading_bot.config.settings import Settings
+        from trading_bot.models.portfolio import PortfolioState, Position
+        from trading_bot.portfolio.ledger import PortfolioLedger
+        from trading_bot.runtime import continuous_loop
+
+        settings = Settings(app={"state_db_path": str(tmp_path / "state.db"), "log_dir": str(tmp_path)})
+        settings.session.eod_enabled = False
+        settings.paper.partial_take_profit_enabled = True
+        settings.paper.partial_take_profit_fraction = 0.5
+        ledger = PortfolioLedger(tmp_path / "state.db")
+        ledger.save_portfolio_state(
+            PortfolioState(
+                cash=9_000.0,
+                equity=10_000.0,
+                positions={
+                    "AAPL": Position(
+                        ticker="AAPL",
+                        quantity=10,
+                        average_cost=100.0,
+                        stop_loss=98.0,
+                        profit_target=108.0,
+                    )
+                },
+            )
+        )
+        frame = pd.DataFrame(
+            {"close": [110.0], "high": [110.0], "low": [109.0], "volume": [1000]},
+            index=pd.DatetimeIndex([pd.Timestamp.now(tz="UTC")]),
+        )
+
+        monkeypatch.setattr(
+            continuous_loop.market_data,
+            "fetch_and_validate_bars",
+            lambda *args, **kwargs: (frame, types.SimpleNamespace(valid=True, reason="")),
+        )
+        monkeypatch.setattr(
+            "trading_bot.safety.kill_switch.check_kill_switch_before_trade",
+            lambda ledger: (True, ""),
+        )
+        monkeypatch.setattr(
+            "trading_bot.safety.circuit_breaker.check_circuit_breakers",
+            lambda ledger, settings: (True, ""),
+        )
+
+        result = continuous_loop._run_manage_positions_once(settings, ledger)
+
+        assert result["actions"] == 1
+        state = ledger.load_portfolio_state()
+        assert state is not None
+        assert state.positions["AAPL"].quantity == 5
+        assert state.positions["AAPL"].stop_loss == 100.0
+        assert state.positions["AAPL"].profit_target is None
+        assert state.positions["AAPL"].partial_profit_taken is True

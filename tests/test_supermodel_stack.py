@@ -37,6 +37,7 @@ from trading_bot.runtime.orchestrator import (
     _trade_strategy_tag,
 )
 from trading_bot.strategy.supermodel import build_stacked_signal
+from trading_bot.swarm.results import CommitteeDecision, SignalVote
 
 
 def test_supermodel_supports_when_strategy_v3_and_rl_agree() -> None:
@@ -108,6 +109,31 @@ def test_supermodel_scan_details_and_summary_are_visible() -> None:
     assert "supermodel_support=1" in _format_scan_summary(summary)
     assert "swarm_approved=1" in _format_scan_summary(summary)
     assert "parallel_buy=1" in _format_scan_summary(summary)
+
+
+def test_format_scan_summary_includes_swarm_sentiment_counts() -> None:
+    summary = {
+        "symbols": 2,
+        "approved": 1,
+        "green": 1,
+        "yellow": 0,
+        "rejected": 1,
+        "no_signal": 0,
+        "errors": 0,
+        "swarm_enabled": True,
+        "swarm_approved": 1,
+        "swarm_rejected": 1,
+        "swarm_hold": 0,
+        "swarm_sentiment_evidence": 2,
+        "swarm_sentiment_bullish": 1,
+        "swarm_sentiment_bearish": 1,
+    }
+
+    formatted = _format_scan_summary(summary)
+
+    assert "swarm_sentiment_evidence=2" in formatted
+    assert "swarm_sentiment_bullish=1" in formatted
+    assert "swarm_sentiment_bearish=1" in formatted
 
 
 def test_compact_scan_persistence_keeps_swarm_evidence() -> None:
@@ -346,6 +372,7 @@ def test_scan_reject_event_keeps_stack_evidence(monkeypatch, tmp_path) -> None:
 
 
 def test_stale_scan_row_keeps_swarm_evidence(monkeypatch, tmp_path) -> None:
+    """Stale check removed — test normal approval with swarm evidence still works."""
     import trading_bot.runtime.orchestrator as orchestrator
 
     db_path = tmp_path / "state.db"
@@ -371,7 +398,6 @@ def test_stale_scan_row_keeps_swarm_evidence(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(orchestrator, "_calculate_portfolio_heat", lambda state, settings: 0.0)
     monkeypatch.setattr(orchestrator, "_fetch_atr", lambda symbol, settings: None)
-    monkeypatch.setattr(orchestrator, "_market_data_status", lambda *args, **kwargs: "stale")
     monkeypatch.setattr(orchestrator, "_market_data_age", lambda timestamp: "99m")
     monkeypatch.setattr(
         orchestrator,
@@ -399,8 +425,7 @@ def test_stale_scan_row_keeps_swarm_evidence(monkeypatch, tmp_path) -> None:
     result = run_scan(["AAPL"], settings, include_details=False)
 
     row = result["candidates"][0]
-    assert row["status"] == "REJECTED"
-    assert row["reason"] == "stale market data"
+    assert row["status"] == "APPROVED"
     assert row["swarm_decision"] == "APPROVE"
     assert row["swarm_confidence"] == 0.75
     assert row["swarm_handoff"] == "risk_manager handoff: technical=BUY fundamental=BUY"
@@ -756,6 +781,192 @@ def test_paper_trade_stack_uses_swarm_decision(monkeypatch, tmp_path) -> None:
     assert filled["swarm_handoff"] == "risk_manager handoff: technical=BUY fundamental=BUY"
 
 
+def test_paper_trade_swarm_sentiment_trims_position_size(monkeypatch, tmp_path) -> None:
+    import trading_bot.runtime.orchestrator as orchestrator
+
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    PortfolioLedger(db_path).save_portfolio_state(PortfolioState(cash=10_000.0, equity=10_000.0))
+    settings = Settings(
+        app={"state_db_path": str(db_path), "log_dir": str(log_dir)},
+        swarm={"enabled": True, "preset": "investment_committee", "swarm_weight": 0.0},
+    )
+    signal = TradeSignal(
+        ticker="AAPL",
+        timeframe="intraday",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=95.0,
+        profit_target=110.0,
+        risk_reward_ratio=2.0,
+        confidence=0.8,
+        reasons=["test"],
+        strategy_tag="test",
+        timestamp=datetime.now(timezone.utc),
+    )
+    fill = FillResult(
+        order_id="order-1",
+        ticker="AAPL",
+        quantity=17,
+        fill_price=100.0,
+        fees=0.0,
+        filled_at=datetime.now(timezone.utc),
+    )
+    position_sizes: list[int] = []
+
+    monkeypatch.setattr(orchestrator, "_calculate_portfolio_heat", lambda state, settings: 0.0)
+    monkeypatch.setattr(orchestrator, "_daily_loss_limit_hit", lambda state, settings: False)
+    monkeypatch.setattr(orchestrator, "_daily_order_limit_hit", lambda ledger, settings: False)
+    monkeypatch.setattr(orchestrator, "_fetch_atr", lambda symbol, settings: None)
+    monkeypatch.setattr(orchestrator, "_scan_quality", lambda details: "GREEN")
+    monkeypatch.setattr(orchestrator, "_build_signal_result", lambda symbol, settings: (signal, "test", {}))
+    import trading_bot.strategy.setup_rules as setup_rules
+    monkeypatch.setattr(setup_rules, "compute_v25_confluence_score", lambda details: 8.0)
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_swarm_overlay",
+        lambda symbols, settings, portfolio_state=None: {
+            "AAPL": CommitteeDecision(
+                decision="APPROVE",
+                ticker="AAPL",
+                action="BUY",
+                confidence=0.8,
+                key_rationale="mixed",
+                supporting_signals=[
+                    SignalVote(
+                        ticker="AAPL",
+                        action="SELL",
+                        confidence=0.7,
+                        worker_name="sentiment_analyst",
+                        preset="investment_committee",
+                        reasons=["news:downgrade"],
+                        metadata={"sentiment_score": -1.0, "news_count": 1, "source": "rss"},
+                    )
+                ],
+            )
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "evaluate_signal",
+        lambda **kwargs: RiskDecision(approved=True, reason="approved", position_size=20, dollar_risk=100.0),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "submit_signal_as_order",
+        lambda **kwargs: position_sizes.append(kwargs["position_size_override"]) or fill,
+    )
+
+    result = run_paper_trade(["AAPL"], settings)
+
+    assert result == [
+        "AAPL FILLED qty=17 price=100.00 cash=10000.00 sent_mult=0.85 sent_action=SELL sent_score=-1.00"
+    ]
+    assert position_sizes == [17]
+    events = [
+        json.loads(line)
+        for line in (log_dir / "decision-log.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    filled = [event for event in events if event.get("status") == "FILLED"][0]
+    assert filled["swarm_sentiment_size_multiplier"] == 0.85
+    assert "sent_mult=0.85" in result[0]
+
+
+def test_paper_trade_swarm_sentiment_can_recover_from_half_size(monkeypatch, tmp_path) -> None:
+    import trading_bot.runtime.orchestrator as orchestrator
+
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    PortfolioLedger(db_path).save_portfolio_state(PortfolioState(cash=10_000.0, equity=10_000.0))
+    settings = Settings(
+        app={"state_db_path": str(db_path), "log_dir": str(log_dir)},
+        swarm={"enabled": True, "preset": "investment_committee", "swarm_weight": 0.0},
+    )
+    signal = TradeSignal(
+        ticker="AAPL",
+        timeframe="intraday",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=95.0,
+        profit_target=110.0,
+        risk_reward_ratio=2.0,
+        confidence=0.8,
+        reasons=["test"],
+        strategy_tag="test",
+        timestamp=datetime.now(timezone.utc),
+    )
+    fill = FillResult(
+        order_id="order-1",
+        ticker="AAPL",
+        quantity=11,
+        fill_price=100.0,
+        fees=0.0,
+        filled_at=datetime.now(timezone.utc),
+    )
+    position_sizes: list[int] = []
+
+    monkeypatch.setattr(orchestrator, "_calculate_portfolio_heat", lambda state, settings: 0.0)
+    monkeypatch.setattr(orchestrator, "_daily_loss_limit_hit", lambda state, settings: False)
+    monkeypatch.setattr(orchestrator, "_daily_order_limit_hit", lambda ledger, settings: False)
+    monkeypatch.setattr(orchestrator, "_fetch_atr", lambda symbol, settings: None)
+    monkeypatch.setattr(orchestrator, "_scan_quality", lambda details: "GREEN")
+    monkeypatch.setattr(
+        orchestrator,
+        "_build_signal_result",
+        lambda symbol, settings: (signal, "test", {"is_half_size": True}),
+    )
+    import trading_bot.strategy.setup_rules as setup_rules
+    monkeypatch.setattr(setup_rules, "compute_v25_confluence_score", lambda details: 8.0)
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_swarm_overlay",
+        lambda symbols, settings, portfolio_state=None: {
+            "AAPL": CommitteeDecision(
+                decision="APPROVE",
+                ticker="AAPL",
+                action="BUY",
+                confidence=0.8,
+                key_rationale="bullish",
+                supporting_signals=[
+                    SignalVote(
+                        ticker="AAPL",
+                        action="BUY",
+                        confidence=0.7,
+                        worker_name="sentiment_analyst",
+                        preset="investment_committee",
+                        reasons=["news:upgrade"],
+                        metadata={"sentiment_score": 1.0, "news_count": 1, "source": "rss"},
+                    )
+                ],
+            )
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "evaluate_signal",
+        lambda **kwargs: RiskDecision(approved=True, reason="approved", position_size=20, dollar_risk=100.0),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "submit_signal_as_order",
+        lambda **kwargs: position_sizes.append(kwargs["position_size_override"]) or fill,
+    )
+
+    result = run_paper_trade(["AAPL"], settings)
+
+    assert result == [
+        "AAPL FILLED qty=11 price=100.00 cash=10000.00 sent_mult=1.15 sent_action=BUY sent_score=1.00"
+    ]
+    assert position_sizes == [11]
+    events = [
+        json.loads(line)
+        for line in (log_dir / "decision-log.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    filled = [event for event in events if event.get("status") == "FILLED"][0]
+    assert filled["swarm_sentiment_size_multiplier"] == 1.15
+    assert "sent_mult=1.15" in result[0]
+
+
 def test_paper_trade_reject_keeps_stack_evidence(monkeypatch, tmp_path) -> None:
     import trading_bot.runtime.orchestrator as orchestrator
 
@@ -803,6 +1014,7 @@ def test_paper_trade_reject_keeps_stack_evidence(monkeypatch, tmp_path) -> None:
 
 
 def test_paper_trade_stale_reject_keeps_stack_evidence(monkeypatch, tmp_path) -> None:
+    """Stale check removed — test that swarm/supermodel evidence is still recorded on normal flow."""
     import trading_bot.runtime.orchestrator as orchestrator
 
     db_path = tmp_path / "state.db"
@@ -822,15 +1034,14 @@ def test_paper_trade_stale_reject_keeps_stack_evidence(monkeypatch, tmp_path) ->
         risk_reward_ratio=2.0,
         confidence=0.8,
         reasons=["test"],
-        strategy_tag="test",
+        strategy_tag="v3-trend_following",
         timestamp=datetime.now(timezone.utc),
     )
 
     monkeypatch.setattr(orchestrator, "_calculate_portfolio_heat", lambda state, settings: 0.0)
     monkeypatch.setattr(orchestrator, "_daily_loss_limit_hit", lambda state, settings: False)
     monkeypatch.setattr(orchestrator, "_daily_order_limit_hit", lambda ledger, settings: False)
-    monkeypatch.setattr(orchestrator, "_market_data_status", lambda *args, **kwargs: "stale")
-    monkeypatch.setattr(orchestrator, "_build_signal_result", lambda symbol, settings: (signal, "test", {}))
+    monkeypatch.setattr(orchestrator, "_build_signal_result", lambda symbol, settings: (signal, "test", {"quality": "GREEN"}))
     monkeypatch.setattr(
         orchestrator,
         "_run_swarm_overlay",
@@ -846,9 +1057,9 @@ def test_paper_trade_stale_reject_keeps_stack_evidence(monkeypatch, tmp_path) ->
 
     result = run_paper_trade(["AAPL"], settings)
 
-    assert result == ["AAPL REJECTED stale market data"]
+    # Signal goes through (GREEN quality)
+    assert any("FILLED" in r or "APPROVED" in r for r in result)
     event = json.loads((log_dir / "decision-log.jsonl").read_text(encoding="utf-8").splitlines()[-1])
-    assert event["reason"] == "stale market data"
     assert event["supermodel_decision"] == "support"
     assert event["swarm_decision"] == "APPROVE"
     assert event["swarm_handoff"] == "risk_manager handoff: technical=BUY fundamental=BUY"

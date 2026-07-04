@@ -108,6 +108,7 @@ class TestV3IsMeanReversionFlag:
             "ema_20": [99.0] * 30, "sma_50": [98.0] * 30,
         }, index=pd.date_range("2025-01-01", periods=30, freq="1d"))
         intraday = _mr_intraday_frame()
+        intraday.loc[intraday.index[-1], "volume"] = 1300.0
 
         with patch("trading_bot.runtime.orchestrator.market_data.fetch_and_validate_bars") as m_fetch:
             from trading_bot.data.validation import ValidationResult

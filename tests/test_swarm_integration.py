@@ -13,6 +13,7 @@ from trading_bot.models.risk import RiskDecision
 from trading_bot.models.signal import TradeSignal
 from trading_bot.models.portfolio import Position
 from trading_bot.portfolio.ledger import PortfolioLedger, PortfolioState
+from trading_bot.swarm.results import CommitteeDecision, SignalVote
 
 
 def _make_frame(n=252, start_price=100.0):
@@ -167,6 +168,129 @@ class TestSwarmOverlayIntegration:
                         assert approved[0]["swarm_decision"] == "APPROVE"
                         assert "swarm:support" in approved[0]["details"]["supermodel_layers"]
 
+    def test_swarm_results_surface_sentiment_fields(self, tmp_path: Path) -> None:
+        """Sentiment analyst evidence should be exposed in scan candidates/details."""
+        db_path = tmp_path / "state.db"
+        ledger = PortfolioLedger(db_path)
+        ledger.save_portfolio_state(PortfolioState(cash=10_000.0, equity=10_000.0))
+
+        settings = Settings(
+            app={"state_db_path": str(db_path)},
+            swarm={"enabled": True, "preset": "investment_committee"},
+        )
+
+        sentiment_vote = SignalVote(
+            ticker="AAPL",
+            action="BUY",
+            confidence=0.72,
+            worker_name="sentiment_analyst",
+            preset="investment_committee",
+            reasons=["news:upgrade"],
+            metadata={
+                "sentiment_score": 0.42,
+                "news_count": 2,
+                "source": "rss",
+            },
+        )
+        committee = CommitteeDecision(
+            decision="APPROVE",
+            ticker="AAPL",
+            action="BUY",
+            confidence=0.8,
+            supporting_signals=[sentiment_vote],
+            key_rationale="bullish",
+        )
+
+        with patch("trading_bot.runtime.orchestrator._run_swarm_overlay", return_value={"AAPL": committee}):
+            with patch(
+                "trading_bot.runtime.orchestrator._build_signal_result",
+                return_value=(_make_signal(), "test", {}),
+            ):
+                with patch(
+                    "trading_bot.runtime.orchestrator.evaluate_signal",
+                    return_value=_make_decision(),
+                ):
+                    from trading_bot.runtime.orchestrator import run_scan
+
+                    result = run_scan(["AAPL"], settings, include_details=True)
+
+        approved = [c for c in result["candidates"] if c["status"] == "APPROVED"]
+        assert len(approved) == 1
+        row = approved[0]
+        assert row["swarm_sentiment_action"] == "BUY"
+        assert row["swarm_sentiment_confidence"] == 0.72
+        assert row["swarm_sentiment_score"] == 0.42
+        assert row["swarm_sentiment_news_count"] == 2
+        assert row["swarm_sentiment_source"] == "rss"
+        assert row["details"]["swarm_sentiment_score"] == 0.42
+
+    def test_swarm_sentiment_influences_scan_order_and_summary(self, tmp_path: Path) -> None:
+        """Bullish sentiment evidence should break ties and appear in summary counts."""
+        db_path = tmp_path / "state.db"
+        ledger = PortfolioLedger(db_path)
+        ledger.save_portfolio_state(PortfolioState(cash=10_000.0, equity=10_000.0))
+
+        settings = Settings(
+            app={"state_db_path": str(db_path)},
+            swarm={"enabled": True, "preset": "investment_committee"},
+        )
+
+        bullish_vote = SignalVote(
+            ticker="AAPL",
+            action="BUY",
+            confidence=0.7,
+            worker_name="sentiment_analyst",
+            preset="investment_committee",
+            reasons=["news:upgrade"],
+            metadata={"sentiment_score": 0.45, "news_count": 1, "source": "rss"},
+        )
+        bearish_vote = SignalVote(
+            ticker="MSFT",
+            action="SELL",
+            confidence=0.7,
+            worker_name="sentiment_analyst",
+            preset="investment_committee",
+            reasons=["news:downgrade"],
+            metadata={"sentiment_score": -0.4, "news_count": 1, "source": "rss"},
+        )
+        committee_results = {
+            "AAPL": CommitteeDecision(
+                decision="APPROVE",
+                ticker="AAPL",
+                action="BUY",
+                confidence=0.7,
+                supporting_signals=[bullish_vote],
+                key_rationale="bullish",
+            ),
+            "MSFT": CommitteeDecision(
+                decision="APPROVE",
+                ticker="MSFT",
+                action="BUY",
+                confidence=0.7,
+                opposing_signals=[bearish_vote],
+                key_rationale="mixed",
+            ),
+        }
+
+        with patch("trading_bot.runtime.orchestrator._run_swarm_overlay", return_value=committee_results):
+            with patch(
+                "trading_bot.runtime.orchestrator._build_signal_result",
+                side_effect=[(_make_signal("AAPL"), "test", {}), (_make_signal("MSFT"), "test", {})],
+            ):
+                with patch(
+                    "trading_bot.runtime.orchestrator.evaluate_signal",
+                    return_value=_make_decision(),
+                ):
+                    from trading_bot.runtime.orchestrator import run_scan
+
+                    result = run_scan(["MSFT", "AAPL"], settings, include_details=True)
+
+        approved = [c for c in result["candidates"] if c["status"] == "APPROVED"]
+        assert [row["ticker"] for row in approved] == ["AAPL", "MSFT"]
+        assert result["summary"]["swarm_sentiment_evidence"] == 2
+        assert result["summary"]["swarm_sentiment_bullish"] == 1
+        assert result["summary"]["swarm_sentiment_bearish"] == 1
+
     def test_swarm_summary_includes_stats(self, tmp_path: Path) -> None:
         """Test that swarm summary includes approval/rejection counts."""
         db_path = tmp_path / "state.db"
@@ -284,9 +408,12 @@ class TestSwarmOverlayIntegration:
         )
         captured: dict[str, pd.DataFrame] = {}
 
-        def capture_run(self, symbols, market_data, portfolio_state=None):
+        def capture_run(self, symbols, market_data, portfolio_state=None, **kwargs):
+            captured["symbols"] = symbols
             captured.update(market_data)
             captured["portfolio_state"] = portfolio_state
+            captured["sentiment_context"] = kwargs.get("sentiment_context")
+            captured["memory_store"] = kwargs.get("memory_store")
             return SimpleNamespace(decisions={})
 
         import trading_bot.data.market_data as market_data
@@ -302,3 +429,6 @@ class TestSwarmOverlayIntegration:
         for column in ("ema_20", "sma_50", "rsi_14", "bb_lower", "bb_upper", "volume_avg_5"):
             assert column in frame.columns
         assert captured["portfolio_state"] == {"cash": 123.0}
+        assert captured["symbols"] == ["AAPL"]
+        assert captured["sentiment_context"]["vix"] > 0
+        assert captured["memory_store"] is None

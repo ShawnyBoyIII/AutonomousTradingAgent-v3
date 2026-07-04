@@ -45,6 +45,7 @@ class SignalHandler(EventHandler):
         self.bus.subscribe("STRATEGY_SIGNAL", self.on_signal)
 
     def on_signal(self, event: StrategySignalEvent) -> None:
+        self.cache.update_from_signal(event)
         if event.action == "HOLD":
             return
 
@@ -125,8 +126,6 @@ class OrderHandler(EventHandler):
         self.bus.subscribe("ORDER_REQUEST", self.on_order_request)
 
     def on_order_request(self, event: OrderRequestEvent) -> None:
-        from trading_bot.execution.paper_broker import PaperBroker
-
         state = self.cache.get_position(event.ticker)
         if state and state.get("quantity", 0) > 0:
             self.bus.publish_to(
@@ -141,7 +140,18 @@ class OrderHandler(EventHandler):
             return
 
         position_size = event.quantity
-        entry_price = 150.0
+        entry_price = self._resolve_fill_price(event)
+        if entry_price is None:
+            self.bus.publish_to(
+                "ORDER_REJECT",
+                OrderRejectEvent(
+                    order_id=event.order_id,
+                    ticker=event.ticker,
+                    reason="missing market price",
+                    timestamp=event.timestamp,
+                ),
+            )
+            return
         total_cost = (entry_price * position_size) + 1.0
         if self.cache.get_cash() < total_cost:
             self.bus.publish_to(
@@ -165,6 +175,21 @@ class OrderHandler(EventHandler):
             timestamp=event.timestamp,
         )
         self.bus.publish_to("ORDER_FILL", fill)
+
+    def _resolve_fill_price(self, event: OrderRequestEvent) -> float | None:
+        recent_bars = self.cache.get_recent_bars(event.ticker, n=1)
+        if recent_bars:
+            close = recent_bars[-1].get("close")
+            if close is not None:
+                return float(close)
+
+        recent_signals = self.cache.get_recent_signals(event.ticker, n=1)
+        if recent_signals:
+            entry_price = recent_signals[-1].get("entry_price")
+            if entry_price is not None:
+                return float(entry_price)
+
+        return None
 
 
 class PortfolioHandler(EventHandler):

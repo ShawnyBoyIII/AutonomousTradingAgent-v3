@@ -34,6 +34,10 @@ def _interval_to_ttl_seconds(interval: str) -> int:
         return max(value * 43200, 3600)
     if unit == "w":
         return max(value * 302400, 86400)
+    if unit == "mo":
+        return max(value * 1_296_000, 604800)
+    if unit == "y":
+        return max(value * 15_552_000, 2_592_000)
     return 300
 
 

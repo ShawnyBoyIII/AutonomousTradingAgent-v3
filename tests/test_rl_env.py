@@ -15,6 +15,7 @@ from trading_bot.rl.rewards import (
     ShannonEntropyReward,
     SharpeReward,
     DrawdownPenaltyReward,
+    Phase3Reward,
 )
 from trading_bot.rl.observer import TensorTradeObserver
 from trading_bot.models.portfolio import PortfolioState
@@ -243,6 +244,26 @@ class TestRewardSchemes:
         assert drawdown.compute_reward(100_000, 101_000) < 0
         drawdown.reset()
         assert drawdown.compute_reward(100_000, 100_000) == 0.0
+
+    def test_phase3_reward_combines_components(self):
+        reward = Phase3Reward(reward_scale=100.0)
+        first = reward.compute_reward(101_000, 100_000)
+        second = reward.compute_reward(100_500, 101_000)
+
+        assert first > 0
+        assert second < first
+
+    def test_env_accepts_phase3_reward_scheme(self, mock_market_data):
+        env = TradingEnv(
+            config=TradingConfig(
+                symbols=["AAPL"],
+                observer_window=5,
+                reward_scheme="phase3",
+            )
+        )
+        env.reset()
+        _, reward, _, _, _ = env.step(0)
+        assert isinstance(reward, float)
 
 
 class TestRLTrainer:

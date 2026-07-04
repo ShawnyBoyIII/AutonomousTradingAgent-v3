@@ -35,6 +35,7 @@ class WorkerConfig(BaseModel):
     timeout_seconds: int = 300
     depends_on: list[str] = Field(default_factory=list)
     priority: int = 0
+    accuracy_weight: float = Field(default=1.0, gt=0.0, le=5.0)
 
 
 class WorkerResult(BaseModel):

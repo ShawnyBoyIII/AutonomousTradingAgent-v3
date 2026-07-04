@@ -1,3 +1,9 @@
+"""Daily breakout research engine.
+
+This module is currently used by the backtest runner only. Live scan and
+paper-trade flows still use the intraday/V3 paths.
+"""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING

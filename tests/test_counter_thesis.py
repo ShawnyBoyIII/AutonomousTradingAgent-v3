@@ -204,7 +204,7 @@ def test_resistance_proximity_finding() -> None:
 def test_regime_misalignment_levels() -> None:
     for regime, expected in [
         (MarketRegime.STRONG_DOWNTREND, "severe"),
-        (MarketRegime.HIGH_VOLATILITY, "high"),
+        (MarketRegime.HIGH_VOLATILITY, "medium"),
         (MarketRegime.WEAK_DOWNTREND, "medium"),
     ]:
         ctx = _clean_context(regime=regime)

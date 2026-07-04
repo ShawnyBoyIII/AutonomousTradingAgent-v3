@@ -16,6 +16,7 @@ from trading_bot.rl.observer import Observer
 from trading_bot.rl.rewards import (
     CompoundDailyReward,
     DrawdownPenaltyReward,
+    Phase3Reward,
     RewardScheme,
     RiskAdjustedReward,
     ShannonEntropyReward,
@@ -122,6 +123,8 @@ class TradingEnv(gym.Env):
             "shannon_entropy": ShannonEntropyReward(),
             "sharpe": SharpeReward(reward_scale=self.config.reward_scale),
             "drawdown_penalty": DrawdownPenaltyReward(reward_scale=self.config.reward_scale),
+            "phase3": Phase3Reward(reward_scale=self.config.reward_scale),
+            "phase3_default": Phase3Reward(reward_scale=self.config.reward_scale),
         }
         self._reward_scheme = reward_schemes.get(
             self.config.reward_scheme,
