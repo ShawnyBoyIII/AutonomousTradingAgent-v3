@@ -9,6 +9,7 @@ from trading_bot.models.scout import ScoutCandidate, ScoutResult, ScoutSummary
 def build_scout_candidates(
     rows: list[dict[str, object]],
     settings: ScoutSettings,
+    advisory_override: dict[str, object] | None = None,
 ) -> ScoutResult:
     grouped: dict[str, list[dict[str, object]]] = {}
     errors = 0
@@ -50,6 +51,13 @@ def build_scout_candidates(
             candidate.reasons.append("outside top universe limit")
         candidate.rank = None
 
+    included_symbols = _apply_advisory_override(
+        ranked,
+        included_symbols,
+        settings,
+        advisory_override,
+    )
+
     ranked.sort(
         key=lambda candidate: (
             not candidate.included,
@@ -69,6 +77,61 @@ def build_scout_candidates(
             errors=errors,
         ),
     )
+
+
+def _apply_advisory_override(
+    ranked: list[ScoutCandidate],
+    included_symbols: list[str],
+    settings: ScoutSettings,
+    advisory_override: dict[str, object] | None,
+) -> list[str]:
+    if not advisory_override:
+        return included_symbols
+
+    main = advisory_override.get("main_midcap") if isinstance(advisory_override, dict) else None
+    if not isinstance(main, dict):
+        return included_symbols
+
+    promote = [str(value).upper().strip() for value in main.get("promote_symbols", []) if str(value).strip()]
+    avoid = {str(value).upper().strip() for value in main.get("avoid_symbols", []) if str(value).strip()}
+    final_symbols: list[str] = []
+    seen: set[str] = set()
+    for raw_symbol in [*promote, *included_symbols]:
+        symbol = raw_symbol.upper().strip()
+        if not symbol or symbol in seen or symbol in avoid:
+            continue
+        seen.add(symbol)
+        final_symbols.append(symbol)
+        if len(final_symbols) >= settings.max_universe_size:
+            break
+
+    by_ticker = {candidate.ticker: candidate for candidate in ranked}
+    for rank, symbol in enumerate(final_symbols, start=1):
+        candidate = by_ticker.get(symbol)
+        if candidate is None:
+            candidate = ScoutCandidate(
+                ticker=symbol,
+                scout_score=100.0,
+                included=True,
+                reasons=["advisory promoted symbol"],
+            )
+            ranked.append(candidate)
+            by_ticker[symbol] = candidate
+        candidate.included = True
+        candidate.rank = rank
+        if "advisory promoted symbol" not in candidate.reasons and symbol in promote and symbol not in included_symbols:
+            candidate.reasons.append("advisory promoted symbol")
+
+    final_set = set(final_symbols)
+    for candidate in ranked:
+        if candidate.ticker in final_set:
+            continue
+        if candidate.ticker in avoid and "advisory avoided symbol" not in candidate.reasons:
+            candidate.reasons.append("advisory avoided symbol")
+        candidate.included = False
+        candidate.rank = None
+
+    return final_symbols
 
 
 def _build_candidate(

@@ -141,11 +141,33 @@ market_data:
 ./scripts/auto-burn-in.sh
 ./tradebot-local tune --dry-run
 ./tradebot-local tune
+./tradebot-local supermodel-report
+./tradebot-local db-features --summary
 tail -f logs/burn_in/decision-log.jsonl
+
+# Advisory learner (paper-only; opt-in via advisory.enabled)
+./tradebot-local advisory-learn                    # Score symbols + write scout_override.yaml
+./tradebot-local advisory-learn --daily-report     # Also write state/advisory_learner/report.md
+./tradebot-local advisory-report                   # Print latest recommendations
+./tradebot-local advisory-report --markdown        # Markdown rendering
+./tradebot-local advisory-report --json            # Machine-readable JSON
+
+# Branch review against the active V2 stack
+git log --oneline v2/main..HEAD
+git diff --stat v2/main...HEAD
 ```
 
 - `./tradebot-local tune` writes `state/tuning_overrides.yaml`; loader applies only allowlisted supermodel + strategy-tracker fields and still forces `live_trading_enabled=false`
 - Swarm worker votes are logged to `logs/worker_votes.jsonl`; use this file for future per-worker weight tuning
+- Decision-log and paper-trade rows preserve compact supermodel/swarm evidence even on rejects and `NO_SIGNAL`; use `supermodel-report`, `trade-attribution`, and `db-features` for paper review before adding new logging.
+- Use `v2/main` as the local base when reviewing this branch's session-specific delta; `origin/main` is older and PR diffs there can include a large pre-existing stack.
+- `git archive HEAD | tar -x -C <tmp-dir>` plus an import smoke test — verifies a branch is self-contained; the live worktree can mask missing tracked files with untracked local dependencies.
+
+---
+
+## Session Gotchas
+
+- When calling `trading_bot.runtime.position_exit` helpers outside CLI entrypoints, pass the active `settings` object explicitly so exit persistence uses the intended DB/log paths.
 
 ---
 
@@ -205,16 +227,19 @@ Fail-fast: stops on first validation error.
 - `trading_bot/strategy/counter_thesis.py` - Counter-thesis engine
 - `trading_bot/strategy/strategy_selector.py` - Regime + confluence
 - `trading_bot/risk/position_sizer.py` - ATR sizing logic
+- `trading_bot/advisory/learner.py` - Advisory learner: scores observations, writes scout override + daily report
 - `docs/V2_5_PHASE_D_BURN_IN_GUIDE.md` - Operational guide
 
 ---
 
 ## Current State
 
-- **Test count:** 1853 passing, 0 failures
+- **Test count:** 1989 passing
 - **V2.5 complete:** ATR sizing, validation, kill switches, burn-in
 - **V3 wired:** Regime detection, confluence scoring, counter-thesis (entry + exit + backtest)
 - **Parallel signal mode:** Burn-in uses V3 + V2.5 consensus with Swarm size modification
+- **Advisory learner:** Paper-only sidecar scores decision-log + scan_features + trade outcomes, writes `state/advisory_learner/scout_override.yaml` and daily `report.md`; auto-consumed by `build_scout_candidates()` and universe loaders when `advisory.enabled`
+- **Paper evidence trail:** `scan_features`, decision logs, and `strategy_tag` persist stack/swarm context for later attribution and report rollups
 - **MR detection relaxed (2026-07-02):** RSI < 40 (was 35), VWAP 0.5% (was 1%), range vol 80% (was 100%)
 - **RL disabled in burn-in:** RL commands remain available for offline experiments, but the active burn-in vote path ignores RL
 - **Phase D active:** Running paper burn-in with dynamic watchlist

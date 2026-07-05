@@ -166,6 +166,9 @@ def load_settings(config_path: Path | None = None) -> Settings:
     settings.app.tuning_overrides_path = _resolve_relative_value(
         settings.app.tuning_overrides_path, base_dir
     )
+    settings.app.advisory_dir = _resolve_relative_value(
+        settings.app.advisory_dir, base_dir
+    )
     settings.sentiment.context_path = _resolve_relative_value(
         settings.sentiment.context_path, base_dir
     )

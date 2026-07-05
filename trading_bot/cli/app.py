@@ -1248,9 +1248,9 @@ def _run_scan_command(
         candidates = _approved_alert_candidates(scan_result["candidates"])
         if not candidates:
             typer.echo("alerts=0")
-            return
-        notify(ctx.obj, "info", "BUY Signal", _format_signal_alert(candidates))
-        typer.echo(f"alerts={len(candidates)}")
+        else:
+            notify(ctx.obj, "info", "BUY Signal", _format_signal_alert(candidates))
+            typer.echo(f"alerts={len(candidates)}")
 
 
 def _parse_symbols(values: list[str]) -> list[str]:
@@ -1270,6 +1270,51 @@ def _merge_symbols(*groups: list[str]) -> list[str]:
                 seen.add(symbol)
                 merged.append(symbol)
     return merged
+
+
+def _apply_advisory_symbol_overrides(symbols: list[str], settings, limit: int | None = None) -> list[str]:
+    from trading_bot.advisory import apply_scout_override
+
+    return apply_scout_override(symbols, settings, limit=limit)
+
+
+def _apply_advisory_candidate_overrides(
+    candidates: list[dict[str, object]],
+    symbols: list[str],
+    settings,
+) -> list[dict[str, object]]:
+    final_symbols = _apply_advisory_symbol_overrides(
+        symbols,
+        settings,
+        limit=settings.scout.max_universe_size,
+    )
+    symbol_set = set(final_symbols)
+    by_ticker = {
+        str(candidate.get("ticker", "")).upper().strip(): dict(candidate)
+        for candidate in candidates
+        if str(candidate.get("ticker", "")).strip()
+    }
+    for rank, ticker in enumerate(final_symbols, start=1):
+        candidate = by_ticker.get(ticker, {"ticker": ticker, "scout_score": 0.0, "source_hits": 0, "source_names": [], "market_cap": None, "price": None, "avg_dollar_volume": 0.0, "volume_ratio": None, "reasons": []})
+        reasons = list(candidate.get("reasons", [])) if isinstance(candidate.get("reasons"), list) else []
+        if ticker not in by_ticker:
+            reasons.append("advisory promoted symbol")
+        candidate.update({"included": True, "rank": rank, "reasons": reasons})
+        by_ticker[ticker] = candidate
+    for ticker, candidate in by_ticker.items():
+        if ticker not in symbol_set:
+            candidate["included"] = False
+            candidate["rank"] = None
+    ordered = sorted(
+        by_ticker.values(),
+        key=lambda candidate: (
+            not bool(candidate.get("included")),
+            int(candidate.get("rank") or 999999),
+            -float(candidate.get("scout_score", 0.0) or 0.0),
+            str(candidate.get("ticker", "")),
+        ),
+    )
+    return ordered
 
 
 def _format_backtest_diagnostics(result: dict) -> str:
@@ -1344,13 +1389,14 @@ def _validate_rl_model_symbols(path: Path, requested_symbols: list[str]) -> list
 
 def _build_universe_file(settings) -> dict[str, object]:
     from trading_bot.data import market_data
+    from trading_bot.advisory import load_scout_override
 
     fetch_limit = max(settings.scout.max_universe_size, settings.scout.max_snapshot_candidates)
     rows = market_data.fetch_small_cap_candidates(
         limit=fetch_limit,
         screeners=settings.scout.screeners,
     )
-    scout_result = build_scout_candidates(rows, settings.scout)
+    scout_result = build_scout_candidates(rows, settings.scout, advisory_override=load_scout_override(settings))
     included_symbols = scout_result.included_symbols
     lines = [
         " ".join(
@@ -1419,8 +1465,16 @@ def _read_ranked_universe_symbols(settings) -> list[str]:
         ]
         if ranked:
             ranked.sort(key=lambda candidate: candidate.rank or 999999)
-            return [candidate.ticker.strip() for candidate in ranked]
-    return _read_universe_symbols(Path(settings.app.universe_path))
+            return _apply_advisory_symbol_overrides(
+                [candidate.ticker.strip() for candidate in ranked],
+                settings,
+                limit=settings.scout.max_universe_size,
+            )
+    return _apply_advisory_symbol_overrides(
+        _read_universe_symbols(Path(settings.app.universe_path)),
+        settings,
+        limit=settings.scout.max_universe_size,
+    )
 
 
 def _load_json_snapshot(path: Path) -> dict[str, object]:
@@ -1982,6 +2036,54 @@ def tune(
     write_tuning_overrides(output_path, proposal)
     typer.echo(f"Wrote tuning overrides to {output_path}")
     typer.echo(rendered)
+
+
+@app.command(name="advisory-learn")
+def advisory_learn(
+    ctx: typer.Context,
+    daily_report: bool = typer.Option(False, "--daily-report", help="Write Daily report.md alongside advisory artifacts."),
+) -> None:
+    """Ingest scan evidence and write advisory learner artifacts."""
+    from trading_bot.advisory import run_advisory_learner
+
+    if not ctx.obj.advisory.enabled:
+        typer.echo("advisory=disabled")
+        return
+
+    summary = run_advisory_learner(ctx.obj, write_daily_report=daily_report)
+    typer.echo(
+        " ".join(
+            [
+                f"observations_added={summary.observations_added}",
+                f"main_recommendations={summary.main_recommendations}",
+                f"cheap_recommendations={summary.cheap_recommendations}",
+            ]
+        )
+    )
+
+
+@app.command(name="advisory-report")
+def advisory_report(
+    ctx: typer.Context,
+    markdown: bool = typer.Option(False, "--markdown", help="Print the markdown daily report if available."),
+    json_output: bool = typer.Option(False, "--json", help="Print the latest learner report as JSON."),
+) -> None:
+    """Show the latest advisory learner report."""
+    from trading_bot.advisory import format_advisory_report, load_latest_advisory_report
+
+    report = load_latest_advisory_report(ctx.obj)
+    if not report:
+        typer.echo("advisory_report=empty")
+        return
+    if json_output:
+        typer.echo(json.dumps(report, indent=2))
+        return
+    if markdown:
+        report_path = Path(ctx.obj.app.advisory_dir) / "Daily report.md"
+        if report_path.exists():
+            typer.echo(report_path.read_text(encoding="utf-8").rstrip())
+            return
+    typer.echo(format_advisory_report(report))
 
 
 @app.command(name="drawdown")
@@ -2676,7 +2778,13 @@ def discover_symbols(
 
     if export:
         export_path = watchlist.export_for_burn_in(ctx.obj.app.universe_path)
-        typer.echo(f"\nExported {len(watchlist.get_symbols())} symbols to {export_path}")
+        overridden = _apply_advisory_symbol_overrides(
+            _read_universe_symbols(Path(export_path)),
+            ctx.obj,
+            limit=max_symbols,
+        )
+        Path(export_path).write_text("\n".join(overridden), encoding="utf-8")
+        typer.echo(f"\nExported {len(overridden)} symbols to {export_path}")
 
 
 @app.command(name="sector-analysis")
