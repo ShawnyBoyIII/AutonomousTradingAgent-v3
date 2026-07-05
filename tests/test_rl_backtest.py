@@ -166,9 +166,10 @@ class TestRLBacktestRunner:
         broker = PaperBroker(starting_cash=10000.0, fee_per_order=1.0, slippage_bps=0)
         prices = {"AAPL": 100.0}
 
-        trade_type, trade_price = runner._action_to_trade(0, "AAPL", prices, broker)
+        trade_type, trade_price, proportion = runner._action_to_trade(0, "AAPL", prices, broker)
         assert trade_type is None
         assert trade_price is None
+        assert proportion == 1.0
 
     def test_action_to_trade_buy(self):
         config = RLBacktestConfig(symbols=["AAPL"])
@@ -179,9 +180,10 @@ class TestRLBacktestRunner:
         prices = {"AAPL": 100.0}
 
         action = 2  # BUY for AAPL (action=1 is HOLD for AAPL)
-        trade_type, trade_price = runner._action_to_trade(action, "AAPL", prices, broker)
+        trade_type, trade_price, proportion = runner._action_to_trade(action, "AAPL", prices, broker)
         assert trade_type == "BUY"
         assert trade_price == 100.0
+        assert proportion == 1.0
 
     def test_action_to_trade_sell_no_position(self):
         config = RLBacktestConfig(symbols=["AAPL"])
@@ -192,9 +194,10 @@ class TestRLBacktestRunner:
         prices = {"AAPL": 100.0}
 
         action = 3  # SELL for AAPL (action=2 is BUY, action=3 is SELL)
-        trade_type, trade_price = runner._action_to_trade(action, "AAPL", prices, broker)
+        trade_type, trade_price, proportion = runner._action_to_trade(action, "AAPL", prices, broker)
         assert trade_type is None
         assert trade_price is None
+        assert proportion == 1.0
 
     def test_action_to_trade_sell_with_position(self):
         config = RLBacktestConfig(symbols=["AAPL"])
@@ -206,9 +209,10 @@ class TestRLBacktestRunner:
         prices = {"AAPL": 100.0}
 
         action = 3  # SELL for AAPL
-        trade_type, trade_price = runner._action_to_trade(action, "AAPL", prices, broker)
+        trade_type, trade_price, proportion = runner._action_to_trade(action, "AAPL", prices, broker)
         assert trade_type == "SELL"
         assert trade_price == 100.0
+        assert proportion == 1.0
 
     def test_action_to_trade_invalid_symbol(self):
         config = RLBacktestConfig(symbols=["AAPL"])
@@ -218,9 +222,10 @@ class TestRLBacktestRunner:
         broker = PaperBroker(starting_cash=10000.0, fee_per_order=1.0, slippage_bps=0)
         prices = {"SPY": 100.0}
 
-        trade_type, trade_price = runner._action_to_trade(1, "SPY", prices, broker)
+        trade_type, trade_price, proportion = runner._action_to_trade(1, "SPY", prices, broker)
         assert trade_type is None
         assert trade_price is None
+        assert proportion == 1.0
 
     def test_resolve_exit_stop_loss_hit(self):
         config = RLBacktestConfig()
@@ -309,6 +314,10 @@ class TestStrategyComparison:
         settings.strategy.use_v3_signals = True
         settings.rl.enabled = True
         settings.rl.model_path = "/tmp/test_model"
+        settings.rl.backtest_starting_cash = 100_000.0
+        settings.rl.backtest_max_shares = 150
+        settings.rl.backtest_stop_loss_pct = 0.03
+        settings.rl.backtest_profit_target_pct = 0.08
         return settings
 
     def test_run_strategy_comparison_detects_strategies(self, mock_settings):
@@ -335,3 +344,212 @@ class TestStrategyComparison:
             assert "best_pnl_strategy" in comparison
             assert "best_winrate_strategy" in comparison
             assert "AAPL" in str(comparison) or "MSFT" in str(comparison)
+
+    def test_run_strategy_comparison_toggles_v3_flag(self, mock_settings):
+        from trading_bot.backtest.runner import run_strategy_comparison
+
+        seen_flags = []
+
+        def fake_backtest(symbols, settings, start=None, end=None):
+            seen_flags.append(settings.strategy.use_v3_signals)
+            return {
+                "trades": 1, "wins": 1, "losses": 0,
+                "net_pnl": 1.0, "win_rate": 1.0, "rows": [],
+            }
+
+        with patch("trading_bot.backtest.runner.run_backtest", side_effect=fake_backtest), \
+             patch("trading_bot.backtest.runner.run_rl_backtest") as mock_rl:
+            mock_rl.return_value = {
+                "trades": 0, "wins": 0, "losses": 0,
+                "net_pnl": 0.0, "win_rate": 0.0, "rows": [],
+            }
+
+            run_strategy_comparison(
+                ["AAPL"], mock_settings, start="2024-01-01", end="2024-12-31", strategies=["v2.5", "v3", "rl"]
+            )
+
+        assert seen_flags == [False, True]
+
+    def test_run_rl_backtest_uses_configured_sizing(self, mock_settings, tmp_path):
+        from trading_bot.backtest.runner import run_rl_backtest
+
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=30, freq="1D"),
+                "open": [100.0] * 30,
+                "high": [101.0] * 30,
+                "low": [99.0] * 30,
+                "close": [100.0] * 30,
+                "volume": [1_000_000] * 30,
+            }
+        )
+        model_path = tmp_path / "PPO_final.zip"
+        model_path.write_text("fake", encoding="utf-8")
+        meta_path = tmp_path / "PPO_final_meta.json"
+        meta_path.write_text(json.dumps({"symbols": ["AAPL"], "action_scheme": "proportion"}), encoding="utf-8")
+        mock_settings.rl.model_path = str(model_path)
+        seen = {}
+
+        class FakeRunner:
+            FEATURE_COLS = RLBacktestRunner.FEATURE_COLS
+
+            def __init__(self, config):
+                seen["starting_cash"] = config.starting_cash
+                seen["max_shares"] = config.max_shares
+                seen["stop_loss_pct"] = config.stop_loss_pct
+                seen["profit_target_pct"] = config.profit_target_pct
+                seen["action_scheme"] = config.action_scheme
+                seen["model_path"] = config.model_path
+                self.config = config
+                self._model = MagicMock()
+                self._model.observation_space.shape = (
+                    config.observer_window,
+                    len(config.symbols) * len(self.FEATURE_COLS) + 5,
+                )
+
+            def load_model(self):
+                return None
+
+            def run_backtest(self, **_kwargs):
+                return {
+                    "trades": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "net_pnl": 0.0,
+                    "win_rate": 0.0,
+                    "gross_profit": 0.0,
+                    "gross_loss": 0.0,
+                    "rl_actions": [],
+                }
+
+        with patch("trading_bot.rl.backtest.RLBacktestRunner", FakeRunner), \
+             patch("trading_bot.backtest.runner._fetch_rl_frames", return_value=({"AAPL": frame}, {"AAPL": frame})), \
+             patch("trading_bot.backtest.runner.append_decision_event"), \
+             patch("trading_bot.backtest.runner._write_rl_summary"):
+            run_rl_backtest(["AAPL"], mock_settings, start="2024-01-01", end="2024-12-31")
+
+        assert seen["starting_cash"] == 100_000.0
+        assert seen["max_shares"] == 150
+        assert seen["stop_loss_pct"] == 0.03
+        assert seen["profit_target_pct"] == 0.08
+        assert seen["action_scheme"] == "proportion"
+        assert seen["model_path"] == str(model_path)
+
+    def test_run_rl_backtest_runs_multisymbol_model_once(self, mock_settings, tmp_path):
+        from trading_bot.backtest.runner import run_rl_backtest
+        from trading_bot.rl.features import CROSS_SYMBOL_FEATURES
+
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=30, freq="1D"),
+                "open": [100.0] * 30,
+                "high": [101.0] * 30,
+                "low": [99.0] * 30,
+                "close": [100.0] * 30,
+                "volume": [1_000_000] * 30,
+            }
+        )
+        model_path = tmp_path / "PPO_final.zip"
+        model_path.write_text("fake", encoding="utf-8")
+        meta_path = tmp_path / "PPO_final_meta.json"
+        meta_path.write_text(json.dumps({"symbols": ["AAPL", "MSFT"]}), encoding="utf-8")
+        mock_settings.rl.model_path = str(model_path)
+        calls = []
+
+        class FakeRunner:
+            FEATURE_COLS = RLBacktestRunner.FEATURE_COLS
+
+            def __init__(self, config):
+                self.config = config
+                self._model = MagicMock()
+                self._model.observation_space.shape = (
+                    config.observer_window,
+                    len(config.symbols) * (len(self.FEATURE_COLS) + len(CROSS_SYMBOL_FEATURES)) + 5,
+                )
+
+            def load_model(self):
+                return None
+
+            def run_backtest(self, **kwargs):
+                calls.append(kwargs)
+                return {
+                    "trades": 2,
+                    "wins": 1,
+                    "losses": 1,
+                    "net_pnl": 10.0,
+                    "win_rate": 0.5,
+                    "gross_profit": 20.0,
+                    "gross_loss": -10.0,
+                    "rl_actions": [],
+                }
+
+        with patch("trading_bot.rl.backtest.RLBacktestRunner", FakeRunner), \
+             patch("trading_bot.backtest.runner._fetch_rl_frames", return_value=({"AAPL": frame, "MSFT": frame}, {"AAPL": frame, "MSFT": frame})), \
+             patch("trading_bot.backtest.runner.append_decision_event"), \
+             patch("trading_bot.backtest.runner._write_rl_summary"):
+            result = run_rl_backtest(["AAPL", "MSFT"], mock_settings)
+
+        assert len(calls) == 1
+        assert calls[0]["trade_symbols"] == ["AAPL", "MSFT"]
+        assert result["trades"] == 2
+        assert result["net_pnl"] == 10.0
+
+    def test_run_rl_backtest_infers_missing_max_symbols_from_model_shape(self, mock_settings, tmp_path):
+        from trading_bot.backtest.runner import run_rl_backtest
+        from trading_bot.rl.features import CROSS_SYMBOL_FEATURES
+
+        symbols = ["XOM", "CVX", "UNH", "LLY", "CAT", "DE"]
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=30, freq="1D"),
+                "open": [100.0] * 30,
+                "high": [101.0] * 30,
+                "low": [99.0] * 30,
+                "close": [100.0] * 30,
+                "volume": [1_000_000] * 30,
+            }
+        )
+        model_path = tmp_path / "PPO_seed_789.zip"
+        model_path.write_text("fake", encoding="utf-8")
+        (tmp_path / "PPO_seed_789_meta.json").write_text(
+            json.dumps({"symbols": symbols, "action_scheme": "proportion"}),
+            encoding="utf-8",
+        )
+        mock_settings.rl.model_path = str(model_path)
+        seen = {}
+
+        class FakeRunner:
+            FEATURE_COLS = RLBacktestRunner.FEATURE_COLS
+
+            def __init__(self, config):
+                self.config = config
+                self._model = MagicMock()
+                self._model.observation_space.shape = (
+                    config.observer_window,
+                    len(symbols) * (len(self.FEATURE_COLS) + len(CROSS_SYMBOL_FEATURES)) + 5,
+                )
+
+            def load_model(self):
+                return None
+
+            def run_backtest(self, **_kwargs):
+                seen["max_symbols"] = self.config.max_symbols
+                return {
+                    "trades": 1,
+                    "wins": 1,
+                    "losses": 0,
+                    "net_pnl": 1.0,
+                    "win_rate": 1.0,
+                    "gross_profit": 1.0,
+                    "gross_loss": 0.0,
+                    "rl_actions": [],
+                }
+
+        with patch("trading_bot.rl.backtest.RLBacktestRunner", FakeRunner), \
+             patch("trading_bot.backtest.runner._fetch_rl_frames", return_value=({s: frame for s in symbols}, {s: frame for s in symbols})), \
+             patch("trading_bot.backtest.runner.append_decision_event"), \
+             patch("trading_bot.backtest.runner._write_rl_summary"):
+            result = run_rl_backtest(symbols, mock_settings)
+
+        assert seen["max_symbols"] == len(symbols)
+        assert result["trades"] == 1

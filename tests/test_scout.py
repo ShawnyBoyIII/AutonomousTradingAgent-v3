@@ -2,6 +2,14 @@ from trading_bot.config.settings import ScoutSettings
 from trading_bot.scout import build_scout_candidates
 
 
+def test_scout_settings_default_to_mid_cap_band() -> None:
+    settings = ScoutSettings()
+
+    assert settings.min_market_cap == 2_000_000_000.0
+    assert settings.max_market_cap == 50_000_000_000.0
+    assert settings.min_price == 5.0
+
+
 def test_build_scout_candidates_merges_duplicates_and_ranks_stably() -> None:
     settings = ScoutSettings(max_universe_size=10, max_snapshot_candidates=10)
     rows = [
@@ -9,48 +17,48 @@ def test_build_scout_candidates_merges_duplicates_and_ranks_stably() -> None:
             "symbol": "DUPE",
             "quoteType": "EQUITY",
             "exchange": "NYQ",
-            "marketCap": 500_000_000,
+            "marketCap": 5_000_000_000,
             "regularMarketPrice": 10.0,
-            "averageDailyVolume3Month": 200_000,
-            "dayVolume": 500_000,
+            "averageDailyVolume3Month": 600_000,
+            "dayVolume": 1_500_000,
             "source": "aggressive_small_caps",
         },
         {
             "symbol": "DUPE",
             "quoteType": "EQUITY",
             "exchange": "NYQ",
-            "marketCap": 500_000_000,
+            "marketCap": 5_000_000_000,
             "regularMarketPrice": 10.0,
-            "averageDailyVolume3Month": 200_000,
-            "dayVolume": 400_000,
+            "averageDailyVolume3Month": 600_000,
+            "dayVolume": 1_400_000,
             "source": "small_cap_gainers",
         },
         {
             "symbol": "SLOW",
             "quoteType": "EQUITY",
             "exchange": "NYQ",
-            "marketCap": 1_500_000_000,
+            "marketCap": 12_000_000_000,
             "regularMarketPrice": 8.0,
-            "averageDailyVolume3Month": 150_000,
-            "dayVolume": 120_000,
+            "averageDailyVolume3Month": 700_000,
+            "dayVolume": 900_000,
             "source": "aggressive_small_caps",
         },
     ]
 
     result = build_scout_candidates(rows, settings)
 
-    assert result["summary"]["candidates"] == 2
-    assert result["summary"]["included"] == 2
-    assert [row["ticker"] for row in result["candidates"]] == ["DUPE", "SLOW"]
-    assert result["included_symbols"] == ["DUPE", "SLOW"]
+    assert result.summary.candidates == 2
+    assert result.summary.included == 2
+    assert [row.ticker for row in result.candidates] == ["DUPE", "SLOW"]
+    assert result.included_symbols == ["DUPE", "SLOW"]
 
-    first = result["candidates"][0]
-    assert first["source_hits"] == 2
-    assert first["source_names"] == ["aggressive_small_caps", "small_cap_gainers"]
-    assert first["included"] is True
-    assert first["rank"] == 1
-    assert first["volume_ratio"] == 2.5
-    assert first["scout_score"] > result["candidates"][1]["scout_score"]
+    first = result.candidates[0]
+    assert first.source_hits == 2
+    assert first.source_names == ["aggressive_small_caps", "small_cap_gainers"]
+    assert first.included is True
+    assert first.rank == 1
+    assert first.volume_ratio == 2.5
+    assert first.scout_score > result.candidates[1].scout_score
 
 
 def test_build_scout_candidates_excludes_bad_filters() -> None:
@@ -87,9 +95,9 @@ def test_build_scout_candidates_excludes_bad_filters() -> None:
 
     result = build_scout_candidates(rows, settings)
 
-    assert result["summary"]["included"] == 0
-    assert result["included_symbols"] == []
-    assert all(row["included"] is False for row in result["candidates"])
+    assert result.summary.included == 0
+    assert result.included_symbols == []
+    assert all(row.included is False for row in result.candidates)
 
 
 def test_build_scout_candidates_does_not_mix_best_fields_across_rows() -> None:
@@ -117,5 +125,46 @@ def test_build_scout_candidates_does_not_mix_best_fields_across_rows() -> None:
 
     result = build_scout_candidates(rows, settings)
 
-    assert result["summary"]["included"] == 0
-    assert result["candidates"][0]["included"] is False
+    assert result.summary.included == 0
+    assert result.candidates[0].included is False
+
+
+def test_build_scout_candidates_applies_advisory_override() -> None:
+    settings = ScoutSettings(max_universe_size=10, max_snapshot_candidates=10)
+    rows = [
+        {
+            "symbol": "FAST",
+            "quoteType": "EQUITY",
+            "exchange": "NYQ",
+            "marketCap": 5_000_000_000,
+            "regularMarketPrice": 10.0,
+            "averageDailyVolume3Month": 600_000,
+            "dayVolume": 1_500_000,
+            "source": "aggressive_small_caps",
+        },
+        {
+            "symbol": "DROP",
+            "quoteType": "EQUITY",
+            "exchange": "NYQ",
+            "marketCap": 5_000_000_000,
+            "regularMarketPrice": 10.0,
+            "averageDailyVolume3Month": 600_000,
+            "dayVolume": 1_500_000,
+            "source": "small_cap_gainers",
+        },
+    ]
+
+    result = build_scout_candidates(
+        rows,
+        settings,
+        advisory_override={
+            "main_midcap": {
+                "promote_symbols": ["BOOST"],
+                "avoid_symbols": ["DROP"],
+            }
+        },
+    )
+
+    assert result.included_symbols == ["BOOST", "FAST"]
+    included = [row.ticker for row in result.candidates if row.included]
+    assert included == ["BOOST", "FAST"]

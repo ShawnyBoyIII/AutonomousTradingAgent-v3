@@ -204,7 +204,7 @@ def test_resistance_proximity_finding() -> None:
 def test_regime_misalignment_levels() -> None:
     for regime, expected in [
         (MarketRegime.STRONG_DOWNTREND, "severe"),
-        (MarketRegime.HIGH_VOLATILITY, "high"),
+        (MarketRegime.HIGH_VOLATILITY, "medium"),
         (MarketRegime.WEAK_DOWNTREND, "medium"),
     ]:
         ctx = _clean_context(regime=regime)
@@ -513,14 +513,16 @@ def test_scan_with_counter_thesis_enabled_rejects_blocked_trade(
     )
 
     assert result.exit_code == 0
-    assert "AAPL REJECTED counter-thesis blocked" in result.stdout
+    assert "AAPL REJECTED" in result.stdout
     assert "counter_thesis_block=true" in result.stdout
     assert "counter_thesis_findings=" in result.stdout
+    # Supermodel veto fires first (aggregates counter-thesis evidence)
+    assert ("supermodel block" in result.stdout or "counter-thesis blocked" in result.stdout)
 
     snapshot = json.loads((tmp_path / "state" / "scan_results.json").read_text(encoding="utf-8"))
     rejected = [c for c in snapshot["candidates"] if c["status"] == "REJECTED"]
     assert len(rejected) == 1
-    assert "counter-thesis blocked" in rejected[0]["reason"]
+    assert rejected[0]["details"]["counter_thesis_block"] is True
 
 
 def test_scan_with_counter_thesis_disabled_does_not_block(

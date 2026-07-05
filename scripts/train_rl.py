@@ -58,6 +58,12 @@ def parse_args() -> argparse.Namespace:
         help="Learning rate (default: 3e-4)",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducible training",
+    )
+    parser.add_argument(
         "--start-date",
         type=str,
         default=None,
@@ -91,6 +97,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="Number of evaluation episodes (default: 10)",
+    )
+    parser.add_argument(
+        "--max-symbols",
+        type=int,
+        default=None,
+        help="Fixed observation symbol capacity (default: number of training symbols)",
     )
     parser.add_argument(
         "--verbose",
@@ -134,7 +146,7 @@ def fetch_training_data(
 
 def train_agent(args: argparse.Namespace) -> int:
     """Train DRL agent on historical data."""
-    from trading_bot.rl.agent import RLAgent, RLAgentConfig
+    from trading_bot.rl.agent import RLAgent
     from trading_bot.rl.env import TradingConfig
     from trading_bot.rl.trainer import TrainingConfig as RLTrainingConfig
 
@@ -150,6 +162,7 @@ def train_agent(args: argparse.Namespace) -> int:
     print(f"  Episodes:    {args.episodes}")
     print(f"  Timesteps:   {args.timesteps:,}")
     print(f"  Learning rate: {args.learning_rate}")
+    print(f"  Seed:        {args.seed if args.seed is not None else 'default'}")
     print(f"  Output dir:  {output_dir}")
     print(f"{'='*60}\n")
 
@@ -163,6 +176,7 @@ def train_agent(args: argparse.Namespace) -> int:
         slippage_bps=5,
         max_positions=10,
         max_episode_steps=500,
+        max_symbols=args.max_symbols,
     )
 
     training_config = RLTrainingConfig(
@@ -176,10 +190,11 @@ def train_agent(args: argparse.Namespace) -> int:
         gamma=0.995,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.01,
+        ent_coef=0.05,
         vf_coef=0.5,
         max_grad_norm=0.5,
         verbose=args.verbose,
+        seed=args.seed,
         log_dir=str(output_dir),
         eval_freq=5000,
         checkpoint_freq=10000,
@@ -201,7 +216,19 @@ def train_agent(args: argparse.Namespace) -> int:
 
     model_path = output_dir / f"{args.agent}_final"
     agent.save(model_path)
+    # Save training metadata so inference can reconstruct the symbol order
+    import json
+    meta_path = output_dir / f"{args.agent}_final_meta.json"
+    meta = {
+        "symbols": symbols,
+        "agent": args.agent,
+        "max_symbols": args.max_symbols,
+        "seed": args.seed,
+        "reward_scheme": env_config.reward_scheme,
+    }
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
     print(f"\n  Model saved to: {model_path}")
+    print(f"  Metadata saved to: {meta_path}")
 
     print(f"\n{'='*60}")
     print(f"  Training complete!")
@@ -275,14 +302,10 @@ def evaluate_agent(args: argparse.Namespace) -> int:
 
     print(f"\n  Evaluating {', '.join(eval_symbols)} from {model_path}...")
 
-    agent_config = RLAgentConfig(
-        enabled=True,
-        env_config=env_config,
-        training=training_config,
-    )
-
-    agent = RLAgent(config=agent_config)
-    agent.load(model_path)
+    agent = RLAgent.load(model_path)
+    agent.config.env_config = env_config
+    agent.config.training = training_config
+    agent._trainer = None  # ponytail: force CLI eval symbols; add load(config=...) if more callers need it.
 
     results = agent.evaluate(n_episodes=args.eval_episodes)
 

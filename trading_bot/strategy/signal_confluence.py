@@ -11,11 +11,23 @@ if TYPE_CHECKING:
 from trading_bot.strategy.market_regime import MarketRegime, RegimeMetrics
 
 
+MEAN_REVERSION_SETUP_TYPES = {
+    "mean_reversion",
+    "mean_reversion_bounce",
+    "oversold_bounce",
+    "vwap_reversion",
+    "range_reversal",
+    "oversold bounce",
+    "vwap reversion",
+    "range reversal",
+}
+
+
 @dataclass
 class SignalScore:
     """Comprehensive signal score with components."""
 
-    total_score: float = 0.0  # 0.0 to 10.0
+    total_score: float = 0.0  # 0.0 to 12.0
     confidence: str = "none"  # none, low, medium, high, very_high
 
     # Component scores (each 0.0 to 2.0)
@@ -24,6 +36,7 @@ class SignalScore:
     trend_score: float = 0.0
     momentum_score: float = 0.0
     regime_alignment: float = 0.0
+    factor_score: float = 0.0
 
     # Factors
     supporting_signals: list[str] = field(default_factory=list)
@@ -69,6 +82,9 @@ def calculate_signal_confluence(
     # 5. Regime Alignment Score (0-2)
     score.regime_alignment = _score_regime_alignment(regime, setup_type)
 
+    # 6. Alpha Factor Score (0-2) - weighted by benching IC IR
+    score.factor_score = _score_alpha_factor(daily_frame, symbol)
+
     # Calculate total
     score.total_score = (
         score.technical_score
@@ -76,6 +92,7 @@ def calculate_signal_confluence(
         + score.trend_score
         + score.momentum_score
         + score.regime_alignment
+        + score.factor_score
     )
 
     # Determine confidence level
@@ -131,7 +148,7 @@ def _score_technical_setup(
 
             if setup_type == "breakout" and position_in_range > 0.7:
                 score += 0.4
-            elif setup_type == "mean_reversion" and position_in_range < 0.3:
+            elif setup_type in MEAN_REVERSION_SETUP_TYPES and position_in_range < 0.3:
                 score += 0.4
 
     # Check moving average alignment
@@ -143,7 +160,7 @@ def _score_technical_setup(
             sma50 = float(sma50_val)
             if setup_type == "breakout" and ema20 > sma50:
                 score += 0.3
-            elif setup_type == "mean_reversion" and ema20 < sma50:
+            elif setup_type in MEAN_REVERSION_SETUP_TYPES and ema20 < sma50:
                 score += 0.3
 
     return min(2.0, score)
@@ -233,7 +250,7 @@ def _score_momentum(intraday_frame: "pd.DataFrame", setup_type: str) -> float:
                     rsi_score = 1.3
                 elif rsi > 70:
                     rsi_score = 0.7
-            elif setup_type in ("mean_reversion", "mean_reversion_bounce", "oversold_bounce", "vwap_reversion", "range_reversal"):
+            elif setup_type in MEAN_REVERSION_SETUP_TYPES:
                 # For mean reversion, oversold is good
                 if rsi < 35:
                     rsi_score = 1.5
@@ -276,7 +293,7 @@ def _score_regime_alignment(regime: MarketRegime, setup_type: str) -> float:
             return 0.5
         else:
             return 0.0
-    elif setup_type in ["oversold bounce", "vwap reversion", "range reversal"]:
+    elif setup_type in MEAN_REVERSION_SETUP_TYPES:
         if recommended == "mean_reversion":
             return 2.0
         elif recommended == "trend_following":
@@ -305,7 +322,7 @@ def _calculate_position_size_multiplier(
     score: SignalScore, regime: MarketRegime
 ) -> float:
     """Calculate recommended position size as percentage of max."""
-    base_multiplier = score.total_score / 10.0  # 0.0 to 1.0
+    base_multiplier = score.total_score / 12.0  # 0.0 to 1.0
 
     # Reduce size in unfavorable regimes
     regime_multipliers = {
@@ -411,7 +428,122 @@ def _identify_risk_factors(
     if regime_metrics.volatility_percentile > 0.9:
         risks.append("Unusually high volatility")
 
-    if score.total_score < 6.0:
+    if score.total_score < 6.5:
         risks.append("Low confluence score")
 
     return risks
+
+
+def _load_benching_weights() -> dict[str, float]:
+    """Load factor benching weights from disk.
+
+    Returns:
+        Dict mapping factor name to IC IR weight.
+        Returns empty dict if weights file doesn't exist.
+    """
+    try:
+        from trading_bot.research.benching_weights import BenchingWeightsManager
+        manager = BenchingWeightsManager()
+        return manager.get_weights()
+    except Exception:
+        return {}
+
+
+def _score_alpha_factor(
+    daily_frame: "pd.DataFrame",
+    symbol: str = "",
+) -> float:
+    """Score alpha factors weighted by benching IC IR.
+
+    Computes factor values from price data and weights them by
+    their benching IC IR scores. Returns a 0-2 score.
+
+    Args:
+        daily_frame: OHLCV DataFrame with at least 60 bars.
+        symbol: Ticker symbol (for logging).
+
+    Returns:
+        Weighted factor score (0.0 to 2.0).
+    """
+    from trading_bot.factors import (
+        AlphaFactorRegistry,
+        MomentumFactor,
+        VolatilityFactor,
+        VolumeFactor,
+        ReturnSkewnessFactor,
+        MaxDrawdownFactor,
+        TrendStrengthFactor,
+        MeanReversionFactor,
+    )
+
+    if len(daily_frame) < 60:
+        return 1.0  # Neutral if insufficient data
+
+    weights = _load_benching_weights()
+    if not weights:
+        # No benching weights yet - use equal weight with default scores
+        factors_to_try = [
+            (MomentumFactor(), 1.0),
+            (VolumeFactor(), 1.0),
+            (TrendStrengthFactor(), 1.0),
+            (MeanReversionFactor(), 1.0),
+        ]
+    else:
+        # Use factors that have benching weights, sorted by IC IR
+        factor_classes = [
+            MomentumFactor,
+            VolatilityFactor,
+            VolumeFactor,
+            ReturnSkewnessFactor,
+            MaxDrawdownFactor,
+            TrendStrengthFactor,
+            MeanReversionFactor,
+        ]
+        factors_to_try = []
+        for cls in factor_classes:
+            instance = cls()
+            name = cls.__name__
+            if name in weights:
+                factors_to_try.append((instance, weights[name]))
+        # Sort by weight descending
+        factors_to_try.sort(key=lambda x: x[1], reverse=True)
+
+    if not factors_to_try:
+        return 1.0
+
+    total_score = 0.0
+    total_weight = 0.0
+
+    for factor, weight in factors_to_try:
+        try:
+            factor_value = factor.compute(daily_frame)
+
+            # Normalize factor value to 0-1 range
+            # Positive factor = bullish, negative = bearish
+            if isinstance(factor, (MomentumFactor, TrendStrengthFactor, VolumeFactor)):
+                # Higher is better
+                normalized = min(max(factor_value / 0.5, 0.0), 2.0)
+            elif isinstance(factor, (MeanReversionFactor, MaxDrawdownFactor)):
+                # For mean reversion, extreme values can be opportunities
+                normalized = min(max(abs(factor_value) * 5, 0.0), 2.0)
+            else:
+                # Default: treat as bullish if positive
+                normalized = min(max(factor_value * 2 + 1.0, 0.0), 2.0)
+
+            total_score += normalized * weight
+            total_weight += weight
+
+        except Exception:
+            continue
+
+    if total_weight == 0:
+        return 1.0
+
+    # Normalize to 0-2 scale
+    weighted_score = (total_score / total_weight)
+
+    # If we have many factors, scale up slightly
+    if len(factors_to_try) >= 3:
+        weighted_score = weighted_score * 1.1
+
+    return float(max(0.0, min(2.0, weighted_score)))

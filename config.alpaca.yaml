@@ -1,0 +1,108 @@
+app:
+  live_trading_enabled: false
+  timezone: America/New_York
+  state_db_path: state/trading_bot.db
+  universe_path: state/universe.txt
+  universe_candidates_path: state/universe_candidates.json
+  log_dir: logs
+  dashboard_summary_path: state/dashboard_summary.json
+  scan_results_path: state/scan_results.json
+  portfolio_summary_path: state/portfolio_summary.json
+  backtest_summary_path: state/backtest_summary.json
+
+market_data:
+  provider: alpaca
+  validate_data: true
+  max_price_jump_pct: 1000.0
+  max_volume_jump_pct: 1000.0
+  min_bars_for_signal: 5
+
+scout:
+  screeners:
+    - aggressive_small_caps
+    - small_cap_gainers
+  min_market_cap: 50000000
+  max_market_cap: 2000000000
+  min_price: 2
+  min_avg_dollar_volume: 1000000
+  max_universe_size: 50
+  max_snapshot_candidates: 100
+
+risk:
+  max_risk_per_trade_pct: 0.01
+  max_daily_risk_pct: 0.03
+  max_daily_orders: 3
+  max_ticker_allocation_pct: 0.20
+  min_reward_risk_ratio: 2.0
+  use_atr_sizing: true
+  atr_period: 14
+  atr_multiplier: 2.0
+  atr_stop_multiplier: 1.5
+  max_portfolio_heat_pct: 0.03
+  max_sector_concentration_pct: 0.20
+  max_consecutive_losses: 5
+  enable_drawdown_circuit_breaker: true
+
+session:
+  close_hour: 16
+  close_minute: 0
+  eod_minutes_before_close: 5
+  eod_enabled: true
+
+paper:
+  fee_per_order: 1.0
+  slippage_bps: 0
+
+alerts:
+  discord_webhook_url: ""
+  discord_username: Autonomous Trading Agent
+  slack_webhook_url: ""
+  webhook_url: ""
+
+robinhood:
+  enabled: false
+  mode: shadow
+  max_position_value: 10000.0
+  daily_loss_limit: 100.0
+
+# V3: Dynamic strategy selection (regime detection + confluence scoring)
+strategy:
+  use_v3_signals: false
+  risk_tolerance: medium
+  min_confidence: medium
+
+# V3: Risk monitoring (VaR, drawdown, correlation)
+monitoring:
+  var_confidence: 0.95
+  var_lookback_days: 252
+  max_drawdown_pct: 10.0
+  max_avg_correlation: 0.6
+  equity_snapshot_interval: 60
+
+# V3: Counter-thesis analysis (blocks trades on bearish evidence)
+counter_thesis:
+  enabled: false
+  block_on_severity: high
+  aggregate_block_threshold: 0.6
+  exit_on_block: true
+  check_overbought: true
+  overbought_rsi_threshold: 75.0
+  check_volume_non_confirmation: true
+  volume_confirmation_floor: 0.8
+  check_rsi_divergence: true
+  check_resistance_proximity: true
+  resistance_bb_percent_b: 100.0
+  check_regime_misalignment: true
+  check_waning_momentum: true
+  check_volatility_spike: true
+  volatility_percentile_threshold: 0.85
+  check_extension: true
+  extension_pct: 5.0
+
+# RL-based trading (disabled by default)
+rl:
+  enabled: false
+  agent_type: PPO
+  feature_set: standard
+  reward_function: sharpe
+  model_path: state/rl_logs/PPO_final.zip

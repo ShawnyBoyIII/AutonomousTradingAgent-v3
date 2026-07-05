@@ -13,9 +13,13 @@ from trading_bot.rl.rewards import (
     RiskAdjustedReward,
     CompoundDailyReward,
     ShannonEntropyReward,
+    SharpeReward,
+    DrawdownPenaltyReward,
+    Phase3Reward,
 )
 from trading_bot.rl.observer import TensorTradeObserver
 from trading_bot.models.portfolio import PortfolioState
+from trading_bot.rl.trainer import RLTrainer, TrainingConfig
 
 
 @pytest.fixture
@@ -74,7 +78,7 @@ class TestTradingEnv:
         obs, info = env.reset()
         assert obs is not None
         assert isinstance(obs, np.ndarray)
-        assert obs.shape == (5, 44)  # (window_size, n_features)
+        assert obs.shape == (5, 53)  # (window_size, n_features)
         assert "net_worth" in info
         assert "step" in info
         assert info["step"] == 0
@@ -95,7 +99,7 @@ class TestTradingEnv:
         for _ in range(10):
             action = env.action_space.sample()
             obs, reward, terminated, truncated, info = env.step(action)
-            assert obs.shape == (5, 44)
+            assert obs.shape == (5, 53)
             assert isinstance(reward, float)
 
     def test_portfolio_tracking(self, env, mock_market_data):
@@ -136,6 +140,26 @@ class TestTradingEnv:
         captured = capsys.readouterr()
         assert "Step" in captured.out
         assert "Equity" in captured.out
+
+    def test_episode_summary_in_terminal_info(self, mock_market_data):
+        env = TradingEnv(
+            config=TradingConfig(
+                symbols=["AAPL"],
+                observer_window=5,
+                max_episode_steps=2,
+                reward_scheme="compound_daily",
+            )
+        )
+        env.reset()
+        _, _, _, truncated, info = env.step(2)  # BUY AAPL
+        assert not truncated
+        _, _, _, truncated, info = env.step(3)  # SELL AAPL
+        assert truncated
+        summary = info["episode_summary"]
+        assert summary["trade_count"] == 2
+        assert summary["buy_count"] == 1
+        assert summary["sell_count"] == 1
+        assert summary["steps"] == 2
 
 
 class TestActionSchemes:
@@ -197,6 +221,113 @@ class TestRewardSchemes:
         expected = math.log(110_000 / 100_000)
         assert abs(r - expected) < 0.001
 
+    def test_env_accepts_shannon_reward_scheme(self, mock_market_data):
+        env = TradingEnv(
+            config=TradingConfig(
+                symbols=["AAPL"],
+                observer_window=5,
+                reward_scheme="shannon_entropy",
+            )
+        )
+        env.reset()
+        _, reward, _, _, _ = env.step(0)
+        assert isinstance(reward, float)
+
+    def test_new_stateful_rewards_reset(self):
+        sharpe = SharpeReward()
+        sharpe.compute_reward(101_000, 100_000)
+        sharpe.reset()
+        assert sharpe.compute_reward(101_000, 100_000) == pytest.approx(1.0)
+
+        drawdown = DrawdownPenaltyReward()
+        assert drawdown.compute_reward(101_000, 100_000) > 0
+        assert drawdown.compute_reward(100_000, 101_000) < 0
+        drawdown.reset()
+        assert drawdown.compute_reward(100_000, 100_000) == 0.0
+
+    def test_phase3_reward_combines_components(self):
+        reward = Phase3Reward(reward_scale=100.0)
+        first = reward.compute_reward(101_000, 100_000)
+        second = reward.compute_reward(100_500, 101_000)
+
+        assert first > 0
+        assert second < first
+
+    def test_env_accepts_phase3_reward_scheme(self, mock_market_data):
+        env = TradingEnv(
+            config=TradingConfig(
+                symbols=["AAPL"],
+                observer_window=5,
+                reward_scheme="phase3",
+            )
+        )
+        env.reset()
+        _, reward, _, _, _ = env.step(0)
+        assert isinstance(reward, float)
+
+
+class TestRLTrainer:
+    def test_train_passes_seed_to_model_constructor(self, monkeypatch, tmp_path, mock_market_data):
+        captured: dict[str, object] = {}
+
+        class FakePPO:
+            def __init__(self, policy, env, **kwargs):
+                captured["policy"] = policy
+                captured["kwargs"] = kwargs
+
+            def learn(self, total_timesteps):
+                captured["total_timesteps"] = total_timesteps
+
+            def save(self, path):
+                captured["save_path"] = path
+
+        import sys
+        import types
+
+        monkeypatch.setitem(
+            sys.modules,
+            "stable_baselines3",
+            types.SimpleNamespace(PPO=FakePPO, A2C=FakePPO, DQN=FakePPO),
+        )
+
+        trainer = RLTrainer(
+            TrainingConfig(
+                env_config=TradingConfig(symbols=["AAPL"], observer_window=5),
+                model_type="PPO",
+                total_timesteps=7,
+                seed=789,
+                log_dir=str(tmp_path),
+                verbose=0,
+            )
+        )
+
+        trainer.train()
+
+        assert captured["policy"] == "MlpPolicy"
+        assert captured["kwargs"]["seed"] == 789
+        assert captured["total_timesteps"] == 7
+
+    def test_evaluate_reports_per_episode_final_equity(self, mock_market_data):
+        trainer = RLTrainer(
+            TrainingConfig(
+                env_config=TradingConfig(
+                    symbols=["AAPL"],
+                    observer_window=5,
+                    max_episode_steps=2,
+                )
+            )
+        )
+
+        class FakeModel:
+            def predict(self, obs, deterministic=True):
+                return 0, None
+
+        trainer._model = FakeModel()
+        result = trainer.evaluate(n_episodes=2)
+        assert "mean_final_equity" in result
+        assert "mean_trade_count" in result
+        assert result["min_final_equity"] <= result["max_final_equity"]
+
 
 class TestObserver:
     def test_observation_shape(self, config, mock_market_data):
@@ -209,7 +340,7 @@ class TestObserver:
 
         obs = observer.observe(state, prices, 0)
         assert isinstance(obs, np.ndarray)
-        assert obs.shape == (config.observer_window, 44)
+        assert obs.shape == (config.observer_window, 53)
 
     def test_observation_space(self, config, mock_market_data):
         observer = TensorTradeObserver(
@@ -219,7 +350,7 @@ class TestObserver:
         assert isinstance(observer.observation_space, gym.spaces.Box)
         assert observer.observation_space.shape == (
             config.observer_window,
-            44,
+            53,
         )
 
     def test_observation_padded_initial(self, config, mock_market_data):
@@ -231,7 +362,7 @@ class TestObserver:
         prices = {"AAPL": 150.0, "MSFT": 380.0, "GOOGL": 140.0}
 
         obs = observer.observe(state, prices, 0)
-        assert obs.shape == (10, 44)
+        assert obs.shape == (10, 53)
 
     def test_portfolio_features(self, config, mock_market_data):
         observer = TensorTradeObserver(

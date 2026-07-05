@@ -98,3 +98,45 @@ def calculate_fixed_stop_position_size(
     max_shares = (max_position_value / entry).to_integral_value(rounding=ROUND_FLOOR)
 
     return int(min(shares, max_shares))
+
+
+def calculate_kelly_fraction(
+    win_probability: float,
+    reward_risk_ratio: float,
+) -> float:
+    """Return the raw Kelly fraction for a trade edge.
+
+    Uses ``f* = p - (1 - p) / b`` where ``p`` is win probability and
+    ``b`` is reward/risk. Invalid or non-positive edges return ``0.0``.
+    """
+    if reward_risk_ratio <= 0:
+        return 0.0
+
+    p = max(0.0, min(1.0, float(win_probability)))
+    b = float(reward_risk_ratio)
+    q = 1.0 - p
+    return max(0.0, p - (q / b))
+
+
+def apply_fractional_kelly(
+    position_size: int,
+    win_probability: float,
+    reward_risk_ratio: float,
+    scale: float = 0.5,
+    min_position_pct: float = 0.25,
+) -> tuple[int, float, float]:
+    """Scale a baseline position size by a fractional Kelly overlay.
+
+    Returns ``(scaled_position_size, multiplier, raw_kelly_fraction)``.
+    A non-positive Kelly edge returns ``(0, 0.0, 0.0)``.
+    """
+    if position_size <= 0:
+        return 0, 0.0, 0.0
+
+    raw_kelly = calculate_kelly_fraction(win_probability, reward_risk_ratio)
+    if raw_kelly <= 0:
+        return 0, 0.0, 0.0
+
+    multiplier = max(min_position_pct, min(1.0, raw_kelly * scale))
+    scaled_size = max(1, int(position_size * multiplier))
+    return scaled_size, multiplier, raw_kelly

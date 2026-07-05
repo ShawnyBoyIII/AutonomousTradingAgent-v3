@@ -2,15 +2,17 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 from typer.testing import CliRunner
 
-from trading_bot.cli.app import app
+from trading_bot.cli.app import app, _format_scan_summary
 from trading_bot.main import main
 from trading_bot.models.order import FillResult
 from trading_bot.models.portfolio import PortfolioState, Position
 from trading_bot.portfolio.ledger import PortfolioLedger
+from trading_bot.runtime.watchlist import add_symbol, read_watchlist, remove_symbol
 
 
 def test_cli_shows_help(monkeypatch, capsys) -> None:
@@ -44,8 +46,460 @@ def test_doctor_command_reports_local_readiness(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert result.stdout.strip() == (
         "doctor live_trading=false state_db=missing log_dir=missing snapshots=0/4 "
-        "provider=yfinance provider_auth=ok"
+        "provider=yfinance provider_auth=yfinance:ok"
     )
+
+
+def test_tune_command_dry_run_prints_override_preview(tmp_path: Path) -> None:
+    from trading_bot.strategy.strategy_tracker import record_exit
+
+    config_file = tmp_path / "config.yaml"
+    log_dir = tmp_path / "logs"
+    config_file.write_text(
+        "app:\n"
+        f"  log_dir: {log_dir}\n"
+        "  scan_results_path: state/scan_results.json\n",
+        encoding="utf-8",
+    )
+    scan_results_path = tmp_path / "state" / "scan_results.json"
+    scan_results_path.parent.mkdir(parents=True)
+    scan_results_path.write_text(
+        json.dumps({"summary": {"approved": 1, "rejected": 9}}),
+        encoding="utf-8",
+    )
+
+    for i in range(20):
+        win = i < 6
+        record_exit(
+            log_dir,
+            "v3-breakout",
+            "AAPL",
+            entry_price=100.0,
+            exit_price=101.0 if win else 99.0,
+            quantity=1,
+            fees=1.0,
+            pnl=10.0 if win else -10.0,
+            reason="target" if win else "stop",
+            timestamp=datetime(2026, 7, 1 + i),
+        )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "tune", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert "DRY RUN" in result.stdout
+    assert "supermodel:" in result.stdout
+    assert "block_threshold: 0.25" in result.stdout
+
+
+def test_swarm_command_passes_saved_portfolio_state(monkeypatch, tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        f"  log_dir: {tmp_path / 'logs'}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=7_500.0,
+            equity=10_000.0,
+            positions={"MSFT": Position(ticker="MSFT", quantity=5, average_cost=200.0)},
+        )
+    )
+
+    frame = pd.DataFrame(
+        {
+            "open": [100.0] * 60,
+            "high": [101.0] * 60,
+            "low": [99.0] * 60,
+            "close": [100.0] * 60,
+            "volume": [1_000_000] * 60,
+        }
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "trading_bot.data.market_data.fetch_and_validate_bars",
+        lambda *args, **kwargs: (frame, SimpleNamespace(valid=True, reason=None)),
+    )
+    monkeypatch.setattr("trading_bot.swarm.engine.SwarmEngine.setup_workers", lambda self, workers: None)
+
+    def capture_run(self, symbols, market_data, portfolio_state=None, **kwargs):
+        captured["portfolio_state"] = portfolio_state
+        return SimpleNamespace(
+            decisions={},
+            execution_time_seconds=0.0,
+            completed_workers=0,
+            total_workers=0,
+        )
+
+    monkeypatch.setattr("trading_bot.swarm.engine.SwarmEngine.run", capture_run)
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "swarm", "--symbols", "AAPL"])
+
+    assert result.exit_code == 0
+    assert captured["portfolio_state"]["cash"] == 7_500.0
+    assert captured["portfolio_state"]["positions"]["MSFT"]["quantity"] == 5
+
+
+def test_scan_summary_includes_rl_counts_when_present() -> None:
+    assert _format_scan_summary(
+        {
+            "symbols": 3,
+            "approved": 1,
+            "green": 1,
+            "yellow": 0,
+            "rejected": 0,
+            "no_signal": 2,
+            "errors": 0,
+            "rl_buy": 1,
+            "rl_hold": 1,
+            "rl_sell": 1,
+            "rl_unsupported": 2,
+            "rl_avg_confidence": 0.62,
+        }
+    ).endswith("rl_buy=1 rl_hold=1 rl_sell=1 rl_unsupported=2 rl_avg_conf=0.62")
+
+
+def test_watchlist_file_adds_and_removes_symbols(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "watchlist.txt"
+
+    assert add_symbol(path, " msft ") == ["MSFT"]
+    assert add_symbol(path, "MSFT") == ["MSFT"]
+    assert add_symbol(path, "brk.b") == ["MSFT", "BRK.B"]
+    assert read_watchlist(path) == ["MSFT", "BRK.B"]
+    assert remove_symbol(path, "msft") == ["BRK.B"]
+
+
+def test_rl_signal_rejects_symbols_outside_model_metadata(monkeypatch, tmp_path: Path) -> None:
+    import types
+
+    import trading_bot.runtime.orchestrator as orchestrator
+    from trading_bot.config.settings import Settings
+
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
+    settings = Settings()
+    settings.app.log_dir = str(tmp_path / "logs")
+    settings.rl.enabled = True
+    settings.rl.model_path = "model.zip"
+    settings.rl.allow_untrained_symbol_inference = True
+    settings.rl.action_confidence_threshold = 0.5
+
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def predict_signal(self, **kwargs):
+            captured["symbols"] = kwargs["symbols"]
+            captured["market_frames"] = sorted(kwargs["market_frames"])
+            return 0, 0.75
+
+    monkeypatch.setattr("trading_bot.rl.agent.RLAgent.load", lambda model_path: FakeAgent())
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=30, freq="D"),
+            "open": [100.0 + index for index in range(30)],
+            "high": [101.0 + index for index in range(30)],
+            "low": [99.0 + index for index in range(30)],
+            "close": [100.0 + index for index in range(30)],
+            "volume": [1_000_000 for _ in range(30)],
+        }
+    )
+
+    def fake_fetch(symbol: str, *args, **kwargs):
+        return frame.copy(), types.SimpleNamespace(valid=True, reason=None)
+
+    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fake_fetch)
+
+    signal, reason, details = orchestrator._build_rl_signal_result("MSFT", settings)
+
+    assert signal is None
+    assert "RL agent predicts HOLD" in reason
+    assert details["rl_trained_symbols"] == ["AAPL"]
+    assert details["rl_untrained_symbol"] is True
+    assert captured["symbols"] == ["AAPL", "MSFT"]
+
+
+def test_rl_signal_rejects_untrained_symbol_by_default(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.runtime.orchestrator as orchestrator
+    from trading_bot.config.settings import Settings
+
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
+    settings = Settings()
+    settings.app.log_dir = str(tmp_path / "logs")
+    settings.rl.enabled = True
+    settings.rl.model_path = "model.zip"
+
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("untrained RL symbol should fail before market data fetch")
+
+    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fail_fetch)
+
+    signal, reason, details = orchestrator._build_rl_signal_result("MSFT", settings)
+
+    assert signal is None
+    assert reason == "RL model not trained for MSFT"
+    assert details["rl_trained_symbols"] == ["AAPL"]
+    assert details["rl_untrained_symbol"] is True
+    assert details["rl_models"] == 0
+
+
+def test_rl_signal_rejects_missing_model_metadata_before_fetch(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.runtime.orchestrator as orchestrator
+    from trading_bot.config.settings import Settings
+
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    settings = Settings()
+    settings.app.log_dir = str(tmp_path / "logs")
+    settings.rl.enabled = True
+    settings.rl.model_path = "model.zip"
+
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("missing RL metadata should fail before market data fetch")
+
+    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fail_fetch)
+
+    signal, reason, details = orchestrator._build_rl_signal_result("AAPL", settings)
+
+    assert signal is None
+    assert "RL model metadata missing or empty:" in reason
+    assert details == {}
+
+
+def test_rl_signal_rejects_empty_model_metadata_before_fetch(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.runtime.orchestrator as orchestrator
+    from trading_bot.config.settings import Settings
+
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "model_meta.json").write_text('{"symbols": []}', encoding="utf-8")
+    settings = Settings()
+    settings.app.log_dir = str(tmp_path / "logs")
+    settings.rl.enabled = True
+    settings.rl.model_path = "model.zip"
+
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("empty RL metadata should fail before market data fetch")
+
+    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fail_fetch)
+
+    signal, reason, details = orchestrator._build_rl_signal_result("AAPL", settings)
+
+    assert signal is None
+    assert "RL model metadata missing or empty:" in reason
+    assert details == {}
+
+
+def test_rl_signal_passes_all_trained_symbol_frames(monkeypatch, tmp_path: Path) -> None:
+    import types
+
+    import trading_bot.runtime.orchestrator as orchestrator
+    from trading_bot.config.settings import Settings
+
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL", "MSFT"]}', encoding="utf-8")
+    settings = Settings()
+    settings.app.log_dir = str(tmp_path / "logs")
+    settings.rl.enabled = True
+    settings.rl.model_path = "model.zip"
+
+    captured: dict[str, object] = {}
+
+    class FakeAgent:
+        def predict_signal(self, **kwargs):
+            captured["symbols"] = kwargs["symbols"]
+            captured["market_frames"] = sorted(kwargs["market_frames"])
+            return 0, 0.75
+
+    monkeypatch.setattr("trading_bot.rl.agent.RLAgent.load", lambda model_path: FakeAgent())
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=30, freq="D"),
+            "open": [100.0 + index for index in range(30)],
+            "high": [101.0 + index for index in range(30)],
+            "low": [99.0 + index for index in range(30)],
+            "close": [100.0 + index for index in range(30)],
+            "volume": [1_000_000 + index for index in range(30)],
+        }
+    )
+
+    def fake_fetch(symbol, period, interval, settings):
+        return frame.copy(deep=True), types.SimpleNamespace(valid=True, reason="")
+
+    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fake_fetch)
+    monkeypatch.setattr(
+        orchestrator.market_data,
+        "fetch_bars",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("HOLD should not fetch a separate current price")),
+    )
+
+    signal, reason, details = orchestrator._build_rl_signal_result("AAPL", settings)
+
+    assert signal is None
+    assert "RL agent predicts HOLD" in reason
+    assert captured["symbols"] == ["AAPL", "MSFT"]
+    assert captured["market_frames"] == ["AAPL", "MSFT"]
+    assert details["rl_action"] == 0
+
+
+def test_rl_signal_rejects_buy_when_current_price_unavailable(monkeypatch, tmp_path: Path) -> None:
+    import types
+
+    import trading_bot.runtime.orchestrator as orchestrator
+    from trading_bot.config.settings import Settings
+
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
+    settings = Settings()
+    settings.app.log_dir = str(tmp_path / "logs")
+    settings.rl.enabled = True
+    settings.rl.model_path = "model.zip"
+    settings.rl.action_confidence_threshold = 0.5
+
+    class FakeAgent:
+        def predict_signal(self, **kwargs):
+            return 1, 0.9
+
+    monkeypatch.setattr("trading_bot.rl.agent.RLAgent.load", lambda model_path: FakeAgent())
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=30, freq="D"),
+            "open": [100.0 + index for index in range(30)],
+            "high": [101.0 + index for index in range(30)],
+            "low": [99.0 + index for index in range(30)],
+            "close": [100.0 + index for index in range(29)] + [0.0],
+            "volume": [1_000_000 for _ in range(30)],
+        }
+    )
+
+    def fake_fetch_validate(symbol, period, interval, settings):
+        return frame.copy(deep=True), types.SimpleNamespace(valid=True, reason="")
+
+    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fake_fetch_validate)
+    monkeypatch.setattr(
+        orchestrator.market_data,
+        "fetch_bars",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("RL should use the validated target frame price")),
+    )
+
+    signal, reason, details = orchestrator._build_rl_signal_result("AAPL", settings)
+
+    assert signal is None
+    assert reason == "RL current price unavailable"
+    assert details["rl_action"] == 1
+    assert details["rl_confidence"] == 0.9
+
+
+def test_rl_signal_penalizes_untrained_symbol_confidence(monkeypatch, tmp_path: Path) -> None:
+    import types
+
+    import trading_bot.runtime.orchestrator as orchestrator
+    from trading_bot.config.settings import Settings
+
+    model_path = tmp_path / "model.zip"
+    model_path.write_bytes(b"")
+    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
+    settings = Settings()
+    settings.app.log_dir = str(tmp_path / "logs")
+    settings.rl.enabled = True
+    settings.rl.model_path = "model.zip"
+    settings.rl.action_confidence_threshold = 0.5
+    settings.rl.untrained_confidence_threshold_multiplier = 0.8
+    settings.rl.allow_untrained_symbol_inference = True
+
+    class FakeAgent:
+        def predict_signal(self, **kwargs):
+            return 1, 0.6
+
+    monkeypatch.setattr("trading_bot.rl.agent.RLAgent.load", lambda model_path: FakeAgent())
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=30, freq="D"),
+            "open": [100.0 + index for index in range(30)],
+            "high": [101.0 + index for index in range(30)],
+            "low": [99.0 + index for index in range(30)],
+            "close": [100.0 + index for index in range(30)],
+            "volume": [1_000_000 for _ in range(30)],
+        }
+    )
+
+    def fake_fetch_validate(symbol, period, interval, settings):
+        return frame.copy(deep=True), types.SimpleNamespace(valid=True, reason="")
+
+    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fake_fetch_validate)
+
+    signal, reason, details = orchestrator._build_rl_signal_result("MSFT", settings)
+
+    assert signal is None
+    assert reason == "RL confidence 0.48 below threshold 0.5"
+    assert details["rl_confidence"] == 0.6
+    assert details["rl_effective_confidence"] == 0.48
+    assert details["rl_untrained_symbol"] is True
+
+
+def test_rl_signal_rejects_ensemble_action_tie(monkeypatch, tmp_path: Path) -> None:
+    import types
+
+    import trading_bot.runtime.orchestrator as orchestrator
+    from trading_bot.config.settings import Settings
+
+    buy_model = tmp_path / "buy_model.zip"
+    sell_model = tmp_path / "sell_model.zip"
+    buy_model.write_bytes(b"")
+    sell_model.write_bytes(b"")
+    (tmp_path / "buy_model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
+    (tmp_path / "sell_model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
+    settings = Settings()
+    settings.app.log_dir = str(tmp_path / "logs")
+    settings.rl.enabled = True
+    settings.rl.model_path = "buy_model.zip"
+    settings.rl.model_paths = ["buy_model.zip", "sell_model.zip"]
+
+    class FakeAgent:
+        def __init__(self, action: int) -> None:
+            self.action = action
+
+        def predict_signal(self, **kwargs):
+            return self.action, 0.8
+
+    def fake_load(model_path):
+        return FakeAgent(1 if "buy_model" in str(model_path) else 2)
+
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=30, freq="D"),
+            "open": [100.0 + index for index in range(30)],
+            "high": [101.0 + index for index in range(30)],
+            "low": [99.0 + index for index in range(30)],
+            "close": [100.0 + index for index in range(30)],
+            "volume": [1_000_000 for _ in range(30)],
+        }
+    )
+
+    monkeypatch.setattr("trading_bot.rl.agent.RLAgent.load", fake_load)
+    monkeypatch.setattr(
+        orchestrator.market_data,
+        "fetch_and_validate_bars",
+        lambda *args, **kwargs: (frame.copy(deep=True), types.SimpleNamespace(valid=True, reason="")),
+    )
+
+    signal, reason, details = orchestrator._build_rl_signal_result("AAPL", settings)
+
+    assert signal is None
+    assert reason == "RL ensemble action tie ([1, 2])"
+    assert details["rl_action"] == 0
+    assert details["rl_vote_tie"] == [1, 2]
 
 
 def test_read_only_analysis_commands_render_cleanly_with_empty_state(tmp_path: Path) -> None:
@@ -75,6 +529,82 @@ def test_read_only_analysis_commands_render_cleanly_with_empty_state(tmp_path: P
         assert text in result.stdout
 
 
+def test_risk_report_handles_normalized_close_history_and_shows_trade_quality(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        "  log_dir: logs\n",
+        encoding="utf-8",
+    )
+
+    ledger = PortfolioLedger(db_path)
+    ledger.save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=95.0,
+                    profit_target=110.0,
+                )
+            },
+        )
+    )
+    ledger.record_fill(
+        FillResult(
+            order_id="sell-1",
+            ticker="AAPL",
+            quantity=10,
+            fill_price=110.0,
+            fees=1.0,
+            filled_at=datetime(2026, 6, 18, 10, 0, 0),
+        ),
+        side="SELL",
+        realized_pnl=99.0,
+        strategy_tag="v3-trend_following",
+    )
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        if interval == "1d":
+            return pd.DataFrame(
+                {
+                    "timestamp": pd.date_range("2026-05-01", periods=30, freq="D"),
+                    "open": [100.0 + i for i in range(30)],
+                    "high": [101.0 + i for i in range(30)],
+                    "low": [99.0 + i for i in range(30)],
+                    "close": [100.0 + i for i in range(30)],
+                    "volume": [1_000_000 for _ in range(30)],
+                }
+            )
+        return pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-06-18T09:55:00"]),
+                "open": [110.0],
+                "high": [110.0],
+                "low": [110.0],
+                "close": [110.0],
+                "volume": [1_000_000],
+            }
+        )
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "risk-report"])
+
+    assert result.exit_code == 0
+    assert "profit_factor=99.00" in result.stdout
+    assert "win_rate=100.0%" in result.stdout
+    assert "Top Strategy Attribution:" in result.stdout
+    assert "v3-trend_following: +99.00" in result.stdout
+
+
 def test_build_universe_writes_ranked_symbols_and_snapshot(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
 
@@ -86,20 +616,20 @@ def test_build_universe_writes_ranked_symbols_and_snapshot(monkeypatch, tmp_path
                 "symbol": "FAST",
                 "quoteType": "EQUITY",
                 "exchange": "NYQ",
-                "marketCap": 300_000_000,
-                "regularMarketPrice": 6.0,
-                "averageDailyVolume3Month": 300_000,
-                "dayVolume": 800_000,
+                "marketCap": 3_000_000_000,
+                "regularMarketPrice": 16.0,
+                "averageDailyVolume3Month": 500_000,
+                "dayVolume": 1_800_000,
                 "source": "aggressive_small_caps",
             },
             {
                 "symbol": "SLOW",
                 "quoteType": "EQUITY",
                 "exchange": "NYQ",
-                "marketCap": 1_500_000_000,
-                "regularMarketPrice": 8.0,
-                "averageDailyVolume3Month": 150_000,
-                "dayVolume": 120_000,
+                "marketCap": 12_500_000_000,
+                "regularMarketPrice": 28.0,
+                "averageDailyVolume3Month": 250_000,
+                "dayVolume": 420_000,
                 "source": "small_cap_gainers",
             },
         ],
@@ -124,6 +654,148 @@ def test_build_universe_writes_ranked_symbols_and_snapshot(monkeypatch, tmp_path
     assert snapshot["summary"]["included"] == 2
 
 
+def test_discover_export_writes_configured_universe_path(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+    import trading_bot.strategy.dynamic_watchlist as dynamic_watchlist
+
+    config_file = tmp_path / "config.yaml"
+    universe_path = tmp_path / "state" / "universe.txt"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        f"  universe_path: {universe_path}\n"
+        "market_data:\n"
+        "  providers:\n"
+        "    - alpaca\n"
+        "    - polygon\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs):
+        captured["provider_stack"] = kwargs["settings"].provider_stack
+        return pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-06-01", periods=30, freq="D"),
+                "open": [100.0] * 30,
+                "high": [101.0] * 30,
+                "low": [99.0] * 30,
+                "close": [100.0] * 30,
+                "volume": [1_000_000] * 30,
+            }
+        )
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    class FakeWatchlist:
+        def __init__(self, max_symbols: int, scout_settings=None) -> None:
+            self.max_symbols = max_symbols
+            self.symbols = ["AAPL", "MSFT"]
+
+        def update(self, data_provider):
+            data_provider("AAPL")
+            return SimpleNamespace(
+                sectors_favored=[],
+                added=[],
+                removed=[],
+                current=[
+                    SimpleNamespace(symbol="AAPL", reason="test", score=80.0),
+                    SimpleNamespace(symbol="MSFT", reason="test", score=75.0),
+                ],
+            )
+
+        def get_symbols(self):
+            return self.symbols
+
+        def export_for_burn_in(self, output_path=None):
+            assert output_path == str(universe_path.resolve())
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_path).write_text("AAPL\nMSFT", encoding="utf-8")
+            return str(output_path)
+
+    monkeypatch.setattr(dynamic_watchlist, "DynamicWatchlist", FakeWatchlist)
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "discover", "--export"])
+
+    assert result.exit_code == 0
+    assert f"Exported 2 symbols to {universe_path.resolve()}" in result.stdout
+    assert universe_path.read_text(encoding="utf-8") == "AAPL\nMSFT"
+    assert not (tmp_path / "burn-in-symbols.txt").exists()
+    assert captured["provider_stack"] == ["alpaca", "polygon"]
+
+
+def test_discover_passes_scout_settings_into_watchlist(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.strategy.dynamic_watchlist as dynamic_watchlist
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "scout:\n"
+        "  min_market_cap: 2000000000\n"
+        "  max_market_cap: 50000000000\n"
+        "  min_price: 5.0\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeWatchlist:
+        def __init__(self, max_symbols: int, scout_settings=None) -> None:
+            captured["max_symbols"] = max_symbols
+            captured["min_market_cap"] = scout_settings.min_market_cap
+            captured["max_market_cap"] = scout_settings.max_market_cap
+            captured["min_price"] = scout_settings.min_price
+
+        def update(self, data_provider):
+            return SimpleNamespace(sectors_favored=[], added=[], removed=[], current=[])
+
+        def get_symbols(self):
+            return []
+
+        def export_for_burn_in(self, output_path=None):
+            return str(output_path)
+
+    monkeypatch.setattr(dynamic_watchlist, "DynamicWatchlist", FakeWatchlist)
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "discover", "--max", "12"])
+
+    assert result.exit_code == 0
+    assert captured == {
+        "max_symbols": 12,
+        "min_market_cap": 2_000_000_000.0,
+        "max_market_cap": 50_000_000_000.0,
+        "min_price": 5.0,
+    }
+
+
+def test_fetch_latest_prices_uses_configured_provider_stack(monkeypatch) -> None:
+    import trading_bot.data.market_data as market_data
+    from trading_bot.cli.app import _fetch_latest_prices
+    from trading_bot.config.settings import Settings
+
+    settings = Settings()
+    settings.market_data.providers = ["alpaca", "polygon"]
+    captured: list[list[str]] = []
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        captured.append(kwargs["settings"].provider_stack)
+        return pd.DataFrame(
+            {
+                "timestamp": [pd.Timestamp("2026-06-01")],
+                "open": [99.0],
+                "high": [101.0],
+                "low": [98.0],
+                "close": [100.5],
+                "volume": [1_000_000],
+            }
+        )
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+
+    prices = _fetch_latest_prices(["AAPL"], settings)
+
+    assert prices == {"AAPL": 100.5}
+    assert captured == [["alpaca", "polygon"]]
+
+
 def test_build_universe_keeps_multi_screener_hits(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
 
@@ -135,20 +807,20 @@ def test_build_universe_keeps_multi_screener_hits(monkeypatch, tmp_path: Path) -
                 "symbol": "DUPE",
                 "quoteType": "EQUITY",
                 "exchange": "NYQ",
-                "marketCap": 500_000_000,
+                "marketCap": 5_000_000_000,
                 "regularMarketPrice": 10.0,
-                "averageDailyVolume3Month": 200_000,
-                "dayVolume": 500_000,
+                "averageDailyVolume3Month": 600_000,
+                "dayVolume": 1_500_000,
                 "source": "aggressive_small_caps",
             },
             {
                 "symbol": "DUPE",
                 "quoteType": "EQUITY",
                 "exchange": "NYQ",
-                "marketCap": 500_000_000,
+                "marketCap": 5_000_000_000,
                 "regularMarketPrice": 10.0,
-                "averageDailyVolume3Month": 200_000,
-                "dayVolume": 400_000,
+                "averageDailyVolume3Month": 600_000,
+                "dayVolume": 1_400_000,
                 "source": "small_cap_gainers",
             },
         ],
@@ -168,6 +840,176 @@ def test_build_universe_keeps_multi_screener_hits(monkeypatch, tmp_path: Path) -
     assert "source_hits=2" in result.stdout
     snapshot = json.loads((tmp_path / "state" / "universe_candidates.json").read_text(encoding="utf-8"))
     assert snapshot["candidates"][0]["source_hits"] == 2
+
+
+def test_build_universe_applies_advisory_scout_override(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+
+    monkeypatch.setattr(
+        market_data,
+        "fetch_small_cap_candidates",
+        lambda limit=200, screeners=None: [
+            {
+                "symbol": "FAST",
+                "quoteType": "EQUITY",
+                "exchange": "NYQ",
+                "marketCap": 4_000_000_000,
+                "regularMarketPrice": 16.0,
+                "averageDailyVolume3Month": 500_000,
+                "dayVolume": 1_800_000,
+                "source": "aggressive_small_caps",
+            },
+            {
+                "symbol": "DROP",
+                "quoteType": "EQUITY",
+                "exchange": "NYQ",
+                "marketCap": 4_000_000_000,
+                "regularMarketPrice": 18.0,
+                "averageDailyVolume3Month": 500_000,
+                "dayVolume": 1_800_000,
+                "source": "small_cap_gainers",
+            },
+        ],
+    )
+    advisory_dir = tmp_path / "state" / "advisory"
+    advisory_dir.mkdir(parents=True)
+    (advisory_dir / "scout_override.yaml").write_text(
+        "main_midcap:\n"
+        "  promote_symbols:\n"
+        "    - BOOST\n"
+        "  avoid_symbols:\n"
+        "    - DROP\n",
+        encoding="utf-8",
+    )
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        f"  universe_path: {tmp_path / 'state' / 'universe.txt'}\n"
+        f"  universe_candidates_path: {tmp_path / 'state' / 'universe_candidates.json'}\n"
+        f"  advisory_dir: {advisory_dir}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "build-universe"])
+
+    assert result.exit_code == 0
+    assert (tmp_path / "state" / "universe.txt").read_text(encoding="utf-8") == "BOOST\nFAST\n"
+    snapshot = json.loads((tmp_path / "state" / "universe_candidates.json").read_text(encoding="utf-8"))
+    included = [row["ticker"] for row in snapshot["candidates"] if row.get("included")]
+    assert included == ["BOOST", "FAST"]
+
+
+def test_discover_export_applies_advisory_scout_override(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.strategy.dynamic_watchlist as dynamic_watchlist
+
+    config_file = tmp_path / "config.yaml"
+    universe_path = tmp_path / "state" / "universe.txt"
+    advisory_dir = tmp_path / "state" / "advisory"
+    advisory_dir.mkdir(parents=True)
+    (advisory_dir / "scout_override.yaml").write_text(
+        "main_midcap:\n"
+        "  promote_symbols:\n"
+        "    - BOOST\n"
+        "  avoid_symbols:\n"
+        "    - MSFT\n",
+        encoding="utf-8",
+    )
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        f"  universe_path: {universe_path}\n"
+        f"  advisory_dir: {advisory_dir}\n",
+        encoding="utf-8",
+    )
+
+    class FakeWatchlist:
+        def __init__(self, max_symbols: int, scout_settings=None) -> None:
+            self.symbols = ["AAPL", "MSFT"]
+
+        def update(self, data_provider):
+            return SimpleNamespace(
+                sectors_favored=[],
+                added=[],
+                removed=[],
+                current=[
+                    SimpleNamespace(symbol="AAPL", reason="test", score=80.0),
+                    SimpleNamespace(symbol="MSFT", reason="test", score=75.0),
+                ],
+            )
+
+        def get_symbols(self):
+            return self.symbols
+
+        def export_for_burn_in(self, output_path=None):
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_path).write_text("AAPL\nMSFT\n", encoding="utf-8")
+            return str(Path(output_path).resolve())
+
+    monkeypatch.setattr(dynamic_watchlist, "DynamicWatchlist", FakeWatchlist)
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "discover", "--export"])
+
+    assert result.exit_code == 0
+    assert universe_path.read_text(encoding="utf-8") == "BOOST\nAAPL"
+
+
+def test_advisory_learn_and_report_commands(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    advisory_dir = tmp_path / "state" / "advisory"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'burn_in.db'}\n"
+        f"  log_dir: {tmp_path / 'logs'}\n"
+        f"  advisory_dir: {advisory_dir}\n"
+        "advisory:\n"
+        "  enabled: true\n"
+        "  min_observations_per_symbol: 1\n",
+        encoding="utf-8",
+    )
+    log_path = tmp_path / "logs" / "decision-log.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        json.dumps(
+            {
+                "command": "scan",
+                "ticker": "AAPL",
+                "status": "APPROVED",
+                "reason": "approved",
+                "confidence": 0.9,
+                "quality": "GREEN",
+                "entry": 100.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    learn_result = CliRunner().invoke(app, ["--config-path", str(config_file), "advisory-learn", "--daily-report"])
+    report_result = CliRunner().invoke(app, ["--config-path", str(config_file), "advisory-report"])
+
+    assert learn_result.exit_code == 0
+    assert "observations_added=1" in learn_result.stdout
+    assert report_result.exit_code == 0
+    assert "ADVISORY LEARNER REPORT" in report_result.stdout
+
+
+def test_advisory_learn_command_noops_when_disabled(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'burn_in.db'}\n"
+        f"  log_dir: {tmp_path / 'logs'}\n"
+        f"  advisory_dir: {tmp_path / 'state' / 'advisory'}\n"
+        "advisory:\n"
+        "  enabled: false\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "advisory-learn"])
+
+    assert result.exit_code == 0
+    assert "advisory=disabled" in result.stdout
 
 
 def test_scan_universe_reads_saved_symbols_file(monkeypatch, tmp_path: Path) -> None:
@@ -218,10 +1060,12 @@ def test_scan_universe_reads_saved_symbols_file(monkeypatch, tmp_path: Path) -> 
     universe_path.write_text("AAPL\n", encoding="utf-8")
     config_file = tmp_path / "config.yaml"
     db_path = tmp_path / "state.db"
+    candidates_path = tmp_path / "state" / "universe_candidates.json"
     config_file.write_text(
         "app:\n"
         f"  state_db_path: {db_path}\n"
-        f"  universe_path: {universe_path}\n",
+        f"  universe_path: {universe_path}\n"
+        f"  universe_candidates_path: {candidates_path}\n",
         encoding="utf-8",
     )
     PortfolioLedger(db_path).save_portfolio_state(PortfolioState(cash=20_000.0, equity=20_000.0))
@@ -283,6 +1127,48 @@ def test_alert_signals_sends_from_scan_snapshot(monkeypatch, tmp_path: Path) -> 
     assert len(sent) == 1
     assert "BUY CANDIDATE" in sent[0]
     assert "AAPL" in sent[0]
+
+
+def test_scan_universe_includes_watchlist_symbols(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.runtime.orchestrator as orchestrator
+
+    captured: dict[str, object] = {}
+
+    def fake_run_scan(symbols, settings, include_details=False):
+        captured["symbols"] = symbols
+        return {
+            "lines": [],
+            "summary": {
+                "symbols": len(symbols),
+                "approved": 0,
+                "green": 0,
+                "yellow": 0,
+                "rejected": 0,
+                "no_signal": len(symbols),
+                "errors": 0,
+            },
+            "candidates": [],
+        }
+
+    monkeypatch.setattr(orchestrator, "run_scan", fake_run_scan)
+    universe_path = tmp_path / "state" / "universe.txt"
+    watchlist_path = tmp_path / "state" / "watchlist.txt"
+    universe_path.parent.mkdir(parents=True, exist_ok=True)
+    universe_path.write_text("AAPL\nMSFT\n", encoding="utf-8")
+    watchlist_path.write_text("msft\nnvda\n", encoding="utf-8")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state.db'}\n"
+        f"  universe_path: {universe_path}\n"
+        f"  watchlist_path: {watchlist_path}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "scan-universe", "--summary"])
+
+    assert result.exit_code == 0
+    assert captured["symbols"] == ["AAPL", "MSFT", "NVDA"]
 
 
 def test_alert_signals_no_webhook_is_noop(tmp_path: Path) -> None:
@@ -501,7 +1387,7 @@ def test_scan_command_sizes_from_saved_portfolio_state(monkeypatch, tmp_path: Pa
     assert result.exit_code == 0
     assert (
         result.stdout.strip()
-        == "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout"
+        == "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout"
     )
     snapshot = json.loads((tmp_path / "state" / "scan_results.json").read_text(encoding="utf-8"))
     assert snapshot["mode"] == "scan"
@@ -598,9 +1484,9 @@ def test_scan_command_sorts_approved_candidates_and_prints_richer_fields(
 
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
-        "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout",
-        "MSFT APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00 last=201.00 qty=19 rr=2.00 conf=0.80 risk=$76.00 alloc=0.19 entry=201.00 stop=199.80 target=203.40 reasons=bullish daily regime; intraday breakout",
-        "summary symbols=2 approved=2 green=2 yellow=0 rejected=0 no_signal=0 errors=0",
+        "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout",
+        "MSFT APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=201.00 qty=19 rr=2.00 conf=0.80 risk=$76.00 alloc=0.19 entry=201.00 stop=199.80 target=203.40 reasons=bullish daily regime; intraday breakout",
+        "summary symbols=2 approved=2 green=2 yellow=0 rejected=0 no_signal=0 errors=0 supermodel_support=2 supermodel_caution=0 supermodel_block=0 supermodel_no_signal=0",
     ]
     log_text = (tmp_path / "logs" / "decision-log.jsonl").read_text(encoding="utf-8")
     assert '"command": "scan"' in log_text
@@ -621,6 +1507,7 @@ def test_scan_quality_marks_weak_confirmation_yellow() -> None:
 
 
 def test_scan_command_marks_stale_market_data(monkeypatch, tmp_path: Path) -> None:
+    """Stale data check removed — signals now go through regardless of age."""
     import trading_bot.data.market_data as market_data
     import trading_bot.runtime.orchestrator as orchestrator
 
@@ -678,8 +1565,11 @@ def test_scan_command_marks_stale_market_data(monkeypatch, tmp_path: Path) -> No
     result = runner.invoke(app, ["--config-path", str(config_file), "scan", "--symbols", "AAPL"])
 
     assert result.exit_code == 0
-    assert "status=stale age=40m ts=2026-06-13T10:20:00" in result.stdout
+    assert "APPROVED" in result.stdout
+    assert "status=stale" in result.stdout
+    assert "age=40m" in result.stdout
     snapshot = json.loads((tmp_path / "state" / "scan_results.json").read_text(encoding="utf-8"))
+    assert snapshot["candidates"][0]["status"] == "APPROVED"
     assert snapshot["candidates"][0]["freshness"] == "stale"
 
 
@@ -741,8 +1631,147 @@ def test_scan_command_writes_empty_snapshot_for_no_signal(monkeypatch, tmp_path:
             "ticker": "AAPL",
             "status": "NO_SIGNAL",
             "reason": "daily regime not bullish",
+            "supermodel_decision": "no_signal",
+            "supermodel_score": 0.0,
         }
     ]
+
+
+def test_scan_command_prefers_fresh_candidate_over_stale_higher_confidence(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import trading_bot.data.market_data as market_data
+    import trading_bot.runtime.orchestrator as orchestrator
+
+    daily = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01", periods=60, freq="D"),
+            "open": [100.0 + index for index in range(60)],
+            "high": [101.0 + index for index in range(60)],
+            "low": [99.0 + index for index in range(60)],
+            "close": [100.0 + index for index in range(60)],
+            "volume": [1_000_000 for _ in range(60)],
+        }
+    )
+    intraday_map = {
+        "AAPL": pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    [
+                        "2026-06-13 10:00:00",
+                        "2026-06-13 10:05:00",
+                        "2026-06-13 10:10:00",
+                        "2026-06-13 10:15:00",
+                        "2026-06-13 10:20:00",
+                    ]
+                ),
+                "open": [99.9, 100.1, 100.0, 100.2, 100.5],
+                "high": [100.1, 100.3, 100.2, 100.4, 101.1],
+                "low": [99.8, 100.0, 99.9, 100.1, 100.4],
+                "close": [100.0, 100.2, 100.1, 100.3, 101.0],
+                "volume": [1000, 1100, 950, 1050, 1500],
+            }
+        ),
+        "MSFT": pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    [
+                        "2026-06-13 09:25:00",
+                        "2026-06-13 09:30:00",
+                        "2026-06-13 09:35:00",
+                        "2026-06-13 09:40:00",
+                        "2026-06-13 09:45:00",
+                    ]
+                ),
+                "open": [199.9, 200.1, 200.0, 200.2, 200.5],
+                "high": [200.1, 200.3, 200.2, 200.4, 201.1],
+                "low": [199.8, 200.0, 199.9, 200.1, 200.4],
+                "close": [200.0, 200.2, 200.1, 200.3, 201.0],
+                "volume": [1000, 1100, 950, 1050, 2500],
+            }
+        ),
+    }
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        if interval == "5m":
+            return intraday_map[symbol].copy(deep=True)
+        return daily.copy(deep=True)
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    monkeypatch.setattr(
+        orchestrator,
+        "_scan_now",
+        lambda signal_timestamp: datetime(2026, 6, 13, 10, 25, 0, tzinfo=signal_timestamp.tzinfo),
+    )
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(cash=20_000.0, equity=20_000.0)
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["--config-path", str(config_file), "scan", "--symbols", "MSFT,AAPL", "--summary"],
+    )
+
+    assert result.exit_code == 0
+    lines = result.stdout.strip().splitlines()
+    assert lines[0].startswith("AAPL APPROVED")
+    assert "status=fresh" in lines[0]
+    assert lines[1].startswith("MSFT APPROVED")
+    assert "status=stale" in lines[1]
+
+
+def test_scan_why_surfaces_swarm_sentiment_fields(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    scan_path = tmp_path / "state" / "scan_results.json"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        f"  scan_results_path: {scan_path}\n",
+        encoding="utf-8",
+    )
+
+    def fake_run_scan(symbols, settings, include_details=False):
+        return {
+            "lines": [
+                "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=test swarm=APPROVE:0.8 swarm_sentiment_action=BUY swarm_sentiment_confidence=0.72 swarm_sentiment_score=0.42 swarm_sentiment_news_count=2"
+            ],
+            "summary": {"symbols": 1, "approved": 1, "green": 1, "yellow": 0, "rejected": 0, "no_signal": 0, "errors": 0},
+            "candidates": [
+                {
+                    "ticker": "AAPL",
+                    "status": "APPROVED",
+                    "confidence": 0.9,
+                    "quality": "GREEN",
+                    "freshness": "fresh",
+                    "swarm_decision": "APPROVE",
+                    "swarm_sentiment_action": "BUY",
+                    "swarm_sentiment_confidence": 0.72,
+                    "swarm_sentiment_score": 0.42,
+                    "swarm_sentiment_news_count": 2,
+                }
+            ],
+        }
+
+    from unittest.mock import patch
+
+    result = None
+    with patch("trading_bot.runtime.orchestrator.run_scan", side_effect=fake_run_scan):
+        result = CliRunner().invoke(app, ["--config-path", str(config_file), "scan", "--symbols", "AAPL", "--why"])
+
+    assert result is not None
+    assert result.exit_code == 0
+    assert "swarm_sentiment_action=BUY" in result.stdout
+    assert "swarm_sentiment_score=0.42" in result.stdout
 
 
 def test_scan_command_prints_no_signal_reason(monkeypatch, tmp_path: Path) -> None:
@@ -852,7 +1881,8 @@ def test_scan_command_can_print_gate_details(monkeypatch, tmp_path: Path) -> Non
     assert result.stdout.strip() == (
         "AAPL NO_SIGNAL reason=daily regime not bullish "
         "daily_close=98.00 ema_20=99.81 sma_50=99.96 "
-        "intraday_close=101.00 range_high=100.40 volume=2500 volume_avg=1320.00 volume_ratio=1.89"
+        "intraday_close=101.00 range_high=100.40 volume=2500 volume_avg=1320.00 volume_ratio=1.89 "
+        "supermodel=no_signal:0.0 supermodel_layers=setup:neutral:0.00"
     )
     snapshot = json.loads((tmp_path / "state" / "scan_results.json").read_text(encoding="utf-8"))
     assert snapshot["candidates"][0]["details"] == {
@@ -864,6 +1894,9 @@ def test_scan_command_can_print_gate_details(monkeypatch, tmp_path: Path) -> Non
         "volume": 2500,
         "volume_avg": 1320.0,
         "volume_ratio": 1.89,
+        "supermodel_decision": "no_signal",
+        "supermodel_score": 0.0,
+        "supermodel_layers": "setup:neutral:0.00",
     }
 
 
@@ -929,7 +1962,7 @@ def test_scan_details_ignore_trailing_zero_volume_bar(monkeypatch, tmp_path: Pat
     )
 
     assert result.exit_code == 0
-    assert "ts=2026-06-13T10:20:00" in result.stdout
+    assert "ts=2026-06-13T10:20:00+00:00" in result.stdout
     assert "intraday_close=101.00" in result.stdout
     assert "volume=2500" in result.stdout
     assert "volume=0" not in result.stdout
@@ -997,7 +2030,7 @@ def test_scan_details_explain_signal_bar_when_later_bar_exists(monkeypatch, tmp_
     )
 
     assert result.exit_code == 0
-    assert "ts=2026-06-13T10:20:00" in result.stdout
+    assert "ts=2026-06-13T10:20:00+00:00" in result.stdout
     assert "intraday_close=101.00" in result.stdout
     assert "volume=2500" in result.stdout
     assert "intraday_close=100.70" not in result.stdout
@@ -1766,6 +2799,108 @@ def test_manage_positions_reports_open_position_price(monkeypatch, tmp_path: Pat
     ]
 
 
+def test_manage_positions_skips_open_position_when_market_data_fetch_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import trading_bot.data.market_data as market_data
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        raise ValueError("provider outage")
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        f"  log_dir: {log_dir}\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={"AAPL": Position(ticker="AAPL", quantity=10, average_cost=100.0)},
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip().splitlines() == [
+        "positions=1 actions=0 skipped=1",
+        "AAPL SKIP reason=market-data-fetch-failed",
+    ]
+    log_text = (log_dir / "decision-log.jsonl").read_text(encoding="utf-8")
+    assert '"reason": "market data fetch failed"' in log_text
+    assert '"error": "provider outage"' in log_text
+
+
+def test_manage_positions_persists_min_stop_widening(monkeypatch, tmp_path: Path) -> None:
+    import sys
+    import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
+
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 10, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(app_module, "now_in_zone", fake_now_in_zone)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        if interval == "5m":
+            return pd.DataFrame(
+                {
+                    "timestamp": pd.to_datetime(["2026-06-18T09:55:00"]),
+                    "high": [100.5],
+                    "close": [100.5],
+                }
+            )
+        return pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-06-18"]),
+                "high": [101.0],
+                "low": [99.0],
+                "close": [100.5],
+                "volume": [1_000_000],
+            }
+        )
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        "risk:\n"
+        "  min_stop_distance_pct: 3.0\n",
+        encoding="utf-8",
+    )
+    ledger = PortfolioLedger(db_path)
+    ledger.save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=99.0,
+                )
+            },
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    assert ledger.load_portfolio_state().positions["AAPL"].stop_loss == 97.0
+
+
 def test_manage_positions_executes_target_exit(monkeypatch, tmp_path: Path) -> None:
     import sys
     import trading_bot.data.market_data as market_data
@@ -1822,6 +2957,69 @@ def test_manage_positions_executes_target_exit(monkeypatch, tmp_path: Path) -> N
     assert state.realized_pnl == 99.0
     assert state.positions == {}
     assert ledger.list_order_rows()[-1]["side"] == "SELL"
+
+
+def test_manage_positions_scales_out_partial_target(monkeypatch, tmp_path: Path) -> None:
+    import sys
+    import trading_bot.data.market_data as market_data
+    from zoneinfo import ZoneInfo
+
+    app_module = sys.modules["trading_bot.cli.app"]
+
+    def fake_now_in_zone(timezone: str):
+        return datetime(2026, 6, 18, 10, 0, tzinfo=ZoneInfo(timezone))
+
+    monkeypatch.setattr(app_module, "now_in_zone", fake_now_in_zone)
+
+    def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
+        assert symbol == "AAPL"
+        assert interval == "5m"
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18T09:55:00"]), "close": [110.0]})
+
+    monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        "paper:\n"
+        "  partial_take_profit_enabled: true\n"
+        "  partial_take_profit_fraction: 0.5\n",
+        encoding="utf-8",
+    )
+    PortfolioLedger(db_path).save_portfolio_state(
+        PortfolioState(
+            cash=9_000.0,
+            equity=10_000.0,
+            positions={
+                "AAPL": Position(
+                    ticker="AAPL",
+                    quantity=10,
+                    average_cost=100.0,
+                    stop_loss=98.0,
+                    profit_target=108.0,
+                )
+            },
+        )
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip().splitlines() == [
+        "positions=1 actions=1 skipped=0",
+        "AAPL FILLED reason=target_partial qty=5 price=110.00 cash=9549.00 remaining=5",
+    ]
+
+    ledger = PortfolioLedger(db_path)
+    state = ledger.load_portfolio_state()
+    assert state is not None
+    assert state.cash == 9549.0
+    assert state.realized_pnl == 49.0
+    assert state.positions["AAPL"].quantity == 5
+    assert state.positions["AAPL"].stop_loss == 100.0
+    assert state.positions["AAPL"].profit_target is None
+    assert state.positions["AAPL"].partial_profit_taken is True
 
 
 def test_manage_positions_executes_stop_exit(monkeypatch, tmp_path: Path) -> None:
@@ -2388,9 +3586,11 @@ def test_manage_positions_freezes_on_stale_market_data(monkeypatch, tmp_path: Pa
 
     config_file = tmp_path / "config.yaml"
     db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
     config_file.write_text(
         "app:\n"
         f"  state_db_path: {db_path}\n"
+        f"  log_dir: {log_dir}\n"
         "market_data:\n"
         "  max_data_age_minutes: 30\n",  # Use minutes for intraday staleness
         encoding="utf-8",
@@ -2424,6 +3624,11 @@ def test_manage_positions_freezes_on_stale_market_data(monkeypatch, tmp_path: Pa
     # Position should be untouched despite last_price=80 < stop=99.
     assert state.positions["AAPL"].quantity == 10
     assert state.cash == 9_000.0
+    log_path = log_dir / "decision-log.jsonl"
+    event = json.loads(log_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert event["reason"] == "stale market data"
+    assert event["max_age_minutes"] == 30
+    assert "max_age_hours" not in event
 
 
 def test_manage_positions_skips_empty_intraday_frame(monkeypatch, tmp_path: Path) -> None:
@@ -2855,6 +4060,7 @@ def test_paper_trade_command_prints_rejection_reason(monkeypatch, tmp_path: Path
 
 
 def test_paper_trade_rejects_stale_signal(monkeypatch, tmp_path: Path) -> None:
+    """Stale data check removed — signals now go through regardless of age."""
     import trading_bot.data.market_data as market_data
     import trading_bot.runtime.orchestrator as orchestrator
 
@@ -2914,7 +4120,7 @@ def test_paper_trade_rejects_stale_signal(monkeypatch, tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0
-    assert result.stdout.strip() == "AAPL REJECTED stale market data"
+    assert "FILLED" in result.stdout
 
 
 def test_paper_trade_rejects_yellow_signal(monkeypatch, tmp_path: Path) -> None:
@@ -3122,6 +4328,372 @@ def test_report_command_prints_summary_and_exports_files(monkeypatch, tmp_path: 
     assert dashboard_snapshot["rows"][0]["ticker"] == "AAPL"
 
 
+def test_trade_attribution_reports_infinite_profit_factor_without_losses(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    ledger = PortfolioLedger(db_path)
+    ledger.record_fill(
+        FillResult(
+            order_id="buy-1",
+            ticker="AAPL",
+            quantity=2,
+            fill_price=100.0,
+            fees=0.0,
+            filled_at=datetime(2026, 6, 13, 10, 0, 0),
+        ),
+        side="BUY",
+    )
+    ledger.record_fill(
+        FillResult(
+            order_id="sell-1",
+            ticker="AAPL",
+            quantity=2,
+            fill_price=110.0,
+            fees=0.0,
+            filled_at=datetime(2026, 6, 13, 11, 0, 0),
+        ),
+        side="SELL",
+        realized_pnl=20.0,
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "trade-attribution"])
+
+    assert result.exit_code == 0
+    assert "Profit factor: inf" in result.stdout
+
+
+def test_trade_attribution_does_not_match_sell_to_future_buy(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n",
+        encoding="utf-8",
+    )
+    ledger = PortfolioLedger(db_path)
+    ledger.record_fill(
+        FillResult(
+            order_id="buy-1",
+            ticker="AAPL",
+            quantity=1,
+            fill_price=100.0,
+            fees=0.0,
+            filled_at=datetime(2026, 6, 13, 10, 0, 0),
+        ),
+        side="BUY",
+    )
+    ledger.record_fill(
+        FillResult(
+            order_id="sell-1",
+            ticker="AAPL",
+            quantity=1,
+            fill_price=110.0,
+            fees=0.0,
+            filled_at=datetime(2026, 6, 13, 11, 0, 0),
+        ),
+        side="SELL",
+        realized_pnl=10.0,
+    )
+    ledger.record_fill(
+        FillResult(
+            order_id="buy-2",
+            ticker="AAPL",
+            quantity=1,
+            fill_price=200.0,
+            fees=0.0,
+            filled_at=datetime(2026, 6, 13, 12, 0, 0),
+        ),
+        side="BUY",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "trade-attribution"])
+
+    assert result.exit_code == 0
+    assert "unknown" in result.stdout
+    assert "100.00" in result.stdout
+    assert "110.00" in result.stdout
+    assert "60m" in result.stdout
+
+
+def test_trade_attribution_reports_swarm_sentiment_buckets(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        f"  log_dir: {log_dir}\n",
+        encoding="utf-8",
+    )
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "decision-log.jsonl").write_text("", encoding="utf-8")
+
+    ledger = PortfolioLedger(db_path)
+    ledger.record_fill(
+        FillResult(
+            order_id="buy-1",
+            ticker="AAPL",
+            quantity=2,
+            fill_price=100.0,
+            fees=0.0,
+            filled_at=datetime(2026, 6, 13, 10, 0, 0),
+        ),
+        side="BUY",
+        strategy_tag="v3-trend_following",
+        swarm_sentiment_bucket="bullish",
+    )
+    ledger.record_fill(
+        FillResult(
+            order_id="sell-1",
+            ticker="AAPL",
+            quantity=2,
+            fill_price=110.0,
+            fees=0.0,
+            filled_at=datetime(2026, 6, 13, 11, 0, 0),
+        ),
+        side="SELL",
+        realized_pnl=20.0,
+        strategy_tag="v3-trend_following",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "trade-attribution"])
+
+    assert result.exit_code == 0
+    assert "Swarm Sentiment" in result.stdout
+    assert "bullish" in result.stdout
+    assert "20.00" in result.stdout
+
+
+def test_db_history_filters_trades_by_swarm_sentiment(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        f"  log_dir: {log_dir}\n",
+        encoding="utf-8",
+    )
+    from trading_bot.db.repositories import upsert_trade
+    from trading_bot.db.session import get_session, init_db, make_session_factory
+    from trading_bot.config.loader import load_settings
+
+    settings = load_settings(config_file)
+    engine = init_db(settings)
+    session = get_session(make_session_factory(engine))
+    try:
+        upsert_trade(
+            session,
+            ticker="AAPL",
+            side="BUY",
+            order_type="market",
+            quantity=1,
+            entry_price=100.0,
+            strategy_tag="v3-trend_following",
+            swarm_sentiment_bucket="bullish",
+        )
+        upsert_trade(
+            session,
+            ticker="MSFT",
+            side="BUY",
+            order_type="market",
+            quantity=1,
+            entry_price=200.0,
+            strategy_tag="v3-trend_following",
+            swarm_sentiment_bucket="bearish",
+        )
+    finally:
+        session.close()
+        engine.dispose()
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "db-history", "--swarm-sentiment", "bullish", "--limit", "10"],
+    )
+
+    assert result.exit_code == 0
+    assert "AAPL BUY qty=1 @$100.00 sentiment=bullish" in result.stdout
+    assert "MSFT BUY qty=1 @$200.00 sentiment=bearish" not in result.stdout
+
+
+def test_db_features_command_queries_scan_features(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        f"  log_dir: {log_dir}\n",
+        encoding="utf-8",
+    )
+    from trading_bot.db.repositories import upsert_scan_feature
+    from trading_bot.db.session import get_session, init_db, make_session_factory
+    from trading_bot.config.loader import load_settings
+
+    settings = load_settings(config_file)
+    engine = init_db(settings)
+    session = get_session(make_session_factory(engine))
+    try:
+        upsert_scan_feature(
+            session, ticker="AAPL", status="APPROVED", action="BUY",
+            confidence=0.9, quality="GREEN", market_regime="strong_uptrend",
+            strategy_tag="v3-trend_following", swarm_sentiment_score=0.5,
+        )
+        upsert_scan_feature(
+            session, ticker="MSFT", status="REJECTED", action="HOLD",
+            confidence=0.3, quality="RED", market_regime="strong_downtrend",
+            strategy_tag="v3-mean_reversion", swarm_sentiment_score=-0.4,
+        )
+    finally:
+        session.close()
+        engine.dispose()
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "db-features", "--ticker", "AAPL", "--limit", "10"],
+    )
+
+    assert result.exit_code == 0
+    assert "AAPL" in result.stdout
+    assert "MSFT" not in result.stdout
+
+
+def test_db_features_command_filters_by_regime(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        f"  log_dir: {log_dir}\n",
+        encoding="utf-8",
+    )
+    from trading_bot.db.repositories import upsert_scan_feature
+    from trading_bot.db.session import get_session, init_db, make_session_factory
+    from trading_bot.config.loader import load_settings
+
+    settings = load_settings(config_file)
+    engine = init_db(settings)
+    session = get_session(make_session_factory(engine))
+    try:
+        upsert_scan_feature(
+            session, ticker="AAPL", status="APPROVED", action="BUY",
+            market_regime="strong_uptrend", swarm_sentiment_score=0.5,
+        )
+        upsert_scan_feature(
+            session, ticker="MSFT", status="APPROVED", action="BUY",
+            market_regime="strong_downtrend", swarm_sentiment_score=0.5,
+        )
+    finally:
+        session.close()
+        engine.dispose()
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "db-features", "--regime", "strong_uptrend", "--limit", "10"],
+    )
+
+    assert result.exit_code == 0
+    assert "AAPL" in result.stdout
+    assert "MSFT" not in result.stdout
+
+
+def test_db_features_command_summary(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        f"  log_dir: {log_dir}\n",
+        encoding="utf-8",
+    )
+    from trading_bot.db.repositories import upsert_scan_feature
+    from trading_bot.db.session import get_session, init_db, make_session_factory
+    from trading_bot.config.loader import load_settings
+
+    settings = load_settings(config_file)
+    engine = init_db(settings)
+    session = get_session(make_session_factory(engine))
+    try:
+        upsert_scan_feature(
+            session, ticker="AAPL", status="APPROVED", action="BUY",
+            quality="GREEN", market_regime="strong_uptrend",
+            strategy_tag="v3-trend_following", swarm_sentiment_score=0.5,
+        )
+        upsert_scan_feature(
+            session, ticker="MSFT", status="APPROVED", action="HOLD",
+            quality="YELLOW", market_regime="strong_uptrend",
+            strategy_tag="v3-trend_following", swarm_sentiment_score=-0.4,
+        )
+        upsert_scan_feature(
+            session, ticker="GOOGL", status="REJECTED", action="SELL",
+            quality="RED", market_regime="strong_downtrend",
+            strategy_tag="v3-mean_reversion", swarm_sentiment_score=-0.5,
+        )
+    finally:
+        session.close()
+        engine.dispose()
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "db-features", "--summary"],
+    )
+
+    assert result.exit_code == 0
+    assert "SUMMARY" in result.stdout
+    assert "Status distribution:" in result.stdout
+    assert "Regime distribution:" in result.stdout
+    assert "Quality distribution:" in result.stdout
+    assert "Swarm Sentiment" in result.stdout
+
+
+def test_db_features_command_json_output(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    db_path = tmp_path / "state.db"
+    log_dir = tmp_path / "logs"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        f"  log_dir: {log_dir}\n",
+        encoding="utf-8",
+    )
+    from trading_bot.db.repositories import upsert_scan_feature
+    from trading_bot.db.session import get_session, init_db, make_session_factory
+    from trading_bot.config.loader import load_settings
+
+    settings = load_settings(config_file)
+    engine = init_db(settings)
+    session = get_session(make_session_factory(engine))
+    try:
+        upsert_scan_feature(
+            session, ticker="AAPL", status="APPROVED", action="BUY",
+            confidence=0.9, quality="GREEN", market_regime="strong_uptrend",
+            strategy_tag="v3-trend_following", swarm_sentiment_score=0.5,
+        )
+    finally:
+        session.close()
+        engine.dispose()
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", str(config_file), "db-features", "--json"],
+    )
+
+    assert result.exit_code == 0
+    import json
+    data = json.loads(result.stdout)
+    assert isinstance(data, list)
+    assert len(data) == 1
+    assert data[0]["ticker"] == "AAPL"
+    assert data[0]["confidence"] == 0.9
+
+
 def test_backtest_command_replays_data_and_prints_summary(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
 
@@ -3275,6 +4847,8 @@ def test_paper_trade_v3_lifecycle_creates_position_and_tracks_pnl(monkeypatch, t
         else:
             c = base + 0.2 * (i % 5)
             oclv.append((c - 0.1, c + 0.3, c - 0.3, c, 1100 + (i % 5) * 100))
+    last_open, last_high, last_low, last_close, _ = oclv[-1]
+    oclv[-1] = (last_open, last_high, last_low, last_close, 1600)
     intraday = pd.DataFrame(
         {
             "timestamp": intraday_ts,
@@ -3342,3 +4916,195 @@ def test_paper_trade_v3_lifecycle_creates_position_and_tracks_pnl(monkeypatch, t
     assert len(buy_rows) == 1
     # PnL column exists and is None for BUY (realized PnL on sells only)
     assert "pnl" in buy_rows[0]
+
+
+def test_cache_data_command_with_symbols(monkeypatch, tmp_path: Path) -> None:
+    """Test cache-data command downloads and saves CSV for symbols."""
+    from unittest.mock import MagicMock
+    from trading_bot.cli.app import app
+    from typer.testing import CliRunner
+
+    runner = CliRunner()
+
+    # Mock fetch_bars to return a small DataFrame
+    mock_df = pd.DataFrame({
+        "close": [100.0, 101.0, 102.0],
+        "open": [99.0, 100.0, 101.0],
+        "high": [101.5, 102.0, 103.0],
+        "low": [98.5, 99.5, 100.5],
+        "volume": [1000, 1100, 1200],
+    })
+
+    captured_provider_stacks = []
+
+    def mock_fetch_bars(symbol, period="1y", interval="1d", start=None, end=None, settings=None):
+        captured_provider_stacks.append(settings.provider_stack if settings else [])
+        return mock_df.copy()
+
+    monkeypatch.setattr("trading_bot.data.market_data.fetch_bars", mock_fetch_bars)
+
+    output_dir = tmp_path / "cache"
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "market_data:\n"
+        "  providers:\n"
+        "    - alpaca\n"
+        "    - polygon\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app,
+        [
+            "--config-path",
+            str(config_file),
+            "cache-data",
+            "--symbols",
+            "AAPL,MSFT",
+            "--output-dir",
+            str(output_dir),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "AAPL" in result.stdout
+    assert "MSFT" in result.stdout
+    assert "2 cached" in result.stdout
+
+    # Verify CSV files were created
+    assert (output_dir / "AAPL.csv").exists()
+    assert (output_dir / "MSFT.csv").exists()
+    assert captured_provider_stacks == [["alpaca", "polygon"], ["alpaca", "polygon"]]
+
+
+def test_cache_data_command_from_watchlist(monkeypatch, tmp_path: Path) -> None:
+    """Test cache-data reads symbols from watchlist file."""
+    from trading_bot.cli.app import app
+    from typer.testing import CliRunner
+    from trading_bot.runtime.watchlist import write_watchlist
+
+    runner = CliRunner()
+
+    watchlist_path = tmp_path / "watchlist.txt"
+    write_watchlist(watchlist_path, ["AAPL", "GOOGL"])
+
+    output_dir = tmp_path / "cache"
+
+    mock_df = pd.DataFrame({
+        "close": [100.0, 101.0],
+        "open": [99.0, 100.0],
+        "high": [101.5, 102.0],
+        "low": [98.5, 99.5],
+        "volume": [1000, 1100],
+    })
+
+    captured_provider_stacks = []
+
+    def mock_fetch_bars(symbol, period="1y", interval="1d", start=None, end=None, settings=None):
+        captured_provider_stacks.append(settings.provider_stack if settings else [])
+        return mock_df.copy()
+
+    monkeypatch.setattr("trading_bot.data.market_data.fetch_bars", mock_fetch_bars)
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "market_data:\n"
+        "  providers:\n"
+        "    - alpaca\n"
+        "    - polygon\n",
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app,
+        [
+            "--config-path",
+            str(config_file),
+            "cache-data",
+            "--watchlist-path",
+            str(watchlist_path),
+            "--output-dir",
+            str(output_dir),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "2 cached" in result.stdout
+    assert (output_dir / "AAPL.csv").exists()
+    assert (output_dir / "GOOGL.csv").exists()
+    assert captured_provider_stacks == [["alpaca", "polygon"], ["alpaca", "polygon"]]
+
+
+def test_supermodel_command_resolves_pipeline_script_from_repo(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The supermodel command should work even when invoked outside the repo cwd."""
+    import subprocess
+
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, capture_output=False):
+        captured["cmd"] = cmd
+        captured["capture_output"] = capture_output
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = CliRunner().invoke(app, ["supermodel", "--dry-run", "--symbols", "AAPL"])
+
+    assert result.exit_code == 0
+    cmd = captured["cmd"]
+    assert Path(cmd[1]).is_absolute()
+    assert Path(cmd[1]).name == "daily_supermodel.py"
+    assert Path(cmd[1]).parent.name == "scripts"
+    assert "--dry-run" in cmd
+    assert cmd[-2:] == ["--symbols", "AAPL"]
+
+
+def test_live_data_command_resolves_collector_script_from_repo(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import subprocess
+
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, capture_output=False):
+        captured["cmd"] = cmd
+        captured["capture_output"] = capture_output
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = CliRunner().invoke(app, ["live-data", "--buffer"])
+
+    assert result.exit_code == 0
+    cmd = captured["cmd"]
+    assert Path(cmd[1]).is_absolute()
+    assert Path(cmd[1]).name == "live_data_collector.py"
+    assert Path(cmd[1]).parent.name == "scripts"
+    assert "--buffer" in cmd
+
+
+def test_auto_retrain_command_resolves_trigger_script_from_repo(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import subprocess
+
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, capture_output=False):
+        captured["cmd"] = cmd
+        captured["capture_output"] = capture_output
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = CliRunner().invoke(app, ["auto-retrain", "--dry-run"])
+
+    assert result.exit_code == 0
+    cmd = captured["cmd"]
+    assert Path(cmd[1]).is_absolute()
+    assert Path(cmd[1]).name == "auto_retrain_trigger.py"
+    assert Path(cmd[1]).parent.name == "scripts"
+    assert "--dry-run" in cmd

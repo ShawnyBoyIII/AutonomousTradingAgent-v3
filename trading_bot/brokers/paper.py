@@ -5,6 +5,7 @@ Implements BrokerAdapter interface using existing PaperBroker.
 Provides standardized interface for V3 while maintaining backward compatibility.
 """
 
+import logging
 import uuid
 from datetime import datetime
 from decimal import Decimal
@@ -25,6 +26,15 @@ from trading_bot.execution.paper_broker import PaperBroker
 from trading_bot.portfolio.ledger import PortfolioLedger
 from trading_bot.config.settings import Settings
 
+logger = logging.getLogger(__name__)
+
+_ORDER_TYPE_MAP: dict[OrderType, str] = {
+    OrderType.MARKET: "market",
+    OrderType.LIMIT: "limit",
+    OrderType.STOP: "stop",
+    OrderType.STOP_LIMIT: "stop",
+}
+
 
 class PaperBrokerAdapter(BrokerAdapter):
     """
@@ -38,8 +48,17 @@ class PaperBrokerAdapter(BrokerAdapter):
         super().__init__(mode=BrokerMode.PAPER, config={})
         self.settings = settings
         self.ledger = ledger or PortfolioLedger(settings.app.state_db_path)
-        self._paper_broker = PaperBroker(settings)
+        self._paper_broker = PaperBroker(
+            starting_cash=settings.rl.backtest_starting_cash,
+            fee_per_order=settings.paper.fee_per_order,
+            slippage_bps=settings.paper.slippage_bps,
+            dynamic_slippage_enabled=settings.paper.dynamic_slippage_enabled,
+            dynamic_slippage_notional_bps_per_10k=settings.paper.dynamic_slippage_notional_bps_per_10k,
+            dynamic_slippage_low_price_boost_bps=settings.paper.dynamic_slippage_low_price_boost_bps,
+            dynamic_slippage_max_extra_bps=settings.paper.dynamic_slippage_max_extra_bps,
+        )
         self._connected = False
+        self._orders: list[BrokerOrder] = []
     
     def connect(self) -> bool:
         """Paper broker is always 'connected'."""
@@ -56,7 +75,9 @@ class PaperBrokerAdapter(BrokerAdapter):
     
     def get_account(self) -> BrokerAccount:
         """Fetch account from local ledger."""
-        portfolio = self.ledger.load_portfolio()
+        portfolio = self.ledger.ensure_portfolio_state(
+            starting_cash=self.settings.rl.backtest_starting_cash
+        )
         
         return BrokerAccount(
             account_id="PAPER_001",
@@ -69,24 +90,26 @@ class PaperBrokerAdapter(BrokerAdapter):
     
     def get_positions(self) -> list[BrokerPosition]:
         """Fetch positions from local ledger."""
-        portfolio = self.ledger.load_portfolio()
+        portfolio = self.ledger.ensure_portfolio_state(
+            starting_cash=self.settings.rl.backtest_starting_cash
+        )
         positions = []
         
         for symbol, pos in portfolio.positions.items():
             # Get current price (if available)
             current_price = getattr(pos, 'current_price', None)
             if current_price is None:
-                current_price = pos.avg_cost
+                current_price = pos.average_cost
             
             market_value = Decimal(str(current_price)) * Decimal(str(pos.quantity))
-            cost_basis = Decimal(str(pos.avg_cost)) * Decimal(str(pos.quantity))
+            cost_basis = Decimal(str(pos.average_cost)) * Decimal(str(pos.quantity))
             unrealized_pnl = market_value - cost_basis
             
             positions.append(BrokerPosition(
                 symbol=symbol,
                 quantity=Decimal(str(pos.quantity)),
-                avg_entry_price=Decimal(str(pos.avg_cost)),
-                current_price=Decimal(str(current_price)) if current_price else None,
+                avg_entry_price=Decimal(str(pos.average_cost)),
+                current_price=Decimal(str(current_price)) if current_price is not None else None,
                 market_value=market_value,
                 unrealized_pnl=unrealized_pnl,
                 timestamp=datetime.now(),
@@ -95,18 +118,19 @@ class PaperBrokerAdapter(BrokerAdapter):
         return positions
     
     def get_orders(self, since: datetime | None = None) -> list[BrokerOrder]:
-        """
-        Fetch recent orders from decision log.
-        
-        Note: Paper broker doesn't have persistent order storage yet.
-        Returns empty list for now - this would be enhanced with order history.
-        """
-        # TODO: Implement order history from decision log
-        return []
+        """Fetch recent orders, optionally filtered by created_at >= since."""
+        if since is None:
+            return list(self._orders)
+        return [
+            o for o in self._orders
+            if o.created_at is not None and o.created_at >= since
+        ]
     
     def get_order(self, order_id: str) -> BrokerOrder | None:
-        """Fetch specific order."""
-        # TODO: Implement order lookup
+        """Fetch specific order by ID, or None if not found."""
+        for o in self._orders:
+            if o.order_id == order_id:
+                return o
         return None
     
     def is_tradable(self, symbol: str) -> bool:
@@ -118,12 +142,17 @@ class PaperBrokerAdapter(BrokerAdapter):
         """
         Get current quote for symbol.
         
-        Uses yfinance provider via market_data module.
+        Uses the configured market data provider stack via market_data module.
         """
         from trading_bot.data.market_data import fetch_bars
         
         try:
-            bars = fetch_bars(symbol, period="1d", interval="1m")
+            bars = fetch_bars(
+                symbol,
+                period="1d",
+                interval="1m",
+                settings=self.settings.market_data,
+            )
             if bars.empty:
                 return {"error": "No data available"}
             
@@ -224,32 +253,82 @@ class PaperBrokerAdapter(BrokerAdapter):
         In PAPER mode, this simulates immediate fill.
         """
         from trading_bot.models.order import OrderRequest
-        
-        # Create order request
+
+        market_price: float
+        if price is not None:
+            market_price = float(price)
+        elif order_type == OrderType.MARKET:
+            quote = self.get_quote(symbol)
+            if "error" in quote:
+                logger.warning("Cannot get quote for %s: %s", symbol, quote["error"])
+                broker_order = BrokerOrder(
+                    order_id=str(uuid.uuid4()),
+                    symbol=symbol,
+                    side=side,
+                    order_type=order_type,
+                    quantity=quantity,
+                    filled_quantity=Decimal("0"),
+                    status=OrderStatus.REJECTED,
+                    price=None,
+                    created_at=datetime.now(),
+                    updated_at=datetime.now(),
+                )
+                self._orders.append(broker_order)
+                return broker_order
+            market_price = float(quote["last"])
+        else:
+            market_price = 0.0
+
+        mapped_order_type = _ORDER_TYPE_MAP.get(order_type, "market")
+
+        price_float = float(price) if price else None
+        limit_price = price_float if mapped_order_type == "limit" else None
+        stop_price = price_float if mapped_order_type == "stop" else None
+
         order_request = OrderRequest(
-            symbol=symbol,
+            ticker=symbol,
             side=side.value,
-            quantity=float(quantity),
-            order_type=order_type.value,
-            limit_price=float(price) if price else None,
+            order_type=mapped_order_type,
+            quantity=int(quantity),
+            submitted_at=datetime.now(),
+            limit_price=limit_price,
+            stop_price=stop_price,
         )
-        
-        # Execute via paper broker
-        fill_result = self._paper_broker.submit_order(order_request)
-        
-        # Convert to BrokerOrder
-        return BrokerOrder(
+
+        try:
+            fill_result = self._paper_broker.submit_order(order_request, market_price=market_price)
+        except ValueError as exc:
+            logger.warning("Paper order rejected for %s: %s", symbol, exc)
+            broker_order = BrokerOrder(
+                order_id=str(uuid.uuid4()),
+                symbol=symbol,
+                side=side,
+                order_type=order_type,
+                quantity=quantity,
+                filled_quantity=Decimal("0"),
+                status=OrderStatus.REJECTED,
+                price=None,
+                created_at=datetime.now(),
+                updated_at=datetime.now(),
+            )
+            self._orders.append(broker_order)
+            return broker_order
+
+        is_filled = fill_result.fill_price is not None and fill_result.fill_price > 0
+        broker_order = BrokerOrder(
             order_id=str(uuid.uuid4()),
             symbol=symbol,
             side=side,
             order_type=order_type,
             quantity=quantity,
-            filled_quantity=quantity if fill_result.is_filled else Decimal("0"),
-            status=OrderStatus.FILLED if fill_result.is_filled else OrderStatus.REJECTED,
+            filled_quantity=quantity if is_filled else Decimal("0"),
+            status=OrderStatus.FILLED if is_filled else OrderStatus.REJECTED,
             price=Decimal(str(fill_result.fill_price)) if fill_result.fill_price else None,
             created_at=datetime.now(),
             updated_at=datetime.now(),
         )
+        self._orders.append(broker_order)
+        return broker_order
     
     def cancel_order(self, order_id: str) -> bool:
         """

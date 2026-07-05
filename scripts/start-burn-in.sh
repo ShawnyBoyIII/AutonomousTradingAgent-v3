@@ -80,10 +80,12 @@ EOF
 fi
 
 # Check symbol universe exists
-if [ ! -f "burn-in-symbols.txt" ]; then
-    echo "⚠️  burn-in-symbols.txt not found!"
+UNIVERSE_FILE="state/universe.txt"
+if [ ! -f "$UNIVERSE_FILE" ]; then
+    mkdir -p "$(dirname "$UNIVERSE_FILE")"
+    echo "⚠️  $UNIVERSE_FILE not found!"
     echo "Creating with default symbols..."
-    cat > burn-in-symbols.txt << 'EOF'
+    cat > "$UNIVERSE_FILE" << 'EOF'
 # Default Burn-In Universe
 SPY
 QQQ
@@ -96,7 +98,7 @@ JPM
 JNJ
 XOM
 EOF
-    echo "✅ Created burn-in-symbols.txt"
+    echo "✅ Created $UNIVERSE_FILE"
     echo "Edit this file to customize your trading universe"
     echo ""
 fi
@@ -105,13 +107,13 @@ fi
 echo "Configuration:"
 echo "---------------"
 echo "Config file: $CONFIG_FILE"
-echo "Symbols file: burn-in-symbols.txt"
+echo "Symbols file: $UNIVERSE_FILE"
 echo "Database: state/burn_in.db"
 echo "Logs: logs/burn_in/"
 echo ""
 
 # Count symbols
-symbol_count=$(grep -v "^#" burn-in-symbols.txt | grep -v "^$" | wc -l)
+symbol_count=$(grep -v "^#" "$UNIVERSE_FILE" | grep -v "^$" | wc -l)
 echo "Symbol universe: $symbol_count symbols"
 echo ""
 
@@ -141,7 +143,7 @@ echo ""
 # Test scan
 echo "Testing Market Connection:"
 echo "--------------------------"
-symbols=$(grep -v "^#" burn-in-symbols.txt | grep -v "^$" | head -3 | tr '\n' ',' | sed 's/,$//')
+symbols=$(grep -v "^#" "$UNIVERSE_FILE" | grep -v "^$" | head -3 | tr '\n' ',' | sed 's/,$//')
 if ! sh ./tradebot-local --config-path "$CONFIG_FILE" scan --symbols "$symbols" --summary > /dev/null 2>&1; then
     echo "⚠️  Market scan failed - check internet connection"
     exit 1

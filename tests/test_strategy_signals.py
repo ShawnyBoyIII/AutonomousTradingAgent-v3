@@ -164,7 +164,7 @@ def test_generate_signal_returns_buy_candidate_on_bullish_breakout() -> None:
     )
     assert "bullish daily regime" in signal.reasons
     assert "intraday breakout" in signal.reasons
-    assert signal.timestamp == pd.Timestamp("2026-06-13 10:20:00")
+    assert signal.timestamp == pd.Timestamp("2026-06-13 10:20:00", tz="UTC")
 
 
 def test_generate_signal_explains_momentum_continuation_candidate() -> None:
@@ -267,7 +267,7 @@ def test_generate_recent_signal_uses_recent_setup_when_latest_bar_is_quiet() -> 
     signal = generate_recent_signal("AAPL", daily, intraday)
 
     assert signal is not None
-    assert signal.timestamp == pd.Timestamp("2026-06-13 10:20:00")
+    assert signal.timestamp == pd.Timestamp("2026-06-13 10:20:00", tz="UTC")
     assert "intraday breakout" in signal.reasons
 
 
@@ -322,7 +322,7 @@ def test_generate_signal_uses_timestamp_column_from_normalized_market_data() -> 
     signal = generate_signal("AAPL", daily, intraday)
 
     assert signal is not None
-    assert signal.timestamp == pd.Timestamp("2026-06-13 10:20:00")
+    assert signal.timestamp == pd.Timestamp("2026-06-13 10:20:00", tz="UTC")
 
 
 def test_generate_signal_returns_none_for_missing_numeric_values() -> None:

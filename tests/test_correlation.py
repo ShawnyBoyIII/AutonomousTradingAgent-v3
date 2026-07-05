@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import pandas as pd
 
 from trading_bot.models.portfolio import Position
 from trading_bot.risk.correlation import (
@@ -12,6 +13,9 @@ from trading_bot.risk.correlation import (
     compute_returns,
     format_correlation_report,
 )
+from trading_bot.models.portfolio import PortfolioState
+from trading_bot.runtime.orchestrator import _correlation_context_for_candidate
+from trading_bot.config.settings import Settings
 
 
 class TestComputeReturns:
@@ -207,3 +211,42 @@ class TestFormatCorrelationReport:
         report = format_correlation_report(result)
         # The 0.9 pair should appear before the 0.1 pair
         assert report.index("0.9000") < report.index("0.1000")
+
+
+class TestOrchestratorCorrelationContext:
+    def test_candidate_context_includes_candidate_symbol(self, monkeypatch) -> None:
+        settings = Settings()
+        state = PortfolioState(
+            cash=10000.0,
+            equity=10000.0,
+            positions={
+                "MSFT": Position(
+                    ticker="MSFT",
+                    quantity=10,
+                    average_cost=100.0,
+                )
+            },
+        )
+
+        def fake_fetch_bars(symbol: str, period: str, interval: str, settings=None):
+            if symbol == "AAPL":
+                closes = [100, 101, 102, 103, 104, 105]
+            else:
+                closes = [200, 202, 204, 206, 208, 210]
+            return pd.DataFrame({"close": closes})
+
+        monkeypatch.setattr(
+            "trading_bot.runtime.orchestrator.market_data.fetch_bars",
+            fake_fetch_bars,
+        )
+
+        avg_corr, max_avg_corr = _correlation_context_for_candidate(
+            "AAPL",
+            state,
+            settings,
+            {},
+        )
+
+        assert avg_corr is not None
+        assert avg_corr == pytest.approx(1.0, abs=0.01)
+        assert max_avg_corr == settings.monitoring.max_avg_correlation

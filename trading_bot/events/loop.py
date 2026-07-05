@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from typing import Callable
 
 from trading_bot.events.bus import MessageBus
 from trading_bot.events.types import Event, SystemHeartbeatEvent, SystemTickEvent
+
+logger = logging.getLogger(__name__)
 
 
 class EventLoop:
@@ -94,8 +97,8 @@ class EventLoop:
         for handler in handlers:
             try:
                 handler(event)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Event processing error: %s", e)
 
         self.bus.publish(event)
 

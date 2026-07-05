@@ -36,6 +36,7 @@ def test_load_settings_reads_yaml(tmp_path: Path) -> None:
         (tmp_path / "state/universe_candidates.json").resolve()
     )
     assert settings.app.scan_results_path == str((tmp_path / "state/scan_results.json").resolve())
+    assert settings.app.advisory_dir == str((tmp_path / "state/advisory_learner").resolve())
     assert settings.market_data.intraday_interval == "5m"
     assert settings.risk.max_daily_risk_pct == 0.03
 
@@ -58,6 +59,49 @@ def test_load_settings_forces_live_trading_off(tmp_path: Path) -> None:
     settings = load_settings(config_file)
 
     assert settings.app.live_trading_enabled is False
+
+
+def test_load_settings_rejects_unknown_market_data_provider(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "market_data:\n"
+        "  provider: alpacca\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Unsupported market data provider"):
+        load_settings(config_file)
+
+
+def test_load_settings_rejects_unknown_market_data_provider_stack(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "market_data:\n"
+        "  providers:\n"
+        "    - alpaca\n"
+        "    - yahooo\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Unsupported market data provider"):
+        load_settings(config_file)
+
+
+def test_load_settings_normalizes_market_data_provider_names(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "market_data:\n"
+        "  provider: ' Alpaca '\n"
+        "  providers:\n"
+        "    - ' Polygon '\n"
+        "    - YFINANCE\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_file)
+
+    assert settings.market_data.provider == "alpaca"
+    assert settings.market_data.provider_stack == ["polygon", "yfinance"]
 
 
 def test_load_settings_clamps_robinhood_mode_to_local_supported_values(
@@ -85,6 +129,52 @@ def test_load_settings_ignores_live_enable_flags_without_local_executor(
     settings = load_settings(config_file)
 
     assert settings.app.live_trading_enabled is False
+
+
+@pytest.mark.parametrize(
+    "credential_line",
+    [
+        "  password: hunter2",
+        "  mfa_secret: abc123",
+        "  api_key: pk_live_123",
+        "  api_secret: shh",
+        "  device_token: device-123",
+        "  token: bearer-token",
+    ],
+)
+def test_load_settings_rejects_hardcoded_credential_like_values(
+    tmp_path: Path, credential_line: str
+) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "robinhood:\n"
+        f"{credential_line}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Credential detected"):
+        load_settings(config_file)
+
+
+@pytest.mark.parametrize(
+    "credential_line",
+    [
+        "  api_key: ${APCA_API_KEY_ID}",
+        "  api_secret: ${APCA_API_SECRET_KEY}",
+        "  token: ${BROKER_TOKEN}",
+    ],
+)
+def test_load_settings_allows_environment_credential_references(
+    tmp_path: Path, credential_line: str
+) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "robinhood:\n"
+        f"{credential_line}\n",
+        encoding="utf-8",
+    )
+
+    load_settings(config_file)
 
 
 @pytest.mark.parametrize(
@@ -162,3 +252,57 @@ def test_load_settings_resolves_relative_paths_from_config_directory(tmp_path: P
     assert settings.app.dashboard_summary_path == str(
         (config_dir / "state/dashboard_summary.json").resolve()
     )
+
+
+def test_load_settings_resolves_sentiment_paths_from_config_directory(tmp_path: Path) -> None:
+    config_dir = tmp_path / "nested"
+    config_dir.mkdir()
+    config_file = config_dir / "config.yaml"
+    config_file.write_text(
+        "sentiment:\n"
+        "  context_path: state/sentiment.json\n"
+        "  memory_db_path: state/sentiment_memory.db\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_file)
+
+    assert settings.sentiment.context_path == str((config_dir / "state/sentiment.json").resolve())
+    assert settings.sentiment.memory_db_path == str(
+        (config_dir / "state/sentiment_memory.db").resolve()
+    )
+
+
+def test_load_settings_applies_tuning_overrides_without_touching_structural_fields(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        "  live_trading_enabled: true\n"
+        "market_data:\n"
+        "  provider: yfinance\n"
+        "risk:\n"
+        "  max_ticker_allocation_pct: 0.15\n",
+        encoding="utf-8",
+    )
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "tuning_overrides.yaml").write_text(
+        "app:\n"
+        "  live_trading_enabled: true\n"
+        "risk:\n"
+        "  max_ticker_allocation_pct: 0.99\n"
+        "supermodel:\n"
+        "  block_threshold: 0.22\n"
+        "strategy_tracker:\n"
+        "  min_win_rate: 0.3\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(config_file)
+
+    assert settings.app.live_trading_enabled is False
+    assert settings.risk.max_ticker_allocation_pct == 0.15
+    assert settings.supermodel.block_threshold == 0.22
+    assert settings.strategy_tracker.min_win_rate == 0.3

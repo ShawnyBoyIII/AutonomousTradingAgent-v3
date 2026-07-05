@@ -9,7 +9,10 @@ from __future__ import annotations
 import json
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import pandas as pd
 import pytest
 
 from trading_bot.config.settings import AppSettings, Settings
@@ -19,6 +22,7 @@ from trading_bot.runtime.dashboard import (
     _positions_table,
     _read_jsonl_tail,
     _render_live_dashboard,
+    _watchlist_widget,
     serve_dashboard,
 )
 
@@ -33,6 +37,7 @@ def _settings_in(tmp_path: Path) -> Settings:
             scan_results_path=str(tmp_path / "scan.json"),
             portfolio_summary_path=str(tmp_path / "portfolio.json"),
             backtest_summary_path=str(tmp_path / "backtest.json"),
+            watchlist_path=str(tmp_path / "watchlist.txt"),
         )
     )
 
@@ -120,6 +125,55 @@ class TestDashboardServerSnapshot:
         assert len(snap["decisions"]) == 3
         assert snap["decisions"][-1]["status"] == "FILLED"
         assert len(snap["strategy_results"]) == 2
+        assert "realtime_pnl" in snap
+
+    def test_snapshot_includes_swarm_sentiment_summary(self, tmp_path: Path) -> None:
+        _seed_state(tmp_path)
+        log_dir = tmp_path / "burn_in"
+        log_dir.mkdir(exist_ok=True)
+        (log_dir / "decision-log.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"command": "scan", "ticker": "AAPL", "status": "APPROVED", "swarm_sentiment_score": 0.5}),
+                    json.dumps({"command": "paper-trade", "ticker": "AAPL", "status": "FILLED", "fill_price": 100.0, "quantity": 10, "fees": 1.0}),
+                    json.dumps({"command": "manage-positions", "ticker": "AAPL", "status": "FILLED", "fill_price": 110.0, "quantity": 10, "fees": 1.0}),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (log_dir / "strategy_results.jsonl").write_text("", encoding="utf-8")
+        settings = _settings_in(tmp_path)
+        (tmp_path / "scan.json").write_text(json.dumps({
+            "candidates": [
+                {
+                    "ticker": "AAPL",
+                    "status": "APPROVED",
+                    "swarm_sentiment_action": "BUY",
+                    "swarm_sentiment_score": 0.5,
+                    "swarm_sentiment_confidence": 0.72,
+                }
+            ]
+        }))
+        server = DashboardServer(
+            settings,
+            decision_log_path=str(log_dir / "decision-log.jsonl"),
+            strategy_log_path=str(log_dir / "strategy_results.jsonl"),
+        )
+
+        snap = server.snapshot()
+
+        assert snap["swarm_sentiment"]["evidence_count"] == 1
+        assert snap["swarm_sentiment"]["bullish"] == 1
+        assert snap["swarm_sentiment"]["top_candidates"][0]["ticker"] == "AAPL"
+
+    def test_snapshot_reads_watchlist(self, tmp_path: Path) -> None:
+        settings = _settings_in(tmp_path)
+        Path(settings.app.watchlist_path).write_text("aapl\nmsft\n", encoding="utf-8")
+        server = DashboardServer(settings)
+
+        snap = server.snapshot()
+
+        assert snap["watchlist"] == ["AAPL", "MSFT"]
 
     def test_snapshot_with_missing_files_yields_empty(self, tmp_path: Path) -> None:
         settings = _settings_in(tmp_path)
@@ -151,6 +205,45 @@ class TestDashboardServerSnapshot:
         assert snap["kill_switch"]["checked"] is True
         assert snap["kill_switch"]["active"] is False
 
+    def test_snapshot_market_regime_uses_configured_provider_stack(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        settings = _settings_in(tmp_path)
+        settings.market_data.providers = ["alpaca", "polygon"]
+        captured = {}
+
+        def fake_fetch_bars(symbol: str, **kwargs):
+            captured["symbol"] = symbol
+            captured["provider_stack"] = kwargs["settings"].provider_stack
+            return pd.DataFrame({"close": [100.0, 101.0]})
+
+        def fake_detect_market_regime(frame):
+            return (
+                SimpleNamespace(value="bullish"),
+                SimpleNamespace(
+                    adx=25.0,
+                    volatility_percentile=0.25,
+                    price_vs_ema20=1.2,
+                    price_vs_sma50=2.4,
+                    momentum=0.8,
+                ),
+            )
+
+        server = DashboardServer(settings)
+        monkeypatch.setattr(
+            server,
+            "_resolve_optional_deps",
+            lambda: {
+                "fetch_bars": fake_fetch_bars,
+                "detect_market_regime": fake_detect_market_regime,
+            },
+        )
+
+        snap = server.snapshot()
+
+        assert captured == {"symbol": "SPY", "provider_stack": ["alpaca", "polygon"]}
+        assert snap["market_regime"]["regime"] == "bullish"
+
 
 class TestRenderLiveDashboard:
     def test_includes_kill_switch_banner(self) -> None:
@@ -166,7 +259,7 @@ class TestRenderLiveDashboard:
     def test_includes_positions_and_candidates(self) -> None:
         snap = {
             "portfolio": {"positions": [{"ticker": "AAPL", "quantity": 5}]},
-            "scan": {"candidates": [{"ticker": "MSFT", "status": "APPROVED"}]},
+            "scan": {"candidates": [{"ticker": "MSFT", "status": "APPROVED", "swarm_sentiment_action": "BUY", "swarm_sentiment_score": 0.42}]},
             "kill_switch": {"active": False},
         }
         html_out = _render_live_dashboard(snap)
@@ -174,6 +267,7 @@ class TestRenderLiveDashboard:
         assert "AAPL" in html_out
         assert "Recent Scan Candidates" in html_out
         assert "MSFT" in html_out
+        assert "0.42" in html_out
 
     def test_includes_decision_feed(self) -> None:
         snap = {
@@ -185,6 +279,14 @@ class TestRenderLiveDashboard:
         assert "SPY" in html_out
         assert "NO_SIGNAL" in html_out
 
+    def test_tab_navigation_rendered(self) -> None:
+        """Dashboard should include tab navigation with Overview and Closed Positions."""
+        html_out = _render_live_dashboard({"kill_switch": {"active": False}})
+        assert 'id="tab-overview"' in html_out
+        assert 'id="tab-closed-positions"' in html_out
+        assert "tab-btn active" in html_out
+        assert "Closed Positions" in html_out
+
     def test_includes_closed_positions_table(self) -> None:
         snap = {
             "strategy_results": [
@@ -193,15 +295,52 @@ class TestRenderLiveDashboard:
             ],
             "kill_switch": {"active": False},
         }
-        html_out = _render_live_dashboard(snap)
+        mock_settings = Settings(app__state_db_path="/tmp/test.db")
+        with patch("trading_bot.runtime.dashboard._load_closed_positions") as mock_load:
+            mock_load.return_value = [
+                {"ticker": "AFL", "entry_date": "2026-06-29T10:00:00", "exit_date": "2026-06-29T14:00:00", "entry_price": 100.0, "exit_price": 99.0, "quantity": 10, "pnl": -12.7, "win": False},
+                {"ticker": "MSFT", "entry_date": "2026-06-29T10:00:00", "exit_date": "2026-06-29T14:00:00", "entry_price": 300.0, "exit_price": 302.5, "quantity": 10, "pnl": 25.0, "win": True},
+            ]
+            html_out = _render_live_dashboard(snap, settings=mock_settings)
         assert "Closed Positions" in html_out
         assert "AFL" in html_out and "MSFT" in html_out
         assert "WIN" in html_out and "LOSS" in html_out
+
+    def test_closed_positions_deduplicates_same_ticker(self) -> None:
+        """Duplicate exit events for the same ticker should collapse to one row."""
+        snap = {
+            "strategy_results": [
+                {"event": "exit", "ticker": "CIEN", "pnl": -154.18, "win": False, "exit_price": 478.03},
+                {"event": "exit", "ticker": "CIEN", "pnl": -154.18, "win": False, "exit_price": 478.03},
+                {"event": "exit", "ticker": "MSFT", "pnl": 25.0, "win": True},
+            ],
+            "kill_switch": {"active": False},
+        }
+        mock_settings = Settings(app__state_db_path="/tmp/test.db")
+        with patch("trading_bot.runtime.dashboard._load_closed_positions") as mock_load:
+            mock_load.return_value = [
+                {"ticker": "CIEN", "entry_date": "2026-06-29T10:00:00", "exit_date": "2026-06-29T14:00:00", "entry_price": 500.0, "exit_price": 478.03, "quantity": 7, "pnl": -154.18, "win": False},
+                {"ticker": "MSFT", "entry_date": "2026-06-29T10:00:00", "exit_date": "2026-06-29T14:00:00", "entry_price": 300.0, "exit_price": 302.5, "quantity": 10, "pnl": 25.0, "win": True},
+            ]
+            html_out = _render_live_dashboard(snap, settings=mock_settings)
+        # CIEN should appear exactly once (last duplicate wins)
+        assert html_out.count("CIEN") == 1
+        assert html_out.count("Closed Positions") >= 1  # Tab nav + tab content
+        assert "tab-closed-positions" in html_out
 
     def test_empty_snapshot_renders_without_error(self) -> None:
         html_out = _render_live_dashboard({"kill_switch": {"active": False}})
         assert "<!doctype html>" in html_out
         assert "No rows." in html_out or "No decisions" in html_out
+
+    def test_includes_watcher_panel(self) -> None:
+        html_out = _render_live_dashboard({"kill_switch": {"active": False}, "watchlist": ["AAPL"]})
+        assert "Watcher" in html_out
+        assert "AAPL" in html_out
+        assert "Add to Watcher" in html_out
+
+    def test_watchlist_widget_empty_state(self) -> None:
+        assert "No watched symbols" in _watchlist_widget([])
 
     def test_realized_pnl_rollup_from_exits(self) -> None:
         snap = {
@@ -232,6 +371,60 @@ class TestRenderLiveDashboard:
         # Should show -106.60 (ledger), not 12.30 (strategy_results sum)
         assert "106.60" in html_out
         assert "12.30" not in html_out
+
+    def test_includes_realtime_monitoring_widget(self) -> None:
+        snap = {
+            "realtime_pnl": {
+                "performance": {
+                    "wins": 5,
+                    "losses": 3,
+                    "win_rate_pct": 62.5,
+                    "profit_factor": 1.8,
+                    "avg_win": 120.0,
+                    "avg_loss": -75.0,
+                },
+                "strategy_attribution": {
+                    "v3-trend_following": 250.0,
+                    "v3-mean_reversion": -50.0,
+                },
+                "alerts": ["LOW_PF: example"],
+                "trading": {"closed_trades": 8},
+            },
+            "kill_switch": {"active": False},
+        }
+        html_out = _render_live_dashboard(snap)
+        assert "Realtime Monitoring" in html_out
+        assert "Strategy Attribution (Realtime)" in html_out
+        assert "LOW_PF: example" in html_out
+        assert "v3-trend_following" in html_out
+
+    def test_includes_swarm_sentiment_widget(self) -> None:
+        snap = {
+            "swarm_sentiment": {
+                "evidence_count": 3,
+                "bullish": 2,
+                "neutral": 1,
+                "bearish": 0,
+                "top_candidates": [
+                    {"ticker": "AAPL", "action": "BUY", "score": 0.5, "confidence": 0.72},
+                ],
+                "closed_outcomes": {
+                    "bullish": {"trades": 1, "win_rate_pct": 100.0, "total_pnl": 98.0},
+                },
+            },
+            "kill_switch": {"active": False},
+        }
+
+        html_out = _render_live_dashboard(snap)
+
+        assert "Swarm Sentiment" in html_out
+        assert "Top Sentiment Candidates" in html_out
+        assert "Closed Outcomes by Bucket" in html_out
+        assert "AAPL" in html_out
+
+    def test_omits_swarm_sentiment_widget_without_evidence(self) -> None:
+        html_out = _render_live_dashboard({"swarm_sentiment": {"evidence_count": 0}, "kill_switch": {"active": False}})
+        assert "Swarm Sentiment" not in html_out
 
     def test_net_pnl_computed_from_realized_plus_unrealized_when_report_missing(
         self,
@@ -518,13 +711,14 @@ class TestTableSanitization:
         from trading_bot.runtime.dashboard import _table
         rows = [{"status": "APPROVED GREEN", "ticker": "SPY"}]
         out = _table(rows, ["status", "ticker"])
-        # Spaces should be removed from class attribute
+        # Spaces should be removed from class attribute on td elements
         import re
-        class_match = re.search(r'class="([^"]*)"', out)
-        assert class_match is not None
-        class_value = class_match.group(1)
-        assert ' ' not in class_value
-        assert class_value == "APPROVEDGREEN"
+        # Find all class attributes on td elements
+        td_classes = re.findall(r'<td[^>]*class="([^"]*)"', out)
+        assert len(td_classes) > 0
+        # The first td should have the sanitized class
+        assert ' ' not in td_classes[0]
+        assert td_classes[0] == "APPROVEDGREEN"
 
 
 class TestEnrichPositionsEdgeCases:
@@ -569,6 +763,38 @@ class TestEnrichPositionsEdgeCases:
         result = _enrich_positions(positions, settings)
         # Should use average_cost as fallback
         assert result[0].get("last_price") == 150.0
+
+    def test_fetch_uses_configured_provider_stack(self, monkeypatch) -> None:
+        """Live dashboard price fetches should honor configured market data providers."""
+        from trading_bot.runtime.dashboard import _enrich_positions, _price_cache, _price_cache_timestamps
+
+        _price_cache.clear()
+        _price_cache_timestamps.clear()
+        settings = Settings()
+        settings.market_data.providers = ["alpaca", "polygon"]
+        captured = {}
+
+        def fake_fetch_bars(symbol, period, interval, **kwargs):
+            captured["symbol"] = symbol
+            captured["period"] = period
+            captured["interval"] = interval
+            captured["provider_stack"] = kwargs["settings"].provider_stack
+            return pd.DataFrame({"close": [123.45]})
+
+        monkeypatch.setattr("trading_bot.data.market_data.fetch_bars", fake_fetch_bars)
+
+        result = _enrich_positions(
+            [{"ticker": "AAPL", "quantity": 2, "average_cost": 100.0}],
+            settings,
+        )
+
+        assert captured == {
+            "symbol": "AAPL",
+            "period": settings.market_data.intraday_period,
+            "interval": settings.market_data.intraday_interval,
+            "provider_stack": ["alpaca", "polygon"],
+        }
+        assert result[0]["last_price"] == 123.45
 
     def test_fallback_to_stop_loss(self, monkeypatch) -> None:
         """When no live price, use stop_loss as fallback."""

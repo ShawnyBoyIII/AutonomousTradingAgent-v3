@@ -22,3 +22,16 @@ def test_live_trading_remains_disabled_with_empty_default_config(
     settings = load_settings()
 
     assert settings.app.live_trading_enabled is False
+
+
+def test_repo_default_config_keeps_rl_opt_in() -> None:
+    settings = load_settings(Path("config.yaml"))
+
+    assert settings.rl.enabled is False
+
+
+def test_rl_guide_documents_default_rl_opt_in_policy() -> None:
+    text = Path("docs/RL_TRADING_GUIDE.md").read_text(encoding="utf-8")
+
+    assert "Root `config.yaml` keeps `rl.enabled: false`" in text
+    assert "--model-path state/rl_logs/sector_diversity/PPO_seed_789.zip" in text

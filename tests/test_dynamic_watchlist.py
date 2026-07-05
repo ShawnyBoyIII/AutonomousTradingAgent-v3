@@ -94,15 +94,15 @@ class TestExportForBurnIn:
 
         assert out.read_text(encoding="utf-8").splitlines() == ["NEW1", "NEW2"]
 
-    def test_default_path_is_burn_in_symbols_txt(self, tmp_path: Path, monkeypatch) -> None:
-        """Without an explicit output_path, export uses 'burn-in-symbols.txt'."""
+    def test_default_path_is_state_universe_txt(self, tmp_path: Path, monkeypatch) -> None:
+        """Without an explicit output_path, export uses the runtime universe file."""
         # Run from tmp dir so the default-path file lands somewhere isolated
         monkeypatch.chdir(tmp_path)
         wl = _make_watchlist(tmp_path, entries=[_entry("AAPL")])
 
         wl.export_for_burn_in()  # no output_path
 
-        default_file = tmp_path / "burn-in-symbols.txt"
+        default_file = tmp_path / "state" / "universe.txt"
         assert default_file.exists()
         assert default_file.read_text(encoding="utf-8").splitlines() == ["AAPL"]
 

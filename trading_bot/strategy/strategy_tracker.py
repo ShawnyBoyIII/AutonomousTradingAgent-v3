@@ -6,6 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from trading_bot.config.settings import StrategyTrackerSettings
+
 
 STRATEGY_LOG = "strategy_results.jsonl"
 
@@ -101,8 +103,9 @@ def allocation_multiplier(
     log_dir: Path,
     strategy_tag: str,
     window: int = 20,
-    min_win_rate: float = 0.40,
+    min_win_rate: float = 0.20,
     full_allocation_rate: float = 0.50,
+    settings: StrategyTrackerSettings | None = None,
 ) -> float:
     """Return an allocation multiplier for *strategy_tag* based on recent performance.
 
@@ -113,6 +116,11 @@ def allocation_multiplier(
     * Win rate between *min_win_rate* and *full_allocation_rate* → 0.5.
     * Win rate < *min_win_rate* → 0.0 (skip the strategy).
     """
+    if settings is not None:
+        window = settings.window
+        min_win_rate = settings.min_win_rate
+        full_allocation_rate = settings.full_allocation_rate
+
     events = _read_events(log_dir)
     exits = [e for e in events if e.get("event") == "exit" and e.get("strategy_tag") == strategy_tag]
     recent = exits[-window:]

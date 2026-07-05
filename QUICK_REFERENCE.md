@@ -57,11 +57,16 @@ tail -f logs/burn_in/decision-log.jsonl # Live decision feed
 | `scan --symbols SPY,AAPL --why` | Scan for signals |
 | `paper-trade --symbols AAPL` | Execute paper trades |
 | `manage-positions` | Check stops/targets/EOD |
+| `backtest --symbols AAPL --start YYYY-MM-DD --end YYYY-MM-DD` | Replay one strategy |
+| `rl-model-info` / `rl-scan-plan` | Show RL model coverage and safe scan command |
+| `rl-benchmark --symbol AAPL --start YYYY-MM-DD --end YYYY-MM-DD` | Compare V2.5 vs V3 vs RL |
+| `rl-benchmark --symbols AAPL,MSFT --start YYYY-MM-DD --end YYYY-MM-DD` | Compare multi-symbol RL models |
 | `portfolio` | View holdings + P&L |
 | `performance --daily` | Performance metrics |
 | `health` | System status |
 | `alerts` | Active warnings |
 | `kill-switch --status` | Check kill switch |
+| `robinhood-status` | Show MCP snapshot state |
 | `serve` | Live web dashboard |
 
 ---
@@ -78,7 +83,7 @@ tail -f logs/burn_in/decision-log.jsonl # Live decision feed
 - `burn-in-config.yaml` — Burn-in config (Alpaca provider, V3 strategy, risk limits)
 - `config.yaml` — Default config (fallback)
 - `.env` — Secrets + `CONFIG_PATH=burn-in-config.yaml` (don't commit!)
-- `burn-in-symbols.txt` — 150-symbol S&P 500 watchlist
+- `state/universe.txt` — runtime burn-in universe
 - `state/burn_in.db` — Paper trading ledger
 - `logs/burn_in/` — Decision logs + strategy results
 

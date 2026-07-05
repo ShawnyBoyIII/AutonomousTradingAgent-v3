@@ -10,6 +10,7 @@ from trading_bot.reports.burn_in_analytics import (
     _parse_decision_log,
     compute_trade_summary,
     compute_signal_summary,
+    compute_swarm_sentiment_summary,
     compute_exit_summary,
     compute_counter_thesis_summary,
     compute_risk_summary,
@@ -59,10 +60,6 @@ class TestComputeTradeSummary:
                           "reason": "profit_target", "quantity": 10, "fill_price": 110.0, "fees": 1.0}) + "\n",
             encoding="utf-8",
         )
-        db_path = tmp_path / "state.db"
-        ledger = None  # Will create a minimal mock
-
-        # Create a minimal ledger mock
         from unittest.mock import MagicMock
         ledger = MagicMock()
         ledger.list_order_rows.return_value = []
@@ -72,7 +69,7 @@ class TestComputeTradeSummary:
         assert summary["closed_trades"] == 1
         assert summary["wins"] == 1
         assert summary["losses"] == 0
-        assert summary["total_pnl"] == 98.0  # (110-100)*10 - 1 - 1
+        assert summary["total_pnl"] == 98.0
 
     def test_counts_losses(self, tmp_path):
         log_path = tmp_path / "decision-log.jsonl"
@@ -89,7 +86,7 @@ class TestComputeTradeSummary:
 
         summary = compute_trade_summary(_parse_decision_log(log_path), ledger)
         assert summary["losses"] == 1
-        assert summary["total_pnl"] == -52.0  # (490-500)*5 - 1 - 1
+        assert summary["total_pnl"] == -52.0
 
     def test_handles_orphan_sells(self, tmp_path):
         log_path = tmp_path / "decision-log.jsonl"
@@ -112,6 +109,45 @@ class TestComputeTradeSummary:
         summary = compute_trade_summary([], ledger)
         assert summary["total_fills"] == 0
         assert summary["closed_trades"] == 0
+
+    def test_prefers_authoritative_ledger_sell_rows(self, tmp_path):
+        from trading_bot.models.order import FillResult
+        from trading_bot.portfolio.ledger import PortfolioLedger
+
+        db_path = tmp_path / "state.db"
+        ledger = PortfolioLedger(db_path)
+        ledger.record_fill(
+            FillResult(
+                order_id="buy-1",
+                ticker="AAPL",
+                quantity=10,
+                fill_price=100.0,
+                fees=1.0,
+                filled_at=datetime(2026, 6, 22, 9, 30),
+            ),
+            side="BUY",
+            strategy_tag="v3-trend_following",
+        )
+        ledger.record_fill(
+            FillResult(
+                order_id="sell-1",
+                ticker="AAPL",
+                quantity=10,
+                fill_price=110.0,
+                fees=1.0,
+                filled_at=datetime(2026, 6, 22, 10, 30),
+            ),
+            side="SELL",
+            realized_pnl=98.0,
+            strategy_tag="v3-trend_following",
+        )
+
+        summary = compute_trade_summary([], ledger)
+
+        assert summary["closed_trades"] == 1
+        assert summary["total_pnl"] == 98.0
+        assert summary["profit_factor"] == 98.0
+        assert summary["avg_win"] == 98.0
 
 
 class TestComputeSignalSummary:
@@ -140,6 +176,44 @@ class TestComputeSignalSummary:
         summary = compute_signal_summary(events)
         assert summary["rejection_reasons"]["stale"] == 2
         assert summary["rejection_reasons"]["low_confidence"] == 1
+
+
+class TestComputeSwarmSentimentSummary:
+    def test_counts_sentiment_buckets_and_closed_outcomes(self):
+        events = [
+            {"command": "scan", "ticker": "AAPL", "status": "APPROVED", "swarm_sentiment_score": 0.5},
+            {"command": "paper-trade", "ticker": "AAPL", "status": "FILLED", "fill_price": 100.0, "quantity": 10, "fees": 1.0},
+            {"command": "manage-positions", "ticker": "AAPL", "status": "FILLED", "fill_price": 110.0, "quantity": 10, "fees": 1.0},
+            {"command": "scan", "ticker": "MSFT", "status": "APPROVED", "swarm_sentiment_score": -0.4},
+            {"command": "paper-trade", "ticker": "MSFT", "status": "FILLED", "fill_price": 100.0, "quantity": 10, "fees": 1.0},
+            {"command": "manage-positions", "ticker": "MSFT", "status": "FILLED", "fill_price": 90.0, "quantity": 10, "fees": 1.0},
+        ]
+
+        summary = compute_swarm_sentiment_summary(events)
+
+        assert summary["evidence_count"] == 2
+        assert summary["bullish"] == 1
+        assert summary["bearish"] == 1
+        assert summary["closed_outcomes"]["bullish"]["trades"] == 1
+        assert summary["closed_outcomes"]["bullish"]["wins"] == 1
+        assert summary["closed_outcomes"]["bullish"]["total_pnl"] == 98.0
+        assert summary["closed_outcomes"]["bearish"]["trades"] == 1
+        assert summary["closed_outcomes"]["bearish"]["losses"] == 1
+        assert summary["closed_outcomes"]["bearish"]["total_pnl"] == -102.0
+
+    def test_uses_entry_time_sentiment_not_latest_scan_bucket(self):
+        events = [
+            {"command": "scan", "ticker": "AAPL", "status": "APPROVED", "swarm_sentiment_score": 0.6},
+            {"command": "paper-trade", "ticker": "AAPL", "status": "FILLED", "fill_price": 100.0, "quantity": 10, "fees": 1.0},
+            {"command": "scan", "ticker": "AAPL", "status": "APPROVED", "swarm_sentiment_score": -0.5},
+            {"command": "manage-positions", "ticker": "AAPL", "status": "FILLED", "fill_price": 110.0, "quantity": 10, "fees": 1.0},
+        ]
+
+        summary = compute_swarm_sentiment_summary(events)
+
+        assert summary["closed_outcomes"]["bullish"]["trades"] == 1
+        assert summary["closed_outcomes"]["bullish"]["avg_sentiment_score"] == 0.6
+        assert "bearish" not in summary["closed_outcomes"]
 
 
 class TestComputeExitSummary:
@@ -300,6 +374,47 @@ class TestComputeBurnInReport:
         assert "recommendations" in report
         assert report["trades"]["total_fills"] == 2
         assert report["signals"]["total_scans"] == 1
+        assert "swarm_sentiment" in report
+
+    def test_uses_ledger_rows_when_database_exists(self, tmp_path):
+        from trading_bot.models.order import FillResult
+        from trading_bot.portfolio.ledger import PortfolioLedger
+
+        log_path = tmp_path / "decision-log.jsonl"
+        log_path.write_text(
+            json.dumps({"command": "scan", "ticker": "AAPL", "status": "APPROVED", "confidence": 0.8}) + "\n",
+            encoding="utf-8",
+        )
+        db_path = tmp_path / "state.db"
+        ledger = PortfolioLedger(db_path)
+        ledger.record_fill(
+            FillResult(
+                order_id="buy-1",
+                ticker="AAPL",
+                quantity=10,
+                fill_price=100.0,
+                fees=1.0,
+                filled_at=datetime(2026, 6, 22, 9, 30),
+            ),
+            side="BUY",
+        )
+        ledger.record_fill(
+            FillResult(
+                order_id="sell-1",
+                ticker="AAPL",
+                quantity=10,
+                fill_price=110.0,
+                fees=1.0,
+                filled_at=datetime(2026, 6, 22, 10, 30),
+            ),
+            side="SELL",
+            realized_pnl=98.0,
+        )
+
+        report = compute_burn_in_report(log_path, db_path)
+
+        assert report["trades"]["total_pnl"] == 98.0
+        assert report["trades"]["profit_factor"] == 98.0
 
 
 class TestFormatReport:
@@ -325,4 +440,20 @@ class TestFormatReport:
         assert "SIGNALS" in text
         assert "RISK MANAGEMENT" in text
         assert "RECOMMENDATIONS" in text
+        assert "Profit Factor" in text
         assert "AAPL" in text
+
+    def test_formats_swarm_sentiment_section_when_present(self, tmp_path):
+        log_path = tmp_path / "decision-log.jsonl"
+        log_path.write_text(
+            json.dumps({"command": "scan", "ticker": "AAPL", "status": "APPROVED", "swarm_sentiment_score": 0.5}) + "\n"
+            + json.dumps({"command": "paper-trade", "ticker": "AAPL", "status": "FILLED", "quantity": 10, "fill_price": 100.0, "fees": 1.0}) + "\n"
+            + json.dumps({"command": "manage-positions", "ticker": "AAPL", "status": "FILLED", "reason": "profit_target", "quantity": 10, "fill_price": 110.0, "fees": 1.0}) + "\n",
+            encoding="utf-8",
+        )
+        report = compute_burn_in_report(log_path, tmp_path / "state.db")
+
+        text = format_report(report)
+
+        assert "SWARM SENTIMENT" in text
+        assert "Bullish Scans" in text

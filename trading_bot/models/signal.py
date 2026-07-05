@@ -19,6 +19,7 @@ class TradeSignal(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     strategy_tag: str
     timestamp: datetime
+    quality: str = "GREEN"
 
     @model_validator(mode="after")
     def validate_trade_setup(self) -> "TradeSignal":

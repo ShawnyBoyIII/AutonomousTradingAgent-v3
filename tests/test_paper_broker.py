@@ -33,6 +33,29 @@ def test_market_buy_updates_cash_and_position() -> None:
     assert broker.positions["AAPL"] == 10
 
 
+def test_market_buy_dynamic_slippage_increases_fill_price() -> None:
+    broker = PaperBroker(
+        starting_cash=20000,
+        fee_per_order=1.0,
+        slippage_bps=0,
+        dynamic_slippage_enabled=True,
+        dynamic_slippage_notional_bps_per_10k=10.0,
+        dynamic_slippage_low_price_boost_bps=0.0,
+        dynamic_slippage_max_extra_bps=50.0,
+    )
+    order = OrderRequest(
+        ticker="AAPL",
+        side="BUY",
+        order_type="market",
+        quantity=100,
+        submitted_at=datetime.now(),
+    )
+
+    fill = broker.submit_order(order, market_price=100.0)
+
+    assert fill.fill_price > 100.0
+
+
 def test_market_buy_rejects_insufficient_cash_without_mutating_state() -> None:
     broker = PaperBroker(starting_cash=100.0, fee_per_order=1.0, slippage_bps=0)
     order = OrderRequest(
@@ -115,7 +138,7 @@ def test_ledger_initializes_sqlite_tables(tmp_path: Path) -> None:
             for row in conn.execute("PRAGMA table_info(orders)")
         ]
 
-    assert columns == ["id", "ticker", "side", "quantity", "fill_price", "fees", "filled_at", "pnl"]
+    assert columns == ["id", "ticker", "side", "quantity", "fill_price", "fees", "filled_at", "pnl", "strategy_tag", "swarm_sentiment_bucket"]
 
 
 def test_ledger_round_trips_portfolio_state(tmp_path: Path) -> None:
@@ -333,4 +356,34 @@ def test_submit_signal_as_order_uses_configured_risk_settings() -> None:
     assert fill is not None
     # With 2% risk on $10k = $200 risk, $1 stop distance = 200 shares desired
     # But max_position_pct=0.20 caps position at $2k / $100 = 20 shares
+    assert fill.quantity == 20
+
+
+def test_submit_signal_as_order_override_cannot_exceed_risk_size() -> None:
+    broker = PaperBroker(starting_cash=10001, fee_per_order=1.0, slippage_bps=0)
+    signal = TradeSignal(
+        ticker="AAPL",
+        timeframe="intraday",
+        action="BUY",
+        entry_price=100.0,
+        stop_loss=99.0,
+        profit_target=102.0,
+        risk_reward_ratio=2.0,
+        confidence=0.8,
+        reasons=["test"],
+        strategy_tag="test",
+        timestamp=datetime.now(),
+    )
+
+    fill = submit_signal_as_order(
+        signal,
+        broker,
+        account_equity=10000,
+        open_tickers=set(),
+        portfolio_heat_pct=0.0,
+        atr=None,
+        position_size_override=999,
+    )
+
+    assert fill is not None
     assert fill.quantity == 20

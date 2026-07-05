@@ -1,5 +1,5 @@
 #!/bin/bash
-# V2.5 Phase D FULLY AUTOMATED Burn-In with Dynamic Watchlist
+# V3 FULLY AUTOMATED Burn-In with Dynamic Watchlist + Swarm Overlay
 # This runs discover → scan → trade → manage loop continuously
 #
 # Scan interval: 300 seconds (5 minutes) during market hours
@@ -11,7 +11,7 @@
 set -e
 
 echo "=========================================="
-echo "V2.5 FULLY AUTOMATED Paper Burn-In"
+echo "FULLY AUTOMATED Paper Burn-In (V3 + Swarm)"
 echo "Date: $(date)"
 echo "Dynamic Watchlist: ENABLED"
 echo "=========================================="
@@ -21,8 +21,9 @@ cd /Users/shawndlima/Documents/AutonomousTradingAgentcopy
 
 # Configuration
 CONFIG_FILE="burn-in-config.yaml"
-SYMBOLS_FILE="burn-in-symbols.txt"
-LOG_DIR="logs/burn_in"
+UNIVERSE_FILE="state/universe.txt"
+WATCHLIST_FILE="state/watchlist.txt"
+LOG_DIR="logs"
 DB_PATH="state/burn_in.db"
 LAST_DISCOVER_FILE=".last_discover_date"
 
@@ -67,13 +68,24 @@ strategy:
   use_v3_signals: true
   risk_tolerance: "medium"
   min_confidence: "medium"
+
+counter_thesis:
+  enabled: true
+  block_on_severity: "high"
+  aggregate_block_threshold: 0.6
+  exit_on_block: true
+
+swarm:
+  enabled: true
+  preset: "investment_committee"
+  max_workers: 4
 EOF
 fi
 
 # Create default symbols file if missing (will be overwritten by discover)
-if [ ! -f "$SYMBOLS_FILE" ]; then
+if [ ! -f "$UNIVERSE_FILE" ]; then
     echo "Creating initial symbol universe..."
-    cat > "$SYMBOLS_FILE" << 'EOF'
+    cat > "$UNIVERSE_FILE" << 'EOF'
 SPY
 QQQ
 AAPL
@@ -112,6 +124,17 @@ run_discovery() {
     
     echo "[$timestamp] 🔍 Running discovery ($trigger_reason refresh)..."
     
+    # Preserve manually added watchlist symbols
+    local watchlist_symbols=()
+    if [ -f "$WATCHLIST_FILE" ]; then
+        while IFS= read -r line; do
+            line=$(echo "$line" | tr -d '[:space:]')
+            if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
+                watchlist_symbols+=("$line")
+            fi
+        done < "$WATCHLIST_FILE"
+    fi
+    
     # Run discover with export
     local discover_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" discover --mode breakout --max 15 --export 2>&1)
     
@@ -128,8 +151,34 @@ run_discovery() {
             done
         fi
         
+        # Merge discovered symbols with watchlist symbols (preserve manual additions)
+        local all_symbols=()
+        while IFS= read -r line; do
+            line=$(echo "$line" | tr -d '[:space:]')
+            if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
+                all_symbols+=("$line")
+            fi
+        done < "$UNIVERSE_FILE"
+        
+        # Add watchlist symbols if not already present
+        for ws in "${watchlist_symbols[@]}"; do
+            local found=0
+            for existing in "${all_symbols[@]}"; do
+                if [ "$existing" = "$ws" ]; then
+                    found=1
+                    break
+                fi
+            done
+            if [ $found -eq 0 ]; then
+                all_symbols+=("$ws")
+            fi
+        done
+        
+        # Update universe file with merged symbols
+        printf "%s\n" "${all_symbols[@]}" > "$UNIVERSE_FILE"
+        
         # Log discovery event
-        echo "{\"event\":\"discovery\",\"timestamp\":\"$timestamp\",\"trigger\":\"$trigger_reason\",\"count\":$count}" >> "$LOG_DIR/discovery.log"
+        echo "{\"event\":\"discovery\",\"timestamp\":\"$timestamp\",\"trigger\":\"$trigger_reason\",\"count\":$count,\"watchlist_preserved\":${#watchlist_symbols[@]}}" >> "$LOG_DIR/discovery.log"
     else
         echo "[$timestamp] ⚠️  Discovery returned no symbols, preserving existing list"
         # Log failed discovery
@@ -143,10 +192,10 @@ run_discovery() {
 # Check if watchlist is running low on symbols
 watchlist_is_low() {
     local threshold=${1:-5}  # Default threshold: 5 symbols
-    if [ ! -f "$SYMBOLS_FILE" ]; then
+    if [ ! -f "$UNIVERSE_FILE" ]; then
         return 0  # No file = definitely low
     fi
-    local count=$(wc -l < "$SYMBOLS_FILE" | tr -d ' ')
+    local count=$(wc -l < "$UNIVERSE_FILE" | tr -d ' ')
     if [ "$count" -lt "$threshold" ]; then
         echo "[$(date '+%H:%M:%S')] 📉 Watchlist low: $count symbols (threshold: $threshold)"
         return 0  # Yes, it's low
@@ -233,20 +282,54 @@ sleep_until_market_open() {
     fi
 }
 
-# Load symbols function
+# Load symbols function - reads from Python-configured paths (universe + watchlist)
 load_symbols() {
-    if [ -f "$SYMBOLS_FILE" ]; then
-        SYMBOLS=$(grep -v "^#" "$SYMBOLS_FILE" | grep -v "^$" | tr '\n' ',' | sed 's/,$//')
-    else
-        SYMBOLS="SPY,QQQ,AAPL,MSFT,NVDA"
+    local all_symbols=()
+    
+    # Read universe file (ranked symbols from build-universe)
+    if [ -f "$UNIVERSE_FILE" ]; then
+        while IFS= read -r line; do
+            line=$(echo "$line" | tr -d '[:space:]')
+            if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
+                all_symbols+=("$line")
+            fi
+        done < "$UNIVERSE_FILE"
     fi
+    
+    # Read watchlist file (manually added symbols)
+    if [ -f "$WATCHLIST_FILE" ]; then
+        while IFS= read -r line; do
+            line=$(echo "$line" | tr -d '[:space:]')
+            if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
+                # Add if not already in universe
+                local found=0
+                for existing in "${all_symbols[@]}"; do
+                    if [ "$existing" = "$line" ]; then
+                        found=1
+                        break
+                    fi
+                done
+                if [ $found -eq 0 ]; then
+                    all_symbols+=("$line")
+                fi
+            fi
+        done < "$WATCHLIST_FILE"
+    fi
+    
+    # If no symbols found, use defaults
+    if [ ${#all_symbols[@]} -eq 0 ]; then
+        all_symbols=("SPY" "QQQ" "AAPL" "MSFT" "NVDA")
+    fi
+    
+    # Join symbols with commas
+    SYMBOLS=$(IFS=','; echo "${all_symbols[*]}")
 }
 
 echo "Configuration:"
 echo "  Config: $CONFIG_FILE"
-echo "  Symbols File: $SYMBOLS_FILE"
+echo "  Symbols File: $UNIVERSE_FILE"
 echo "  Database: $DB_PATH"
-echo "  Mode: Dynamic discovery + V3 signals"
+echo "  Mode: Dynamic discovery + V3 signals + Swarm overlay"
 echo ""
 
 # Pre-flight checks
@@ -285,7 +368,7 @@ echo ""
 echo "This will:"
 echo "  1. Discover new candidates on first cycle of each day"
 echo "  2. Scan universe every 60 seconds during market hours"
-echo "  3. Auto-trade GREEN signals (V3 strategy)"
+echo "  3. Auto-trade GREEN signals (V3 + RL + Swarm overlay)"
 echo "  4. Manage positions (stops, targets, EOD)"
 echo "  5. Log everything to $LOG_DIR"
 echo ""
@@ -296,6 +379,73 @@ echo ""
 echo "To stop: Press Ctrl-C"
 echo "=========================================="
 echo ""
+
+# Function to run RL model comparison
+run_rl_compare() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] 🤖 Running RL model comparison..."
+    
+    local rl_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" rl-compare --symbols "$SYMBOLS" 2>&1)
+    
+    if echo "$rl_output" | grep -q "No RL models found"; then
+        echo "[$timestamp] ⚪ No RL models available for comparison"
+        return 0
+    fi
+    
+    if echo "$rl_output" | grep -q "Best P&L"; then
+        local best_pnl=$(echo "$rl_output" | grep "Best P&L" | sed 's/.*Best P&L: //')
+        local best_wr=$(echo "$rl_output" | grep "Best Win Rate" | sed 's/.*Best Win Rate: //')
+        echo "[$timestamp] 🤖 RL comparison complete - Best P&L: $best_pnl, Best Win Rate: $best_wr"
+        
+        # Log RL comparison result
+        echo "{\"event\":\"rl_compare\",\"timestamp\":\"$timestamp\",\"best_pnl_strategy\":\"$best_pnl\",\"best_winrate_strategy\":\"$best_wr\"}" >> "$LOG_DIR/rl_comparison.log"
+    else
+        echo "[$timestamp] ⚠️  RL comparison had issues"
+    fi
+}
+
+# Function to refresh tuning overrides from recent paper results
+run_nightly_tuning() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] 🧠 Running nightly tuning..."
+
+    local tune_output
+    tune_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" tune 2>&1)
+    local status=$?
+
+    if [ $status -ne 0 ]; then
+        echo "[$timestamp] ⚠️  Nightly tuning failed"
+        echo "$tune_output" >> "$LOG_DIR/tuning.log"
+        return 0
+    fi
+
+    echo "$tune_output" >> "$LOG_DIR/tuning.log"
+    echo "[$timestamp] ✅ Nightly tuning complete"
+    return 0
+}
+
+# Function to refresh advisory learner artifacts
+run_advisory_learner() {
+    if [ "$ADVISORY_ENABLED" != "true" ]; then
+        return 0
+    fi
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] 📚 Running advisory learner..."
+
+    local learner_output
+    learner_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" advisory-learn 2>&1)
+    echo "$learner_output" >> "$LOG_DIR/advisory.log"
+    return 0
+}
+
+on_shutdown() {
+    if [ "$ADVISORY_ENABLED" != "true" ]; then
+        return 0
+    fi
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] 📝 Writing Daily report.md before shutdown..."
+    sh ./tradebot-local --config-path "$CONFIG_FILE" advisory-learn --daily-report >> "$LOG_DIR/advisory.log" 2>&1 || true
+}
 
 # Function to scan and trade
 scan_and_trade() {
@@ -362,12 +512,211 @@ scan_and_trade() {
     fi
 }
 
+# Function to check confidence gates before trading
+check_confidence_gates() {
+    local db_path="$1"
+    local min_trades=${2:-10}
+    local min_net_pnl=${3:-500}
+    local min_profit_factor=${4:-1.2}
+    local min_positive_windows=${5:-60}
+    
+    if [ ! -f "$db_path" ]; then
+        echo "[$(date '+%H:%M:%S')] ⚠️  Confidence gates: no database yet, skipping gates"
+        return 0
+    fi
+    
+    local result=$(.venv/bin/python -c "
+import sqlite3
+import json
+import sys
+
+db_path = '$db_path'
+conn = sqlite3.connect(db_path)
+cursor = conn.cursor()
+
+# Get total trades
+cursor.execute('SELECT COUNT(*) FROM orders')
+total_trades = cursor.fetchone()[0]
+
+# Get realized PnL from latest portfolio_state
+cursor.execute('SELECT payload FROM portfolio_state ORDER BY id DESC LIMIT 1')
+row = cursor.fetchone()
+if row:
+    state = json.loads(row[0])
+    realized_pnl = state.get('realized_pnl', 0)
+else:
+    realized_pnl = 0
+
+# Calculate profit factor (simplified: positive PnL trades vs negative PnL trades)
+cursor.execute('SELECT pnl FROM orders WHERE pnl > 0')
+winning_pnl = [r[0] for r in cursor.fetchall()]
+cursor.execute('SELECT pnl FROM orders WHERE pnl < 0')
+losing_pnl = [r[0] for r in cursor.fetchall()]
+
+gross_profit = sum(winning_pnl) if winning_pnl else 0
+gross_loss = abs(sum(losing_pnl)) if losing_pnl else 0
+profit_factor = gross_profit / gross_loss if gross_loss > 0 else (2.0 if gross_profit > 0 else 1.0)
+
+# Count positive equity windows (equity > starting equity)
+cursor.execute('SELECT equity FROM equity_history ORDER BY rowid ASC LIMIT 1')
+start_row = cursor.fetchone()
+cursor.execute('SELECT equity FROM equity_history ORDER BY rowid DESC')
+end_rows = cursor.fetchall()
+
+if start_row and end_rows:
+    start_equity = start_row[0]
+    positive_windows = sum(1 for r in end_rows if r[0] >= start_equity)
+    total_windows = len(end_rows)
+    positive_pct = (positive_windows / total_windows * 100) if total_windows > 0 else 0
+else:
+    positive_pct = 0
+
+conn.close()
+
+# Check gates
+min_trades = $min_trades
+min_net_pnl = $min_net_pnl
+min_profit_factor = $min_profit_factor
+min_positive_windows = $min_positive_windows
+
+gates_passed = True
+issues = []
+
+if total_trades < min_trades:
+    gates_passed = False
+    issues.append(f'trades={total_trades}<{min_trades}')
+
+if realized_pnl < min_net_pnl:
+    gates_passed = False
+    issues.append(f'pnl={realized_pnl:.0f}<{min_net_pnl}')
+
+if profit_factor < min_profit_factor:
+    gates_passed = False
+    issues.append(f'pf={profit_factor:.2f}<{min_profit_factor}')
+
+if positive_pct < min_positive_windows:
+    gates_passed = False
+    issues.append(f'positive_windows={positive_pct:.0f}%<{min_positive_windows}%')
+
+if gates_passed:
+    print('GATES_PASSED')
+else:
+    print(f'GATES_FAILED: {\", \".join(issues)}')
+" 2>/dev/null)
+    
+    if echo "$result" | grep -q "GATES_PASSED"; then
+        echo "[$(date '+%H:%M:%S')] ✅ Confidence gates passed"
+        return 0
+    elif echo "$result" | grep -q "GATES_FAILED"; then
+        echo "[$(date '+%H:%M:%S')] ⚠️  Confidence gates NOT met: $result"
+        return 1
+    else
+        echo "[$(date '+%H:%M:%S')] ⚠️  Could not evaluate confidence gates"
+        return 0
+    fi
+}
+
+# Function to check max drawdown and halt if exceeded
+check_max_drawdown() {
+    local db_path="$1"
+    local max_drawdown_pct=${2:-10}  # Default: 10% max drawdown
+    
+    if [ ! -f "$db_path" ]; then
+        echo "[$(date '+%H:%M:%S')] ⚠️  Max drawdown check: no database yet, skipping"
+        return 0
+    fi
+    
+    local result=$(.venv/bin/python -c "
+import sqlite3
+import json
+
+db_path = '$db_path'
+conn = sqlite3.connect(db_path)
+cursor = conn.cursor()
+
+# Get equity history
+cursor.execute('SELECT equity FROM equity_history ORDER BY rowid ASC')
+equities = [r[0] for r in cursor.fetchall() if r[0] is not None]
+
+if len(equities) < 2:
+    print('DRAWDOWN_OK:insufficient_data')
+    conn.close()
+    exit(0)
+
+# Calculate max drawdown from peak
+peak = equities[0]
+max_dd = 0.0
+current_dd = 0.0
+
+for eq in equities:
+    if eq > peak:
+        peak = eq
+    dd = (peak - eq) / peak * 100 if peak > 0 else 0
+    if dd > max_dd:
+        max_dd = dd
+
+# Get current equity
+cursor.execute('SELECT payload FROM portfolio_state ORDER BY id DESC LIMIT 1')
+row = cursor.fetchone()
+if row:
+    state = json.loads(row[0])
+    current_equity = state.get('equity', 0)
+else:
+    current_equity = equities[-1] if equities else 0
+
+# Get starting equity
+starting_equity = equities[0] if equities else current_equity
+
+# Calculate total return
+total_return = (current_equity - starting_equity) / starting_equity * 100 if starting_equity > 0 else 0
+
+conn.close()
+
+max_dd_limit = $max_drawdown_pct
+
+if max_dd >= max_dd_limit:
+    print(f'DRAWDOWN_HALT:peak_dd={max_dd:.2f}%>={max_dd_limit}%,current_equity={current_equity:.2f},starting_equity={starting_equity:.2f}')
+elif max_dd >= max_dd_limit * 0.8:
+    print(f'DRAWDOWN_WARNING:peak_dd={max_dd:.2f}% approaching {max_dd_limit}%,current_equity={current_equity:.2f}')
+else:
+    print(f'DRAWDOWN_OK:peak_dd={max_dd:.2f}%,current_equity={current_equity:.2f},total_return={total_return:.2f}%')
+" 2>/dev/null)
+    
+    if echo "$result" | grep -q "DRAWDOWN_HALT"; then
+        echo "[$(date '+%H:%M:%S')] 🚨 MAX DRAWDOWN HALT: $result"
+        echo "[$(date '+%H:%M:%S')] 🚨 Halting burn-in - drawdown exceeded ${max_drawdown_pct}%"
+        echo "[$(date '+%H:%M:%S')] Review: tail -f $LOG_DIR/decision-log.jsonl"
+        echo "[$(date '+%H:%M:%S')] Resume manually after review: sh ./scripts/auto-burn-in.sh"
+        # Log halt event
+        echo "{\"event\":\"max_drawdown_halt\",\"timestamp\":\"$(date '+%Y-%m-%d %H:%M:%S')\",\"reason\":\"$result\"}" >> "$LOG_DIR/halt.log"
+        exit 1
+    elif echo "$result" | grep -q "DRAWDOWN_WARNING"; then
+        echo "[$(date '+%H:%M:%S')] ⚠️  Drawdown warning: $result"
+        # Log warning but continue
+        echo "{\"event\":\"drawdown_warning\",\"timestamp\":\"$(date '+%Y-%m-%d %H:%M:%S')\",\"reason\":\"$result\"}" >> "$LOG_DIR/halt.log"
+    else
+        echo "[$(date '+%H:%M:%S')] ✅ Drawdown OK: $result"
+    fi
+    
+    return 0
+}
+
 # Main loop
 echo "Starting automated loop..."
 echo ""
 
 # Track cycle count
 CYCLE_COUNT=0
+
+trap on_shutdown EXIT INT TERM
+
+# Confidence gate thresholds (tightened after 50+ trade sample)
+MIN_TRADES=50
+MIN_NET_PNL=0
+MIN_PROFIT_FACTOR=0.8
+MIN_POSITIVE_WINDOWS=40
+MAX_DRAWDOWN_PCT=10
+ADVISORY_ENABLED=$(.venv/bin/python -c "from pathlib import Path; from trading_bot.config.loader import load_settings; s=load_settings(Path('$CONFIG_FILE')); print('true' if s.advisory.enabled else 'false')" 2>/dev/null || printf "false")
 
 while true; do
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
@@ -380,6 +729,7 @@ while true; do
             run_discovery "midday"
         else
             run_discovery "daily"
+            run_nightly_tuning
         fi
         load_symbols
     fi
@@ -404,12 +754,29 @@ while true; do
     # Market is open - run cycle
     scan_and_trade
     
-    # Show cycle summary every 10 cycles
+    # Check drawdown after each cycle
+    check_max_drawdown "$DB_PATH" "$MAX_DRAWDOWN_PCT"
+    
+    # Show cycle summary every 10 cycles and run RL comparison
     if [ $((CYCLE_COUNT % 10)) -eq 0 ]; then
         echo "[$timestamp] 📈 Completed $CYCLE_COUNT cycles"
+        
+        # Check confidence gates every 10 cycles
+        if ! check_confidence_gates "$DB_PATH" "$MIN_TRADES" "$MIN_NET_PNL" "$MIN_PROFIT_FACTOR" "$MIN_POSITIVE_WINDOWS"; then
+            echo "[$timestamp] 🚨 CONFIDENCE GATES FAILED - halting burn-in"
+            echo "[$timestamp] Trading performance below minimum thresholds"
+            echo "[$timestamp] Review: tail -f $LOG_DIR/decision-log.jsonl"
+            echo "[$timestamp] Resume manually after review: sh ./scripts/auto-burn-in.sh"
+            echo "{\"event\":\"confidence_gate_halt\",\"timestamp\":\"$timestamp\",\"reason\":\"gates_failed\"}" >> "$LOG_DIR/halt.log"
+            exit 1
+        fi
+
+        run_advisory_learner
+
+        run_rl_compare
     fi
     
     echo ""
-    echo "[$timestamp] Sleeping 300 seconds (5 min)..."
-    sleep 300
+    echo "[$timestamp] Sleeping 60 seconds (1 min)..."
+    sleep 60
 done

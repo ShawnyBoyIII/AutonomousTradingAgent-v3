@@ -15,6 +15,7 @@ class Position(BaseModel):
     initial_risk: float | None = Field(default=None, gt=0.0)
     entry_at: datetime | None = None
     strategy_tag: str = ""
+    partial_profit_taken: bool = False
 
 
 class PortfolioState(BaseModel):
@@ -23,3 +24,4 @@ class PortfolioState(BaseModel):
     positions: dict[str, Position] = Field(default_factory=dict)
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
+    last_exited_at: dict[str, str] = Field(default_factory=dict)

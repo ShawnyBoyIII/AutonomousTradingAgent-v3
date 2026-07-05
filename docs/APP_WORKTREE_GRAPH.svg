@@ -1,0 +1,237 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="1100" viewBox="0 0 2200 1100">
+  <defs>
+    <style>
+      .page { fill: #fff; }
+      .frame { fill: #fff; stroke: #dedede; stroke-width: 3; rx: 36; }
+      .group { fill: #fff; stroke: #ededed; stroke-width: 1.5; }
+      .label { font: 400 13px Arial, sans-serif; fill: #111; }
+      .tiny { font: 400 10px Arial, sans-serif; fill: #111; }
+      .box { fill: #fff; stroke: #e4e4e4; stroke-width: 1.5; rx: 2; }
+      .core { fill: #fff; stroke: #cfcfcf; stroke-width: 1.7; rx: 2; }
+      .arrow { stroke: #111; stroke-width: 1.1; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #111; stroke-width: 1.1; fill: none; stroke-dasharray: 5 5; marker-end: url(#arrow); }
+      .light { stroke: #777; stroke-width: 0.9; fill: none; marker-end: url(#arrow-light); }
+    </style>
+    <marker id="arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#111"/>
+    </marker>
+    <marker id="arrow-light" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#777"/>
+    </marker>
+  </defs>
+
+  <rect class="page" width="2200" height="1100"/>
+  <rect x="65" y="28" width="2070" height="1035" class="frame"/>
+
+  <!-- group frames -->
+  <rect x="120" y="145" width="295" height="780" class="group"/>
+  <text x="275" y="154" text-anchor="middle" class="tiny">Operator / CLI</text>
+
+  <rect x="585" y="145" width="325" height="390" class="group"/>
+  <text x="747" y="154" text-anchor="middle" class="tiny">Core Paper App</text>
+
+  <rect x="815" y="75" width="320" height="265" class="group"/>
+  <text x="975" y="84" text-anchor="middle" class="tiny">Market Data</text>
+
+  <rect x="1015" y="350" width="500" height="300" class="group"/>
+  <text x="1265" y="359" text-anchor="middle" class="tiny">Strategy + Risk</text>
+
+  <rect x="1330" y="785" width="690" height="130" class="group"/>
+  <text x="1675" y="794" text-anchor="middle" class="tiny">Execution + Portfolio</text>
+
+  <rect x="465" y="590" width="520" height="230" class="group"/>
+  <text x="725" y="599" text-anchor="middle" class="tiny">Backtest / RL</text>
+
+  <rect x="465" y="835" width="520" height="125" class="group"/>
+  <text x="725" y="844" text-anchor="middle" class="tiny">Broker Boundary</text>
+
+  <rect x="120" y="950" width="1990" height="90" class="group"/>
+  <text x="1115" y="959" text-anchor="middle" class="tiny">Ops / Reports</text>
+
+  <!-- central CLI -->
+  <rect x="330" y="510" width="115" height="42" class="core"/>
+  <text x="387" y="528" text-anchor="middle" class="tiny">trading_bot.main -></text>
+  <text x="387" y="542" text-anchor="middle" class="tiny">cli/app.py</text>
+
+  <rect x="168" y="170" width="95" height="28" class="box"/>
+  <text x="215" y="188" text-anchor="middle" class="tiny">./tradebot-local</text>
+
+  <rect x="150" y="685" width="145" height="28" class="box"/>
+  <text x="222" y="703" text-anchor="middle" class="tiny">scripts/*.sh / scripts/*.py</text>
+
+  <rect x="148" y="980" width="135" height="28" class="box"/>
+  <text x="215" y="998" text-anchor="middle" class="tiny">burn-in scripts + logs</text>
+
+  <!-- core paper app -->
+  <rect x="642" y="180" width="116" height="28" class="box"/>
+  <text x="700" y="198" text-anchor="middle" class="tiny">scan / scan-universe</text>
+
+  <rect x="642" y="260" width="88" height="28" class="box"/>
+  <text x="686" y="278" text-anchor="middle" class="tiny">paper-trade</text>
+
+  <rect x="645" y="380" width="165" height="38" class="box"/>
+  <text x="727" y="397" text-anchor="middle" class="tiny">manage-positions /</text>
+  <text x="727" y="411" text-anchor="middle" class="tiny">run-manager / continuous</text>
+
+  <rect x="642" y="485" width="92" height="28" class="box"/>
+  <text x="688" y="503" text-anchor="middle" class="tiny">kill-switch</text>
+
+  <!-- market data -->
+  <rect x="850" y="250" width="120" height="28" class="core"/>
+  <text x="910" y="268" text-anchor="middle" class="tiny">data/market_data.py</text>
+
+  <rect x="1010" y="105" width="105" height="44" class="box"/>
+  <text x="1062" y="122" text-anchor="middle" class="tiny">Alpaca / YFinance /</text>
+  <text x="1062" y="136" text-anchor="middle" class="tiny">Finnhub / Polygon</text>
+
+  <rect x="1017" y="190" width="75" height="28" class="box"/>
+  <text x="1054" y="208" text-anchor="middle" class="tiny">cache.py</text>
+
+  <rect x="1012" y="250" width="88" height="28" class="box"/>
+  <text x="1056" y="268" text-anchor="middle" class="tiny">validation.py</text>
+
+  <rect x="1010" y="305" width="88" height="28" class="box"/>
+  <text x="1054" y="323" text-anchor="middle" class="tiny">indicators.py</text>
+
+  <!-- strategy + risk -->
+  <rect x="1035" y="440" width="120" height="38" class="box"/>
+  <text x="1095" y="456" text-anchor="middle" class="tiny">daily/intraday signal</text>
+  <text x="1095" y="470" text-anchor="middle" class="tiny">engines</text>
+
+  <rect x="1230" y="385" width="145" height="38" class="box"/>
+  <text x="1302" y="402" text-anchor="middle" class="tiny">strategy_selector /</text>
+  <text x="1302" y="416" text-anchor="middle" class="tiny">confluence / regime</text>
+
+  <rect x="1412" y="395" width="95" height="28" class="box"/>
+  <text x="1459" y="413" text-anchor="middle" class="tiny">counter_thesis.py</text>
+
+  <rect x="1250" y="505" width="145" height="38" class="box"/>
+  <text x="1322" y="522" text-anchor="middle" class="tiny">risk_manager /</text>
+  <text x="1322" y="536" text-anchor="middle" class="tiny">position_sizer / exposure</text>
+
+  <rect x="1420" y="570" width="112" height="38" class="box"/>
+  <text x="1476" y="587" text-anchor="middle" class="tiny">trailing_stop / EOD /</text>
+  <text x="1476" y="601" text-anchor="middle" class="tiny">stops / targets</text>
+
+  <!-- execution + portfolio -->
+  <rect x="1400" y="855" width="145" height="28" class="box"/>
+  <text x="1472" y="873" text-anchor="middle" class="tiny">execution/order_manager.py</text>
+
+  <rect x="1585" y="855" width="145" height="28" class="box"/>
+  <text x="1657" y="873" text-anchor="middle" class="tiny">execution/paper_broker.py</text>
+
+  <rect x="1770" y="825" width="105" height="28" class="box"/>
+  <text x="1822" y="843" text-anchor="middle" class="tiny">portfolio/ledger.py</text>
+
+  <rect x="1845" y="880" width="135" height="28" class="box"/>
+  <text x="1912" y="898" text-anchor="middle" class="tiny">runtime/decision_log.py +</text>
+  <text x="1912" y="912" text-anchor="middle" class="tiny">state/*.json</text>
+
+  <rect x="1878" y="780" width="135" height="28" class="box"/>
+  <text x="1945" y="798" text-anchor="middle" class="tiny">portfolio/performance.py</text>
+
+  <!-- backtest / RL -->
+  <rect x="585" y="645" width="115" height="28" class="box"/>
+  <text x="642" y="663" text-anchor="middle" class="tiny">backtest/runner.py</text>
+
+  <rect x="715" y="712" width="135" height="28" class="box"/>
+  <text x="782" y="730" text-anchor="middle" class="tiny">rl/env / trainer.py /</text>
+  <text x="782" y="744" text-anchor="middle" class="tiny">agent.py</text>
+
+  <rect x="565" y="735" width="120" height="28" class="box"/>
+  <text x="625" y="753" text-anchor="middle" class="tiny">rl-train -></text>
+  <text x="625" y="767" text-anchor="middle" class="tiny">scripts/train_rl.py</text>
+
+  <rect x="530" y="790" width="130" height="28" class="box"/>
+  <text x="595" y="808" text-anchor="middle" class="tiny">rl-benchmark /</text>
+  <text x="595" y="822" text-anchor="middle" class="tiny">rl-walkforward</text>
+
+  <rect x="820" y="790" width="125" height="28" class="box"/>
+  <text x="882" y="808" text-anchor="middle" class="tiny">backtest/diagnostics.py</text>
+
+  <!-- broker -->
+  <rect x="482" y="880" width="145" height="38" class="box"/>
+  <text x="554" y="897" text-anchor="middle" class="tiny">robinhood-status /</text>
+  <text x="554" y="911" text-anchor="middle" class="tiny">sync-account / sync-positions</text>
+
+  <rect x="705" y="892" width="145" height="28" class="box"/>
+  <text x="777" y="910" text-anchor="middle" class="tiny">brokers/robinhood/boundary.py</text>
+
+  <rect x="875" y="875" width="115" height="28" class="box"/>
+  <text x="932" y="893" text-anchor="middle" class="tiny">state/robinhood_*.json</text>
+
+  <rect x="875" y="925" width="125" height="28" class="box"/>
+  <text x="937" y="943" text-anchor="middle" class="tiny">operator/MCP intent</text>
+  <text x="937" y="957" text-anchor="middle" class="tiny">handoff</text>
+
+  <!-- ops -->
+  <rect x="1850" y="982" width="95" height="28" class="box"/>
+  <text x="1897" y="1000" text-anchor="middle" class="tiny">doctor / health</text>
+
+  <rect x="2050" y="963" width="90" height="28" class="box"/>
+  <text x="2095" y="981" text-anchor="middle" class="tiny">reports/*.py</text>
+
+  <rect x="2050" y="1018" width="95" height="28" class="box"/>
+  <text x="2097" y="1036" text-anchor="middle" class="tiny">monitoring/*.py</text>
+
+  <!-- prune candidates -->
+  <rect x="1380" y="985" width="330" height="38" class="box"/>
+  <text x="1545" y="1002" text-anchor="middle" class="tiny">prune review candidates</text>
+  <text x="1545" y="1016" text-anchor="middle" class="tiny">events/*, env/trading_env.py, brokers/paper.py, research-only RL scripts</text>
+
+  <!-- title note -->
+  <text x="1100" y="55" text-anchor="middle" class="label">AutonomousTradingAgent Worktree Map</text>
+  <text x="1100" y="1075" text-anchor="middle" class="tiny">Core confidence path: data -> signal -> risk -> paper execution -> ledger -> diagnostics</text>
+
+  <!-- connections -->
+  <path d="M263 184 C310 205 330 405 387 510" class="dash"/>
+  <path d="M295 699 C330 650 358 585 387 552" class="dash"/>
+  <path d="M283 994 C335 890 338 640 387 552" class="dash"/>
+
+  <path d="M445 524 C505 440 550 205 642 194" class="light"/>
+  <path d="M445 529 C520 455 575 285 642 274" class="light"/>
+  <path d="M445 535 C520 425 585 399 645 399" class="light"/>
+  <path d="M445 542 C535 535 585 499 642 499" class="light"/>
+  <path d="M445 545 C515 620 535 646 585 659" class="light"/>
+  <path d="M445 548 C535 700 540 738 565 749" class="light"/>
+  <path d="M445 550 C520 765 510 800 530 804" class="light"/>
+  <path d="M445 545 C505 850 505 890 482 899" class="light"/>
+  <path d="M445 552 C540 970 1650 985 1850 996" class="light"/>
+
+  <path d="M758 194 C802 195 832 220 850 264" class="dash"/>
+  <path d="M730 274 C780 285 822 285 850 264" class="light"/>
+  <path d="M810 399 C835 365 852 318 910 278" class="light"/>
+  <path d="M700 659 C795 650 832 450 910 278" class="light"/>
+  <path d="M660 804 C775 790 820 450 910 278" class="light"/>
+
+  <path d="M970 264 C1000 160 1015 130 1010 127" class="dash"/>
+  <path d="M970 264 C1005 230 1010 205 1017 204" class="light"/>
+  <path d="M970 264 L1012 264" class="light"/>
+  <path d="M970 264 C1015 292 1012 318 1010 319" class="light"/>
+
+  <path d="M970 264 C1010 355 1015 440 1035 459" class="dash"/>
+  <path d="M1155 459 C1190 424 1205 405 1230 404" class="arrow"/>
+  <path d="M1375 404 L1412 409" class="light"/>
+  <path d="M1155 459 C1200 500 1215 524 1250 524" class="arrow"/>
+  <path d="M1395 524 C1412 552 1410 586 1420 589" class="arrow"/>
+
+  <path d="M1395 524 C1430 650 1460 780 1472 855" class="dash"/>
+  <path d="M1532 589 C1545 690 1540 790 1585 855" class="dash"/>
+  <path d="M1545 869 L1585 869" class="arrow"/>
+  <path d="M1730 869 C1750 850 1760 840 1770 839" class="arrow"/>
+  <path d="M1875 839 C1890 820 1905 805 1878 794" class="light"/>
+  <path d="M1875 839 C1900 850 1910 870 1912 880" class="light"/>
+  <path d="M1912 908 C1980 930 2035 950 2050 977" class="dash"/>
+  <path d="M1912 908 C1990 955 2035 1000 2050 1032" class="dash"/>
+
+  <path d="M700 659 C750 675 790 715 820 804" class="light"/>
+  <path d="M685 749 C715 740 710 730 715 726" class="arrow"/>
+  <path d="M660 804 L820 804" class="arrow"/>
+
+  <path d="M627 899 L705 906" class="arrow"/>
+  <path d="M850 906 C865 895 870 889 875 889" class="arrow"/>
+  <path d="M850 906 C865 920 870 940 875 939" class="dash"/>
+
+  <path d="M1945 996 L2050 977" class="light"/>
+  <path d="M1945 996 L2050 1032" class="light"/>
+</svg>

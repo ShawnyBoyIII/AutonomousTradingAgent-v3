@@ -11,7 +11,9 @@ app:
   backtest_summary_path: state/backtest_summary.json
 
 market_data:
-  provider: alpaca  # "yfinance" or "alpaca"
+  providers:
+    - alpaca
+    - polygon
   validate_data: true
   max_price_jump_pct: 1000.0
   max_volume_jump_pct: 1000.0
@@ -32,12 +34,13 @@ risk:
   max_risk_per_trade_pct: 0.01
   max_daily_risk_pct: 0.03
   max_daily_orders: 3
-  max_ticker_allocation_pct: 0.20
+  max_ticker_allocation_pct: 0.15
   min_reward_risk_ratio: 2.0
   use_atr_sizing: true
   atr_period: 14
   atr_multiplier: 2.0
-  atr_stop_multiplier: 1.5
+  atr_stop_multiplier: 3.0
+  min_stop_distance_pct: 3.0
   max_portfolio_heat_pct: 0.03
   max_sector_concentration_pct: 0.20
   max_consecutive_losses: 5
@@ -104,5 +107,10 @@ rl:
   enabled: false
   agent_type: PPO
   feature_set: standard
-  reward_function: sharpe
-  model_path: trained_models/rl_agent.zip
+  reward_function: risk_adjusted
+  model_path: state/rl_logs/sector_diversity/PPO_seed_789.zip
+  backtest_starting_cash: 100000.0
+  backtest_max_shares: 150
+  backtest_stop_loss_pct: 0.03
+  backtest_profit_target_pct: 0.08
+  action_confidence_threshold: 0.4

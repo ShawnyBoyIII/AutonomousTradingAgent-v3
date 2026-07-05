@@ -25,6 +25,7 @@ def submit_signal_as_order(
     risk_settings: RiskSettings | None = None,
     counter_thesis: "CounterThesisResult | None" = None,
     mode: ExecutionMode = ExecutionMode.PAPER,
+    position_size_override: int | None = None,
 ) -> FillResult | None:
     require_paper_mode(mode)
 
@@ -40,21 +41,26 @@ def submit_signal_as_order(
     if not decision.approved:
         return None
 
+    quantity = (
+        min(position_size_override, decision.position_size)
+        if position_size_override is not None
+        else decision.position_size
+    )
     order = OrderRequest(
         ticker=signal.ticker,
         side="BUY",
         order_type="market",
-        quantity=decision.position_size,
+        quantity=quantity,
         submitted_at=signal.timestamp,
     )
 
     broker_cash = _extract_broker_cash(broker)
-    estimated_fill_price = apply_slippage(
+    estimated_fill_price = _estimate_broker_fill_price(
+        broker,
+        order,
         signal.entry_price,
-        getattr(broker, "slippage_bps", 0),
-        "BUY",
     )
-    estimated_total_cost = (estimated_fill_price * decision.position_size) + getattr(
+    estimated_total_cost = (estimated_fill_price * quantity) + getattr(
         broker, "fee_per_order", 0.0
     )
     if broker_cash is not None and broker_cash < estimated_total_cost:
@@ -64,6 +70,21 @@ def submit_signal_as_order(
         return broker.submit_order(order, market_price=signal.entry_price)
     except ValueError:
         return None
+
+
+def _estimate_broker_fill_price(
+    broker: BrokerAdapter,
+    order: OrderRequest,
+    market_price: float,
+) -> float:
+    estimator = getattr(broker, "estimate_fill_price", None)
+    if callable(estimator):
+        return float(estimator(order, market_price))
+    return apply_slippage(
+        market_price,
+        getattr(broker, "slippage_bps", 0),
+        order.side,
+    )
 
 
 def _extract_broker_cash(broker: BrokerAdapter) -> float | None:

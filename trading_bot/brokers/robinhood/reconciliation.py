@@ -9,10 +9,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from trading_bot.brokers.base import BrokerAdapter
+    from trading_bot.brokers.robinhood.boundary import RobinhoodBrokerBoundary
     from trading_bot.portfolio.ledger import PortfolioLedger
 
 logger = logging.getLogger(__name__)
@@ -206,7 +207,8 @@ class PositionReconciler:
         source = getattr(self.broker_client, "settings", None)
         source_name = "broker"
         if source is not None and hasattr(source, "robinhood"):
-            status = self.broker_client.get_status()  # type: ignore[attr-defined]
+            boundary = cast("RobinhoodBrokerBoundary", self.broker_client)
+            status = boundary.get_status()
             source_name = status.source if status else "broker"
 
         positions: dict[str, dict] = {}

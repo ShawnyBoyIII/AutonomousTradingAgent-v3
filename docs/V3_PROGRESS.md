@@ -1,5 +1,9 @@
 # V3 Implementation Progress
 
+> Historical doc. Many sections below describe superseded direct-auth Robinhood work.
+> Current supported Robinhood path: MCP/operator-managed snapshots plus local intent logs.
+> Current CLI surface: `robinhood-status`, `sync-account`, `sync-positions`, `reconcile-positions`.
+
 ## ✅ Completed (Ready for Testing)
 
 ### Phase 1: UI Prototype
@@ -121,12 +125,8 @@ ROBINHOOD_DAILY_LOSS_LIMIT=100
 
 ---
 
-## 📊 Current Test Status
-```
-344 passed
-```
-
-All tests pass including 26 new tests for Robinhood auth.
+## 📊 Historical Test Status
+This section is stale. Current suite is much larger than numbers below.
 
 ---
 

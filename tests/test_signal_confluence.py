@@ -115,6 +115,31 @@ class TestSignalConfluence:
 
         assert score_trend_aligned.regime_alignment >= score_trend_misaligned.regime_alignment
 
+    def test_mean_reversion_aliases_score_as_mean_reversion(self) -> None:
+        frame = pd.DataFrame({
+            "close": [100],
+            "high": [101],
+            "low": [99],
+            "volume": [1000],
+        })
+
+        daily_frame = pd.DataFrame({
+            "close": [100], "high": [101], "low": [99],
+            "ema_20": [90], "sma_50": [95], "atr_14": [2],
+            "bb_upper": [110], "bb_lower": [90],
+        })
+
+        score = calculate_signal_confluence(
+            "TEST",
+            daily_frame,
+            frame,
+            MarketRegime.RANGE_BOUND,
+            RegimeMetrics(),
+            "oversold_bounce",
+        )
+
+        assert score.regime_alignment == 2.0
+
 
 class TestScoreToConfidence:
     """Tests for confidence level conversion."""
