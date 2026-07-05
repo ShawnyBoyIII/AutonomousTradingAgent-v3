@@ -33,6 +33,29 @@ def test_market_buy_updates_cash_and_position() -> None:
     assert broker.positions["AAPL"] == 10
 
 
+def test_market_buy_dynamic_slippage_increases_fill_price() -> None:
+    broker = PaperBroker(
+        starting_cash=20000,
+        fee_per_order=1.0,
+        slippage_bps=0,
+        dynamic_slippage_enabled=True,
+        dynamic_slippage_notional_bps_per_10k=10.0,
+        dynamic_slippage_low_price_boost_bps=0.0,
+        dynamic_slippage_max_extra_bps=50.0,
+    )
+    order = OrderRequest(
+        ticker="AAPL",
+        side="BUY",
+        order_type="market",
+        quantity=100,
+        submitted_at=datetime.now(),
+    )
+
+    fill = broker.submit_order(order, market_price=100.0)
+
+    assert fill.fill_price > 100.0
+
+
 def test_market_buy_rejects_insufficient_cash_without_mutating_state() -> None:
     broker = PaperBroker(starting_cash=100.0, fee_per_order=1.0, slippage_bps=0)
     order = OrderRequest(
@@ -115,7 +138,7 @@ def test_ledger_initializes_sqlite_tables(tmp_path: Path) -> None:
             for row in conn.execute("PRAGMA table_info(orders)")
         ]
 
-    assert columns == ["id", "ticker", "side", "quantity", "fill_price", "fees", "filled_at", "pnl", "strategy_tag"]
+    assert columns == ["id", "ticker", "side", "quantity", "fill_price", "fees", "filled_at", "pnl", "strategy_tag", "swarm_sentiment_bucket"]
 
 
 def test_ledger_round_trips_portfolio_state(tmp_path: Path) -> None:

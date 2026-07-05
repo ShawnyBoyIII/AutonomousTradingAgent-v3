@@ -23,6 +23,10 @@ from trading_bot.db.repositories.scan_results import (
     get_scan_results,
     upsert_scan_result,
 )
+from trading_bot.db.repositories.scan_features import (
+    get_scan_features,
+    upsert_scan_feature,
+)
 from trading_bot.db.repositories.trades import (
     get_open_trades,
     get_trades,
@@ -41,6 +45,8 @@ __all__ = [
     "upsert_market_bars",
     "get_scan_results",
     "upsert_scan_result",
+    "get_scan_features",
+    "upsert_scan_feature",
     "get_open_trades",
     "get_trades",
     "upsert_trade",

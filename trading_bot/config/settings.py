@@ -32,6 +32,7 @@ class AppSettings(BaseModel):
     portfolio_summary_path: str = "state/portfolio_summary.json"
     backtest_summary_path: str = "state/backtest_summary.json"
     tuning_overrides_path: str = "state/tuning_overrides.yaml"
+    advisory_dir: str = "state/advisory_learner"
     benchmark_symbol: str | None = None
     allow_yellow_mean_reversion: bool = False
     min_entry_confluence_score: float = Field(default=4.0, ge=0.0, le=12.0)
@@ -82,6 +83,15 @@ class ScoutSettings(BaseModel):
     min_avg_dollar_volume: float = Field(default=5_000_000.0, ge=0.0)
     max_universe_size: int = Field(default=50, ge=1)
     max_snapshot_candidates: int = Field(default=100, ge=1)
+
+
+class AdvisorySettings(BaseModel):
+    enabled: bool = Field(default=False)
+    min_observations_per_symbol: int = Field(default=5, ge=1)
+    main_limit: int = Field(default=10, ge=1)
+    cheap_limit: int = Field(default=10, ge=1)
+    cheap_stock_max_price: float = Field(default=5.0, gt=0.0)
+    min_hit_rate_for_promote: float = Field(default=0.55, ge=0.0, le=1.0)
 
 
 class RiskSettings(BaseModel):
@@ -322,6 +332,7 @@ class Settings(BaseModel):
     app: AppSettings = Field(default_factory=AppSettings)
     market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
     scout: ScoutSettings = Field(default_factory=ScoutSettings)
+    advisory: AdvisorySettings = Field(default_factory=AdvisorySettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)
     session: SessionSettings = Field(default_factory=SessionSettings)
     paper: PaperSettings = Field(default_factory=PaperSettings)

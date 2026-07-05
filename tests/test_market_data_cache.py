@@ -35,6 +35,15 @@ class TestIntervalTTL:
     def test_1d_interval(self):
         assert _interval_to_ttl_seconds("1d") == 43200
 
+    def test_1w_interval(self):
+        assert _interval_to_ttl_seconds("1w") == 302400
+
+    def test_1mo_interval(self):
+        assert _interval_to_ttl_seconds("1mo") == 1296000
+
+    def test_1y_interval(self):
+        assert _interval_to_ttl_seconds("1y") == 15552000
+
     def test_unknown_unit(self):
         assert _interval_to_ttl_seconds("1x") == 300
 
@@ -355,3 +364,45 @@ class TestIntegration:
         assert float(first["close"].iloc[0]) == 101.0
         assert float(second["close"].iloc[0]) == 101.0
         assert float(third["close"].iloc[0]) == 102.0
+
+    def test_intraday_fetch_prioritizes_realtime_capable_providers(self, cache, monkeypatch):
+        from trading_bot.data import market_data
+
+        called = []
+
+        class Provider:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def fetch_bars(self, symbol, period, interval, start=None, end=None):
+                called.append(self.name)
+                return pd.DataFrame({
+                    "timestamp": pd.date_range("2025-01-01", periods=1, freq="1d"),
+                    "open": [100.0],
+                    "high": [100.0],
+                    "low": [100.0],
+                    "close": [100.0],
+                    "volume": [1000],
+                })
+
+        monkeypatch.setattr(market_data, "_get_cache", lambda: cache)
+        monkeypatch.setattr(cache, "get", lambda *a, **k: None)
+        monkeypatch.setattr(cache, "put", lambda *a, **k: None)
+        monkeypatch.setattr(
+            market_data,
+            "_resolve_provider_by_name",
+            lambda name: Provider(str(name)),
+        )
+
+        settings = MarketDataSettings(providers=["yfinance", "polygon", "alpaca"])
+        market_data.fetch_bars("AAPL", "5d", "5m", settings=settings)
+
+        assert called == ["alpaca"]
+
+    def test_intraday_cache_namespace_uses_effective_provider_order(self):
+        from trading_bot.data.market_data import _cache_namespace
+
+        settings = MarketDataSettings(providers=["yfinance", "polygon", "alpaca"])
+
+        assert _cache_namespace(settings, "5m") == "providers=alpaca,polygon,yfinance"
+        assert _cache_namespace(settings, "1d") == "providers=yfinance,polygon,alpaca"

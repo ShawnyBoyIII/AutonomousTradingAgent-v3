@@ -842,6 +842,176 @@ def test_build_universe_keeps_multi_screener_hits(monkeypatch, tmp_path: Path) -
     assert snapshot["candidates"][0]["source_hits"] == 2
 
 
+def test_build_universe_applies_advisory_scout_override(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.data.market_data as market_data
+
+    monkeypatch.setattr(
+        market_data,
+        "fetch_small_cap_candidates",
+        lambda limit=200, screeners=None: [
+            {
+                "symbol": "FAST",
+                "quoteType": "EQUITY",
+                "exchange": "NYQ",
+                "marketCap": 4_000_000_000,
+                "regularMarketPrice": 16.0,
+                "averageDailyVolume3Month": 500_000,
+                "dayVolume": 1_800_000,
+                "source": "aggressive_small_caps",
+            },
+            {
+                "symbol": "DROP",
+                "quoteType": "EQUITY",
+                "exchange": "NYQ",
+                "marketCap": 4_000_000_000,
+                "regularMarketPrice": 18.0,
+                "averageDailyVolume3Month": 500_000,
+                "dayVolume": 1_800_000,
+                "source": "small_cap_gainers",
+            },
+        ],
+    )
+    advisory_dir = tmp_path / "state" / "advisory"
+    advisory_dir.mkdir(parents=True)
+    (advisory_dir / "scout_override.yaml").write_text(
+        "main_midcap:\n"
+        "  promote_symbols:\n"
+        "    - BOOST\n"
+        "  avoid_symbols:\n"
+        "    - DROP\n",
+        encoding="utf-8",
+    )
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        f"  universe_path: {tmp_path / 'state' / 'universe.txt'}\n"
+        f"  universe_candidates_path: {tmp_path / 'state' / 'universe_candidates.json'}\n"
+        f"  advisory_dir: {advisory_dir}\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "build-universe"])
+
+    assert result.exit_code == 0
+    assert (tmp_path / "state" / "universe.txt").read_text(encoding="utf-8") == "BOOST\nFAST\n"
+    snapshot = json.loads((tmp_path / "state" / "universe_candidates.json").read_text(encoding="utf-8"))
+    included = [row["ticker"] for row in snapshot["candidates"] if row.get("included")]
+    assert included == ["BOOST", "FAST"]
+
+
+def test_discover_export_applies_advisory_scout_override(monkeypatch, tmp_path: Path) -> None:
+    import trading_bot.strategy.dynamic_watchlist as dynamic_watchlist
+
+    config_file = tmp_path / "config.yaml"
+    universe_path = tmp_path / "state" / "universe.txt"
+    advisory_dir = tmp_path / "state" / "advisory"
+    advisory_dir.mkdir(parents=True)
+    (advisory_dir / "scout_override.yaml").write_text(
+        "main_midcap:\n"
+        "  promote_symbols:\n"
+        "    - BOOST\n"
+        "  avoid_symbols:\n"
+        "    - MSFT\n",
+        encoding="utf-8",
+    )
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        f"  universe_path: {universe_path}\n"
+        f"  advisory_dir: {advisory_dir}\n",
+        encoding="utf-8",
+    )
+
+    class FakeWatchlist:
+        def __init__(self, max_symbols: int, scout_settings=None) -> None:
+            self.symbols = ["AAPL", "MSFT"]
+
+        def update(self, data_provider):
+            return SimpleNamespace(
+                sectors_favored=[],
+                added=[],
+                removed=[],
+                current=[
+                    SimpleNamespace(symbol="AAPL", reason="test", score=80.0),
+                    SimpleNamespace(symbol="MSFT", reason="test", score=75.0),
+                ],
+            )
+
+        def get_symbols(self):
+            return self.symbols
+
+        def export_for_burn_in(self, output_path=None):
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(output_path).write_text("AAPL\nMSFT\n", encoding="utf-8")
+            return str(Path(output_path).resolve())
+
+    monkeypatch.setattr(dynamic_watchlist, "DynamicWatchlist", FakeWatchlist)
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "discover", "--export"])
+
+    assert result.exit_code == 0
+    assert universe_path.read_text(encoding="utf-8") == "BOOST\nAAPL"
+
+
+def test_advisory_learn_and_report_commands(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    advisory_dir = tmp_path / "state" / "advisory"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'burn_in.db'}\n"
+        f"  log_dir: {tmp_path / 'logs'}\n"
+        f"  advisory_dir: {advisory_dir}\n"
+        "advisory:\n"
+        "  enabled: true\n"
+        "  min_observations_per_symbol: 1\n",
+        encoding="utf-8",
+    )
+    log_path = tmp_path / "logs" / "decision-log.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        json.dumps(
+            {
+                "command": "scan",
+                "ticker": "AAPL",
+                "status": "APPROVED",
+                "reason": "approved",
+                "confidence": 0.9,
+                "quality": "GREEN",
+                "entry": 100.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    learn_result = CliRunner().invoke(app, ["--config-path", str(config_file), "advisory-learn", "--daily-report"])
+    report_result = CliRunner().invoke(app, ["--config-path", str(config_file), "advisory-report"])
+
+    assert learn_result.exit_code == 0
+    assert "observations_added=1" in learn_result.stdout
+    assert report_result.exit_code == 0
+    assert "ADVISORY LEARNER REPORT" in report_result.stdout
+
+
+def test_advisory_learn_command_noops_when_disabled(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'burn_in.db'}\n"
+        f"  log_dir: {tmp_path / 'logs'}\n"
+        f"  advisory_dir: {tmp_path / 'state' / 'advisory'}\n"
+        "advisory:\n"
+        "  enabled: false\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "advisory-learn"])
+
+    assert result.exit_code == 0
+    assert "advisory=disabled" in result.stdout
+
+
 def test_scan_universe_reads_saved_symbols_file(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
     import trading_bot.runtime.orchestrator as orchestrator

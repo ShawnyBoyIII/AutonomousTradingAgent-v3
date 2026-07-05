@@ -202,40 +202,6 @@ async def execute_split_orders(
     Returns:
         Updated SplitResult with execution results
     """
-    import asyncio
-
-    successful = 0
-    failed = 0
-
-    for i, order_info in enumerate(split_result.results):
-        if i > 0 and delay_between_orders > 0:
-            await asyncio.sleep(delay_between_orders)
-
-        quantity = order_info["quantity"]
-
-        try:
-            # Place order through broker
-            # Note: This would need to integrate with your existing order flow
-            # For now, we'll log the execution
-            logger.info(
-                f"Executing split order {i + 1}/{split_result.num_orders}: "
-                f"{side.upper()} {quantity} {symbol}"
-            )
-
-            order_info["status"] = "success"
-            successful += 1
-
-        except Exception as e:
-            logger.error(f"Split order {i + 1} failed: {e}")
-            order_info["status"] = "failed"
-            order_info["error"] = str(e)
-            failed += 1
-
-    split_result.successful_orders = successful
-    split_result.failed_orders = failed
-
-    logger.info(
-        f"Split order execution complete: {successful}/{split_result.num_orders} successful"
+    raise NotImplementedError(
+        "execute_split_orders is not wired into the broker order flow yet"
     )
-
-    return split_result

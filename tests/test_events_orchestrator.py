@@ -179,6 +179,7 @@ class TestOrderHandler:
         handler = OrderHandler(bus, cache, settings)
         handler.register()
         cache.cash = 100.0
+        cache.update_from_signal(StrategySignalEvent(ticker="AAPL", action="BUY", entry_price=150.0))
 
         request = OrderRequestEvent(order_id="test-2", ticker="AAPL", side="BUY", quantity=50)
         bus.publish_to("ORDER_REQUEST", request)
@@ -191,6 +192,7 @@ class TestOrderHandler:
         handler = OrderHandler(bus, cache, settings)
         handler.register()
         cache.cash = 10000.0
+        cache.update_from_signal(StrategySignalEvent(ticker="AAPL", action="BUY", entry_price=150.0))
 
         request = OrderRequestEvent(order_id="test-3", ticker="AAPL", side="BUY", quantity=50)
         bus.publish_to("ORDER_REQUEST", request)
@@ -199,8 +201,34 @@ class TestOrderHandler:
         assert len(fills) == 1
         assert fills[0].ticker == "AAPL"
         assert fills[0].quantity == 50
-        assert fills[0].fill_price == 150.0  # Hardcoded in handler
+        assert fills[0].fill_price == 150.0
         assert fills[0].fees == 1.0
+
+    def test_prefers_recent_bar_price(self, bus, cache, settings):
+        handler = OrderHandler(bus, cache, settings)
+        handler.register()
+        cache.cash = 10000.0
+        cache.update_from_signal(StrategySignalEvent(ticker="AAPL", action="BUY", entry_price=150.0))
+        cache.update_from_bar(MarketBarEvent(ticker="AAPL", open=151.0, high=152.0, low=150.0, close=151.5, volume=1000))
+
+        request = OrderRequestEvent(order_id="test-3b", ticker="AAPL", side="BUY", quantity=10)
+        bus.publish_to("ORDER_REQUEST", request)
+
+        fills = _events_of(bus, "ORDER_FILL")
+        assert len(fills) == 1
+        assert fills[0].fill_price == 151.5
+
+    def test_rejects_when_no_market_price_available(self, bus, cache, settings):
+        handler = OrderHandler(bus, cache, settings)
+        handler.register()
+        cache.cash = 10000.0
+
+        request = OrderRequestEvent(order_id="test-3c", ticker="AAPL", side="BUY", quantity=10)
+        bus.publish_to("ORDER_REQUEST", request)
+
+        rejects = _events_of(bus, "ORDER_REJECT")
+        assert len(rejects) == 1
+        assert rejects[0].reason == "missing market price"
 
 
 # ──────────────────────────── PortfolioHandler tests ────────────────────────────

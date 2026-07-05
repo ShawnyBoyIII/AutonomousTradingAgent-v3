@@ -97,6 +97,7 @@ class Cache:
         self.signal_history.append({
             "ticker": event.ticker,
             "action": event.action,
+            "entry_price": event.entry_price,
             "confidence": event.confidence,
             "strategy_tag": event.strategy_tag,
             "timestamp": event.timestamp,

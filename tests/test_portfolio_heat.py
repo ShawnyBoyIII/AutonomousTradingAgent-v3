@@ -5,8 +5,40 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from trading_bot.models.portfolio import PortfolioState, Position
-from trading_bot.portfolio.performance import compute_portfolio_heat
+from trading_bot.portfolio.performance import (
+    compute_exposure_ratio,
+    compute_portfolio_heat,
+    compute_position_market_value,
+    compute_unrealized_pnl,
+)
 from trading_bot.runtime.orchestrator import _calculate_portfolio_heat
+
+
+class TestPortfolioPerformanceMath:
+    """Portfolio math helpers cover long/short and invalid-equity cases."""
+
+    def test_unrealized_pnl_for_long_and_short_positions(self) -> None:
+        assert compute_unrealized_pnl(quantity=10, average_cost=100.0, market_price=150.0) == 500.0
+        assert compute_unrealized_pnl(quantity=10, average_cost=100.0, market_price=80.0) == -200.0
+        assert compute_unrealized_pnl(quantity=10, average_cost=100.0, market_price=100.0) == 0.0
+        assert compute_unrealized_pnl(quantity=-10, average_cost=100.0, market_price=80.0) == 200.0
+        assert compute_unrealized_pnl(quantity=-10, average_cost=100.0, market_price=150.0) == -500.0
+        assert compute_unrealized_pnl(quantity=0, average_cost=100.0, market_price=150.0) == 0.0
+
+    def test_position_market_value_keeps_position_direction(self) -> None:
+        assert compute_position_market_value(quantity=10, market_price=150.0) == 1500.0
+        assert compute_position_market_value(quantity=-10, market_price=150.0) == -1500.0
+        assert compute_position_market_value(quantity=0, market_price=150.0) == 0.0
+        assert compute_position_market_value(quantity=10, market_price=0.0) == 0.0
+
+    def test_exposure_ratio_fails_closed_when_equity_is_not_positive(self) -> None:
+        assert compute_exposure_ratio(market_value=50_000.0, equity=100_000.0) == 0.5
+        assert compute_exposure_ratio(market_value=100_000.0, equity=100_000.0) == 1.0
+        assert compute_exposure_ratio(market_value=150_000.0, equity=100_000.0) == 1.5
+        assert compute_exposure_ratio(market_value=0.0, equity=100_000.0) == 0.0
+        assert compute_exposure_ratio(market_value=-50_000.0, equity=100_000.0) == -0.5
+        assert compute_exposure_ratio(market_value=50_000.0, equity=0.0) == 0.0
+        assert compute_exposure_ratio(market_value=50_000.0, equity=-10_000.0) == 0.0
 
 
 class TestComputePortfolioHeat:

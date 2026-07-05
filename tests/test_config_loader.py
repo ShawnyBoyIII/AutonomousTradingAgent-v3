@@ -36,6 +36,7 @@ def test_load_settings_reads_yaml(tmp_path: Path) -> None:
         (tmp_path / "state/universe_candidates.json").resolve()
     )
     assert settings.app.scan_results_path == str((tmp_path / "state/scan_results.json").resolve())
+    assert settings.app.advisory_dir == str((tmp_path / "state/advisory_learner").resolve())
     assert settings.market_data.intraday_interval == "5m"
     assert settings.risk.max_daily_risk_pct == 0.03
 

@@ -28,17 +28,36 @@ def normalize_ohlcv_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return renamed[["timestamp", "open", "high", "low", "close", "volume"]]
 
 
-def _resolve_provider_stack(settings: MarketDataSettings | None = None) -> list:
-    """Return an ordered list of provider instances from *settings*.provider_stack."""
-    names = settings.provider_stack if settings is not None else ["yfinance"]
+def _prioritize_provider_names(
+    settings: MarketDataSettings | None = None,
+    interval: str | None = None,
+) -> list[str]:
+    names = list(settings.provider_stack if settings is not None else ["yfinance"])
+    if not interval:
+        return names
+
+    token = str(interval).strip().lower()
+    # For sub-daily bars, prefer lower-latency providers before yfinance when
+    # the user configured a stack containing both.
+    is_intraday = token.endswith("m") or token.endswith("h")
+    if not is_intraday:
+        return names
+
+    priority = {"alpaca": 0, "polygon": 1, "finnhub": 2, "yfinance": 3}
+    return sorted(names, key=lambda name: (priority.get(str(name).strip().lower(), 99), names.index(name)))
+
+
+def _resolve_provider_stack(settings: MarketDataSettings | None = None, interval: str | None = None) -> list:
+    """Return an ordered list of provider instances from the effective provider stack."""
+    names = _prioritize_provider_names(settings, interval)
     providers: list = []
     for name in names:
         providers.append(_resolve_provider_by_name(name))
     return providers
 
 
-def _cache_namespace(settings: MarketDataSettings | None = None) -> str:
-    names = settings.provider_stack if settings is not None else ["yfinance"]
+def _cache_namespace(settings: MarketDataSettings | None = None, interval: str | None = None) -> str:
+    names = _prioritize_provider_names(settings, interval)
     return "providers=" + ",".join(str(name).strip().lower() for name in names)
 
 
@@ -73,9 +92,7 @@ def _fallback_fetch(
     primary_settings: MarketDataSettings | None = None,
 ) -> pd.DataFrame:
     """Try each provider in the configured stack; first success wins."""
-    stack_names = []
-    if primary_settings is not None:
-        stack_names = primary_settings.provider_stack
+    stack_names = _prioritize_provider_names(primary_settings, interval)
     if not stack_names:
         stack_names = ["yfinance"]
     logger.info(f"_fallback_fetch symbol={symbol} stack={stack_names}")
@@ -110,7 +127,7 @@ def fetch_bars(
     settings: MarketDataSettings | None = None,
 ) -> pd.DataFrame:
     cache = _get_cache()
-    namespace = _cache_namespace(settings)
+    namespace = _cache_namespace(settings, interval)
     cached = cache.get(symbol, period, interval, start, end, namespace=namespace)
     if cached is not None:
         return cached

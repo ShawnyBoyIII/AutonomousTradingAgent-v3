@@ -16,6 +16,7 @@ from trading_bot.swarm.workers import (
     PatternRecognizerWorker,
     QuantFactorWorker,
     RiskManagerWorker,
+    SentimentAnalystWorker,
     TechnicalAnalystWorker,
     WORKER_CLASSES,
     get_worker_class,
@@ -258,6 +259,7 @@ class TestRiskManagerWorker:
         risks = result.data["risks"]
         assert any("concentration" in r.lower() for r in risks)
 
+
     def test_low_cash_buffer_risk_detected(self):
         config = WorkerConfig(name="test_risk", preset="risk_committee")
         worker = RiskManagerWorker(config)
@@ -320,6 +322,150 @@ class TestRiskManagerWorker:
         assert metadata["technical_confidence"] == 0.77
         assert metadata["fundamental_action"] == "HOLD"
         assert metadata["fundamental_confidence"] == 0.5
+
+    def test_consumes_upstream_sentiment_results(self):
+        config = WorkerConfig(name="risk_manager", preset="risk_committee")
+        worker = RiskManagerWorker(config)
+        df = _make_dataframe()
+        sentiment = WorkerResult(
+            worker_name="sentiment_analyst",
+            preset="investment_committee",
+            state=WorkerState.DONE,
+            ticker_results={
+                "AAPL": {
+                    "action": "BUY",
+                    "confidence": 0.72,
+                    "metadata": {"sentiment_score": 0.42},
+                }
+            },
+        )
+
+        result = worker.execute(
+            ["AAPL"],
+            {"AAPL": df},
+            worker_results={"sentiment_analyst": sentiment},
+        )
+
+        metadata = result.ticker_results["AAPL"]["metadata"]
+        assert metadata["sentiment_action"] == "BUY"
+        assert metadata["sentiment_confidence"] == 0.72
+        assert metadata["sentiment_score"] == 0.42
+
+
+class TestSentimentAnalystWorker:
+    def test_positive_news_with_calm_vix_generates_buy(self):
+        config = WorkerConfig(name="sentiment_analyst", preset="investment_committee")
+        worker = SentimentAnalystWorker(config)
+        result = worker.execute(
+            ["AAPL"],
+            {},
+            sentiment_context={
+                "vix": 13.5,
+                "tickers": {
+                    "AAPL": {
+                        "news": [
+                            {"title": "analyst upgrade", "sentiment": 0.6},
+                            {"title": "earnings beat", "sentiment": 0.4},
+                        ],
+                        "source": "unit-test",
+                    }
+                },
+            },
+        )
+
+        vote = result.ticker_results["AAPL"]
+        assert vote["action"] == "BUY"
+        assert vote["metadata"]["sentiment_score"] > 0.35
+        assert vote["metadata"]["news_count"] == 2
+        assert any("calm VIX" in reason for reason in vote["reasons"])
+
+    def test_high_vix_can_veto_weak_positive_news(self):
+        config = WorkerConfig(name="sentiment_analyst", preset="investment_committee")
+        worker = SentimentAnalystWorker(config)
+        result = worker.execute(
+            ["AAPL"],
+            {},
+            sentiment_context={
+                "vix": 34.0,
+                "tickers": {"AAPL": {"news": [{"title": "minor upgrade", "sentiment": 0.1}]}},
+            },
+        )
+
+        vote = result.ticker_results["AAPL"]
+        assert vote["action"] == "HOLD"
+        assert vote["metadata"]["vix_score"] < 0
+        assert any("high VIX fear" in reason for reason in vote["reasons"])
+
+    def test_scores_rss_headline_keywords_without_numeric_sentiment(self):
+        config = WorkerConfig(name="sentiment_analyst", preset="investment_committee")
+        worker = SentimentAnalystWorker(config)
+        result = worker.execute(
+            ["AAPL"],
+            {},
+            sentiment_context={
+                "tickers": {"AAPL": {"news": [{"title": "AAPL upgraded after earnings beat"}]}}
+            },
+        )
+
+        vote = result.ticker_results["AAPL"]
+        assert vote["metadata"]["news_score"] > 0
+        assert vote["action"] == "BUY"
+
+    def test_market_breadth_adjusts_sentiment_score(self):
+        config = WorkerConfig(name="sentiment_analyst", preset="investment_committee")
+        worker = SentimentAnalystWorker(config)
+        result = worker.execute(
+            ["AAPL"],
+            {},
+            sentiment_context={
+                "breadth": {"advancers": 600, "decliners": 300},
+                "tickers": {"AAPL": {"news": [{"title": "neutral item", "sentiment": 0.25}]}},
+            },
+        )
+
+        vote = result.ticker_results["AAPL"]
+        assert vote["metadata"]["breadth_score"] > 0
+        assert any("strong breadth" in reason for reason in vote["reasons"])
+
+    def test_no_context_returns_hold_with_unavailable_reason(self):
+        config = WorkerConfig(name="sentiment_analyst", preset="investment_committee")
+        worker = SentimentAnalystWorker(config)
+
+        result = worker.execute(["AAPL"], {})
+
+        vote = result.ticker_results["AAPL"]
+        assert vote["action"] == "HOLD"
+        assert vote["confidence"] == 0.4
+        assert "sentiment unavailable" in vote["reasons"]
+        assert "breadth unavailable" in vote["reasons"]
+
+    def test_persists_sentiment_to_memory_store_when_provided(self):
+        class FakeMemoryStore:
+            def __init__(self) -> None:
+                self.entries = []
+
+            def save_memory(self, entry):
+                self.entries.append(entry)
+                return len(self.entries)
+
+        memory_store = FakeMemoryStore()
+        config = WorkerConfig(name="sentiment_analyst", preset="investment_committee")
+        worker = SentimentAnalystWorker(config)
+
+        worker.execute(
+            ["AAPL"],
+            {},
+            sentiment_context={
+                "tickers": {"AAPL": {"news": [{"title": "upgrade", "sentiment": 0.7}]}}
+            },
+            memory_store=memory_store,
+        )
+
+        assert len(memory_store.entries) == 1
+        entry = memory_store.entries[0]
+        assert entry.title == "Sentiment score AAPL"
+        assert "sentiment" in entry.tags
+        assert entry.metadata["sentiment_score"] == 0.7
 
 
 class TestQuantFactorWorker:

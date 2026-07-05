@@ -237,6 +237,48 @@ class DashboardServer:
             except Exception:
                 logger.debug("Failed to compute strategy attribution")
 
+        realtime_pnl = None
+        if ledger:
+            try:
+                from trading_bot.monitoring.realtime_pnl import calculate_realtime_pnl, format_pnl_snapshot
+
+                current_prices = {
+                    str(pos.get("ticker", "")): float(pos.get("last_price", 0.0))
+                    for pos in enriched_positions
+                    if pos.get("ticker") and pos.get("last_price") is not None
+                }
+                realtime_pnl = format_pnl_snapshot(calculate_realtime_pnl(ledger, current_prices))
+            except Exception:
+                logger.debug("Failed to compute realtime pnl snapshot")
+
+        swarm_sentiment = None
+        try:
+            from trading_bot.reports.burn_in_analytics import compute_swarm_sentiment_summary
+
+            swarm_sentiment = compute_swarm_sentiment_summary(decisions)
+            candidates = scan.get("candidates", []) if isinstance(scan, dict) else []
+            if isinstance(candidates, list):
+                ranked = [
+                    row for row in candidates
+                    if isinstance(row, dict) and row.get("swarm_sentiment_score") is not None
+                ]
+                ranked.sort(
+                    key=lambda row: abs(float(row.get("swarm_sentiment_score", 0.0) or 0.0)),
+                    reverse=True,
+                )
+                swarm_sentiment["top_candidates"] = [
+                    {
+                        "ticker": str(row.get("ticker", "")),
+                        "status": str(row.get("status", "")),
+                        "action": str(row.get("swarm_sentiment_action", "")),
+                        "score": round(float(row.get("swarm_sentiment_score", 0.0) or 0.0), 3),
+                        "confidence": round(float(row.get("swarm_sentiment_confidence", 0.0) or 0.0), 2),
+                    }
+                    for row in ranked[:5]
+                ]
+        except Exception:
+            logger.debug("Failed to compute swarm sentiment snapshot")
+
         return {
             "scan": scan,
             "portfolio": portfolio,
@@ -254,6 +296,8 @@ class DashboardServer:
                 "drawdown_current_pct": round(drawdown_metrics.current_drawdown_pct, 2) if drawdown_metrics else None,
                 "drawdown_max_pct": round(drawdown_metrics.max_drawdown_pct, 2) if drawdown_metrics else None,
             },
+            "realtime_pnl": realtime_pnl,
+            "swarm_sentiment": swarm_sentiment,
             "market_regime": market_regime,
             "strategy_attribution": strategy_attribution,
             "generated_at": _now_iso(),
@@ -449,6 +493,8 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
     strategy_results = snapshot.get("strategy_results", [])
     watchlist = snapshot.get("watchlist", [])
     kill = snapshot.get("kill_switch", {})
+    realtime_pnl = snapshot.get("realtime_pnl", {})
+    swarm_sentiment = snapshot.get("swarm_sentiment")
     generated_at = snapshot.get("generated_at", "")
 
     portfolio_summary = portfolio.get("summary", {})
@@ -511,6 +557,10 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
         else '<div class="banner kill-inactive" id="kill-banner" role="status">Kill switch: inactive (trading enabled) '
              '<button class="btn kill-halt" onclick="toggleKillSwitch(\'halt\')" aria-label="Halt all trading activity">HALT Trading</button></div>'
     )
+
+    realtime_performance = realtime_pnl.get("performance", {}) if isinstance(realtime_pnl, dict) else {}
+    realtime_strategy = realtime_pnl.get("strategy_attribution", {}) if isinstance(realtime_pnl, dict) else {}
+    realtime_alerts = realtime_pnl.get("alerts", []) if isinstance(realtime_pnl, dict) else []
 
     return f"""<!doctype html>
 <html lang="en">
@@ -750,10 +800,16 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
     {_card("Net P/L", _signed_money(net_pnl), raw=True)}
     {_card("Open Positions", portfolio_summary.get("positions", 0))}
     {_card("Realized Win Rate", _pct(realized_win_rate))}
+    {_card("Profit Factor", f"{float(realtime_performance.get('profit_factor', 0.0)):.2f}" if realtime_performance else "n/a")}
+    {_card("Closed Trades", realtime_pnl.get("trading", {}).get("closed_trades", 0) if isinstance(realtime_pnl, dict) else 0)}
     {_card(cb_label, cb_value, raw=cb_raw)}
     {_card("Drawdown (max)", f"{drawdown_max:.2f}%" if drawdown_max is not None else "n/a")}
     {_card("Drawdown (current)", f"{drawdown_current:.2f}%" if drawdown_current is not None else "n/a")}
   </section>
+
+  {_realtime_monitoring_widget(realtime_performance, realtime_strategy, realtime_alerts)}
+
+  {_swarm_sentiment_widget(swarm_sentiment)}
 
   {_market_regime_widget(snapshot.get("market_regime"))}
   {_strategy_attribution_widget(snapshot.get("strategy_attribution"))}
@@ -774,7 +830,7 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
           <input id="candidates-search" type="text" placeholder="Filter candidates..." onkeyup="filterCandidates()" style="width: 100%; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px; font-family: inherit;">
         </div>
         <div id="candidates-container">
-        {_table(candidates, ["ticker", "status", "quality", "confidence", "entry"])}
+        {_table(candidates, ["ticker", "status", "quality", "confidence", "swarm_sentiment_action", "swarm_sentiment_score", "entry"])}
         </div>
       </div>
       <div>
@@ -1180,6 +1236,97 @@ def _strategy_attribution_widget(attribution: list[dict] | None) -> str:
     <p class="label">Last {50} exits per strategy</p>
     {''.join(rows)}
   </div>
+'''
+
+
+def _realtime_monitoring_widget(
+    performance: dict[str, Any] | None,
+    strategy_attribution: dict[str, Any] | None,
+    alerts: list[str] | None,
+) -> str:
+    performance = performance or {}
+    strategy_attribution = strategy_attribution or {}
+    alerts = alerts or []
+    if not performance and not strategy_attribution and not alerts:
+        return ""
+
+    strategy_lines = "".join(
+        f'<tr><td>{html.escape(str(tag))}</td><td>{_signed_money(value)}</td></tr>'
+        for tag, value in list(strategy_attribution.items())[:5]
+    ) or '<tr><td colspan="2" class="label">No realized strategy attribution yet.</td></tr>'
+
+    alert_items = "".join(f"<li>{html.escape(str(alert))}</li>" for alert in alerts) or '<li class="label">No active monitoring alerts.</li>'
+
+    return f'''
+  <section class="card" style="margin: 16px 0;">
+    <h2>Realtime Monitoring</h2>
+    <div class="grid">
+      {_card("Win Rate", f"{float(performance.get('win_rate_pct', 0.0)):.2f}%")}
+      {_card("Avg Win", _money(performance.get('avg_win')))}
+      {_card("Avg Loss", _money(performance.get('avg_loss')))}
+      {_card("Wins / Losses", f"{int(performance.get('wins', 0))} / {int(performance.get('losses', 0))}")}
+    </div>
+    <div class="two-col">
+      <div>
+        <h2>Strategy Attribution (Realtime)</h2>
+        <table class="data-table"><thead><tr><th>Strategy</th><th>Realized P&L</th></tr></thead><tbody>{strategy_lines}</tbody></table>
+      </div>
+      <div>
+        <h2>Monitoring Alerts</h2>
+        <ul>{alert_items}</ul>
+      </div>
+    </div>
+  </section>
+'''
+
+
+def _swarm_sentiment_widget(summary: dict[str, Any] | None) -> str:
+    summary = summary or {}
+    if summary.get("evidence_count", 0) <= 0:
+        return ""
+
+    top_candidates = summary.get("top_candidates", []) if isinstance(summary.get("top_candidates"), list) else []
+    top_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(row.get('ticker', '')))}</td>"
+        f"<td>{html.escape(str(row.get('action', '')) or 'n/a')}</td>"
+        f"<td>{float(row.get('score', 0.0)):+.2f}</td>"
+        f"<td>{float(row.get('confidence', 0.0)):.2f}</td>"
+        "</tr>"
+        for row in top_candidates
+    ) or '<tr><td colspan="4" class="label">No sentiment-ranked candidates in the current scan snapshot.</td></tr>'
+
+    closed_outcomes = summary.get("closed_outcomes", {}) if isinstance(summary.get("closed_outcomes"), dict) else {}
+    outcome_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(bucket.title())}</td>"
+        f"<td>{int(metrics.get('trades', 0))}</td>"
+        f"<td>{float(metrics.get('win_rate_pct', 0.0)):.1f}%</td>"
+        f"<td>{_signed_money(metrics.get('total_pnl'))}</td>"
+        "</tr>"
+        for bucket, metrics in closed_outcomes.items()
+    ) or '<tr><td colspan="4" class="label">No closed trades yet for sentiment outcome buckets.</td></tr>'
+
+    return f'''
+  <section class="card" style="margin: 16px 0;">
+    <h2>Swarm Sentiment</h2>
+    <div class="grid">
+      {_card("Evidence", int(summary.get('evidence_count', 0)))}
+      {_card("Bullish", int(summary.get('bullish', 0)))}
+      {_card("Neutral", int(summary.get('neutral', 0)))}
+      {_card("Bearish", int(summary.get('bearish', 0)))}
+    </div>
+    <div class="two-col">
+      <div>
+        <h2>Top Sentiment Candidates</h2>
+        <table class="data-table"><thead><tr><th>Ticker</th><th>Action</th><th>Score</th><th>Conf</th></tr></thead><tbody>{top_rows}</tbody></table>
+      </div>
+      <div>
+        <h2>Closed Outcomes by Bucket</h2>
+        <table class="data-table"><thead><tr><th>Bucket</th><th>Trades</th><th>Win Rate</th><th>P&amp;L</th></tr></thead><tbody>{outcome_rows}</tbody></table>
+      </div>
+    </div>
+  </section>
 '''
 
 

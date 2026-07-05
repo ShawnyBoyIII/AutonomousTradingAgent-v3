@@ -11,25 +11,36 @@ INVESTMENT_COMMITTEE = [
         preset="investment_committee",
         description="Analyzes price action, trends, momentum, and chart patterns",
         priority=1,
+        accuracy_weight=1.1,
     ),
     WorkerConfig(
         name="fundamental_analyst",
         preset="investment_committee",
         description="Evaluates financial health, valuation metrics, and growth prospects",
         priority=1,
+        accuracy_weight=1.0,
+    ),
+    WorkerConfig(
+        name="sentiment_analyst",
+        preset="investment_committee",
+        description="Scores news/sentiment context and market-wide fear indicators",
+        priority=1,
+        accuracy_weight=0.9,
     ),
     WorkerConfig(
         name="risk_manager",
         preset="investment_committee",
         description="Assesses portfolio impact, position sizing, and risk metrics",
         priority=2,
-        depends_on=["technical_analyst", "fundamental_analyst"],
+        depends_on=["technical_analyst", "fundamental_analyst", "sentiment_analyst"],
+        accuracy_weight=1.15,
     ),
     WorkerConfig(
         name="macro_strategist",
         preset="investment_committee",
         description="Evaluates macroeconomic conditions and sector rotation",
         priority=0,
+        accuracy_weight=0.95,
     ),
 ]
 

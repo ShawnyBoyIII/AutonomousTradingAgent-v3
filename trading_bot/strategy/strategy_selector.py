@@ -454,6 +454,10 @@ def selection_to_signal(
         if isinstance(candidate, datetime):
             timestamp = candidate
     if timestamp is None and not intraday_frame.empty:
+        candidate = intraday_frame.index[-1]
+        if isinstance(candidate, datetime):
+            timestamp = candidate
+    if timestamp is None and not intraday_frame.empty:
         timestamp = datetime.now(timezone.utc)
 
     if timestamp is None:

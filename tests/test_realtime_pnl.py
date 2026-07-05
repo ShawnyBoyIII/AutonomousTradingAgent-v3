@@ -36,6 +36,8 @@ class TestRealTimePnL:
         assert result.total_equity == 10000.0
         assert result.cash == 5000.0
         assert result.open_positions == 0
+        assert result.closed_trades == 0
+        assert result.profit_factor == 0.0
 
     def test_calculate_realtime_pnl_with_positions(self) -> None:
         """Test P&L calculation with open positions."""
@@ -79,6 +81,54 @@ class TestRealTimePnL:
 
         assert result.realized_pnl == 100.0  # 150 - 50
         assert result.total_pnl == 100.0
+        assert result.closed_trades == 2
+        assert result.wins == 1
+        assert result.losses == 1
+        assert result.win_rate_pct == 50.0
+        assert result.profit_factor == 3.0
+
+    def test_calculate_realtime_pnl_uses_portfolio_equity_field(self) -> None:
+        mock_ledger = MagicMock()
+        mock_portfolio = MagicMock()
+        del mock_portfolio.total_equity
+        mock_portfolio.equity = 12000.0
+        mock_portfolio.cash = 4000.0
+        mock_portfolio.positions = {}
+        mock_ledger.ensure_portfolio_state.return_value = mock_portfolio
+        mock_ledger.list_order_rows.return_value = []
+
+        result = calculate_realtime_pnl(mock_ledger, {})
+
+        assert result.total_equity == 12000.0
+
+    def test_calculate_realtime_pnl_includes_strategy_attribution(self) -> None:
+        mock_ledger = MagicMock()
+        mock_portfolio = MagicMock()
+        mock_portfolio.total_equity = 10000.0
+        mock_portfolio.cash = 10000.0
+        mock_portfolio.positions = {}
+        mock_ledger.ensure_portfolio_state.return_value = mock_portfolio
+        mock_ledger.list_order_rows.return_value = [
+            {
+                "filled_at": datetime.now(timezone.utc).isoformat(),
+                "side": "SELL",
+                "pnl": 150.0,
+                "strategy_tag": "v3-trend_following",
+            },
+            {
+                "filled_at": datetime.now(timezone.utc).isoformat(),
+                "side": "SELL",
+                "pnl": -50.0,
+                "strategy_tag": "v3-mean_reversion",
+            },
+        ]
+
+        result = calculate_realtime_pnl(mock_ledger, {})
+
+        assert result.strategy_pnl == {
+            "v3-trend_following": 150.0,
+            "v3-mean_reversion": -50.0,
+        }
 
     def test_calculate_realtime_pnl_heat_calculation(self) -> None:
         """Test portfolio heat calculation with losing positions."""
@@ -129,6 +179,8 @@ class TestFormatPnLSnapshot:
         assert formatted["equity"]["total"] == 10000.0
         assert formatted["pnl"]["total"] == 150.0
         assert formatted["trading"]["today_trades"] == 5
+        assert "performance" in formatted
+        assert "strategy_attribution" in formatted
         assert len(formatted["alerts"]) == 1
 
 
@@ -180,6 +232,26 @@ class TestCheckPnLAlerts:
         alerts = check_pnl_alerts(snapshot, thresholds)
 
         assert len(alerts) == 0
+
+    def test_check_pnl_alerts_confidence_gate_profit_factor(self) -> None:
+        snapshot = RealTimePnL(
+            timestamp=datetime.now(timezone.utc),
+            total_equity=10000.0,
+            cash=3000.0,
+            closed_trades=60,
+            wins=20,
+            losses=40,
+            win_rate_pct=33.3,
+            profit_factor=0.7,
+        )
+
+        alerts = check_pnl_alerts(snapshot, PnLAlertThresholds())
+
+        pf_alerts = [a for a in alerts if a["type"] == "low_profit_factor"]
+        wr_alerts = [a for a in alerts if a["type"] == "low_win_rate"]
+        assert len(pf_alerts) == 1
+        assert pf_alerts[0]["level"] == "critical"
+        assert len(wr_alerts) == 1
 
     def test_check_pnl_alerts_low_cash(self) -> None:
         """Test low cash buffer alert."""

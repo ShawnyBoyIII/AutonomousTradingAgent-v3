@@ -424,6 +424,29 @@ run_nightly_tuning() {
     return 0
 }
 
+# Function to refresh advisory learner artifacts
+run_advisory_learner() {
+    if [ "$ADVISORY_ENABLED" != "true" ]; then
+        return 0
+    fi
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] 📚 Running advisory learner..."
+
+    local learner_output
+    learner_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" advisory-learn 2>&1)
+    echo "$learner_output" >> "$LOG_DIR/advisory.log"
+    return 0
+}
+
+on_shutdown() {
+    if [ "$ADVISORY_ENABLED" != "true" ]; then
+        return 0
+    fi
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] 📝 Writing Daily report.md before shutdown..."
+    sh ./tradebot-local --config-path "$CONFIG_FILE" advisory-learn --daily-report >> "$LOG_DIR/advisory.log" 2>&1 || true
+}
+
 # Function to scan and trade
 scan_and_trade() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
@@ -685,12 +708,15 @@ echo ""
 # Track cycle count
 CYCLE_COUNT=0
 
+trap on_shutdown EXIT INT TERM
+
 # Confidence gate thresholds (tightened after 50+ trade sample)
 MIN_TRADES=50
 MIN_NET_PNL=0
 MIN_PROFIT_FACTOR=0.8
 MIN_POSITIVE_WINDOWS=40
 MAX_DRAWDOWN_PCT=10
+ADVISORY_ENABLED=$(.venv/bin/python -c "from pathlib import Path; from trading_bot.config.loader import load_settings; s=load_settings(Path('$CONFIG_FILE')); print('true' if s.advisory.enabled else 'false')" 2>/dev/null || printf "false")
 
 while true; do
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
@@ -744,7 +770,9 @@ while true; do
             echo "{\"event\":\"confidence_gate_halt\",\"timestamp\":\"$timestamp\",\"reason\":\"gates_failed\"}" >> "$LOG_DIR/halt.log"
             exit 1
         fi
-        
+
+        run_advisory_learner
+
         run_rl_compare
     fi
     

@@ -127,3 +127,44 @@ def test_build_scout_candidates_does_not_mix_best_fields_across_rows() -> None:
 
     assert result.summary.included == 0
     assert result.candidates[0].included is False
+
+
+def test_build_scout_candidates_applies_advisory_override() -> None:
+    settings = ScoutSettings(max_universe_size=10, max_snapshot_candidates=10)
+    rows = [
+        {
+            "symbol": "FAST",
+            "quoteType": "EQUITY",
+            "exchange": "NYQ",
+            "marketCap": 5_000_000_000,
+            "regularMarketPrice": 10.0,
+            "averageDailyVolume3Month": 600_000,
+            "dayVolume": 1_500_000,
+            "source": "aggressive_small_caps",
+        },
+        {
+            "symbol": "DROP",
+            "quoteType": "EQUITY",
+            "exchange": "NYQ",
+            "marketCap": 5_000_000_000,
+            "regularMarketPrice": 10.0,
+            "averageDailyVolume3Month": 600_000,
+            "dayVolume": 1_500_000,
+            "source": "small_cap_gainers",
+        },
+    ]
+
+    result = build_scout_candidates(
+        rows,
+        settings,
+        advisory_override={
+            "main_midcap": {
+                "promote_symbols": ["BOOST"],
+                "avoid_symbols": ["DROP"],
+            }
+        },
+    )
+
+    assert result.included_symbols == ["BOOST", "FAST"]
+    included = [row.ticker for row in result.candidates if row.included]
+    assert included == ["BOOST", "FAST"]

@@ -7,6 +7,7 @@ import pytest
 from trading_bot.execution.order_splitter import (
     SplitResult,
     calculate_split_size,
+    execute_split_orders,
     split_order,
 )
 
@@ -165,3 +166,21 @@ class TestSplitResult:
 
         assert len(split_result.results) == 2
         assert split_result.results[0]["order_num"] == 1
+
+
+class TestExecuteSplitOrders:
+    def test_raises_until_broker_flow_is_wired(self) -> None:
+        import asyncio
+
+        split_result = split_order("AAPL", quantity=50, side="buy", split_size=25)
+
+        with pytest.raises(NotImplementedError, match="not wired"):
+            asyncio.run(
+                execute_split_orders(
+                    split_result,
+                    symbol="AAPL",
+                    side="buy",
+                    broker=None,
+                    ledger=None,
+                )
+            )

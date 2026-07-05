@@ -14,6 +14,20 @@ from trading_bot.swarm.results import SignalVote
 logger = logging.getLogger(__name__)
 
 
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class TechnicalAnalystWorker(BaseSwarmWorker):
     """Technical analysis worker using indicators and chart patterns."""
 
@@ -247,6 +261,11 @@ class RiskManagerWorker(BaseSwarmWorker):
                 "fundamental_analyst",
                 ticker,
             )
+            sentiment_context = self._worker_vote_context(
+                worker_results,
+                "sentiment_analyst",
+                ticker,
+            )
 
             # Generate risk-adjusted signal
             signal = self._risk_adjusted_signal(
@@ -255,6 +274,7 @@ class RiskManagerWorker(BaseSwarmWorker):
                 ticker_risks,
                 technical_context,
                 fundamental_context,
+                sentiment_context,
             )
             if signal:
                 signals.append(signal.model_dump())
@@ -356,6 +376,7 @@ class RiskManagerWorker(BaseSwarmWorker):
         risks: list[str],
         technical_context: dict[str, Any] | None = None,
         fundamental_context: dict[str, Any] | None = None,
+        sentiment_context: dict[str, Any] | None = None,
     ) -> SignalVote | None:
         """Generate risk-adjusted signal."""
         try:
@@ -392,6 +413,9 @@ class RiskManagerWorker(BaseSwarmWorker):
                     "technical_confidence": (technical_context or {}).get("confidence"),
                     "fundamental_action": (fundamental_context or {}).get("action"),
                     "fundamental_confidence": (fundamental_context or {}).get("confidence"),
+                    "sentiment_action": (sentiment_context or {}).get("action"),
+                    "sentiment_confidence": (sentiment_context or {}).get("confidence"),
+                    "sentiment_score": ((sentiment_context or {}).get("metadata") or {}).get("sentiment_score"),
                 },
             )
 
@@ -1414,6 +1438,193 @@ class TechnicalConsensusWorker(BaseSwarmWorker):
         )
 
 
+class SentimentAnalystWorker(BaseSwarmWorker):
+    """Sentiment/news worker with offline-first inputs.
+
+    The worker intentionally does not fetch news itself.  Callers may pass
+    ``sentiment_context`` with ticker-level news scores and optional VIX data;
+    the worker turns that context into committee votes and can persist compact
+    scores to ``MemoryStore`` when a ``memory_store`` kwarg is supplied.
+    """
+
+    def execute(self, symbols, market_data, portfolio_state=None, **kwargs):
+        context = kwargs.get("sentiment_context", {}) or {}
+        memory_store = kwargs.get("memory_store")
+        vix_score, vix_reason = self._market_fear_score(market_data, context)
+        breadth_score, breadth_reason = self._breadth_score(context)
+        signals = []
+        ticker_results = {}
+        analysis_parts = []
+
+        for ticker in symbols:
+            ticker_context = self._ticker_context(ticker, context)
+            news_score, news_reasons = self._news_score(ticker_context)
+            score = max(-1.0, min(1.0, news_score + vix_score + breadth_score))
+            action, confidence = self._score_to_vote(score, ticker_context)
+            reasons = [*news_reasons, vix_reason, breadth_reason]
+            metadata = {
+                "sentiment_score": round(score, 4),
+                "news_score": round(news_score, 4),
+                "vix_score": round(vix_score, 4),
+                "breadth_score": round(breadth_score, 4),
+                "news_count": len(ticker_context.get("news", []) or []),
+                "source": ticker_context.get("source", "offline_context"),
+            }
+            vote = SignalVote(
+                ticker=ticker,
+                action=action,
+                confidence=confidence,
+                worker_name=self.config.name,
+                preset=self.config.preset,
+                reasons=reasons,
+                metadata=metadata,
+            )
+            signals.append(vote.model_dump())
+            ticker_results[ticker] = vote.model_dump()
+            analysis_parts.append(f"{ticker}: sentiment={score:.2f} action={action}")
+            self._persist_sentiment(memory_store, ticker, metadata, reasons)
+
+        return WorkerResult(
+            worker_name=self.config.name,
+            preset=self.config.preset,
+            state=WorkerState.DONE,
+            signals=signals,
+            analysis="\n".join(analysis_parts),
+            ticker_results=ticker_results,
+            data={
+                "vix_reason": vix_reason,
+                "symbols_analyzed": len(ticker_results),
+            },
+        )
+
+    def _ticker_context(self, ticker: str, context: dict[str, Any]) -> dict[str, Any]:
+        ticker_contexts = context.get("tickers", {}) if isinstance(context, dict) else {}
+        direct = ticker_contexts.get(ticker) or ticker_contexts.get(ticker.upper())
+        return direct if isinstance(direct, dict) else {}
+
+    def _news_score(self, ticker_context: dict[str, Any]) -> tuple[float, list[str]]:
+        news_items = ticker_context.get("news", []) or []
+        if not news_items:
+            return 0.0, ["sentiment unavailable"]
+        scores = []
+        reasons = []
+        for item in news_items:
+            if not isinstance(item, dict):
+                continue
+            raw_score = item.get("sentiment", item.get("score"))
+            if raw_score is None:
+                raw_score = self._headline_score(str(item.get("title", "")))
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                score = 0.0
+            scores.append(max(-1.0, min(1.0, score)))
+            label = str(item.get("title") or item.get("source") or "news")
+            reasons.append(f"news:{label[:80]}")
+        if not scores:
+            return 0.0, ["sentiment unavailable"]
+        return sum(scores) / len(scores), reasons[:5]
+
+    def _headline_score(self, title: str) -> float:
+        text = title.lower()
+        positive = ("upgrade", "beat", "raises", "raised", "strong", "record", "approval")
+        negative = ("downgrade", "miss", "cuts", "cut", "weak", "probe", "lawsuit")
+        score = 0.0
+        if any(token in text for token in positive):
+            score += 0.35
+        if any(token in text for token in negative):
+            score -= 0.35
+        return score
+
+    def _market_fear_score(
+        self,
+        market_data: dict[str, Any],
+        context: dict[str, Any],
+    ) -> tuple[float, str]:
+        vix_level = None
+        if isinstance(context, dict):
+            vix_level = context.get("vix")
+        if vix_level is None:
+            for key in ("^VIX", "VIX"):
+                frame = market_data.get(key)
+                if isinstance(frame, pd.DataFrame) and not frame.empty and "close" in frame.columns:
+                    vix_level = frame.iloc[-1].get("close")
+                    break
+        try:
+            vix = float(vix_level)
+        except (TypeError, ValueError):
+            return 0.0, "vix unavailable"
+        if vix >= 30:
+            return -0.35, f"high VIX fear ({vix:.1f})"
+        if vix >= 22:
+            return -0.15, f"elevated VIX ({vix:.1f})"
+        if vix <= 14:
+            return 0.1, f"calm VIX ({vix:.1f})"
+        return 0.0, f"neutral VIX ({vix:.1f})"
+
+    def _breadth_score(self, context: dict[str, Any]) -> tuple[float, str]:
+        breadth = context.get("breadth") if isinstance(context, dict) else None
+        if not isinstance(breadth, dict):
+            return 0.0, "breadth unavailable"
+        ratio = breadth.get("advance_decline_ratio")
+        if ratio is None:
+            advancers = breadth.get("advancers")
+            decliners = breadth.get("decliners")
+            try:
+                ratio = float(advancers) / max(float(decliners), 1.0)
+            except (TypeError, ValueError):
+                ratio = None
+        try:
+            numeric = float(ratio)
+        except (TypeError, ValueError):
+            return 0.0, "breadth unavailable"
+        if numeric >= 1.8:
+            return 0.15, f"strong breadth ({numeric:.2f})"
+        if numeric <= 0.6:
+            return -0.15, f"weak breadth ({numeric:.2f})"
+        return 0.0, f"neutral breadth ({numeric:.2f})"
+
+    def _score_to_vote(self, score: float, ticker_context: dict[str, Any]) -> tuple[str, float]:
+        if score >= 0.35:
+            return "BUY", min(0.85, 0.55 + abs(score) * 0.4)
+        if score <= -0.35:
+            return "SELL", min(0.85, 0.55 + abs(score) * 0.4)
+        if not ticker_context:
+            return "HOLD", 0.4
+        return "HOLD", 0.5
+
+    def _persist_sentiment(
+        self,
+        memory_store: Any,
+        ticker: str,
+        metadata: dict[str, Any],
+        reasons: list[str],
+    ) -> None:
+        if memory_store is None:
+            return
+        has_evidence = (
+            _safe_int(metadata.get("news_count")) > 0
+            or abs(_safe_float(metadata.get("vix_score"))) > 0.0
+            or abs(_safe_float(metadata.get("breadth_score"))) > 0.0
+        )
+        if not has_evidence:
+            return
+        try:
+            from trading_bot.memory.models import MemoryEntry, MemoryType
+
+            entry = MemoryEntry(
+                memory_type=MemoryType.TRADING_INSIGHT,
+                title=f"Sentiment score {ticker}",
+                content=f"{ticker} sentiment={metadata['sentiment_score']}: {'; '.join(reasons)}",
+                tags=["sentiment", ticker.upper()],
+                relevance_score=min(1.0, 0.5 + abs(float(metadata["sentiment_score"])) / 2),
+                metadata=metadata,
+            )
+            memory_store.save_memory(entry)
+        except Exception:
+            logger.debug("Failed to persist sentiment memory for %s", ticker)
+
+
 # Worker class registry
 WORKER_CLASSES: dict[str, type[BaseSwarmWorker]] = {
     "technical_analyst": TechnicalAnalystWorker,
@@ -1421,6 +1632,7 @@ WORKER_CLASSES: dict[str, type[BaseSwarmWorker]] = {
     "factor_model": QuantFactorWorker,
     "fundamental_analyst": FundamentalAnalystWorker,
     "macro_strategist": MacroStrategistWorker,
+    "sentiment_analyst": SentimentAnalystWorker,
     "pattern_recognizer": PatternRecognizerWorker,
     "on_chain_analyst": OnChainAnalystWorker,
     "trend_follower": TrendFollowerWorker,

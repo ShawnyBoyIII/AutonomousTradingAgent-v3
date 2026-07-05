@@ -18,6 +18,7 @@ from trading_bot.backtest.attribution import (
     _monte_carlo_simulation,
     _regime_analysis,
     _signal_quality_attribution,
+    _swarm_sentiment_attribution,
     _trade_level_attribution,
     _winner_loser_analysis,
     run_attribution,
@@ -229,6 +230,29 @@ class TestSignalQualityAttribution:
         })
         aapl_quality = [t for t in result["ticker_quality"] if t["ticker"] == "AAPL"][0]
         assert aapl_quality["win_rate"] == 0.0
+
+
+class TestSwarmSentimentAttribution:
+    def test_returns_note_when_missing(self):
+        result = _swarm_sentiment_attribution(_base_result())
+        assert result["rows_with_sentiment"] == 0
+        assert "note" in result
+
+    def test_groups_rows_by_sentiment_bucket(self):
+        result = _swarm_sentiment_attribution(
+            {
+                "rows": [
+                    {"ticker": "AAPL", "trades": 10, "wins": 7, "net_pnl": 500.0, "swarm_sentiment_score": 0.5},
+                    {"ticker": "MSFT", "trades": 8, "wins": 3, "net_pnl": -200.0, "swarm_sentiment_score": -0.4},
+                    {"ticker": "SPY", "trades": 6, "wins": 3, "net_pnl": 50.0, "swarm_sentiment_score": 0.0},
+                ]
+            }
+        )
+
+        assert result["rows_with_sentiment"] == 3
+        assert result["bucket_summary"]["bullish"]["tickers"] == 1
+        assert result["bucket_summary"]["bearish"]["tickers"] == 1
+        assert result["bucket_summary"]["neutral"]["tickers"] == 1
 
 
 class TestBetaRegression:
@@ -444,6 +468,7 @@ class TestRunAttribution:
         assert "holding_period_analysis" in result
         assert "exit_reason_attribution" in result
         assert "signal_quality_attribution" in result
+        assert "swarm_sentiment_attribution" in result
         assert "beta_regression" in result
         assert "regime_analysis" in result
         assert "monte_carlo" in result

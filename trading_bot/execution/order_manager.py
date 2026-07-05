@@ -55,10 +55,10 @@ def submit_signal_as_order(
     )
 
     broker_cash = _extract_broker_cash(broker)
-    estimated_fill_price = apply_slippage(
+    estimated_fill_price = _estimate_broker_fill_price(
+        broker,
+        order,
         signal.entry_price,
-        getattr(broker, "slippage_bps", 0),
-        "BUY",
     )
     estimated_total_cost = (estimated_fill_price * quantity) + getattr(
         broker, "fee_per_order", 0.0
@@ -70,6 +70,21 @@ def submit_signal_as_order(
         return broker.submit_order(order, market_price=signal.entry_price)
     except ValueError:
         return None
+
+
+def _estimate_broker_fill_price(
+    broker: BrokerAdapter,
+    order: OrderRequest,
+    market_price: float,
+) -> float:
+    estimator = getattr(broker, "estimate_fill_price", None)
+    if callable(estimator):
+        return float(estimator(order, market_price))
+    return apply_slippage(
+        market_price,
+        getattr(broker, "slippage_bps", 0),
+        order.side,
+    )
 
 
 def _extract_broker_cash(broker: BrokerAdapter) -> float | None:

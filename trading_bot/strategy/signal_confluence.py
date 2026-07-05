@@ -11,6 +11,18 @@ if TYPE_CHECKING:
 from trading_bot.strategy.market_regime import MarketRegime, RegimeMetrics
 
 
+MEAN_REVERSION_SETUP_TYPES = {
+    "mean_reversion",
+    "mean_reversion_bounce",
+    "oversold_bounce",
+    "vwap_reversion",
+    "range_reversal",
+    "oversold bounce",
+    "vwap reversion",
+    "range reversal",
+}
+
+
 @dataclass
 class SignalScore:
     """Comprehensive signal score with components."""
@@ -136,7 +148,7 @@ def _score_technical_setup(
 
             if setup_type == "breakout" and position_in_range > 0.7:
                 score += 0.4
-            elif setup_type == "mean_reversion" and position_in_range < 0.3:
+            elif setup_type in MEAN_REVERSION_SETUP_TYPES and position_in_range < 0.3:
                 score += 0.4
 
     # Check moving average alignment
@@ -148,7 +160,7 @@ def _score_technical_setup(
             sma50 = float(sma50_val)
             if setup_type == "breakout" and ema20 > sma50:
                 score += 0.3
-            elif setup_type == "mean_reversion" and ema20 < sma50:
+            elif setup_type in MEAN_REVERSION_SETUP_TYPES and ema20 < sma50:
                 score += 0.3
 
     return min(2.0, score)
@@ -238,7 +250,7 @@ def _score_momentum(intraday_frame: "pd.DataFrame", setup_type: str) -> float:
                     rsi_score = 1.3
                 elif rsi > 70:
                     rsi_score = 0.7
-            elif setup_type in ("mean_reversion", "mean_reversion_bounce", "oversold_bounce", "vwap_reversion", "range_reversal"):
+            elif setup_type in MEAN_REVERSION_SETUP_TYPES:
                 # For mean reversion, oversold is good
                 if rsi < 35:
                     rsi_score = 1.5
@@ -281,7 +293,7 @@ def _score_regime_alignment(regime: MarketRegime, setup_type: str) -> float:
             return 0.5
         else:
             return 0.0
-    elif setup_type in ["oversold bounce", "vwap reversion", "range reversal"]:
+    elif setup_type in MEAN_REVERSION_SETUP_TYPES:
         if recommended == "mean_reversion":
             return 2.0
         elif recommended == "trend_following":

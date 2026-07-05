@@ -21,10 +21,35 @@ def _make_engine(db_path: Path) -> any:
 
 def init_db(settings: Settings) -> any:
     from trading_bot.db.models import Base
+    from sqlalchemy import text
 
     db_path = _resolve_db_path(settings)
     engine = _make_engine(db_path)
     Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        for ddl in (
+            "ALTER TABLE trades ADD COLUMN swarm_sentiment_bucket VARCHAR(20)",
+            "ALTER TABLE trades ADD COLUMN signal_quality VARCHAR(20)",
+            "ALTER TABLE trades ADD COLUMN market_regime VARCHAR(40)",
+            "ALTER TABLE trades ADD COLUMN supermodel_decision VARCHAR(20)",
+            "ALTER TABLE trades ADD COLUMN swarm_decision VARCHAR(30)",
+            "ALTER TABLE trades ADD COLUMN consensus VARCHAR(20)",
+            "ALTER TABLE trades ADD COLUMN swarm_sentiment_score FLOAT",
+            "ALTER TABLE trades ADD COLUMN swarm_sentiment_confidence FLOAT",
+            "ALTER TABLE trades ADD COLUMN entry_volume_ratio FLOAT",
+            "ALTER TABLE trades ADD COLUMN entry_range_ratio FLOAT",
+            "ALTER TABLE trades ADD COLUMN adaptive_rr FLOAT",
+            "ALTER TABLE trades ADD COLUMN exit_rsi FLOAT",
+            "ALTER TABLE trades ADD COLUMN exit_atr FLOAT",
+            "ALTER TABLE trades ADD COLUMN hold_duration_minutes FLOAT",
+            "ALTER TABLE trades ADD COLUMN exit_regime VARCHAR(40)",
+            "ALTER TABLE trades ADD COLUMN exit_strategy VARCHAR(200)",
+            "ALTER TABLE trades ADD COLUMN exit_reason VARCHAR(50)",
+        ):
+            try:
+                conn.execute(text(ddl))
+            except Exception:
+                pass
     return engine
 
 

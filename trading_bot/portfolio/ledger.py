@@ -68,7 +68,9 @@ class PortfolioLedger:
                     fill_price REAL,
                     fees REAL,
                     filled_at TEXT,
-                    pnl REAL DEFAULT 0
+                    pnl REAL DEFAULT 0,
+                    strategy_tag TEXT DEFAULT '',
+                    swarm_sentiment_bucket TEXT DEFAULT ''
                 )
                 """
             )
@@ -80,6 +82,10 @@ class PortfolioLedger:
             # Migration: add strategy_tag column for trade attribution.
             try:
                 conn.execute("ALTER TABLE orders ADD COLUMN strategy_tag TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE orders ADD COLUMN swarm_sentiment_bucket TEXT DEFAULT ''")
             except sqlite3.OperationalError:
                 pass
             conn.execute(
@@ -164,12 +170,19 @@ class PortfolioLedger:
             (state.model_dump_json(),),
         )
 
-    def record_fill(self, fill: FillResult, side: str, realized_pnl: float = 0.0, strategy_tag: str = "") -> None:
+    def record_fill(
+        self,
+        fill: FillResult,
+        side: str,
+        realized_pnl: float = 0.0,
+        strategy_tag: str = "",
+        swarm_sentiment_bucket: str = "",
+    ) -> None:
         self.initialize()
         self._execute_write(
             """
-            INSERT INTO orders (id, ticker, side, quantity, fill_price, fees, filled_at, pnl, strategy_tag)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO orders (id, ticker, side, quantity, fill_price, fees, filled_at, pnl, strategy_tag, swarm_sentiment_bucket)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 fill.order_id,
@@ -181,6 +194,7 @@ class PortfolioLedger:
                 fill.filled_at.isoformat(),
                 float(realized_pnl),
                 strategy_tag,
+                swarm_sentiment_bucket,
             ),
         )
 
@@ -189,9 +203,12 @@ class PortfolioLedger:
         with self._connect() as conn:
             table_info = conn.execute("PRAGMA table_info(orders)").fetchall()
             has_tag = any(r[1] == "strategy_tag" for r in table_info)
+            has_sentiment = any(r[1] == "swarm_sentiment_bucket" for r in table_info)
             cols = "id, ticker, side, quantity, fill_price, fees, filled_at, pnl"
             if has_tag:
                 cols += ", strategy_tag"
+            if has_sentiment:
+                cols += ", swarm_sentiment_bucket"
             rows = conn.execute(
                 f"SELECT {cols} FROM orders ORDER BY filled_at ASC, id ASC"
             ).fetchall()
@@ -211,6 +228,10 @@ class PortfolioLedger:
             tag = (row[8] if len(row) > 8 and row[8] else "") if has_tag else ""
             if tag:
                 d["strategy_tag"] = tag
+            sentiment_idx = 9 if has_tag else 8
+            sentiment = (row[sentiment_idx] if len(row) > sentiment_idx and row[sentiment_idx] else "") if has_sentiment else ""
+            if sentiment:
+                d["swarm_sentiment_bucket"] = sentiment
             results.append(d)
         return results
 

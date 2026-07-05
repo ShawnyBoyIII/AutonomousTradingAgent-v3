@@ -15,6 +15,7 @@ class Position(BaseModel):
     initial_risk: float | None = Field(default=None, gt=0.0)
     entry_at: datetime | None = None
     strategy_tag: str = ""
+    partial_profit_taken: bool = False
 
 
 class PortfolioState(BaseModel):

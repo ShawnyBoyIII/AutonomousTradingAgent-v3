@@ -5,8 +5,11 @@ from pathlib import Path
 import time
 import logging
 
+import pandas as pd
+
 from trading_bot.config.settings import Settings
 from trading_bot.data import market_data
+from trading_bot.data.indicators import add_atr, add_rsi
 from trading_bot.events.bus import MessageBus
 from trading_bot.events.cache import Cache
 from trading_bot.events.loop import EventLoop
@@ -19,10 +22,12 @@ from trading_bot.events.types import (
 from trading_bot.execution.paper_broker import PaperBroker
 from trading_bot.portfolio.ledger import PortfolioLedger
 from trading_bot.portfolio.performance import compute_portfolio_heat
+from trading_bot.runtime.decision_log import append_decision_event
 from trading_bot.runtime.orchestrator import (
     run_scan,
     run_paper_trade,
 )
+from trading_bot.runtime.position_exit import fill_partial_take_profit_position, fill_sell_position
 from trading_bot.scout import build_scout_candidates
 
 logger = logging.getLogger(__name__)
@@ -164,22 +169,22 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
         _build_signal_result,
         _evaluate_counter_thesis_for_signal,
         _scan_quality,
-        _portfolio_state_from_broker,
     )
-    from trading_bot.runtime.decision_log import append_decision_event
     from trading_bot.runtime.snapshots import write_snapshot
     from trading_bot.safety.kill_switch import check_kill_switch_before_trade
     from trading_bot.safety.circuit_breaker import check_circuit_breakers
     from trading_bot.risk.risk_manager import evaluate_signal
     from trading_bot.strategy.trailing_stop import next_trailing_stop
-    from trading_bot.execution.fills import apply_slippage
-    from trading_bot.execution.order_manager import submit_signal_as_order
 
     state = ledger.ensure_portfolio_state()
     broker = PaperBroker(
         starting_cash=state.cash,
         fee_per_order=settings.paper.fee_per_order,
         slippage_bps=settings.paper.slippage_bps,
+        dynamic_slippage_enabled=settings.paper.dynamic_slippage_enabled,
+        dynamic_slippage_notional_bps_per_10k=settings.paper.dynamic_slippage_notional_bps_per_10k,
+        dynamic_slippage_low_price_boost_bps=settings.paper.dynamic_slippage_low_price_boost_bps,
+        dynamic_slippage_max_extra_bps=settings.paper.dynamic_slippage_max_extra_bps,
     )
     broker.positions = {
         ticker: position.quantity for ticker, position in state.positions.items()
@@ -277,7 +282,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
             # Exit priority 1: EOD exit
             from trading_bot.runtime.session import now_in_zone, should_eod_exit
             if should_eod_exit(now_in_zone(settings.app.timezone), settings.session):
-                _close_position(
+                updated_state = _close_position(
                     ticker=ticker,
                     position=position,
                     broker=broker,
@@ -289,12 +294,15 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                     log_path=log_path,
                     reason="eod_exit",
                     state=state,
+                    bars=intraday_frame,
                 )
+                if updated_state is not None:
+                    state = updated_state
                 continue
 
             # Exit priority 2: Stop loss
             if position.stop_loss is not None and current_price <= position.stop_loss:
-                _close_position(
+                updated_state = _close_position(
                     ticker=ticker,
                     position=position,
                     broker=broker,
@@ -306,24 +314,58 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                     log_path=log_path,
                     reason="stop_loss",
                     state=state,
+                    bars=intraday_frame,
                 )
+                if updated_state is not None:
+                    state = updated_state
                 continue
 
             # Exit priority 3: Profit target
             if position.profit_target is not None and current_price >= position.profit_target:
-                _close_position(
-                    ticker=ticker,
-                    position=position,
-                    broker=broker,
-                    ledger=ledger,
-                    current_price=current_price,
-                    settings=settings,
-                    line_parts=line_parts,
-                    exit_events=exit_events,
-                    log_path=log_path,
-                    reason="profit_target",
-                    state=state,
-                )
+                if (
+                    settings.paper.partial_take_profit_enabled
+                    and not getattr(position, "partial_profit_taken", False)
+                    and position.quantity >= settings.paper.partial_take_profit_min_qty
+                ):
+                    updated_state, event, line = fill_partial_take_profit_position(
+                        ticker=ticker,
+                        position=position,
+                        submitted_at=now,
+                        last_price=current_price,
+                        broker=broker,
+                        ledger=ledger,
+                        state=state,
+                        log_path=log_path,
+                        fraction=settings.paper.partial_take_profit_fraction,
+                        settings=settings,
+                    )
+                    append_decision_event(log_path, event)
+                    line_parts.append(line)
+                    exit_events.append(
+                        {
+                            "ticker": ticker,
+                            "reason": event["reason"],
+                            "quantity": event["quantity"],
+                            "fill_price": event["fill_price"],
+                        }
+                    )
+                else:
+                    updated_state = _close_position(
+                        ticker=ticker,
+                        position=position,
+                        broker=broker,
+                        ledger=ledger,
+                        current_price=current_price,
+                        settings=settings,
+                        line_parts=line_parts,
+                        exit_events=exit_events,
+                        log_path=log_path,
+                        reason="profit_target",
+                        state=state,
+                        bars=intraday_frame,
+                    )
+                if updated_state is not None:
+                    state = updated_state
                 continue
 
             # Exit priority 4: Time-based exit (stale positions)
@@ -334,7 +376,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                     entry_at = entry_at.replace(tzinfo=timezone.utc)
                 held = (now - entry_at).total_seconds() / 60.0
                 if held >= time_exit_m:
-                    _close_position(
+                    updated_state = _close_position(
                         ticker=ticker,
                         position=position,
                         broker=broker,
@@ -346,7 +388,10 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                         log_path=log_path,
                         reason=f"time_exit_{int(held)}m",
                         state=state,
+                        bars=intraday_frame,
                     )
+                    if updated_state is not None:
+                        state = updated_state
                     continue
 
             # Exit priority 5: Counter-thesis exit (V3)
@@ -355,7 +400,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                 if signal is not None:
                     counter_result = _evaluate_counter_thesis_for_signal(ticker, signal, settings)
                     if counter_result is not None and counter_result.exit_triggered:
-                        _close_position(
+                        updated_state = _close_position(
                             ticker=ticker,
                             position=position,
                             broker=broker,
@@ -367,14 +412,17 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                             log_path=log_path,
                             reason="counter_thesis",
                             state=state,
+                            bars=intraday_frame,
                         )
+                        if updated_state is not None:
+                            state = updated_state
                         continue
 
             # Exit priority 5: Trailing stop
             atr = _fetch_atr(ticker, settings) if settings.risk.use_atr_sizing else None
             trailing_stop, _ = next_trailing_stop(position, current_price, atr)
             if trailing_stop is not None and current_price <= trailing_stop:
-                _close_position(
+                updated_state = _close_position(
                     ticker=ticker,
                     position=position,
                     broker=broker,
@@ -386,7 +434,10 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                     log_path=log_path,
                     reason="trailing_stop",
                     state=state,
+                    bars=intraday_frame,
                 )
+                if updated_state is not None:
+                    state = updated_state
                 continue
 
             # No exit triggered - update highest_high
@@ -450,60 +501,73 @@ def _close_position(
     log_path: Path,
     reason: str,
     state: PortfolioState | None = None,
-) -> None:
-    """Close a position and record the fill."""
-    estimated_fill_price = apply_slippage(current_price, broker.slippage_bps, "SELL")
-    fill = submit_signal_as_order(
-        signal=None,
-        broker=broker,
-        account_equity=broker.cash + (current_price * position.quantity),
-        open_tickers=set(),
-        risk_settings=settings.risk,
-        ticker=ticker,
-        quantity=position.quantity,
-        side="SELL",
-        price=estimated_fill_price,
-    )
+    bars=None,
+) -> PortfolioState | None:
+    """Close a position and return the updated portfolio state."""
+    exit_rsi = None
+    exit_atr = None
+    hold_duration = None
+    exit_strategy = None
 
-    if fill is None:
+    if bars is not None and not bars.empty:
+        try:
+            bar_copy = bars.copy()
+            bar_copy = add_rsi(bar_copy, period=14)
+            rsi_val = bar_copy["rsi_14"].iloc[-1] if "rsi_14" in bar_copy.columns else None
+            if rsi_val is not None and not (isinstance(rsi_val, float) and pd.isna(rsi_val)):
+                exit_rsi = float(rsi_val)
+        except (KeyError, ValueError):
+            exit_rsi = None
+        try:
+            bar_copy = bars.copy()
+            bar_copy = add_atr(bar_copy, period=14)
+            atr_val = bar_copy["atr_14"].iloc[-1] if "atr_14" in bar_copy.columns else None
+            if atr_val is not None and not (isinstance(atr_val, float) and pd.isna(atr_val)):
+                exit_atr = float(atr_val)
+        except (KeyError, ValueError):
+            exit_atr = None
+
+    if position.entry_at is not None:
+        entry_at = position.entry_at
+        if entry_at.tzinfo is None:
+            entry_at = entry_at.replace(tzinfo=timezone.utc)
+        hold_duration = (datetime.now(timezone.utc) - entry_at).total_seconds() / 60.0
+
+    exit_strategy = getattr(position, "strategy_tag", None)
+
+    try:
+        updated_state, event, line = fill_sell_position(
+            ticker=ticker,
+            position=position,
+            reason=reason,
+            submitted_at=datetime.now(timezone.utc),
+            last_price=current_price,
+            broker=broker,
+            ledger=ledger,
+            state=state or ledger.ensure_portfolio_state(),
+            log_path=log_path,
+            exit_rsi=exit_rsi,
+            exit_atr=exit_atr,
+            hold_duration_minutes=hold_duration,
+            exit_strategy=exit_strategy,
+            exit_reason=reason,
+            settings=settings,
+        )
+    except ValueError:
         line_parts.append(f"SELL_FAILED reason={reason}")
-        return
+        return None
 
-    ledger.record_fill(fill, side="SELL", strategy_tag=position.strategy_tag)
-    updated_state = _portfolio_state_from_broker(
-        broker,
-        None,
-        previous_state=state,
-        fill_fees=fill.fees,
-        filled_at=fill.filled_at,
-    )
-    # Record exit timestamp for idempotency guard against concurrent sells
-    if state is not None:
-        updated_state.last_exited_at = dict(state.last_exited_at)
-        updated_state.last_exited_at[ticker] = fill.filled_at.isoformat()
-    ledger.save_portfolio_state(updated_state)
-    ledger.record_equity_snapshot(updated_state, timestamp=fill.filled_at)
-
-    append_decision_event(
-        log_path,
+    append_decision_event(log_path, event)
+    line_parts.append(line)
+    exit_events.append(
         {
-            "command": "manage-positions",
             "ticker": ticker,
-            "status": "FILLED",
             "reason": reason,
-            "quantity": fill.quantity,
-            "fill_price": fill.fill_price,
-            "fees": fill.fees,
-        },
+            "quantity": event["quantity"],
+            "fill_price": event["fill_price"],
+        }
     )
-
-    line_parts.append(f"SELL qty={fill.quantity} price={fill.fill_price:.2f} reason={reason}")
-    exit_events.append({
-        "ticker": ticker,
-        "reason": reason,
-        "quantity": fill.quantity,
-        "fill_price": fill.fill_price,
-    })
+    return updated_state
 
 
 def run_continuous_loop(

@@ -52,6 +52,10 @@ class PaperBrokerAdapter(BrokerAdapter):
             starting_cash=settings.rl.backtest_starting_cash,
             fee_per_order=settings.paper.fee_per_order,
             slippage_bps=settings.paper.slippage_bps,
+            dynamic_slippage_enabled=settings.paper.dynamic_slippage_enabled,
+            dynamic_slippage_notional_bps_per_10k=settings.paper.dynamic_slippage_notional_bps_per_10k,
+            dynamic_slippage_low_price_boost_bps=settings.paper.dynamic_slippage_low_price_boost_bps,
+            dynamic_slippage_max_extra_bps=settings.paper.dynamic_slippage_max_extra_bps,
         )
         self._connected = False
         self._orders: list[BrokerOrder] = []
