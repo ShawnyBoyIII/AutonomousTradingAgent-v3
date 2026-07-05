@@ -726,7 +726,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
         if eod_active:
             state, event, line = _fill_sell_position(
                 ticker, position, "eod", manage_now, last_price,
-                broker, ledger, state, log_path, frame,
+                broker, ledger, state, log_path, frame, ctx.obj,
             )
             append_decision_event(log_path, event)
             exit_events.append(event)
@@ -736,7 +736,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
         if position.stop_loss is not None and last_price <= position.stop_loss:
             state, event, line = _fill_sell_position(
                 ticker, position, "stop", manage_now, last_price,
-                broker, ledger, state, log_path, frame,
+                broker, ledger, state, log_path, frame, ctx.obj,
             )
             append_decision_event(log_path, event)
             exit_events.append(event)
@@ -759,11 +759,12 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
                     state=state,
                     log_path=log_path,
                     fraction=ctx.obj.paper.partial_take_profit_fraction,
+                    settings=ctx.obj,
                 )
             else:
                 state, event, line = _fill_sell_position(
                     ticker, position, "target", manage_now, last_price,
-                    broker, ledger, state, log_path, frame,
+                    broker, ledger, state, log_path, frame, ctx.obj,
                 )
             append_decision_event(log_path, event)
             exit_events.append(event)
@@ -779,7 +780,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
             if held >= time_exit_m:
                 state, event, line = _fill_sell_position(
                     ticker, position, f"time_exit_{int(held)}m", manage_now, last_price,
-                    broker, ledger, state, log_path, frame,
+                    broker, ledger, state, log_path, frame, ctx.obj,
                 )
                 append_decision_event(log_path, event)
                 exit_events.append(event)
@@ -1538,7 +1539,7 @@ def _maybe_counter_thesis_exit(
 
     new_state, event, line = _fill_sell_position(
         ticker, position, "counter-thesis", manage_now, last_price,
-        broker, ledger, state, log_path, frame,
+        broker, ledger, state, log_path, frame, settings,
     )
     event["counter_thesis"] = result.to_dict()
     return new_state, event, line
@@ -1555,6 +1556,7 @@ def _fill_sell_position(
     state,
     log_path,
     bars=None,
+    settings=None,
 ) -> tuple:
     """Submit a market SELL order, record the fill, and update portfolio state."""
     exit_rsi = None
@@ -1603,6 +1605,7 @@ def _fill_sell_position(
         hold_duration_minutes=hold_duration,
         exit_strategy=exit_strategy,
         exit_reason=reason,
+        settings=settings,
     )
 
 

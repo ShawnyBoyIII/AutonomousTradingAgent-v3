@@ -237,8 +237,6 @@ def compute_swarm_sentiment_summary(events: list[dict]) -> dict[str, Any]:
         return "neutral"
 
     bucket_counts = Counter()
-    latest_scan_bucket: dict[str, str] = {}
-    latest_scan_score: dict[str, float] = {}
     for event in scored_scans:
         try:
             score = float(event.get("swarm_sentiment_score", 0.0) or 0.0)
@@ -246,12 +244,10 @@ def compute_swarm_sentiment_summary(events: list[dict]) -> dict[str, Any]:
             continue
         sentiment_bucket = bucket(score)
         bucket_counts[sentiment_bucket] += 1
-        ticker = str(event.get("ticker", "") or "")
-        if ticker:
-            latest_scan_bucket[ticker] = sentiment_bucket
-            latest_scan_score[ticker] = score
 
-    open_buckets: dict[str, list[str]] = defaultdict(list)
+    latest_scan_bucket: dict[str, str] = {}
+    latest_scan_score: dict[str, float] = {}
+    open_entries: dict[str, list[dict[str, float | str | int]]] = defaultdict(list)
     closed_outcomes: dict[str, dict[str, float]] = defaultdict(lambda: {
         "trades": 0,
         "wins": 0,
@@ -266,11 +262,31 @@ def compute_swarm_sentiment_summary(events: list[dict]) -> dict[str, Any]:
         ticker = str(event.get("ticker", "") or "")
         if not ticker:
             continue
-        if command == "paper-trade" and status == "FILLED":
+        if command == "scan" and event.get("swarm_sentiment_score") is not None:
+            try:
+                score = float(event.get("swarm_sentiment_score", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            latest_scan_bucket[ticker] = bucket(score)
+            latest_scan_score[ticker] = score
+        elif command == "paper-trade" and status == "FILLED":
             if ticker in latest_scan_bucket:
-                open_buckets[ticker].append(latest_scan_bucket[ticker])
-        elif command == "manage-positions" and status == "FILLED" and open_buckets.get(ticker):
-            sentiment_bucket = open_buckets[ticker].pop(0)
+                try:
+                    entry_price = float(event.get("fill_price", 0.0) or 0.0)
+                    quantity = int(event.get("quantity", 0) or 0)
+                    fees = float(event.get("fees", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                open_entries[ticker].append(
+                    {
+                        "bucket": latest_scan_bucket[ticker],
+                        "score": latest_scan_score.get(ticker, 0.0),
+                        "entry_price": entry_price,
+                        "quantity": quantity,
+                        "fees": fees,
+                    }
+                )
+        elif command == "manage-positions" and status == "FILLED" and open_entries.get(ticker):
             try:
                 sell_price = float(event.get("fill_price", 0.0) or 0.0)
                 quantity = int(event.get("quantity", 0) or 0)
@@ -279,15 +295,36 @@ def compute_swarm_sentiment_summary(events: list[dict]) -> dict[str, Any]:
                 sell_price = 0.0
                 quantity = 0
                 fees = 0.0
-            pnl = (sell_price * quantity) - fees
-            summary = closed_outcomes[sentiment_bucket]
-            summary["trades"] += 1
-            summary["total_pnl"] += pnl
-            if pnl > 0:
-                summary["wins"] += 1
-            elif pnl < 0:
-                summary["losses"] += 1
-            score_sums[sentiment_bucket] += latest_scan_score.get(ticker, 0.0)
+            remaining_qty = quantity
+            remaining_sell_fees = fees
+            while remaining_qty > 0 and open_entries.get(ticker):
+                entry = open_entries[ticker][0]
+                entry_qty = int(entry["quantity"])
+                if entry_qty <= 0:
+                    open_entries[ticker].pop(0)
+                    continue
+                closed_qty = min(remaining_qty, entry_qty)
+                entry_fees = float(entry["fees"])
+                entry_fee_share = entry_fees * (closed_qty / entry_qty)
+                sell_fee_share = remaining_sell_fees * (closed_qty / remaining_qty) if remaining_qty > 0 else 0.0
+                pnl = ((sell_price - float(entry["entry_price"])) * closed_qty) - entry_fee_share - sell_fee_share
+                sentiment_bucket = str(entry["bucket"])
+                summary = closed_outcomes[sentiment_bucket]
+                summary["trades"] += 1
+                summary["total_pnl"] += pnl
+                if pnl > 0:
+                    summary["wins"] += 1
+                elif pnl < 0:
+                    summary["losses"] += 1
+                score_sums[sentiment_bucket] += float(entry["score"])
+
+                remaining_qty -= closed_qty
+                remaining_sell_fees -= sell_fee_share
+                if closed_qty == entry_qty:
+                    open_entries[ticker].pop(0)
+                else:
+                    entry["quantity"] = entry_qty - closed_qty
+                    entry["fees"] = max(0.0, entry_fees - entry_fee_share)
 
     normalized_outcomes: dict[str, dict[str, float]] = {}
     for sentiment_bucket, summary in closed_outcomes.items():

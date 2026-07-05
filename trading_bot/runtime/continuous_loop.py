@@ -337,6 +337,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                         state=state,
                         log_path=log_path,
                         fraction=settings.paper.partial_take_profit_fraction,
+                        settings=settings,
                     )
                     append_decision_event(log_path, event)
                     line_parts.append(line)
@@ -550,6 +551,7 @@ def _close_position(
             hold_duration_minutes=hold_duration,
             exit_strategy=exit_strategy,
             exit_reason=reason,
+            settings=settings,
         )
     except ValueError:
         line_parts.append(f"SELL_FAILED reason={reason}")

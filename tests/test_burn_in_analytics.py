@@ -60,10 +60,6 @@ class TestComputeTradeSummary:
                           "reason": "profit_target", "quantity": 10, "fill_price": 110.0, "fees": 1.0}) + "\n",
             encoding="utf-8",
         )
-        db_path = tmp_path / "state.db"
-        ledger = None  # Will create a minimal mock
-
-        # Create a minimal ledger mock
         from unittest.mock import MagicMock
         ledger = MagicMock()
         ledger.list_order_rows.return_value = []
@@ -73,7 +69,7 @@ class TestComputeTradeSummary:
         assert summary["closed_trades"] == 1
         assert summary["wins"] == 1
         assert summary["losses"] == 0
-        assert summary["total_pnl"] == 98.0  # (110-100)*10 - 1 - 1
+        assert summary["total_pnl"] == 98.0
 
     def test_counts_losses(self, tmp_path):
         log_path = tmp_path / "decision-log.jsonl"
@@ -90,7 +86,7 @@ class TestComputeTradeSummary:
 
         summary = compute_trade_summary(_parse_decision_log(log_path), ledger)
         assert summary["losses"] == 1
-        assert summary["total_pnl"] == -52.0  # (490-500)*5 - 1 - 1
+        assert summary["total_pnl"] == -52.0
 
     def test_handles_orphan_sells(self, tmp_path):
         log_path = tmp_path / "decision-log.jsonl"
@@ -199,7 +195,25 @@ class TestComputeSwarmSentimentSummary:
         assert summary["bullish"] == 1
         assert summary["bearish"] == 1
         assert summary["closed_outcomes"]["bullish"]["trades"] == 1
+        assert summary["closed_outcomes"]["bullish"]["wins"] == 1
+        assert summary["closed_outcomes"]["bullish"]["total_pnl"] == 98.0
         assert summary["closed_outcomes"]["bearish"]["trades"] == 1
+        assert summary["closed_outcomes"]["bearish"]["losses"] == 1
+        assert summary["closed_outcomes"]["bearish"]["total_pnl"] == -102.0
+
+    def test_uses_entry_time_sentiment_not_latest_scan_bucket(self):
+        events = [
+            {"command": "scan", "ticker": "AAPL", "status": "APPROVED", "swarm_sentiment_score": 0.6},
+            {"command": "paper-trade", "ticker": "AAPL", "status": "FILLED", "fill_price": 100.0, "quantity": 10, "fees": 1.0},
+            {"command": "scan", "ticker": "AAPL", "status": "APPROVED", "swarm_sentiment_score": -0.5},
+            {"command": "manage-positions", "ticker": "AAPL", "status": "FILLED", "fill_price": 110.0, "quantity": 10, "fees": 1.0},
+        ]
+
+        summary = compute_swarm_sentiment_summary(events)
+
+        assert summary["closed_outcomes"]["bullish"]["trades"] == 1
+        assert summary["closed_outcomes"]["bullish"]["avg_sentiment_score"] == 0.6
+        assert "bearish" not in summary["closed_outcomes"]
 
 
 class TestComputeExitSummary:

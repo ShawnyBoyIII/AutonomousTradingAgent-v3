@@ -28,6 +28,7 @@ def fill_sell_position(
     exit_regime: str | None = None,
     exit_strategy: str | None = None,
     exit_reason: str | None = None,
+    settings=None,
 ) -> tuple[PortfolioState, dict[str, object], str]:
     """Submit a market SELL order, record the fill, and update portfolio state."""
     fill_quantity = quantity if quantity is not None else position.quantity
@@ -45,14 +46,16 @@ def fill_sell_position(
     ledger.record_fill(fill, side="SELL", realized_pnl=realized_pnl, strategy_tag=position.strategy_tag)
 
     try:
-        from trading_bot.cli.app import load_settings
         from trading_bot.db.models import Trade
         from trading_bot.db.repositories import close_position, update_trade_exit
         from trading_bot.db.session import get_session, init_db, make_session_factory
         from sqlalchemy import select
 
-        cfg = load_settings()
-        engine = init_db(cfg)
+        if settings is None:
+            from trading_bot.cli.app import load_settings
+
+            settings = load_settings()
+        engine = init_db(settings)
         session_factory = make_session_factory(engine)
         session = get_session(session_factory)
         try:
@@ -60,9 +63,9 @@ def fill_sell_position(
                 select(Trade).where(
                     Trade.ticker == ticker.upper(),
                     Trade.status == "FILLED",
-                )
-            ).scalars().order_by(Trade.filled_at.desc()).first()
-            if trade:
+                ).order_by(Trade.filled_at.desc())
+            ).scalars().first()
+            if trade and close_db_position:
                 try:
                     update_trade_exit(
                         session=session,
@@ -142,9 +145,10 @@ def fill_partial_take_profit_position(
     last_price: float,
     broker,
     ledger,
-    state: PortfolioState,
-    log_path,
-    fraction: float = 0.5,
+        state: PortfolioState,
+        log_path,
+        fraction: float = 0.5,
+        settings=None,
 ) -> tuple[PortfolioState, dict[str, object], str]:
     """Scale out part of a winning position and protect the remainder."""
     partial_qty = max(1, int(position.quantity * fraction))
@@ -164,6 +168,7 @@ def fill_partial_take_profit_position(
         quantity=partial_qty,
         close_db_position=False,
         mark_exit_timestamp=False,
+        settings=settings,
     )
     remaining = new_state.positions.get(ticker)
     if remaining is not None:
@@ -176,7 +181,6 @@ def fill_partial_take_profit_position(
             }
         )
         ledger.save_portfolio_state(new_state)
-        ledger.record_equity_snapshot(new_state, timestamp=submitted_at)
 
     event["remaining_quantity"] = new_state.positions.get(ticker).quantity if ticker in new_state.positions else 0
     line = f"{line} remaining={event['remaining_quantity']}"
