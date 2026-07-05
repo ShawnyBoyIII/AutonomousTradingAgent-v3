@@ -854,6 +854,7 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
     {_closed_positions_table_from_ledger(closed_positions)}
     </div>
   </div>
+  </main>
 
   <script>
   function switchTab(tabName) {{
@@ -1024,8 +1025,8 @@ def _decision_feed(entries: list[dict[str, Any]]) -> str:
             f'<td class="{status_class}">{status}</td><td>{reason}{extra}</td></tr>'
         )
     return (
-        '<table><thead><tr><th>Command</th><th>Ticker</th><th>Status</th>'
-        f'<th>Detail</th></tr></thead><tbody>{"".join(rows)}</tbody></table>'
+        '<table><thead><tr><th scope="col">Command</th><th scope="col">Ticker</th><th scope="col">Status</th>'
+        f'<th scope="col">Detail</th></tr></thead><tbody>{"".join(rows)}</tbody></table>'
     )
 
 
@@ -1515,7 +1516,7 @@ def _closed_positions_table(exits: list[dict[str, Any]]) -> str:
     
     return (
         '<table><thead><tr>' +
-        ''.join(f'<th>{h}</th>' for h in headers) +
+        ''.join(f'<th scope="col">{h}</th>' for h in headers) +
         f'</tr></thead><tbody>{"".join(rows)}</tbody></table>'
     )
 
@@ -1703,10 +1704,13 @@ def _render_dashboard(
   </style>
 </head>
 <body>
-  <h1>Autonomous Trading Agent</h1>
-  <p class="label">Static local dashboard from JSON snapshots.</p>
+  <header>
+    <h1>Autonomous Trading Agent</h1>
+    <p class="label">Static local dashboard from JSON snapshots.</p>
+  </header>
 
-  <section class="grid">
+  <main>
+    <section class="grid" aria-label="Summary Metrics">
     {_card("Equity", _money(portfolio_summary.get("equity")))}
     {_card("Cash", _money(portfolio_summary.get("cash")))}
     {_card("Exposure", _pct(portfolio_summary.get("exposure")))}
@@ -1723,6 +1727,7 @@ def _render_dashboard(
   {_table(positions, ["ticker", "quantity", "average_cost", "last_price", "market_value", "unrealized_pnl", "allocation"])}
   <h2>Recent Decisions</h2>
   {_table(decisions, ["timestamp", "command", "ticker", "status", "reason"])}
+  </main>
 </body>
 </html>
 """
@@ -1745,7 +1750,7 @@ def _card(label: str, value: object, raw: bool = False) -> str:
 def _table(rows: list[dict[str, Any]], columns: list[str]) -> str:
     if not rows:
         return '<p class="label">No rows.</p>'
-    head = "".join(f"<th>{html.escape(column)}</th>" for column in columns)
+    head = "".join(f'<th scope="col">{html.escape(column)}</th>' for column in columns)
     
     def _sanitize_class(value: str) -> str:
         """Sanitize string for use as CSS class - only alphanumeric and hyphens."""
