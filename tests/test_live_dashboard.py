@@ -890,3 +890,141 @@ class TestPriceCaching:
             _set_cached_price(f"CACHE_TEST_{i}", float(i))
         # Should not exceed max size
         assert len(_price_cache) <= _CACHE_MAX_SIZE
+
+    # ─── Advisory Dashboard Tests ──────────────────────────────────────────
+
+    def test_advisory_widget_empty_data(self) -> None:
+        """Test _advisory_widget returns empty string with None data."""
+        from trading_bot.runtime.dashboard import _advisory_widget
+        result = _advisory_widget(None)
+        assert result == ""
+
+    def test_advisory_widget_with_data(self) -> None:
+        """Test _advisory_widget renders recommendation data."""
+        from trading_bot.runtime.dashboard import _advisory_widget
+        data = {
+            "observations": 10,
+            "main_recommendations": 3,
+            "cheap_recommendations": 0,
+            "promoted_symbols": 1,
+            "avoided_symbols": 0,
+            "promote_list": ["AAPL"],
+            "avoid_list": [],
+            "generated_at": "2025-01-01T00:00:00",
+            "top_main_recommendations": [
+                {"ticker": "AAPL", "score": 0.85, "approval_rate": 0.75, "win_rate": 0.6, "net_pnl": 100.0, "observations": 5},
+            ],
+            "top_cheap_recommendations": [],
+        }
+        result = _advisory_widget(data)
+        assert "Advisory Learner" in result
+        assert "AAPL" in result
+        assert "Promoted" in result
+
+    def test_advisory_card_section(self) -> None:
+        """Test _advisory_card_section renders summary cards."""
+        from trading_bot.runtime.dashboard import _advisory_card_section
+        result = _advisory_card_section(100, 20, 5, 3, 1)
+        assert "100" in result
+        assert "20" in result
+        assert "5" in result
+        assert "3" in result
+        assert "1" in result
+        assert "Advisory Learner" in result
+
+    def test_advisory_tables_section_with_data(self) -> None:
+        """Test _advisory_tables_section renders recommendation tables."""
+        from trading_bot.runtime.dashboard import _advisory_tables_section
+        main_rows = '<tr><td>AAPL</td><td>0.85</td><td>75%</td><td>60%</td><td>$100</td><td>5</td></tr>'
+        cheap_rows = '<tr><td>STOCK1</td><td>0.60</td><td>sidecar</td></tr>'
+        promote_items = '<span class="badge">AAPL</span>'
+        avoid_items = ""
+        generated_at = "2025-01-01T00:00:00"
+        result = _advisory_tables_section(main_rows, cheap_rows, promote_items, avoid_items, generated_at)
+        assert "AAPL" in result
+        assert "STOCK1" in result
+        assert "Main Midcap Recommendations" in result
+        assert "Cheap Stock Ideas" in result
+        assert "Generated:" in result
+
+    def test_advisory_tables_section_empty(self) -> None:
+        """Test _advisory_tables_section handles empty data."""
+        from trading_bot.runtime.dashboard import _advisory_tables_section
+        result = _advisory_tables_section("", "", "", "", "")
+        assert "Main Midcap Recommendations" in result
+        assert "Cheap Stock Ideas" in result
+        assert '<span class="label">None</span>' in result
+
+    def test_load_advisory_data_with_report(self) -> None:
+        """Test _load_advisory_data parses advisory report correctly."""
+        from trading_bot.runtime.dashboard import _load_advisory_data
+        from trading_bot.config.settings import Settings
+
+        def mock_load_report(settings: Settings) -> dict:
+            return {
+                "summary": {
+                    "observations": 42,
+                    "main_recommendations": 12,
+                    "cheap_recommendations": 3,
+                },
+                "main_midcap": [
+                    {"ticker": "AAPL", "score": 0.85, "approval_rate": 0.75, "win_rate": 0.6, "net_pnl": 100.0, "observations": 5},
+                ],
+                "cheap_stocks": [
+                    {"ticker": "STOCK1", "score": 0.6, "source_names": ["sidecar"]},
+                ],
+                "generated_at": "2025-01-01T00:00:00",
+            }
+
+        def mock_load_override(settings: Settings) -> dict:
+            return {
+                "main_midcap": {
+                    "promote_symbols": ["AAPL", "GOOGL"],
+                    "avoid_symbols": ["TSLA"],
+                }
+            }
+
+        settings = Settings()
+        result = _load_advisory_data(settings, mock_load_report, mock_load_override)
+        assert result is not None
+        assert result["observations"] == 42
+        assert result["main_recommendations"] == 12
+        assert result["cheap_recommendations"] == 3
+        assert len(result["top_main_recommendations"]) == 1
+        assert result["top_main_recommendations"][0]["ticker"] == "AAPL"
+        assert len(result["top_cheap_recommendations"]) == 1
+        assert result["top_cheap_recommendations"][0]["ticker"] == "STOCK1"
+        assert result["promoted_symbols"] == 2
+        assert result["avoided_symbols"] == 1
+        assert result["promote_list"] == ["AAPL", "GOOGL"]
+        assert result["avoid_list"] == ["TSLA"]
+
+    def test_load_advisory_data_no_report(self) -> None:
+        """Test _load_advisory_data returns None when no report."""
+        from trading_bot.runtime.dashboard import _load_advisory_data
+        from trading_bot.config.settings import Settings
+
+        def mock_empty_report(settings: Settings) -> dict:
+            return {"summary": {}}
+
+        def mock_load_override(settings: Settings) -> dict:
+            return {}
+
+        settings = Settings()
+        result = _load_advisory_data(settings, mock_empty_report, mock_load_override)
+        assert result is None
+
+    def test_load_advisory_data_exception(self) -> None:
+        """Test _load_advisory_data returns None on exception."""
+        from trading_bot.runtime.dashboard import _load_advisory_data
+        from trading_bot.config.settings import Settings
+
+        def mock_raises(settings: Settings) -> dict:
+            raise RuntimeError("test error")
+
+        def mock_load_override(settings: Settings) -> dict:
+            return {}
+
+        settings = Settings()
+        result = _load_advisory_data(settings, mock_raises, mock_load_override)
+        assert result is None
