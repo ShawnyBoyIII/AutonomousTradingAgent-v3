@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 
+from trading_bot.advisory import load_scout_override, load_latest_advisory_report
 from trading_bot.config.settings import Settings
 from trading_bot.portfolio.ledger import PortfolioLedger
 from trading_bot.runtime.watchlist import add_symbol, read_watchlist, remove_symbol
@@ -300,6 +301,7 @@ class DashboardServer:
             "swarm_sentiment": swarm_sentiment,
             "market_regime": market_regime,
             "strategy_attribution": strategy_attribution,
+            "advisory": _load_advisory_data(self.settings),
             "generated_at": _now_iso(),
         }
 
@@ -813,6 +815,7 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
 
   {_market_regime_widget(snapshot.get("market_regime"))}
   {_strategy_attribution_widget(snapshot.get("strategy_attribution"))}
+  {_advisory_widget(snapshot.get("advisory"))}
   {_watchlist_widget(watchlist)}
 
   <div class="tab-nav">
@@ -1958,3 +1961,181 @@ def _read_jsonl_tail(path: str, limit: int = 50) -> list[dict[str, Any]]:
 def _now_iso() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+def _load_advisory_data(settings: Settings) -> dict[str, Any]:
+    """Load advisory learner data for dashboard display."""
+    try:
+        report = load_latest_advisory_report(settings)
+        if not report:
+            return {}
+
+        summary = report.get("summary", {})
+        main_midcap = report.get("main_midcap", [])
+        cheap_stocks = report.get("cheap_stocks", [])
+
+        if not isinstance(main_midcap, list):
+            main_midcap = []
+        if not isinstance(cheap_stocks, list):
+            cheap_stocks = []
+
+        top_main = []
+        for row in main_midcap[:8]:
+            if not isinstance(row, dict):
+                continue
+            top_main.append({
+                "ticker": str(row.get("ticker", "")),
+                "score": round(float(row.get("score", 0.0)), 4),
+                "approval_rate": round(float(row.get("approval_rate", 0.0)), 2),
+                "win_rate": round(float(row.get("win_rate", 0.0) or 0.0), 2),
+                "net_pnl": round(float(row.get("net_pnl", 0.0)), 2),
+                "observations": int(row.get("observations", 0)),
+            })
+
+        top_cheap = []
+        for row in cheap_stocks[:5]:
+            if not isinstance(row, dict):
+                continue
+            top_cheap.append({
+                "ticker": str(row.get("ticker", "")),
+                "score": round(float(row.get("score", 0.0)), 4),
+                "source_names": row.get("source_names", []),
+            })
+
+        override = load_scout_override(settings)
+        main_mid = override.get("main_midcap", {}) if isinstance(override, dict) else {}
+        promote = main_mid.get("promote_symbols", []) if isinstance(main_mid, dict) else []
+        avoid = main_mid.get("avoid_symbols", []) if isinstance(main_mid, dict) else []
+
+        return {
+            "observations": int(summary.get("observations", 0)),
+            "main_recommendations": int(summary.get("main_recommendations", 0)),
+            "cheap_recommendations": int(summary.get("cheap_recommendations", 0)),
+            "promoted_symbols": len(promote),
+            "avoided_symbols": len(avoid),
+            "promote_list": [str(s) for s in promote],
+            "avoid_list": [str(s) for s in avoid],
+            "generated_at": str(report.get("generated_at", "")),
+            "top_main_recommendations": top_main,
+            "top_cheap_recommendations": top_cheap,
+        }
+    except Exception:
+        logger.debug("Failed to load advisory data for dashboard")
+        return {}
+
+
+def _advisory_widget(data: dict[str, Any] | None) -> str:
+    """Render advisory learner widget showing scout recommendations and overrides."""
+    if not data:
+        return ""
+
+    observations = int(data.get("observations", 0))
+    main_recs = int(data.get("main_recommendations", 0))
+    cheap_recs = int(data.get("cheap_recommendations", 0))
+    promoted = int(data.get("promoted_symbols", 0))
+    avoided = int(data.get("avoided_symbols", 0))
+    generated_at = str(data.get("generated_at", ""))[:19] if data.get("generated_at") else ""
+
+    top_main = data.get("top_main_recommendations", [])
+    if not isinstance(top_main, list):
+        top_main = []
+    main_rows = ""
+    for row in top_main:
+        if not isinstance(row, dict):
+            continue
+        ticker = html.escape(str(row.get("ticker", "")))
+        score = f"{float(row.get('score', 0.0)):.4f}"
+        appr = f"{float(row.get('approval_rate', 0.0)):.0%}"
+        wr = f"{float(row.get('win_rate', 0.0) or 0.0):.0%}" if row.get('win_rate') is not None else "—"
+        pnl = _signed_money(row.get("net_pnl"))
+        obs = int(row.get("observations", 0))
+        main_rows += f'<tr><td>{ticker}</td><td>{score}</td><td>{appr}</td><td>{wr}</td><td>{pnl}</td><td>{obs}</td></tr>\n'
+    if not main_rows:
+        main_rows = '<tr><td colspan="6" class="label">No main recommendations yet.</td></tr>'
+
+    top_cheap = data.get("top_cheap_recommendations", [])
+    if not isinstance(top_cheap, list):
+        top_cheap = []
+    cheap_rows = ""
+    for row in top_cheap:
+        if not isinstance(row, dict):
+            continue
+        ticker = html.escape(str(row.get("ticker", "")))
+        score = f"{float(row.get('score', 0.0)):.4f}"
+        sources = ", ".join(str(s) for s in (row.get("source_names", []) or []))[:40]
+        cheap_rows += f'<tr><td>{ticker}</td><td>{score}</td><td>{html.escape(sources)}</td></tr>\n'
+    if not cheap_rows:
+        cheap_rows = '<tr><td colspan="3" class="label">No cheap stock recommendations yet.</td></tr>'
+
+    promote_list = data.get("promote_list", [])
+    if not isinstance(promote_list, list):
+        promote_list = []
+    promote_items = ""
+    for sym in promote_list:
+        promote_items += f'<span class="badge" style="border-color:var(--accent-green);color:var(--accent-green);">{html.escape(str(sym))}</span> '
+
+    avoid_list = data.get("avoid_list", [])
+    if not isinstance(avoid_list, list):
+        avoid_list = []
+    avoid_items = ""
+    for sym in avoid_list:
+        avoid_items += f'<span class="badge" style="border-color:var(--accent-red);color:var(--accent-red);">{html.escape(str(sym))}</span> '
+
+    return f'''
+  {_advisory_card_section(observations, main_recs, cheap_recs, promoted, avoided)}
+  {_advisory_tables_section(main_rows, cheap_rows, promote_items, avoid_items, generated_at)}
+  </section>
+'''
+
+
+def _advisory_card_section(
+    observations: int,
+    main_recs: int,
+    cheap_recs: int,
+    promoted: int,
+    avoided: int,
+) -> str:
+    """Advisory learner summary cards."""
+    return f'''
+  <section class="card" style="margin: 16px 0;">
+    <h2>Advisory Learner</h2>
+    <div class="grid">
+      {_card("Observations", observations)}
+      {_card("Main Recs", main_recs)}
+      {_card("Cheap Recs", cheap_recs)}
+      {_card("Promoted", promoted)}
+      {_card("Avoided", avoided)}
+    </div>
+  </section>
+'''
+
+
+def _advisory_tables_section(
+    main_rows: str,
+    cheap_rows: str,
+    promote_items: str,
+    avoid_items: str,
+    generated_at: str,
+) -> str:
+    """Advisory learner recommendation tables and override badges."""
+    return f'''
+  <div class="two-col">
+    <div>
+      <h2>Main Midcap Recommendations</h2>
+      <table class="data-table"><thead><tr><th>Ticker</th><th>Score</th><th>Appr.</th><th>Win Rate</th><th>P&amp;L</th><th>Obs</th></tr></thead><tbody>{main_rows}</tbody></table>
+    </div>
+    <div>
+      <h2>Cheap Stock Ideas</h2>
+      <table class="data-table"><thead><tr><th>Ticker</th><th>Score</th><th>Sources</th></tr></thead><tbody>{cheap_rows}</tbody></table>
+      <div style="margin-top: 16px;">
+        <div class="label">Promoted Symbols</div>
+        <div style="margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px;">{promote_items or '<span class="label">None</span>'}</div>
+      </div>
+      <div style="margin-top: 12px;">
+        <div class="label">Avoided Symbols</div>
+        <div style="margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px;">{avoid_items or '<span class="label">None</span>'}</div>
+      </div>
+      {f'<div style="margin-top: 12px;"><span class="label">Generated: {html.escape(generated_at)}</span></div>' if generated_at else ''}
+    </div>
+  </div>
+'''

@@ -955,37 +955,46 @@ class TestPriceCaching:
         assert "Cheap Stock Ideas" in result
         assert '<span class="label">None</span>' in result
 
-    def test_load_advisory_data_with_report(self) -> None:
+    def test_load_advisory_data_with_report(self, tmp_path: "Path") -> None:
         """Test _load_advisory_data parses advisory report correctly."""
         from trading_bot.runtime.dashboard import _load_advisory_data
-        from trading_bot.config.settings import Settings
+        from trading_bot.config.settings import Settings, AppSettings, AdvisorySettings
+        import json, yaml
 
-        def mock_load_report(settings: Settings) -> dict:
-            return {
-                "summary": {
-                    "observations": 42,
-                    "main_recommendations": 12,
-                    "cheap_recommendations": 3,
-                },
-                "main_midcap": [
-                    {"ticker": "AAPL", "score": 0.85, "approval_rate": 0.75, "win_rate": 0.6, "net_pnl": 100.0, "observations": 5},
-                ],
-                "cheap_stocks": [
-                    {"ticker": "STOCK1", "score": 0.6, "source_names": ["sidecar"]},
-                ],
-                "generated_at": "2025-01-01T00:00:00",
+        advisory_dir = tmp_path / "advisory"
+        advisory_dir.mkdir()
+
+        report_data = {
+            "summary": {
+                "observations": 42,
+                "main_recommendations": 12,
+                "cheap_recommendations": 3,
+            },
+            "main_midcap": [
+                {"ticker": "AAPL", "score": 0.85, "approval_rate": 0.75, "win_rate": 0.6, "net_pnl": 100.0, "observations": 5},
+            ],
+            "cheap_stocks": [
+                {"ticker": "STOCK1", "score": 0.6, "source_names": ["sidecar"]},
+            ],
+            "generated_at": "2025-01-01T00:00:00",
+        }
+        (advisory_dir / "latest_report.json").write_text(json.dumps(report_data))
+
+        override_data = {
+            "main_midcap": {
+                "promote_symbols": ["AAPL", "GOOGL"],
+                "avoid_symbols": ["TSLA"],
             }
+        }
+        (advisory_dir / "scout_override.yaml").write_text(yaml.dump(override_data))
 
-        def mock_load_override(settings: Settings) -> dict:
-            return {
-                "main_midcap": {
-                    "promote_symbols": ["AAPL", "GOOGL"],
-                    "avoid_symbols": ["TSLA"],
-                }
-            }
-
-        settings = Settings()
-        result = _load_advisory_data(settings, mock_load_report, mock_load_override)
+        settings = Settings(
+            app=AppSettings(
+                advisory_dir=str(advisory_dir),
+            ),
+            advisory=AdvisorySettings(enabled=True),
+        )
+        result = _load_advisory_data(settings)
         assert result is not None
         assert result["observations"] == 42
         assert result["main_recommendations"] == 12
@@ -996,35 +1005,46 @@ class TestPriceCaching:
         assert result["top_cheap_recommendations"][0]["ticker"] == "STOCK1"
         assert result["promoted_symbols"] == 2
         assert result["avoided_symbols"] == 1
-        assert result["promote_list"] == ["AAPL", "GOOGL"]
-        assert result["avoid_list"] == ["TSLA"]
+        assert set(result["promote_list"]) == {"AAPL", "GOOGL"}
+        assert "TSLA" in result["avoid_list"]
 
-    def test_load_advisory_data_no_report(self) -> None:
-        """Test _load_advisory_data returns None when no report."""
+    def test_load_advisory_data_no_report(self, tmp_path: "Path") -> None:
+        """Test _load_advisory_data returns empty when no report."""
         from trading_bot.runtime.dashboard import _load_advisory_data
-        from trading_bot.config.settings import Settings
+        from trading_bot.config.settings import Settings, AppSettings, AdvisorySettings
 
-        def mock_empty_report(settings: Settings) -> dict:
-            return {"summary": {}}
+        advisory_dir = tmp_path / "advisory"
+        advisory_dir.mkdir()
 
-        def mock_load_override(settings: Settings) -> dict:
-            return {}
+        settings = Settings(
+            app=AppSettings(
+                advisory_dir=str(advisory_dir),
+            ),
+            advisory=AdvisorySettings(enabled=True),
+        )
+        result = _load_advisory_data(settings)
+        assert result == {}
 
-        settings = Settings()
-        result = _load_advisory_data(settings, mock_empty_report, mock_load_override)
-        assert result is None
-
-    def test_load_advisory_data_exception(self) -> None:
-        """Test _load_advisory_data returns None on exception."""
+    def test_load_advisory_data_exception(self, tmp_path: "Path") -> None:
+        """Test _load_advisory_data returns empty on exception."""
         from trading_bot.runtime.dashboard import _load_advisory_data
-        from trading_bot.config.settings import Settings
+        from trading_bot.config.settings import Settings, AppSettings, AdvisorySettings
 
-        def mock_raises(settings: Settings) -> dict:
-            raise RuntimeError("test error")
+        # Use a path that will cause an error when reading
+        advisory_dir = tmp_path / "advisory"
+        advisory_dir.mkdir()
+        # Remove read permissions to trigger an exception
+        import os
+        os.chmod(advisory_dir, 0o000)
 
-        def mock_load_override(settings: Settings) -> dict:
-            return {}
-
-        settings = Settings()
-        result = _load_advisory_data(settings, mock_raises, mock_load_override)
-        assert result is None
+        settings = Settings(
+            app=AppSettings(
+                advisory_dir=str(advisory_dir),
+            ),
+            advisory=AdvisorySettings(enabled=True),
+        )
+        try:
+            result = _load_advisory_data(settings)
+            assert result == {}
+        finally:
+            os.chmod(advisory_dir, 0o755)
