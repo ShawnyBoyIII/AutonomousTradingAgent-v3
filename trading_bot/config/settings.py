@@ -299,10 +299,9 @@ class SwarmSettings(BaseModel):
     """Multi-agent swarm analysis configuration.
 
     When ``enabled``, the orchestrator runs a swarm analysis on the
-    universe before generating signals. In ``signal_mode="serial"``
-    (default), the swarm acts as a read-only overlay: its committee
-    decisions are logged alongside scanner results but do not affect
-    trading behavior.
+    universe before generating signals. Swarm results are logged
+    alongside scanner results. Swarm sentiment can affect position
+    sizing when enabled; there is no separate ``signal_mode`` setting.
     """
     enabled: bool = Field(default=False)
     preset: str = Field(default="investment_committee")

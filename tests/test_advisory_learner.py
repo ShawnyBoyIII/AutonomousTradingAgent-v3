@@ -152,8 +152,9 @@ def test_run_advisory_learner_writes_artifacts_and_daily_report(tmp_path: Path, 
     assert (advisory_dir / "latest_report.json").exists()
     assert (advisory_dir / "Daily report.md").exists()
 
-    main_rows = json.loads((advisory_dir / "recommendations.main_midcap.json").read_text(encoding="utf-8"))
-    cheap_rows = json.loads((advisory_dir / "recommendations.cheap_stocks.json").read_text(encoding="utf-8"))
+    report = json.loads((advisory_dir / "latest_report.json").read_text(encoding="utf-8"))
+    main_rows = {"recommendations": report["main_midcap"]}
+    cheap_rows = {"recommendations": report["cheap_stocks"]}
     override = yaml.safe_load((advisory_dir / "scout_override.yaml").read_text(encoding="utf-8"))
 
     assert any(row["ticker"] == "AAPL" for row in main_rows["recommendations"])
@@ -263,7 +264,8 @@ def test_run_advisory_learner_uses_scan_features_and_closed_trades_for_scoring(t
     summary = run_advisory_learner(settings)
 
     assert summary.observations_added == 0
-    main_rows = json.loads((Path(settings.app.advisory_dir) / "recommendations.main_midcap.json").read_text(encoding="utf-8"))
+    report = json.loads((Path(settings.app.advisory_dir) / "latest_report.json").read_text(encoding="utf-8"))
+    main_rows = {"recommendations": report["main_midcap"]}
     aapl = next(row for row in main_rows["recommendations"] if row["ticker"] == "AAPL")
     assert aapl["approval_rate"] > 0.9
     assert aapl["win_rate"] == 1.0

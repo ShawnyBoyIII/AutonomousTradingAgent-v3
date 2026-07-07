@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 if TYPE_CHECKING:
@@ -44,9 +45,8 @@ def init_db(settings: Settings) -> any:
         ):
             try:
                 conn.execute(text(ddl))
-            except Exception:
-                logger = __import__("logging").getLogger(__name__)
-                logger.warning("DDL skipped (column may already exist): %s", ddl)
+            except OperationalError:
+                pass  # column already exists
     return engine
 
 

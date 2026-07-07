@@ -122,6 +122,11 @@ trading_bot/
 3. `manage-positions` → checks stops, targets, EOD exits
 4. All entry points check kill switch first
 
+**Ledger trade lifecycle:** There is no single `record_closed_trade` method.
+A trade is recorded in two steps: `record_fill()` on BUY/SELL (writes to
+`orders` table) then `update_trade_exit()` on SELL (updates P&L fields).
+Cross-table reporting reads both `orders` and `trades` tables separately.
+
 ---
 
 ## Common Commands

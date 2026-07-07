@@ -34,7 +34,7 @@ from trading_bot.runtime.latency import frame_last_timestamp, is_stale
 from trading_bot.runtime.position_exit import (
     fill_partial_take_profit_position as _shared_fill_partial_take_profit_position,
     fill_sell_position as _shared_fill_sell_position,
-    portfolio_state_after_sell as _shared_portfolio_state_after_sell,
+
 )
 from trading_bot.runtime.snapshots import read_recent_decision_rows, write_snapshot
 from trading_bot.scout import build_scout_candidates
@@ -793,7 +793,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
                 lines.append(line)
                 continue
         # V3: Counter-thesis exit — original BUY thesis broken, exit early.
-        # Priority: EOD > stop > target > counter-thesis > trailing stop.
+        # Priority: EOD > stop > target > time_exit > counter-thesis > trailing stop.
         counter_exit = _maybe_counter_thesis_exit(
             ticker, position, frame, last_price, ctx.obj, manage_now,
             broker, ledger, state, log_path,
@@ -1694,24 +1694,6 @@ def _update_trailing_stop(
         return None
 
     return new_stop, method, new_highest_high, new_initial_risk or position.initial_risk
-
-
-def _portfolio_state_after_sell(
-    previous_state: PortfolioState,
-    ticker: str,
-    sold_quantity: int,
-    fill_price: float,
-    fill_fees: float,
-    broker: PaperBroker,
-) -> PortfolioState:
-    return _shared_portfolio_state_after_sell(
-        previous_state=previous_state,
-        ticker=ticker,
-        sold_quantity=sold_quantity,
-        fill_price=fill_price,
-        fill_fees=fill_fees,
-        broker=broker,
-    )
 
 
 def _fetch_latest_prices(symbols: list[str], settings) -> dict[str, float]:

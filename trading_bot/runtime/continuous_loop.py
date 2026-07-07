@@ -420,7 +420,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                             state = updated_state
                         continue
 
-            # Exit priority 5: Trailing stop
+            # Exit priority 6: Trailing stop
             atr = _fetch_atr(ticker, settings) if settings.risk.use_atr_sizing else None
             trailing_stop, _ = next_trailing_stop(position, current_price, atr)
             if trailing_stop is not None and current_price <= trailing_stop:

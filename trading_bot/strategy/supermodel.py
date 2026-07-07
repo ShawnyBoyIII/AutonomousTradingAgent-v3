@@ -141,7 +141,7 @@ def _decision_from_layers(
         return "support"
     if score >= settings.block_threshold:
         return "caution"
-    return "block"
+    return "no_signal"
 
 
 def _verdict_from_score(

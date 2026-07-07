@@ -27,8 +27,6 @@ class AdvisoryPaths:
     root: Path
     observations: Path
     state: Path
-    main: Path
-    cheap: Path
     latest_report: Path
     scout_override: Path
     daily_report: Path
@@ -40,8 +38,6 @@ def advisory_paths(settings: Settings) -> AdvisoryPaths:
         root=root,
         observations=root / "observations.jsonl",
         state=root / "learner_state.json",
-        main=root / "recommendations.main_midcap.json",
-        cheap=root / "recommendations.cheap_stocks.json",
         latest_report=root / "latest_report.json",
         scout_override=root / "scout_override.yaml",
         daily_report=root / "Daily report.md",
@@ -113,8 +109,6 @@ def run_advisory_learner(settings: Settings, write_daily_report: bool = False) -
         "main_midcap": main_rows,
         "cheap_stocks": cheap_rows,
     }
-    write_snapshot(paths.main, {"mode": "advisory_main", "recommendations": main_rows})
-    write_snapshot(paths.cheap, {"mode": "advisory_cheap", "recommendations": cheap_rows})
     export_json(report, paths.latest_report)
 
     promote_symbols = [
