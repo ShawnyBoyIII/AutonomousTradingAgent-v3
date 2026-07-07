@@ -7,9 +7,11 @@ app:
   allow_yellow_mean_reversion: true
   min_entry_confluence_score: 4.0
   signal_mode: "parallel"
+  min_timeframe_alignment: 1
 
 market_data:
-  provider: yfinance
+  provider: alpaca
+  providers: [alpaca, yfinance]
   daily_period: "1y"
   intraday_period: "5d"
   intraday_interval: "5m"
@@ -46,10 +48,13 @@ rl:
   enabled: false
 
 swarm:
-  enabled: true
+  enabled: false
   preset: "investment_committee"
   max_workers: 4
   swarm_weight: 0.3
+  # NOTE: swarm overlay was removed from the automated burn-in scan/vote path.
+  # The swarm engine and CLI (`./tradebot-local swarm`) remain as a manual
+  # research/advisory tool only — see AGENTS.md.
 
 sentiment:
   enabled: true

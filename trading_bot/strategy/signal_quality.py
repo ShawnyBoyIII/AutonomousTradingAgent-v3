@@ -88,12 +88,14 @@ def evaluate_signal_quality(
     signal: TradeSignal | None = None,
     setup_name: str | None = None,
     quality: str | None = None,
+    required_count: int = 1,
 ) -> SignalQualityVerdict:
     """Evaluate Phase 1 entry gates without fetching data or mutating state."""
     alignment = evaluate_timeframe_alignment(
         daily_frame=daily_frame,
         hourly_frame=hourly_frame,
         intraday_frame=intraday_frame,
+        required_count=required_count,
         setup_name=setup_name,
     )
     entry_timing = evaluate_entry_timing(

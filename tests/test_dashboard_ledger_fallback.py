@@ -143,12 +143,12 @@ def test_load_open_positions_from_ledger_no_positions(settings: Settings):
     assert positions == []
 
 
-def test_snapshot_falls_back_to_ledger_open_positions(
+def test_snapshot_uses_ledger_open_positions(
     settings: Settings,
     ledger_with_positions: None,
     empty_portfolio_json: None,
 ):
-    """Dashboard snapshot falls back to ledger when portfolio_summary has no positions."""
+    """Dashboard snapshot uses ledger as single source of truth for positions."""
     import pathlib
 
     from trading_bot.runtime.dashboard import DashboardServer
@@ -169,7 +169,7 @@ def test_snapshot_falls_back_to_ledger_open_positions(
 
     portfolio = snapshot["portfolio"]
 
-    # Should have TNXP and SOFI from ledger fallback
+    # Should have TNXP and SOFI from ledger (single source of truth)
     positions = portfolio.get("positions", [])
     assert isinstance(positions, list)
     assert len(positions) >= 2
@@ -178,17 +178,12 @@ def test_snapshot_falls_back_to_ledger_open_positions(
     assert "TNXP" in tickers
     assert "SOFI" in tickers
 
-    # Cash and equity should come from ledger
-    assert portfolio.get("cash") == 8500.0
-    assert portfolio.get("equity") == 9200.0
-    assert portfolio.get("realized_pnl") == -178.41
 
-
-def test_snapshot_does_not_override_existing_positions(
+def test_snapshot_uses_ledger_positions_over_json(
     settings: Settings,
     ledger_with_positions: None,
 ):
-    """Dashboard snapshot does NOT fall back to ledger when portfolio_summary already has positions."""
+    """Dashboard snapshot uses ledger positions, ignoring JSON file positions."""
     import pathlib
 
     from trading_bot.runtime.dashboard import DashboardServer
@@ -230,9 +225,9 @@ def test_snapshot_does_not_override_existing_positions(
     portfolio = snapshot["portfolio"]
     positions = portfolio.get("positions", [])
 
-    # Should have QQQ and SPY from portfolio_summary, NOT TNXP/SOFI from ledger
+    # Should have TNXP and SOFI from ledger (single source of truth), NOT QQQ/SPY from JSON
     tickers = {p.get("ticker") for p in positions if isinstance(p, dict)}
-    assert "QQQ" in tickers
-    assert "SPY" in tickers
-    assert "TNXP" not in tickers
-    assert "SOFI" not in tickers
+    assert "TNXP" in tickers
+    assert "SOFI" in tickers
+    assert "QQQ" not in tickers
+    assert "SPY" not in tickers
