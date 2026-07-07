@@ -569,7 +569,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 results.append(f"{symbol} REJECTED ticker re-entry cooldown")
                 continue
 
-            signal, _, details = _build_signal_result(symbol, settings)
+            signal, no_signal_reason, details = _build_signal_result(symbol, settings)
             if signal is None:
                 details.update(
                     build_stacked_signal(
@@ -585,6 +585,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                         "command": "paper-trade",
                         "ticker": symbol,
                         "status": "NO_SIGNAL",
+                        "reason": no_signal_reason or "no signal",
                         **_paper_evidence_fields(details),
                     },
                 )
