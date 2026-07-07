@@ -5,7 +5,7 @@ app:
   portfolio_summary_path: "state/burn_in/portfolio_summary.json"
   scan_results_path: "state/burn_in/scan_results.json"
   allow_yellow_mean_reversion: true
-  min_entry_confluence_score: 4.0
+  min_entry_confluence_score: 2.0
   signal_mode: "parallel"
   min_timeframe_alignment: 1
 

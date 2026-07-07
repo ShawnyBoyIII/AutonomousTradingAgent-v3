@@ -721,7 +721,6 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 results.append(f"{symbol} REJECTED {decision.reason}")
                 continue
 
-            risk_approved_size = decision.position_size
             if alloc < 1.0:
                 decision.position_size = max(1, int(decision.position_size * alloc))
 
@@ -730,10 +729,6 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
 
             if details.get("is_half_size"):
                 decision.position_size = max(1, int(decision.position_size * 0.5))
-
-            if decision.position_size > risk_approved_size:
-                decision.position_size = risk_approved_size
-                details["position_size_capped"] = "risk_approved"
 
             sector_reason = _sector_concentration_exceeded(
                 symbol,
@@ -2105,7 +2100,7 @@ def _persist_trade_to_db(
             session.close()
             engine.dispose()
     except Exception:
-        logger.debug("Failed to persist trade to database")
+        logger.exception("Failed to persist trade to database")
 
 
 def _trade_strategy_tag(signal, details: dict | None = None) -> str | None:
@@ -2150,7 +2145,6 @@ def _paper_evidence_fields(details: dict | None) -> dict[str, object]:
             "consensus_count",
             "consensus_votes",
             "source_votes",
-            "position_size_capped",
             "supermodel_decision",
             "supermodel_score",
             "mtf_aligned",

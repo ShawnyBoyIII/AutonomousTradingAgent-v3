@@ -81,14 +81,14 @@ def fill_sell_position(
                         exit_reason=exit_reason,
                     )
                 except ValueError:
-                    pass
+                    logger.warning("update_trade_exit skipped: trade_id=%s not found", trade.id)
             if close_db_position:
                 close_position(session, ticker.upper())
         finally:
             session.close()
             engine.dispose()
     except Exception:
-        logger.debug("Failed to persist sell trade to database")
+        logger.exception("Failed to persist sell trade to database")
 
     new_state = portfolio_state_after_sell(
         previous_state=state,
