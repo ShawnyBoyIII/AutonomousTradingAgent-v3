@@ -1,7 +1,7 @@
 app:
   live_trading_enabled: false
   timezone: America/New_York
-  state_db_path: state/trading_bot.db
+  state_db_path: state/burn_in.db
   universe_path: state/universe.txt
   universe_candidates_path: state/universe_candidates.json
   log_dir: logs

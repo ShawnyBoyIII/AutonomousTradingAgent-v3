@@ -11,7 +11,6 @@ class AdvisoryObservation(BaseModel):
     quality: str = ""
     entry_price: float | None = None
     supermodel_decision: str = ""
-    swarm_decision: str = ""
     consensus: str = ""
     observed_at: str
 

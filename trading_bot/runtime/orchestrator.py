@@ -166,7 +166,6 @@ def run_scan(
     rl_confidence_total = 0.0
     rl_confidence_count = 0
     rl_unsupported = 0
-    parallel_counts = {"BUY": 0, "SELL": 0, "NO_TRADE": 0}
 
     # V2.5: Calculate portfolio heat before scanning
     portfolio_heat = _calculate_portfolio_heat(state, settings)
@@ -211,14 +210,6 @@ def run_scan(
             "candidates": [],
         }
 
-    # Swarm scan evidence stays read-only; paper-trade may use it for sizing.
-    swarm_results: dict[str, Any] = {}
-    if settings.swarm.enabled:
-        try:
-            swarm_results = _run_swarm_overlay(symbols, settings, portfolio_state=state.model_dump())
-        except Exception as e:
-            logger.warning("Swarm overlay failed: %s", e)
-            swarm_results = {}
 
     for symbol in (value.strip() for value in symbols if value.strip()):
         try:
@@ -236,9 +227,6 @@ def run_scan(
             if counter_result is not None:
                 _augment_details_with_counter_thesis(details, counter_result)
             if signal is None:
-                if settings.swarm.enabled and symbol in swarm_results:
-                    swarm_decision = swarm_results[symbol]
-                    _augment_details_with_swarm(details, swarm_decision)
                 details.update(
                     build_stacked_signal(
                         symbol,
@@ -247,8 +235,6 @@ def run_scan(
                         settings=settings.supermodel,
                     ).to_details()
                 )
-                if details.get("signal_mode") == "parallel" and details.get("consensus") in parallel_counts:
-                    parallel_counts[str(details["consensus"])] += 1
                 detail_text = _format_scan_details(details) if include_details else ""
                 append_decision_event(
                     log_path,
@@ -263,17 +249,11 @@ def run_scan(
                 other_results.append(f"{symbol} NO_SIGNAL reason={no_signal_reason}{detail_text}")
                 row = {"ticker": symbol, "status": "NO_SIGNAL", "reason": no_signal_reason}
                 _attach_supermodel_row_fields(row, details)
-                if settings.swarm.enabled and symbol in swarm_results:
-                    swarm_decision = swarm_results[symbol]
-                    _attach_swarm_row_fields(row, swarm_decision)
                 if include_details:
                     row["details"] = details
                 candidate_rows.append(row)
                 continue
 
-            if settings.swarm.enabled and symbol in swarm_results:
-                swarm_decision = swarm_results[symbol]
-                _augment_details_with_swarm(details, swarm_decision)
             stacked = build_stacked_signal(symbol, signal, details, settings=settings.supermodel)
             details.update(stacked.to_details())
             detail_text = _format_scan_details(details) if include_details else ""
@@ -297,15 +277,10 @@ def run_scan(
                     "reason": f"supermodel block (score={stacked.score:.2f})",
                 }
                 _attach_supermodel_row_fields(row, details)
-                if settings.swarm.enabled and symbol in swarm_results:
-                    swarm_decision = swarm_results[symbol]
-                    _attach_swarm_row_fields(row, swarm_decision)
                 if include_details:
                     row["details"] = details
                 candidate_rows.append(row)
                 continue
-            if details.get("signal_mode") == "parallel" and details.get("consensus") in parallel_counts:
-                parallel_counts[str(details["consensus"])] += 1
 
             # V2.5: Fetch ATR for volatility-adjusted sizing
             atr = _fetch_atr(symbol, settings) if settings.risk.use_atr_sizing else None
@@ -345,9 +320,6 @@ def run_scan(
                     "reason": decision.reason,
                 }
                 _attach_supermodel_row_fields(row, details)
-                if settings.swarm.enabled and symbol in swarm_results:
-                    swarm_decision = swarm_results[symbol]
-                    _attach_swarm_row_fields(row, swarm_decision)
                 if include_details:
                     row["details"] = details
                 candidate_rows.append(row)
@@ -400,9 +372,6 @@ def run_scan(
                 "reasons": signal.reasons,
             }
             _attach_supermodel_row_fields(row, details)
-            if settings.swarm.enabled and symbol in swarm_results:
-                swarm_decision = swarm_results[symbol]
-                _attach_swarm_row_fields(row, swarm_decision)
             if include_details:
                 row["details"] = details
             candidate_rows.append(row)
@@ -429,9 +398,6 @@ def run_scan(
             )
         except Exception as exc:
             error_evidence: dict[str, object] = {}
-            if settings.swarm.enabled and symbol in swarm_results:
-                swarm_decision = swarm_results[symbol]
-                _attach_swarm_row_fields(error_evidence, swarm_decision)
             append_decision_event(
                 log_path,
                 {
@@ -459,33 +425,6 @@ def run_scan(
         "no_signal": sum(1 for row in candidate_rows if row["status"] == "NO_SIGNAL"),
         "errors": sum(1 for row in candidate_rows if row["status"] == "ERROR"),
     }
-    if settings.swarm.enabled:
-        swarm_decisions = [row.get("swarm_decision") for row in candidate_rows if "swarm_decision" in row]
-        summary.update({
-            "swarm_enabled": True,
-            "swarm_approved": sum(1 for d in swarm_decisions if d == "APPROVE"),
-            "swarm_rejected": sum(1 for d in swarm_decisions if d == "REJECT"),
-            "swarm_hold": sum(1 for d in swarm_decisions if d in ("HOLD", "HOLD_FOR_MORE_INFO")),
-        })
-        sentiment_rows = [
-            row for row in candidate_rows if row.get("swarm_sentiment_score") is not None
-        ]
-        if sentiment_rows:
-            summary.update(
-                {
-                    "swarm_sentiment_evidence": len(sentiment_rows),
-                    "swarm_sentiment_bullish": sum(
-                        1
-                        for row in sentiment_rows
-                        if float(row.get("swarm_sentiment_score", 0.0) or 0.0) >= 0.35
-                    ),
-                    "swarm_sentiment_bearish": sum(
-                        1
-                        for row in sentiment_rows
-                        if float(row.get("swarm_sentiment_score", 0.0) or 0.0) <= -0.35
-                    ),
-                }
-            )
     if getattr(settings, "rl", None) is not None and settings.rl.enabled:
         summary.update(
             {
@@ -502,14 +441,6 @@ def run_scan(
             }
         )
     supermodel_decisions = [row["supermodel_decision"] for row in candidate_rows if row.get("supermodel_decision")]
-    if any(parallel_counts.values()):
-        summary.update(
-            {
-                "parallel_buy": parallel_counts["BUY"],
-                "parallel_sell": parallel_counts["SELL"],
-                "parallel_no_trade": parallel_counts["NO_TRADE"],
-            }
-        )
     if supermodel_decisions:
         summary.update(
             {
@@ -537,209 +468,10 @@ def _attach_supermodel_row_fields(row: dict[str, object], details: dict[str, obj
         row["supermodel_score"] = details.get("supermodel_score")
 
 
-def _augment_details_with_swarm(details: dict[str, object], swarm_decision: Any) -> None:
-    details["swarm_decision"] = swarm_decision.decision
-    details["swarm_confidence"] = round(swarm_decision.confidence, 2)
-    if swarm_decision.key_rationale:
-        details["swarm_rationale"] = swarm_decision.key_rationale
-    handoff = _swarm_handoff(swarm_decision)
-    if handoff:
-        details["swarm_handoff"] = handoff
-    details.update(_swarm_sentiment_fields(swarm_decision))
 
 
-def _attach_swarm_row_fields(row: dict[str, object], swarm_decision: Any) -> None:
-    row["swarm_decision"] = swarm_decision.decision
-    row["swarm_confidence"] = round(swarm_decision.confidence, 2)
-    if swarm_decision.key_rationale:
-        row["swarm_rationale"] = swarm_decision.key_rationale
-    handoff = _swarm_handoff(swarm_decision)
-    if handoff:
-        row["swarm_handoff"] = handoff
-    row.update(_swarm_sentiment_fields(swarm_decision))
 
 
-def _swarm_handoff(swarm_decision: Any) -> str | None:
-    for risk in getattr(swarm_decision, "risk_factors", []) or []:
-        text = str(risk)
-        if text.startswith("risk_manager handoff:"):
-            return text
-    return None
-
-
-def _swarm_sentiment_fields(swarm_decision: Any) -> dict[str, object]:
-    signal = _swarm_sentiment_signal(swarm_decision)
-    if signal is None:
-        return {}
-    metadata = signal.metadata if hasattr(signal, "metadata") and isinstance(signal.metadata, dict) else {}
-    fields: dict[str, object] = {
-        "swarm_sentiment_action": signal.action,
-        "swarm_sentiment_confidence": round(signal.confidence, 2),
-    }
-    sentiment_score = _finite_float(metadata.get("sentiment_score"))
-    if sentiment_score is not None:
-        fields["swarm_sentiment_score"] = round(sentiment_score, 4)
-    news_count = metadata.get("news_count")
-    if isinstance(news_count, int):
-        fields["swarm_sentiment_news_count"] = news_count
-    source = metadata.get("source")
-    if source:
-        fields["swarm_sentiment_source"] = str(source)
-    return fields
-
-
-def _swarm_sentiment_signal(swarm_decision: Any) -> Any | None:
-    for collection_name in ("supporting_signals", "opposing_signals"):
-        for signal in getattr(swarm_decision, collection_name, []) or []:
-            if getattr(signal, "worker_name", "") == "sentiment_analyst":
-                return signal
-    return None
-
-
-def _swarm_sentiment_size_multiplier(swarm_decision: Any) -> float:
-    signal = _swarm_sentiment_signal(swarm_decision)
-    if signal is None:
-        return 1.0
-    metadata = signal.metadata if hasattr(signal, "metadata") and isinstance(signal.metadata, dict) else {}
-    sentiment_score = _finite_float(metadata.get("sentiment_score"))
-    if sentiment_score is None:
-        return 1.0
-    bounded_score = max(-1.0, min(1.0, sentiment_score))
-    # Sentiment is a secondary nudge only: cap impact to +/-15%.
-    return max(0.85, min(1.15, 1.0 + (bounded_score * 0.15)))
-
-
-def _swarm_sentiment_result_suffix(details: dict[str, object] | None) -> str:
-    if not isinstance(details, dict):
-        return ""
-    multiplier = _finite_float(details.get("swarm_sentiment_size_multiplier"))
-    if multiplier is None or abs(multiplier - 1.0) < 1e-9:
-        return ""
-    score = _finite_float(details.get("swarm_sentiment_score"))
-    action = details.get("swarm_sentiment_action")
-    parts = [f"sent_mult={multiplier:.2f}"]
-    if action is not None:
-        parts.append(f"sent_action={action}")
-    if score is not None:
-        parts.append(f"sent_score={score:.2f}")
-    return " " + " ".join(parts)
-
-
-def _swarm_sentiment_bucket(details: dict[str, object] | None) -> str:
-    if not isinstance(details, dict):
-        return ""
-    score = _finite_float(details.get("swarm_sentiment_score"))
-    if score is None:
-        return ""
-    if score >= 0.35:
-        return "bullish"
-    if score <= -0.35:
-        return "bearish"
-    return "neutral"
-
-
-def _run_swarm_overlay(
-    symbols: list[str],
-    settings: Settings,
-    portfolio_state: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Run swarm analysis and return per-symbol committee decisions.
-
-    Scanner uses these decisions as evidence only. Paper trading may use the
-    same decisions as bounded position-size modifiers.
-    """
-    try:
-        from trading_bot.swarm.engine import SwarmEngine
-        from trading_bot.swarm.workers import WORKER_CLASSES
-        from trading_bot.sentiment import load_sentiment_context
-
-        engine = SwarmEngine(
-            preset_name=settings.swarm.preset,
-            max_concurrent=settings.swarm.max_workers,
-        )
-        engine.setup_workers(WORKER_CLASSES)
-
-        # Fetch market data for swarm
-        frames: dict[str, pd.DataFrame] = {}
-        for symbol in symbols:
-            try:
-                frame = market_data.fetch_bars(
-                    symbol=symbol,
-                    period=settings.market_data.daily_period,
-                    interval="1d",
-                    settings=settings.market_data,
-                )
-                if frame is not None and not frame.empty:
-                    frame = add_ema(frame, period=20, column_name="ema_20")
-                    frame = add_sma(frame, period=50, column_name="sma_50")
-                    frame = add_rsi(frame, period=14)
-                    frame = add_bollinger_bands(frame, period=20, std_dev=2.0)
-                    frame["volume_avg_5"] = frame["volume"].rolling(5).mean()
-                    frames[symbol] = frame
-            except Exception:
-                continue
-
-        if not frames:
-            return {}
-
-        sentiment_context: dict[str, object] = load_sentiment_context(settings, list(frames.keys()))
-        try:
-            vix_frame = market_data.fetch_bars(
-                symbol="^VIX",
-                period=settings.market_data.daily_period,
-                interval="1d",
-                settings=settings.market_data,
-            )
-            if vix_frame is not None and not vix_frame.empty and "close" in vix_frame.columns:
-                vix_level = _finite_float(vix_frame.iloc[-1].get("close"))
-                if vix_level is not None and "vix" not in sentiment_context:
-                    sentiment_context["vix"] = vix_level
-        except Exception:
-            logger.debug("VIX context fetch failed for swarm overlay")
-
-        memory_store = None
-        if settings.sentiment.memory_enabled and _sentiment_context_has_evidence(sentiment_context):
-            try:
-                from trading_bot.memory.store import MemoryStore
-
-                memory_store = MemoryStore(settings.sentiment.memory_db_path)
-            except Exception:
-                logger.debug("Sentiment memory store unavailable")
-
-        # Run swarm analysis
-        run_summary = engine.run(
-            symbols=list(frames.keys()),
-            market_data=frames,
-            portfolio_state=portfolio_state,
-            sentiment_context=sentiment_context,
-            memory_store=memory_store,
-            vote_log_path=Path(settings.app.log_dir) / "worker_votes.jsonl",
-        )
-
-        # Extract per-ticker decisions
-        results = {}
-        for ticker, decision in run_summary.decisions.items():
-            results[ticker] = decision
-
-        return results
-
-    except Exception as e:
-        logger.warning("Swarm overlay failed: %s", e)
-        return {}
-
-
-def _sentiment_context_has_evidence(context: dict[str, object]) -> bool:
-    if not context:
-        return False
-    if context.get("vix") is not None or isinstance(context.get("breadth"), dict):
-        return True
-    tickers = context.get("tickers")
-    if not isinstance(tickers, dict):
-        return False
-    for ticker_context in tickers.values():
-        if isinstance(ticker_context, dict) and ticker_context.get("news"):
-            return True
-    return False
 
 
 def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = False) -> list[str]:
@@ -781,13 +513,6 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
         )
         return [f"CIRCUIT_BREAKER: {cb_reason}"]
 
-    swarm_results: dict[str, Any] = {}
-    if settings.swarm.enabled:
-        try:
-            swarm_results = _run_swarm_overlay(symbols, settings, portfolio_state=state.model_dump())
-        except Exception as e:
-            logger.warning("Swarm overlay failed: %s", e)
-            swarm_results = {}
 
     for symbol in (value.strip() for value in symbols if value.strip()):
         try:
@@ -846,9 +571,6 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
 
             signal, _, details = _build_signal_result(symbol, settings)
             if signal is None:
-                if symbol in swarm_results:
-                    swarm_decision = swarm_results[symbol]
-                    _augment_details_with_swarm(details, swarm_decision)
                 details.update(
                     build_stacked_signal(
                         symbol,
@@ -872,9 +594,6 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
             counter_result = _evaluate_counter_thesis_for_signal(symbol, signal, settings)
             if counter_result is not None:
                 _augment_details_with_counter_thesis(details, counter_result)
-            if symbol in swarm_results:
-                swarm_decision = swarm_results[symbol]
-                _augment_details_with_swarm(details, swarm_decision)
             stacked = build_stacked_signal(symbol, signal, details, settings=settings.supermodel)
             details.update(stacked.to_details())
             if stacked.decision == "block":
@@ -1012,19 +731,6 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
             if details.get("is_half_size"):
                 decision.position_size = max(1, int(decision.position_size * 0.5))
 
-            if settings.swarm.enabled and symbol in swarm_results:
-                swarm_decision = swarm_results[symbol]
-                if settings.swarm.swarm_weight > 0:
-                    swarm_conf = getattr(swarm_decision, "confidence", 0.0)
-                    swarm_adjust = settings.swarm.swarm_weight * swarm_conf
-                    if getattr(swarm_decision, "decision", "") == "APPROVE":
-                        decision.position_size = max(1, int(decision.position_size * (1.0 + swarm_adjust)))
-                    elif getattr(swarm_decision, "decision", "") == "REJECT":
-                        decision.position_size = max(1, int(decision.position_size * max(0.1, 1.0 - swarm_adjust)))
-                sentiment_multiplier = _swarm_sentiment_size_multiplier(swarm_decision)
-                details["swarm_sentiment_size_multiplier"] = round(sentiment_multiplier, 4)
-                if sentiment_multiplier != 1.0:
-                    decision.position_size = max(1, int(decision.position_size * sentiment_multiplier))
             if decision.position_size > risk_approved_size:
                 decision.position_size = risk_approved_size
                 details["position_size_capped"] = "risk_approved"
@@ -1090,7 +796,6 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 results.append(
                     f"{symbol} DRY_RUN qty={decision.position_size} "
                     f"price={estimated_fill_price:.2f} cash_after={broker.cash - estimated_total_cost:.2f}"
-                    f"{_swarm_sentiment_result_suffix(details)}"
                 )
                 continue
 
@@ -1124,7 +829,6 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 fill,
                 side="BUY",
                 strategy_tag=strategy_tag,
-                swarm_sentiment_bucket=_swarm_sentiment_bucket(details),
             )
             _persist_trade_to_db(fill, signal, settings, details)
             updated_state = _portfolio_state_from_broker(
@@ -1138,6 +842,11 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
             ledger.record_equity_snapshot(updated_state, timestamp=fill.filled_at)
             state = updated_state
             open_tickers.add(symbol)
+            # Recompute portfolio heat so the next symbol's heat check reflects
+            # fills from this loop iteration. Without this, `portfolio_heat`
+            # stays frozen at the pre-loop value (line ~498) and the Nth fill
+            # uses stale heat from before fills 1..N-1.
+            portfolio_heat = _calculate_portfolio_heat(state, settings)
 
             if strategy_tag:
                 from trading_bot.strategy.strategy_tracker import record_entry as _rec_entry
@@ -1165,7 +874,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
             )
             results.append(
                 f"{symbol} FILLED qty={fill.quantity} price={fill.fill_price:.2f} cash={state.cash:.2f}"
-                f"{_swarm_sentiment_result_suffix(details)}"
+                
             )
         except Exception as exc:
             append_decision_event(
@@ -1186,167 +895,6 @@ def _build_signal_with_reason(symbol: str, settings: Settings) -> tuple[TradeSig
     signal, reason, _ = _build_signal_result(symbol, settings)
     return signal, reason
 
-
-def _build_parallel_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal | None, str, dict]:
-    """Run all enabled signal sources in parallel and resolve by consensus.
-
-    Each source emits a ``(signal, confidence, details)`` tuple. The
-    consensus logic:
-      - 2+ sources agree BUY → full position size
-      - 1 source says BUY → half position size (via details flag)
-      - 0 sources say BUY → no trade
-      - Any source says SELL → veto (no trade)
-    Swarm runs outside this resolver; paper trading applies it later as a
-    bounded position-size modifier.
-    """
-    source_votes: list[dict] = []
-
-    v3_sig: TradeSignal | None = None
-    v25_sig: TradeSignal | None = None
-    v3_details: dict = {}
-    v25_details: dict = {}
-
-    v3_enabled = getattr(settings, "strategy", None) is not None and settings.strategy.use_v3_signals
-
-    shared_daily = None
-    shared_intraday = None
-    shared_hourly = None
-    daily_frame, daily_valid = market_data.fetch_and_validate_bars(
-        symbol, settings.market_data.daily_period, "1d", settings.market_data,
-    )
-    if daily_valid.valid:
-        intraday_frame, intraday_valid = market_data.fetch_and_validate_bars(
-            symbol, settings.market_data.intraday_period,
-            settings.market_data.intraday_interval, settings.market_data,
-        )
-        if intraday_valid.valid:
-            daily_frame = add_ema(daily_frame, period=20, column_name="ema_20")
-            daily_frame = add_sma(daily_frame, period=50, column_name="sma_50")
-            shared_daily = daily_frame
-            intraday_frame = _drop_trailing_zero_volume_bars(intraday_frame)
-            intraday_frame["volume_avg_5"] = intraday_frame["volume"].rolling(5).mean()
-            intraday_frame = add_atr(intraday_frame, period=settings.risk.atr_period)
-            intraday_frame = add_rsi(intraday_frame, period=14)
-            intraday_frame = add_bollinger_bands(intraday_frame, period=20, std_dev=2.0)
-            intraday_frame = add_vwap(intraday_frame)
-            shared_intraday = intraday_frame
-            shared_hourly = _fetch_hourly_alignment_frame(symbol, settings)
-            from trading_bot.strategy.intraday_signal_engine import generate_recent_signal_with_reason
-            v25_sig, v25_reason = generate_recent_signal_with_reason(
-                symbol, daily_frame, intraday_frame,
-                atr_stop_multiplier=settings.risk.atr_stop_multiplier,
-                min_stop_distance_pct=settings.risk.min_stop_distance_pct,
-            )
-            v25_details = _scan_details(daily_frame, intraday_frame)
-            if settings.app.allow_yellow_mean_reversion:
-                from trading_bot.strategy.setup_rules import is_valid_mean_reversion_setup
-                v25_details["is_mean_reversion"] = is_valid_mean_reversion_setup(intraday_frame)
-
-    if v3_enabled and shared_daily is not None and shared_intraday is not None:
-        v3_sig, v3_reason, v3_details = _build_v3_signal_result(
-            symbol, settings,
-            daily_frame=shared_daily,
-            intraday_frame=shared_intraday,
-        )
-    elif v3_enabled:
-        v3_sig, v3_reason, v3_details = _build_v3_signal_result(symbol, settings)
-
-    for source, sig, details, cond in [
-        ("v3", v3_sig, v3_details, v3_enabled),
-        ("v2.5", v25_sig, v25_details, True),
-    ]:
-        if not cond:
-            continue
-        if sig is not None and hasattr(sig, "action") and sig.action == "BUY":
-            conf = getattr(sig, "confidence", 0.0)
-            source_votes.append({
-                "source": source,
-                "action": "BUY",
-                "confidence": float(conf),
-                "signal": sig,
-                "details": details,
-            })
-        elif sig is not None and hasattr(sig, "action") and sig.action == "SELL":
-            source_votes.append({
-                "source": source,
-                "action": "SELL",
-                "confidence": float(getattr(sig, "confidence", 0.0)),
-            })
-        else:
-            source_votes.append({
-                "source": source,
-                "action": "HOLD" if sig is None else "NO_SIGNAL",
-                "confidence": 0.0,
-            })
-
-    buy_votes = [v for v in source_votes if v["action"] == "BUY"]
-    sell_votes = [v for v in source_votes if v["action"] == "SELL"]
-    active_votes = [v for v in source_votes if v["action"] != "SKIPPED"]
-    vote_count = len(active_votes)
-
-    public_votes = [
-        {
-            "source": str(v["source"]),
-            "action": str(v["action"]),
-            "confidence": round(float(v.get("confidence", 0.0)), 4),
-        }
-        for v in source_votes
-    ]
-    details: dict[str, object] = {
-        **v25_details,
-        **v3_details,
-        "source_votes": public_votes,
-        "signal_mode": "parallel",
-    }
-
-    for v in public_votes:
-        details[f"vote_{v['source']}"] = f"{v['action']}:{v['confidence']:.2f}"
-
-    if sell_votes:
-        details["consensus"] = "SELL"
-        details["consensus_reason"] = f"veto by {sell_votes[0]['source']}"
-        return None, f"parallel veto: SELL from {sell_votes[0]['source']}", details
-
-    if len(buy_votes) >= 2:
-        best = max(buy_votes, key=lambda v: v["confidence"])
-        details["consensus"] = "BUY"
-        details["consensus_count"] = len(buy_votes)
-        details["consensus_votes"] = vote_count
-        details["is_full_size"] = True
-        signal = _copy_signal_with_confidence(best["signal"], best["confidence"])
-        return _apply_phase1_signal_quality(
-            symbol,
-            signal,
-            f"parallel consensus ({len(buy_votes)}/{vote_count})",
-            details,
-            daily_frame=shared_daily,
-            intraday_frame=shared_intraday,
-            hourly_frame=shared_hourly,
-            settings=settings,
-        )
-
-    if len(buy_votes) == 1:
-        vote = buy_votes[0]
-        details["consensus"] = "BUY"
-        details["consensus_count"] = 1
-        details["consensus_votes"] = vote_count
-        details["is_half_size"] = True
-        signal = _copy_signal_with_confidence(vote["signal"], vote["confidence"])
-        return _apply_phase1_signal_quality(
-            symbol,
-            signal,
-            f"parallel single-source ({vote['source']})",
-            details,
-            daily_frame=shared_daily,
-            intraday_frame=shared_intraday,
-            hourly_frame=shared_hourly,
-            settings=settings,
-        )
-
-    source_list = ", ".join(v["source"] for v in active_votes)
-    details["consensus"] = "NO_TRADE"
-    details["consensus_votes"] = vote_count
-    return None, f"parallel no consensus ({source_list})", details
 
 
 def _copy_signal_with_confidence(signal: TradeSignal, confidence: float) -> TradeSignal:
@@ -1413,6 +961,7 @@ def _apply_phase1_signal_quality(
         signal=signal,
         setup_name=setup_name,
         quality=str(details.get("quality", getattr(signal, "quality", ""))),
+        required_count=getattr(settings.app, "min_timeframe_alignment", 1),
     )
     details.update(verdict.to_details())
     if not verdict.passed:
@@ -1431,9 +980,6 @@ def _apply_phase1_signal_quality(
 
 
 def _build_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal | None, str, dict]:
-    if getattr(settings.app, "signal_mode", "serial") == "parallel":
-        return _build_parallel_signal_result(symbol, settings)
-
     # RL path: use RL model if enabled AND trained for this symbol.
     # If RL is enabled but the symbol isn't trained, fall through to V3.
     if getattr(settings, "rl", None) is not None and settings.rl.enabled:
@@ -2038,23 +1584,6 @@ def _format_scan_details(details: dict[str, object]) -> str:
     if details.get("supermodel_layers"):
         parts.append(f"supermodel_layers={details.get('supermodel_layers')}")
 
-    if details.get("swarm_decision"):
-        parts.append(
-            f"swarm={details.get('swarm_decision')}"
-            f":{details.get('swarm_confidence')}"
-        )
-    for key in (
-        "swarm_sentiment_action",
-        "swarm_sentiment_confidence",
-        "swarm_sentiment_score",
-        "swarm_sentiment_news_count",
-    ):
-        value = details.get(key)
-        if value is not None:
-            parts.append(f"{key}={value}")
-    if details.get("swarm_handoff"):
-        parts.append(f"swarm_handoff={str(details.get('swarm_handoff')).replace(' ', '_')}")
-
     return f" {' '.join(parts)}" if parts else ""
 
 
@@ -2091,13 +1620,11 @@ def _scan_row_sort_key(row: dict[str, object]) -> tuple[int, int, int, float, fl
     relative_volume = _finite_float(
         detail_map.get("entry_volume_ratio", detail_map.get("volume_ratio"))
     ) or 0.0
-    sentiment_score = _finite_float(row.get("swarm_sentiment_score")) or 0.0
     return (
         status_order.get(str(row.get("status", "")), -1),
         quality_order.get(str(row.get("quality", "")), 0),
         freshness_order.get(str(row.get("freshness", "")), 0),
         relative_volume,
-        sentiment_score,
         float(row.get("rr", 0.0) or 0.0),
         float(row.get("confidence", -1.0) or -1.0),
         -float(row.get("risk", 0.0) or 0.0),
@@ -2492,9 +2019,6 @@ def _persist_scan_feature_row(
         consensus=str(details.get("consensus", "")) or None,
         v3_total_score=_finite_float(details.get("v3_total_score")),
         supermodel_score=_finite_float(row.get("supermodel_score", details.get("supermodel_score"))),
-        swarm_confidence=_finite_float(row.get("swarm_confidence", details.get("swarm_confidence"))),
-        swarm_sentiment_score=_finite_float(row.get("swarm_sentiment_score", details.get("swarm_sentiment_score"))),
-        swarm_sentiment_confidence=_finite_float(row.get("swarm_sentiment_confidence", details.get("swarm_sentiment_confidence"))),
         mtf_aligned=_safe_int(details.get("mtf_aligned")),
         entry_volume_ratio=_finite_float(details.get("entry_volume_ratio")),
         entry_range_ratio=_finite_float(details.get("entry_range_ratio")),
@@ -2528,10 +2052,6 @@ def _scan_row_details_for_persistence(row: dict) -> dict | None:
         for key in (
             "supermodel_decision",
             "supermodel_score",
-            "swarm_decision",
-            "swarm_confidence",
-            "swarm_rationale",
-            "swarm_handoff",
         )
         if key in row
     }
@@ -2563,14 +2083,10 @@ def _persist_trade_to_db(
                 profit_target=signal.profit_target if signal else None,
                 fees=fill.fees,
                 strategy_tag=strategy_tag,
-                swarm_sentiment_bucket=_swarm_sentiment_bucket(details),
                 signal_quality=(str(details.get("quality", "")) if isinstance(details, dict) else None) or None,
                 market_regime=(str(details.get("mtf_regime", details.get("v3_regime", ""))) if isinstance(details, dict) else None) or None,
                 supermodel_decision=(str(details.get("supermodel_decision", "")) if isinstance(details, dict) else None) or None,
-                swarm_decision=(str(details.get("swarm_decision", "")) if isinstance(details, dict) else None) or None,
                 consensus=(str(details.get("consensus", "")) if isinstance(details, dict) else None) or None,
-                swarm_sentiment_score=_finite_float(details.get("swarm_sentiment_score")) if isinstance(details, dict) else None,
-                swarm_sentiment_confidence=_finite_float(details.get("swarm_sentiment_confidence")) if isinstance(details, dict) else None,
                 entry_volume_ratio=_finite_float(details.get("entry_volume_ratio")) if isinstance(details, dict) else None,
                 entry_range_ratio=_finite_float(details.get("entry_range_ratio")) if isinstance(details, dict) else None,
                 adaptive_rr=_finite_float(details.get("adaptive_rr")) if isinstance(details, dict) else None,
@@ -2595,7 +2111,6 @@ def _persist_trade_to_db(
 def _trade_strategy_tag(signal, details: dict | None = None) -> str | None:
     base = getattr(signal, "strategy_tag", None) if signal else None
     decision = details.get("supermodel_decision") if isinstance(details, dict) else None
-    swarm_decision = details.get("swarm_decision") if isinstance(details, dict) else None
     consensus = details.get("consensus") if isinstance(details, dict) else None
     suffixes = []
     if decision:
@@ -2607,12 +2122,6 @@ def _trade_strategy_tag(signal, details: dict | None = None) -> str | None:
         consensus_suffix = f"consensus:{_tag_token(consensus, 8)}"
     else:
         consensus_suffix = ""
-    if swarm_decision:
-        swarm_max = 20
-        if consensus_suffix:
-            reserved = len(consensus_suffix) + (1 if stack_suffix else 0) + len(stack_suffix)
-            swarm_max = max(1, 50 - reserved - len("|swarm:"))
-        suffixes.append(f"swarm:{_tag_token(swarm_decision, swarm_max)}")
     if consensus_suffix:
         suffixes.append(consensus_suffix)
     if not suffixes:
@@ -2620,13 +2129,6 @@ def _trade_strategy_tag(signal, details: dict | None = None) -> str | None:
     suffix = "|".join(suffixes)
     base = str(base or "")[:max(0, 200 - len(suffix))]
     return f"{base}|{suffix}" if base else suffix
-
-
-def _short_swarm_decision(decision: object) -> str:
-    value = _tag_token(decision, 20)
-    if value == "hold_for_more_info":
-        return "hold"
-    return value
 
 
 def _tag_token(value: object, max_length: int) -> str:
@@ -2651,15 +2153,6 @@ def _paper_evidence_fields(details: dict | None) -> dict[str, object]:
             "position_size_capped",
             "supermodel_decision",
             "supermodel_score",
-            "swarm_decision",
-            "swarm_confidence",
-            "swarm_handoff",
-            "swarm_sentiment_action",
-            "swarm_sentiment_confidence",
-            "swarm_sentiment_score",
-            "swarm_sentiment_news_count",
-            "swarm_sentiment_source",
-            "swarm_sentiment_size_multiplier",
             "mtf_aligned",
             "mtf_required",
             "mtf_passed",

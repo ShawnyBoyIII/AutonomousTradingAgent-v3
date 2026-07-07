@@ -129,8 +129,7 @@ class TestModels:
         expected = {
             "id", "ticker", "side", "order_type", "quantity", "entry_price",
             "stop_loss", "profit_target", "fees", "filled_at", "strategy_tag",
-            "swarm_sentiment_bucket", "signal_quality", "market_regime", "supermodel_decision",
-            "swarm_decision", "consensus", "swarm_sentiment_score", "swarm_sentiment_confidence",
+            "signal_quality", "market_regime", "supermodel_decision",
             "entry_volume_ratio", "entry_range_ratio", "adaptive_rr",
             "status", "exit_price", "exit_fees", "exited_at", "pnl",
         }
@@ -142,8 +141,6 @@ class TestModels:
         expected = {
             "id", "scan_result_id", "ticker", "timestamp", "status", "action", "confidence",
             "quality", "freshness", "market_age_minutes", "market_regime", "strategy_tag",
-            "consensus", "v3_total_score", "supermodel_score", "swarm_confidence",
-            "swarm_sentiment_score", "swarm_sentiment_confidence", "mtf_aligned",
             "entry_volume_ratio", "entry_range_ratio", "adaptive_rr",
         }
         assert expected.issubset(cols)
@@ -264,19 +261,17 @@ class TestTradesRepo:
         trade = upsert_trade(
             session, ticker="AAPL", side="BUY", order_type="limit",
             quantity=50, entry_price=145.0, stop_loss=140.0,
-            profit_target=160.0, fees=1.0, strategy_tag="momentum", swarm_sentiment_bucket="bullish",
+            profit_target=160.0, fees=1.0, strategy_tag="momentum",
             signal_quality="GREEN", market_regime="strong_uptrend", supermodel_decision="support",
-            swarm_decision="APPROVE", consensus="BUY", swarm_sentiment_score=0.42,
-            swarm_sentiment_confidence=0.72, entry_volume_ratio=1.35, entry_range_ratio=0.8,
+            consensus="BUY",
+            entry_volume_ratio=1.35, entry_range_ratio=0.8,
             adaptive_rr=2.5,
         )
         assert trade.stop_loss == 140.0
         assert trade.profit_target == 160.0
         assert trade.strategy_tag == "momentum"
-        assert trade.swarm_sentiment_bucket == "bullish"
         assert trade.signal_quality == "GREEN"
         assert trade.market_regime == "strong_uptrend"
-        assert trade.swarm_sentiment_score == 0.42
         assert trade.adaptive_rr == 2.5
 
     def test_update_trade_exit(self, session):
@@ -331,32 +326,6 @@ class TestTradesRepo:
         result = get_trades(session, limit=3)
         assert len(result) == 3
 
-    def test_get_trades_by_swarm_sentiment_bucket(self, session):
-        upsert_trade(
-            session,
-            ticker="AAPL",
-            side="BUY",
-            order_type="market",
-            quantity=100,
-            entry_price=150.0,
-            swarm_sentiment_bucket="bullish",
-        )
-        upsert_trade(
-            session,
-            ticker="MSFT",
-            side="BUY",
-            order_type="market",
-            quantity=50,
-            entry_price=200.0,
-            swarm_sentiment_bucket="bearish",
-        )
-
-        result = get_trades(session, swarm_sentiment_bucket="bullish")
-
-        assert len(result) == 1
-        assert result[0].ticker == "AAPL"
-
-
 class TestScanFeaturesRepo:
     def test_upsert_scan_feature(self, session):
         feature = upsert_scan_feature(
@@ -373,9 +342,6 @@ class TestScanFeaturesRepo:
             consensus="BUY",
             v3_total_score=8.5,
             supermodel_score=0.7,
-            swarm_confidence=0.8,
-            swarm_sentiment_score=0.42,
-            swarm_sentiment_confidence=0.72,
             mtf_aligned=3,
             entry_volume_ratio=1.4,
             entry_range_ratio=0.9,
@@ -384,11 +350,10 @@ class TestScanFeaturesRepo:
 
         assert feature.id is not None
         assert feature.ticker == "AAPL"
-        assert feature.swarm_sentiment_score == 0.42
 
     def test_get_scan_features(self, session):
-        upsert_scan_feature(session, ticker="AAPL", status="APPROVED", action="BUY", swarm_sentiment_score=0.5)
-        upsert_scan_feature(session, ticker="MSFT", status="REJECTED", action="HOLD", swarm_sentiment_score=-0.4)
+        upsert_scan_feature(session, ticker="AAPL", status="APPROVED", action="BUY")
+        upsert_scan_feature(session, ticker="MSFT", status="REJECTED", action="HOLD")
 
         result = get_scan_features(session, ticker="AAPL")
 
@@ -416,13 +381,10 @@ class TestScanFeaturesRepo:
                 "freshness": "fresh",
                 "age": "5m",
                 "supermodel_score": 0.7,
-                "swarm_confidence": 0.8,
-                "swarm_sentiment_score": 0.42,
                 "details": {
                     "mtf_regime": "strong_uptrend",
                     "consensus": "BUY",
                     "v3_total_score": 8.5,
-                    "swarm_sentiment_confidence": 0.72,
                     "mtf_aligned": 3,
                     "entry_volume_ratio": 1.4,
                     "entry_range_ratio": 0.9,
@@ -439,7 +401,6 @@ class TestScanFeaturesRepo:
         try:
             features = get_scan_features(session, ticker="AAPL")
             assert len(features) == 1
-            assert features[0].swarm_sentiment_score == 0.42
             assert features[0].market_age_minutes == 5
             assert features[0].strategy_tag == "v3-trend_following"
         finally:
@@ -491,68 +452,8 @@ class TestScanFeaturesRepo:
         assert len(result) == 2
         assert all(f.strategy_tag == "v3-trend_following" for f in result)
 
-    def test_get_scan_features_sentiment_bullish(self, session):
-        upsert_scan_feature(session, ticker="AAPL", status="APPROVED", action="BUY", swarm_sentiment_score=0.5)
-        upsert_scan_feature(session, ticker="MSFT", status="APPROVED", action="BUY", swarm_sentiment_score=-0.4)
-        upsert_scan_feature(session, ticker="GOOGL", status="APPROVED", action="BUY", swarm_sentiment_score=0.4)
-
-        result = get_scan_features(session, swarm_sentiment_bucket="bullish")
-        assert len(result) == 2
-        assert all(f.swarm_sentiment_score is not None and f.swarm_sentiment_score >= 0.35 for f in result)
-
-    def test_get_scan_features_sentiment_bearish(self, session):
-        upsert_scan_feature(session, ticker="AAPL", status="APPROVED", action="BUY", swarm_sentiment_score=0.5)
-        upsert_scan_feature(session, ticker="MSFT", status="APPROVED", action="BUY", swarm_sentiment_score=-0.4)
-        upsert_scan_feature(session, ticker="GOOGL", status="APPROVED", action="BUY", swarm_sentiment_score=-0.5)
-
-        result = get_scan_features(session, swarm_sentiment_bucket="bearish")
-        assert len(result) == 2
-        assert all(f.swarm_sentiment_score is not None and f.swarm_sentiment_score <= -0.35 for f in result)
-
-    def test_get_scan_features_sentiment_neutral(self, session):
-        upsert_scan_feature(session, ticker="AAPL", status="APPROVED", action="BUY", swarm_sentiment_score=0.5)
-        upsert_scan_feature(session, ticker="MSFT", status="APPROVED", action="BUY", swarm_sentiment_score=0.1)
-        upsert_scan_feature(session, ticker="GOOGL", status="APPROVED", action="BUY", swarm_sentiment_score=-0.1)
-
-        result = get_scan_features(session, swarm_sentiment_bucket="neutral")
-        assert len(result) == 2
-        assert all(
-            f.swarm_sentiment_score is not None and -0.35 < f.swarm_sentiment_score < 0.35
-            for f in result
-        )
-
-    def test_get_scan_features_combined_filters(self, session):
-        upsert_scan_feature(
-            session, ticker="AAPL", status="APPROVED", action="BUY",
-            market_regime="strong_uptrend", quality="GREEN",
-            strategy_tag="v3-trend_following", swarm_sentiment_score=0.5,
-        )
-        upsert_scan_feature(
-            session, ticker="MSFT", status="APPROVED", action="BUY",
-            market_regime="strong_uptrend", quality="GREEN",
-            strategy_tag="v3-mean_reversion", swarm_sentiment_score=0.5,
-        )
-        upsert_scan_feature(
-            session, ticker="GOOGL", status="APPROVED", action="HOLD",
-            market_regime="strong_uptrend", quality="GREEN",
-            strategy_tag="v3-trend_following", swarm_sentiment_score=0.5,
-        )
-
-        result = get_scan_features(
-            session,
-            status="APPROVED", action="BUY", market_regime="strong_uptrend",
-            quality="GREEN", strategy_tag="v3-trend_following",
-        )
-        assert len(result) == 1
-        assert result[0].ticker == "AAPL"
-
-    def test_get_scan_features_sentiment_unknown(self, session):
-        upsert_scan_feature(session, ticker="AAPL", status="APPROVED", action="BUY", swarm_sentiment_score=0.5)
-        upsert_scan_feature(session, ticker="MSFT", status="APPROVED", action="BUY")
-
-        result = get_scan_features(session, swarm_sentiment_bucket="unknown")
-        assert len(result) == 1
-        assert result[0].ticker == "MSFT"
+        tickers = {f.ticker for f in result}
+        assert tickers == {"AAPL", "GOOGL"}
 
 
 # ──────────────────────────── Positions repository ────────────────────────────

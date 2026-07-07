@@ -24,9 +24,6 @@ def upsert_scan_feature(
     consensus: str | None = None,
     v3_total_score: float | None = None,
     supermodel_score: float | None = None,
-    swarm_confidence: float | None = None,
-    swarm_sentiment_score: float | None = None,
-    swarm_sentiment_confidence: float | None = None,
     mtf_aligned: int | None = None,
     entry_volume_ratio: float | None = None,
     entry_range_ratio: float | None = None,
@@ -47,9 +44,6 @@ def upsert_scan_feature(
         consensus=consensus,
         v3_total_score=v3_total_score,
         supermodel_score=supermodel_score,
-        swarm_confidence=swarm_confidence,
-        swarm_sentiment_score=swarm_sentiment_score,
-        swarm_sentiment_confidence=swarm_sentiment_confidence,
         mtf_aligned=mtf_aligned,
         entry_volume_ratio=entry_volume_ratio,
         entry_range_ratio=entry_range_ratio,
@@ -69,7 +63,6 @@ def get_scan_features(
     status: str | None = None,
     action: str | None = None,
     market_regime: str | None = None,
-    swarm_sentiment_bucket: str | None = None,
     quality: str | None = None,
     strategy_tag: str | None = None,
 ) -> list[ScanFeature]:
@@ -84,18 +77,6 @@ def get_scan_features(
         query = query.where(ScanFeature.action == action)
     if market_regime:
         query = query.where(ScanFeature.market_regime == market_regime)
-    if swarm_sentiment_bucket:
-        if swarm_sentiment_bucket == "bullish":
-            query = query.where(ScanFeature.swarm_sentiment_score >= 0.35)
-        elif swarm_sentiment_bucket == "bearish":
-            query = query.where(ScanFeature.swarm_sentiment_score <= -0.35)
-        elif swarm_sentiment_bucket == "neutral":
-            query = query.where(
-                (ScanFeature.swarm_sentiment_score > -0.35)
-                & (ScanFeature.swarm_sentiment_score < 0.35)
-            )
-        elif swarm_sentiment_bucket == "unknown":
-            query = query.where(ScanFeature.swarm_sentiment_score == None)  # noqa: E711
     if quality:
         query = query.where(ScanFeature.quality == quality)
     if strategy_tag:

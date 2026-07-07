@@ -47,7 +47,6 @@ def run_attribution(
         "holding_period_analysis": _holding_period_analysis(backtest_result),
         "exit_reason_attribution": _exit_reason_attribution(backtest_result),
         "signal_quality_attribution": _signal_quality_attribution(backtest_result),
-        "swarm_sentiment_attribution": _swarm_sentiment_attribution(backtest_result),
     }
 
     if benchmark_data is not None and not benchmark_data.empty:
@@ -258,60 +257,6 @@ def _signal_quality_attribution(result: dict[str, Any]) -> dict[str, Any]:
         "tier_summary": tier_summary,
     }
 
-
-def _swarm_sentiment_attribution(result: dict[str, Any]) -> dict[str, Any]:
-    """Summarize backtest rows by swarm sentiment buckets when available."""
-    rows = result.get("rows", [])
-    sentiment_rows = []
-    for row in rows:
-        raw_score = row.get("swarm_sentiment_score")
-        if raw_score is None:
-            continue
-        try:
-            score = float(raw_score)
-        except (TypeError, ValueError):
-            continue
-        sentiment_rows.append((row, score))
-
-    if not sentiment_rows:
-        return {
-            "rows_with_sentiment": 0,
-            "bucket_summary": {},
-            "note": "No swarm sentiment metadata available in backtest rows.",
-        }
-
-    def bucket(score: float) -> str:
-        if score >= 0.35:
-            return "bullish"
-        if score <= -0.35:
-            return "bearish"
-        return "neutral"
-
-    buckets: dict[str, list[tuple[dict[str, Any], float]]] = {"bullish": [], "neutral": [], "bearish": []}
-    for row, score in sentiment_rows:
-        buckets[bucket(score)].append((row, score))
-
-    bucket_summary: dict[str, dict[str, Any]] = {}
-    for bucket_name, entries in buckets.items():
-        if not entries:
-            continue
-        trades = sum(int(row.get("trades", 0) or 0) for row, _ in entries)
-        wins = sum(int(row.get("wins", 0) or 0) for row, _ in entries)
-        net_pnl = sum(float(row.get("net_pnl", 0.0) or 0.0) for row, _ in entries)
-        scores = [score for _, score in entries]
-        bucket_summary[bucket_name] = {
-            "tickers": len(entries),
-            "trades": trades,
-            "wins": wins,
-            "win_rate": round(wins / trades * 100, 1) if trades > 0 else 0.0,
-            "net_pnl": round(net_pnl, 2),
-            "avg_sentiment_score": round(float(np.mean(scores)), 3),
-        }
-
-    return {
-        "rows_with_sentiment": len(sentiment_rows),
-        "bucket_summary": bucket_summary,
-    }
 
 
 def _beta_regression(

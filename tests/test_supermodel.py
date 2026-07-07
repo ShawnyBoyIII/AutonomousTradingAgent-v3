@@ -164,34 +164,6 @@ def test_rl_layer_omitted_when_missing() -> None:
 
 
 # ---------------------------------------------------------------------------
-# swarm layer
-# ---------------------------------------------------------------------------
-
-
-def test_swarm_approve_creates_agent_layer() -> None:
-    signal = build_stacked_signal(
-        "AAPL",
-        FakeSignal(confidence=0.8),
-        {"swarm_decision": "APPROVE", "swarm_confidence": 0.75},
-    )
-    swarm = [l for l in signal.layers if l.name == "swarm"][0]
-    assert swarm.score == 0.75
-    assert swarm.verdict == "support"
-
-
-def test_swarm_reject_is_caution_not_block() -> None:
-    signal = build_stacked_signal(
-        "AAPL",
-        FakeSignal(confidence=0.9),
-        {"swarm_decision": "REJECT", "swarm_confidence": 0.9},
-    )
-    swarm = [l for l in signal.layers if l.name == "swarm"][0]
-    assert swarm.verdict == "caution"
-    assert swarm.score == 0.35
-    assert signal.decision != "block"
-
-
-# ---------------------------------------------------------------------------
 # counter-thesis layer
 # ---------------------------------------------------------------------------
 

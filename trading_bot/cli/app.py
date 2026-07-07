@@ -719,7 +719,12 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
         min_stop_pct = ctx.obj.risk.min_stop_distance_pct
         if min_stop_pct > 0 and position.stop_loss is not None:
             min_stop = round(position.average_cost * (1.0 - min_stop_pct / 100.0), 4)
-            if position.stop_loss > min_stop:
+            # Only widen stops that are still protective (below entry); a
+            # stop already ratcheted up by trailing should not be undone.
+            if (
+                position.stop_loss > min_stop
+                and position.stop_loss < position.average_cost
+            ):
                 state.positions[ticker] = position.model_copy(update={"stop_loss": min_stop})
                 position = state.positions[ticker]
                 state_changed = True
@@ -1013,49 +1018,6 @@ def trade_attribution(ctx: typer.Context) -> None:
     orders = ledger.list_order_rows()
     decision_log_path = Path(ctx.obj.app.log_dir) / "decision-log.jsonl"
 
-    def sentiment_bucket(score: object) -> str:
-        try:
-            numeric = float(score)
-        except (TypeError, ValueError):
-            return "unknown"
-        if numeric >= 0.35:
-            return "bullish"
-        if numeric <= -0.35:
-            return "bearish"
-        return "neutral"
-
-    buy_sentiment_events: dict[str, list[str]] = {}
-    if decision_log_path.exists():
-        for raw_line in decision_log_path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                event = json_module.loads(line)
-            except json_module.JSONDecodeError:
-                continue
-            if event.get("command") != "paper-trade" or event.get("status") != "FILLED":
-                continue
-            ticker = str(event.get("ticker", "") or "").upper()
-            if not ticker:
-                continue
-            buy_sentiment_events.setdefault(ticker, []).append(
-                sentiment_bucket(event.get("swarm_sentiment_score"))
-            )
-
-    buy_sentiment_by_order_id: dict[str, str] = {}
-    buy_order_rows = sorted(
-        [o for o in orders if o["side"] == "BUY"],
-        key=lambda row: (str(row.get("filled_at", "")), str(row.get("id", ""))),
-    )
-    for buy in buy_order_rows:
-        ticker = str(buy.get("ticker", "") or "").upper()
-        bucket = str(buy.get("swarm_sentiment_bucket", "") or "unknown")
-        queued = buy_sentiment_events.get(ticker, [])
-        if bucket == "unknown" and queued:
-            bucket = queued.pop(0)
-        buy_sentiment_by_order_id[str(buy.get("id", ""))] = bucket
-
     last_buy: dict[str, dict] = {}
     sells: list[dict] = []
     for o in orders:
@@ -1073,8 +1035,6 @@ def trade_attribution(ctx: typer.Context) -> None:
     losses = 0
     strategy_pnl: dict[str, float] = {}
     strategy_count: dict[str, int] = {}
-    sentiment_pnl: dict[str, float] = {}
-    sentiment_count: dict[str, int] = {}
     prior_buys: dict[str, list[dict]] = {}
     for o in orders:
         if o["side"] == "BUY":
@@ -1103,7 +1063,6 @@ def trade_attribution(ctx: typer.Context) -> None:
             except (ValueError, TypeError):
                 pass
         tag = s.get("strategy_tag", "") or (b.get("strategy_tag", "") if b else "") or "unknown"
-        sentiment = buy_sentiment_by_order_id.get(str(b.get("id", "")), "unknown") if b else "unknown"
         print(f"{t:8} {tag[:24]:24} {buy_price:9.2f} {sell_price:9.2f} {s['quantity']:5} {pnl:10.2f} {ret:7.2f}% {held:>8}")
         total_pnl += pnl
         if pnl > 0:
@@ -1114,8 +1073,6 @@ def trade_attribution(ctx: typer.Context) -> None:
             loss_pnl += abs(pnl)
         strategy_pnl[tag] = strategy_pnl.get(tag, 0.0) + pnl
         strategy_count[tag] = strategy_count.get(tag, 0) + 1
-        sentiment_pnl[sentiment] = sentiment_pnl.get(sentiment, 0.0) + pnl
-        sentiment_count[sentiment] = sentiment_count.get(sentiment, 0) + 1
     print("-" * 90)
     print(f'{"":8} {"TOTAL":24} {"":9} {"":9} {"":5} {total_pnl:10.2f}')
     wl = wins + losses
@@ -1128,13 +1085,6 @@ def trade_attribution(ctx: typer.Context) -> None:
         print("-" * 50)
         for tag in sorted(strategy_pnl, key=lambda k: strategy_pnl[k]):
             print(f"{tag[:30]:30} {strategy_count[tag]:7} {strategy_pnl[tag]:10.2f}")
-    if sentiment_pnl:
-        print(f"\n{'Swarm Sentiment':30} {'Trades':>7} {'P&L':>10}")
-        print("-" * 50)
-        for bucket in ("bullish", "neutral", "bearish", "unknown"):
-            if bucket not in sentiment_pnl:
-                continue
-            print(f"{bucket[:30]:30} {sentiment_count[bucket]:7} {sentiment_pnl[bucket]:10.2f}")
 
 
 def _build_portfolio_view(state: PortfolioState, settings) -> dict[str, object]:
@@ -1822,30 +1772,6 @@ def _format_scan_summary(summary: dict[str, object]) -> str:
                 f"rl_sell={summary['rl_sell']}",
                 f"rl_unsupported={summary.get('rl_unsupported', 0)}",
                 f"rl_avg_conf={summary.get('rl_avg_confidence', 0.0)}",
-            ]
-        )
-    if summary.get("swarm_enabled"):
-        parts.extend(
-            [
-                f"swarm_approved={summary.get('swarm_approved', 0)}",
-                f"swarm_rejected={summary.get('swarm_rejected', 0)}",
-                f"swarm_hold={summary.get('swarm_hold', 0)}",
-            ]
-        )
-        if "swarm_sentiment_evidence" in summary:
-            parts.extend(
-                [
-                    f"swarm_sentiment_evidence={summary.get('swarm_sentiment_evidence', 0)}",
-                    f"swarm_sentiment_bullish={summary.get('swarm_sentiment_bullish', 0)}",
-                    f"swarm_sentiment_bearish={summary.get('swarm_sentiment_bearish', 0)}",
-                ]
-            )
-    if "parallel_buy" in summary:
-        parts.extend(
-            [
-                f"parallel_buy={summary['parallel_buy']}",
-                f"parallel_sell={summary['parallel_sell']}",
-                f"parallel_no_trade={summary['parallel_no_trade']}",
             ]
         )
     if "supermodel_support" in summary:
@@ -3138,7 +3064,6 @@ def db_history(
     ctx: typer.Context,
     ticker: str | None = typer.Option(None, "--ticker", help="Filter by ticker"),
     since: str | None = typer.Option(None, "--since", help="Start date (YYYY-MM-DD)"),
-    swarm_sentiment: str | None = typer.Option(None, "--swarm-sentiment", help="Filter trades by stored swarm sentiment bucket (bullish|neutral|bearish|unknown)"),
     limit: int = typer.Option(50, "--limit", help="Max rows to return"),
 ) -> None:
     """Query scan results and trades from the database."""
@@ -3168,13 +3093,11 @@ def db_history(
                     session,
                     ticker=ticker.upper(),
                     since=datetime.fromisoformat(since) if since else None,
-                    swarm_sentiment_bucket=(swarm_sentiment.lower() if swarm_sentiment else None),
                     limit=limit,
                 )
                 for t in trades:
                     pnl_str = f" pnl={t.pnl:.2f}" if t.pnl is not None else ""
-                    sentiment_str = f" sentiment={t.swarm_sentiment_bucket}" if getattr(t, "swarm_sentiment_bucket", None) else ""
-                    typer.echo(f"  {t.filled_at} {t.ticker} {t.side} qty={t.quantity} @${t.entry_price:.2f}{pnl_str}{sentiment_str}")
+                    typer.echo(f"  {t.filled_at} {t.ticker} {t.side} qty={t.quantity} @${t.entry_price:.2f}{pnl_str}")
             else:
                 typer.echo("RECENT SCAN RESULTS")
                 typer.echo("=" * 60)
@@ -3187,13 +3110,11 @@ def db_history(
                 trades = get_trades(
                     session,
                     since=datetime.fromisoformat(since) if since else None,
-                    swarm_sentiment_bucket=(swarm_sentiment.lower() if swarm_sentiment else None),
                     limit=limit,
                 )
                 for t in trades:
                     pnl_str = f" pnl={t.pnl:.2f}" if t.pnl is not None else ""
-                    sentiment_str = f" sentiment={t.swarm_sentiment_bucket}" if getattr(t, "swarm_sentiment_bucket", None) else ""
-                    typer.echo(f"  {t.filled_at} {t.ticker} {t.side} qty={t.quantity} @${t.entry_price:.2f}{pnl_str}{sentiment_str}")
+                    typer.echo(f"  {t.filled_at} {t.ticker} {t.side} qty={t.quantity} @${t.entry_price:.2f}{pnl_str}")
         finally:
             session.close()
     finally:
@@ -3234,9 +3155,7 @@ def supermodel_report(
     counts: Counter[str] = Counter()
     actions: Counter[tuple[str, str]] = Counter()
     hold_reasons: Counter[tuple[str, str]] = Counter()
-    swarm_pairs: Counter[tuple[str, str]] = Counter()
     consensus_pairs: Counter[tuple[str, str]] = Counter()
-    swarm_handoff_rows = 0
     scores: dict[str, list[float]] = {}
     missing = 0
     for row in rows:
@@ -3249,11 +3168,6 @@ def supermodel_report(
         if row.action == "HOLD":
             for reason in _scan_row_reasons(row):
                 hold_reasons[(decision, reason)] += 1
-        swarm_decision = _scan_row_swarm_decision(row)
-        if swarm_decision:
-            swarm_pairs[(swarm_decision, decision)] += 1
-        if _scan_row_swarm_handoff(row):
-            swarm_handoff_rows += 1
         details = _scan_row_details(row)
         if details and details.get("signal_mode") == "parallel":
             consensus = str(details.get("consensus") or "")
@@ -3279,13 +3193,6 @@ def supermodel_report(
         typer.echo("SCAN HOLD REASONS")
         for (decision, reason), total in sorted(hold_reasons.items()):
             typer.echo(f"{decision} reason={reason} count={total}")
-    if swarm_pairs:
-        typer.echo("SWARM ALIGNMENT")
-        typer.echo(f"swarm_handoff_rows={swarm_handoff_rows}")
-        for (swarm_decision, stack_decision), total in sorted(swarm_pairs.items()):
-            typer.echo(
-                f"swarm={swarm_decision} stack={stack_decision} count={total}"
-            )
     if consensus_pairs:
         typer.echo("PARALLEL CONSENSUS")
         for (consensus, stack_decision), total in sorted(consensus_pairs.items()):
@@ -3296,11 +3203,6 @@ def supermodel_report(
     trade_wins: Counter[str] = Counter()
     trade_losses: Counter[str] = Counter()
     trade_open_counts: Counter[str] = Counter()
-    trade_pairs: Counter[tuple[str, str]] = Counter()
-    trade_pair_pnl: Counter[tuple[str, str]] = Counter()
-    trade_pair_wins: Counter[tuple[str, str]] = Counter()
-    trade_pair_losses: Counter[tuple[str, str]] = Counter()
-    trade_pair_open_counts: Counter[tuple[str, str]] = Counter()
     trade_consensus: Counter[tuple[str, str]] = Counter()
     trade_consensus_pnl: Counter[tuple[str, str]] = Counter()
     trade_consensus_wins: Counter[tuple[str, str]] = Counter()
@@ -3314,9 +3216,6 @@ def supermodel_report(
         if trade.pnl is None:
             open_trades += 1
             trade_open_counts[decision] += 1
-            swarm_decision = _trade_swarm_decision(trade)
-            if swarm_decision:
-                trade_pair_open_counts[(swarm_decision, decision)] += 1
             consensus = _trade_consensus(trade)
             if consensus:
                 trade_consensus_open_counts[(consensus, decision)] += 1
@@ -3328,14 +3227,6 @@ def supermodel_report(
             trade_wins[decision] += 1
         elif pnl < 0:
             trade_losses[decision] += 1
-        swarm_decision = _trade_swarm_decision(trade)
-        if swarm_decision:
-            trade_pairs[(swarm_decision, decision)] += 1
-            trade_pair_pnl[(swarm_decision, decision)] += pnl
-            if pnl > 0:
-                trade_pair_wins[(swarm_decision, decision)] += 1
-            elif pnl < 0:
-                trade_pair_losses[(swarm_decision, decision)] += 1
         consensus = _trade_consensus(trade)
         if consensus:
             trade_consensus[(consensus, decision)] += 1
@@ -3364,17 +3255,6 @@ def supermodel_report(
                 f"avg_pnl={avg_pnl:.2f} win_rate={win_rate:.2f} "
                 f"wins={trade_wins[decision]} losses={trade_losses[decision]} open={open_total}"
             )
-        trade_pair_keys = set(trade_pairs) | set(trade_pair_open_counts)
-        for swarm_decision, stack_decision in sorted(trade_pair_keys):
-            total = trade_pairs[(swarm_decision, stack_decision)]
-            open_total = trade_pair_open_counts[(swarm_decision, stack_decision)]
-            win_rate = trade_pair_wins[(swarm_decision, stack_decision)] / total if total else 0.0
-            typer.echo(
-                f"swarm={swarm_decision} stack={stack_decision} closed={total} "
-                f"net_pnl={trade_pair_pnl[(swarm_decision, stack_decision)]:.2f} "
-                f"win_rate={win_rate:.2f} wins={trade_pair_wins[(swarm_decision, stack_decision)]} "
-                f"losses={trade_pair_losses[(swarm_decision, stack_decision)]} open={open_total}"
-            )
         consensus_keys = set(trade_consensus) | set(trade_consensus_open_counts)
         for consensus, stack_decision in sorted(consensus_keys):
             total = trade_consensus[(consensus, stack_decision)]
@@ -3400,22 +3280,6 @@ def _scan_row_supermodel(row) -> tuple[str | None, float | None]:
     except (TypeError, ValueError):
         score = None
     return str(decision), score
-
-
-def _scan_row_swarm_decision(row) -> str | None:
-    details = _scan_row_details(row)
-    if not details:
-        return None
-    decision = details.get("swarm_decision")
-    return _normalize_swarm_decision(decision) if decision else None
-
-
-def _scan_row_swarm_handoff(row) -> str | None:
-    details = _scan_row_details(row)
-    if not details:
-        return None
-    handoff = details.get("swarm_handoff")
-    return str(handoff) if handoff else None
 
 
 def _scan_row_reasons(row) -> list[str]:
@@ -3450,17 +3314,6 @@ def _trade_stack_decision(trade) -> str | None:
     return None
 
 
-def _trade_swarm_decision(trade) -> str | None:
-    tag = getattr(trade, "strategy_tag", None)
-    if not tag:
-        return None
-    for part in str(tag).split("|"):
-        if part.startswith("swarm:"):
-            value = part.split(":", 1)[1]
-            return _normalize_swarm_decision(value) if value else None
-    return None
-
-
 def _trade_consensus(trade) -> str | None:
     tag = getattr(trade, "strategy_tag", None)
     if not tag:
@@ -3471,13 +3324,6 @@ def _trade_consensus(trade) -> str | None:
     return None
 
 
-def _normalize_swarm_decision(decision: object) -> str:
-    value = str(decision).lower()
-    if value in {"hold_for_more_info", "hold_for_more_in"}:
-        return "hold"
-    return value
-
-
 @app.command(name="db-features")
 def db_features(
     ctx: typer.Context,
@@ -3486,7 +3332,6 @@ def db_features(
     status: str | None = typer.Option(None, "--status", help="Filter by status (APPROVED, REJECTED, etc.)"),
     action: str | None = typer.Option(None, "--action", help="Filter by action (BUY, HOLD, SELL)"),
     regime: str | None = typer.Option(None, "--regime", help="Filter by market regime (trending_up, trending_down, mean_reversion, high_volatility, sideways)"),
-    sentiment: str | None = typer.Option(None, "--sentiment", help="Filter by swarm sentiment bucket (bullish|neutral|bearish|unknown)"),
     quality: str | None = typer.Option(None, "--quality", help="Filter by signal quality (GREEN, YELLOW, RED)"),
     strategy: str | None = typer.Option(None, "--strategy", help="Filter by strategy tag"),
     limit: int = typer.Option(100, "--limit", help="Max rows to return"),
@@ -3516,7 +3361,6 @@ def db_features(
                 status=status,
                 action=action,
                 market_regime=regime,
-                swarm_sentiment_bucket=sentiment,
                 quality=quality,
                 strategy_tag=strategy,
             )
@@ -3540,9 +3384,6 @@ def db_features(
                         "consensus": f.consensus,
                         "v3_total_score": f.v3_total_score,
                         "supermodel_score": f.supermodel_score,
-                        "swarm_confidence": f.swarm_confidence,
-                        "swarm_sentiment_score": f.swarm_sentiment_score,
-                        "swarm_sentiment_confidence": f.swarm_sentiment_confidence,
                         "mtf_aligned": f.mtf_aligned,
                         "entry_volume_ratio": f.entry_volume_ratio,
                         "entry_range_ratio": f.entry_range_ratio,
@@ -3589,15 +3430,6 @@ def db_features(
                 typer.echo(f"\nQuality distribution:")
                 for q, c in sorted(quality_counts.items()):
                     typer.echo(f"  {q}: {c}")
-
-                sentiment_scores = [f.swarm_sentiment_score for f in features if f.swarm_sentiment_score is not None]
-                if sentiment_scores:
-                    avg_sentiment = sum(sentiment_scores) / len(sentiment_scores)
-                    bullish = sum(1 for s in sentiment_scores if s >= 0.35)
-                    bearish = sum(1 for s in sentiment_scores if s <= -0.35)
-                    neutral = len(sentiment_scores) - bullish - bearish
-                    typer.echo(f"\nSwarm Sentiment ({len(sentiment_scores)} records):")
-                    typer.echo(f"  avg={avg_sentiment:.3f} bullish={bullish} neutral={neutral} bearish={bearish}")
 
                 v3_scores = [f.v3_total_score for f in features if f.v3_total_score is not None]
                 if v3_scores:
@@ -5366,3 +5198,109 @@ def auto_retrain(
         typer.echo("-" * 60)
         typer.echo(f"Auto-retrain failed with exit code {result.returncode}")
         raise typer.Exit(code=result.returncode)
+
+
+@app.command(name="reset-portfolio")
+def reset_portfolio(
+    ctx: typer.Context,
+    confirm: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Skip the confirmation prompt.",
+    ),
+    backup: bool = typer.Option(
+        True,
+        "--backup/--no-backup",
+        help="Create a timestamped backup of the database before resetting.",
+    ),
+) -> None:
+    """Reset portfolio state, trade history, and equity tracking.
+
+    Clears orders, trades, equity_history, and resets portfolio_state to
+    the starting cash amount. This is a destructive operation — use with
+    caution.
+    """
+    settings: Settings = ctx.obj
+    db_path = Path(settings.app.state_db_path)
+
+    if not db_path.exists():
+        typer.echo(f"No database found at {db_path}")
+        raise typer.Exit(code=1)
+
+    typer.echo("PORTFOLIO RESET")
+    typer.echo("=" * 60)
+    typer.echo(f"  Database: {db_path}")
+    typer.echo(f"  Backup:   {'yes' if backup else 'no'}")
+    typer.echo("")
+
+    if not confirm:
+        typer.echo("WARNING: This will delete all trade history and reset")
+        typer.echo("         portfolio state to starting cash.")
+        typer.echo("")
+        answer = typer.prompt("Type 'RESET' to confirm", default="", show_default=False)
+        if answer != "RESET":
+            typer.echo("Aborted.")
+            raise typer.Exit(code=130)
+
+    import shutil
+    import sqlite3
+    from datetime import datetime
+
+    # Backup before doing anything
+    if backup:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = db_path.with_name(f"{db_path.name}.reset_{ts}.bak")
+        shutil.copy2(db_path, backup_path)
+        typer.echo(f"  Backup created: {backup_path}")
+
+    conn = sqlite3.connect(str(db_path), timeout=5)
+    try:
+        cur = conn.cursor()
+
+        # Count rows before clearing
+        tables_to_clear = ["orders", "trades", "equity_history"]
+        counts = {}
+        for t in tables_to_clear:
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {t}")
+                counts[t] = cur.fetchone()[0]
+            except sqlite3.OperationalError:
+                counts[t] = 0
+
+        # Clear trade history
+        for t in tables_to_clear:
+            if counts[t] > 0:
+                cur.execute(f"DELETE FROM {t}")
+                typer.echo(f"  Cleared {t}: {counts[t]} rows")
+
+        # Reset portfolio state to starting cash
+        starting_cash = 100_000.0
+        initial_state = PortfolioState(
+            cash=starting_cash,
+            equity=starting_cash,
+            realized_pnl=0.0,
+            unrealized_pnl=0.0,
+        )
+        cur.execute(
+            """
+            INSERT INTO portfolio_state (id, payload)
+            VALUES (1, ?)
+            ON CONFLICT(id) DO UPDATE SET payload = excluded.payload
+            """,
+            (initial_state.model_dump_json(),),
+        )
+        typer.echo(f"  Reset portfolio_state: ${starting_cash:,.2f}")
+
+        # Reset auto-increment counters
+        try:
+            cur.execute("DELETE FROM sqlite_sequence WHERE name IN ('equity_history', 'trades')")
+        except sqlite3.OperationalError:
+            pass
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    typer.echo("")
+    typer.echo("Portfolio reset complete.")

@@ -14,7 +14,7 @@ from trading_bot.data import market_data
 from trading_bot.data.indicators import add_atr, add_bollinger_bands, add_ema, add_rsi, add_sma
 from trading_bot.execution.order_manager import submit_signal_as_order
 from trading_bot.execution.paper_broker import PaperBroker
-from trading_bot.runtime.decision_log import append_decision_event
+from trading_bot.runtime.decision_log import append_decision_event, should_append_backtest_entry
 from trading_bot.runtime.snapshots import write_snapshot
 from trading_bot.strategy.daily_signal_engine import generate_daily_signal
 from trading_bot.strategy.intraday_signal_engine import generate_signal
@@ -167,19 +167,20 @@ def run_backtest(
                 "end": end,
             }
         )
-        append_decision_event(
-            log_path,
-            {
-                "command": "backtest",
-                "ticker": symbol,
-                "trades": result["trades"],
-                "wins": result["wins"],
-                "losses": result["losses"],
-                "net_pnl": result["net_pnl"],
-                "start": start,
-                "end": end,
-            },
-        )
+        if should_append_backtest_entry(log_path, symbol):
+            append_decision_event(
+                log_path,
+                {
+                    "command": "backtest",
+                    "ticker": symbol,
+                    "trades": result["trades"],
+                    "wins": result["wins"],
+                    "losses": result["losses"],
+                    "net_pnl": result["net_pnl"],
+                    "start": start,
+                    "end": end,
+                },
+            )
 
     summary = {
         "trades": trades,
@@ -967,20 +968,22 @@ def run_rl_backtest(
             "end": end,
             "strategy": "rl",
         })
-        append_decision_event(
-            log_path,
-            {
-                "command": "backtest",
-                "ticker": ",".join(meta_symbols),
-                "strategy": "rl",
-                "trades": result["trades"],
-                "wins": result["wins"],
-                "losses": result["losses"],
-                "net_pnl": result["net_pnl"],
-                "start": start,
-                "end": end,
-            },
-        )
+        rl_ticker = ",".join(meta_symbols)
+        if should_append_backtest_entry(log_path, rl_ticker):
+            append_decision_event(
+                log_path,
+                {
+                    "command": "backtest",
+                    "ticker": rl_ticker,
+                    "strategy": "rl",
+                    "trades": result["trades"],
+                    "wins": result["wins"],
+                    "losses": result["losses"],
+                    "net_pnl": result["net_pnl"],
+                    "start": start,
+                    "end": end,
+                },
+            )
 
     summary = {
         "trades": trades,

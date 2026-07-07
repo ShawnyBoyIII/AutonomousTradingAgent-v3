@@ -19,14 +19,10 @@ def upsert_trade(
     profit_target: float | None = None,
     fees: float = 0.0,
     strategy_tag: str | None = None,
-    swarm_sentiment_bucket: str | None = None,
     signal_quality: str | None = None,
     market_regime: str | None = None,
     supermodel_decision: str | None = None,
-    swarm_decision: str | None = None,
     consensus: str | None = None,
-    swarm_sentiment_score: float | None = None,
-    swarm_sentiment_confidence: float | None = None,
     entry_volume_ratio: float | None = None,
     entry_range_ratio: float | None = None,
     adaptive_rr: float | None = None,
@@ -43,14 +39,10 @@ def upsert_trade(
         fees=fees,
         filled_at=datetime.now(timezone.utc),
         strategy_tag=strategy_tag,
-        swarm_sentiment_bucket=swarm_sentiment_bucket,
         signal_quality=signal_quality,
         market_regime=market_regime,
         supermodel_decision=supermodel_decision,
-        swarm_decision=swarm_decision,
         consensus=consensus,
-        swarm_sentiment_score=swarm_sentiment_score,
-        swarm_sentiment_confidence=swarm_sentiment_confidence,
         entry_volume_ratio=entry_volume_ratio,
         entry_range_ratio=entry_range_ratio,
         adaptive_rr=adaptive_rr,
@@ -104,7 +96,6 @@ def get_trades(
     session: Session,
     ticker: str | None = None,
     since: datetime | None = None,
-    swarm_sentiment_bucket: str | None = None,
     limit: int | None = None,
 ) -> list[Trade]:
     query = select(Trade)
@@ -112,8 +103,6 @@ def get_trades(
         query = query.where(Trade.ticker == ticker)
     if since:
         query = query.where(Trade.filled_at >= since)
-    if swarm_sentiment_bucket:
-        query = query.where(Trade.swarm_sentiment_bucket == swarm_sentiment_bucket)
     query = query.order_by(Trade.filled_at.desc())
     if limit:
         query = query.limit(limit)

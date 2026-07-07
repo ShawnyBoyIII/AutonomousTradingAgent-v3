@@ -29,12 +29,34 @@ _CACHE_MAX_SIZE = 100  # Max entries to keep in memory
 
 def build_dashboard(settings: Settings, output_path: Path) -> Path:
     scan = _read_json(settings.app.scan_results_path)
-    portfolio = _read_json(settings.app.portfolio_summary_path)
     report = _read_json(settings.app.dashboard_summary_path)
     backtest = _read_json(settings.app.backtest_summary_path)
+    
+    # Build portfolio from ledger (single source of truth)
+    try:
+        from trading_bot.portfolio.ledger import PortfolioLedger
+        ledger = PortfolioLedger(Path(settings.app.state_db_path))
+        ledger_state = ledger.load_portfolio_state()
+        ledger_portfolio = {}
+        if ledger_state:
+            ledger_portfolio = {
+                "cash": ledger_state.cash,
+                "equity": ledger_state.equity,
+                "realized_pnl": ledger_state.realized_pnl,
+                "unrealized_pnl": ledger_state.unrealized_pnl,
+                "positions": len(ledger_state.positions) if ledger_state.positions else 0,
+            }
+            ledger_positions = _load_open_positions_from_ledger(settings)
+            enriched = _enrich_positions(ledger_positions, settings) if ledger_positions else []
+            if enriched:
+                ledger_portfolio["positions"] = enriched
+    except Exception:
+        logger.debug("Failed to build ledger portfolio for static dashboard")
+        ledger_portfolio = {}
+    
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
-        _render_dashboard(scan=scan, portfolio=portfolio, report=report, backtest=backtest),
+        _render_dashboard(scan=scan, portfolio=ledger_portfolio, report=report, backtest=backtest),
         encoding="utf-8",
     )
     return output_path
@@ -169,27 +191,26 @@ class DashboardServer:
             except Exception:
                 logger.debug("Failed to load ledger or kill-switch state")
 
-        # Enrich open positions with live prices + computed metrics
-        raw_positions = portfolio.get("positions", [])
-        enriched_positions = _enrich_positions(raw_positions, self.settings)
-        # Fallback: if portfolio_summary.json has no positions (stale / not yet
-        # written), read open positions directly from the portfolio ledger.
-        # This covers burn-in sessions where only the state DB is updated.
-        if not enriched_positions and ledger:
+        # Build portfolio data from ledger (single source of truth)
+        ledger_portfolio = None
+        ledger_positions = []
+        if ledger:
             try:
-                ledger_positions = _load_open_positions_from_ledger(self.settings)
-                if ledger_positions:
-                    enriched_positions = _enrich_positions(ledger_positions, self.settings)
-                    # Also pull cash/equity from ledger state
-                    ledger_state = ledger.load_portfolio_state()
-                    if ledger_state:
-                        portfolio["cash"] = ledger_state.cash
-                        portfolio["equity"] = ledger_state.equity
-                        portfolio["realized_pnl"] = ledger_state.realized_pnl
-                        portfolio["unrealized_pnl"] = ledger_state.unrealized_pnl
-                        portfolio["positions"] = len(ledger_state.positions)
+                ledger_state = ledger.load_portfolio_state()
+                if ledger_state:
+                    ledger_portfolio = {
+                        "cash": ledger_state.cash,
+                        "equity": ledger_state.equity,
+                        "realized_pnl": ledger_state.realized_pnl,
+                        "unrealized_pnl": ledger_state.unrealized_pnl,
+                        "positions": len(ledger_state.positions) if ledger_state.positions else 0,
+                    }
+                    ledger_positions = _load_open_positions_from_ledger(self.settings)
             except Exception:
-                logger.debug("Ledger fallback for open positions failed")
+                logger.debug("Failed to load ledger portfolio state")
+
+        # Enrich open positions with live prices
+        enriched_positions = _enrich_positions(ledger_positions, self.settings) if ledger_positions else []
         if enriched_positions:
             portfolio["positions"] = enriched_positions
 
@@ -252,37 +273,10 @@ class DashboardServer:
             except Exception:
                 logger.debug("Failed to compute realtime pnl snapshot")
 
-        swarm_sentiment = None
-        try:
-            from trading_bot.reports.burn_in_analytics import compute_swarm_sentiment_summary
-
-            swarm_sentiment = compute_swarm_sentiment_summary(decisions)
-            candidates = scan.get("candidates", []) if isinstance(scan, dict) else []
-            if isinstance(candidates, list):
-                ranked = [
-                    row for row in candidates
-                    if isinstance(row, dict) and row.get("swarm_sentiment_score") is not None
-                ]
-                ranked.sort(
-                    key=lambda row: abs(float(row.get("swarm_sentiment_score", 0.0) or 0.0)),
-                    reverse=True,
-                )
-                swarm_sentiment["top_candidates"] = [
-                    {
-                        "ticker": str(row.get("ticker", "")),
-                        "status": str(row.get("status", "")),
-                        "action": str(row.get("swarm_sentiment_action", "")),
-                        "score": round(float(row.get("swarm_sentiment_score", 0.0) or 0.0), 3),
-                        "confidence": round(float(row.get("swarm_sentiment_confidence", 0.0) or 0.0), 2),
-                    }
-                    for row in ranked[:5]
-                ]
-        except Exception:
-            logger.debug("Failed to compute swarm sentiment snapshot")
-
         return {
             "scan": scan,
             "portfolio": portfolio,
+            "ledger_portfolio": ledger_portfolio,
             "report": report,
             "backtest": backtest,
             "decisions": decisions,
@@ -298,7 +292,6 @@ class DashboardServer:
                 "drawdown_max_pct": round(drawdown_metrics.max_drawdown_pct, 2) if drawdown_metrics else None,
             },
             "realtime_pnl": realtime_pnl,
-            "swarm_sentiment": swarm_sentiment,
             "market_regime": market_regime,
             "strategy_attribution": strategy_attribution,
             "advisory": _load_advisory_data(self.settings),
@@ -489,6 +482,7 @@ def _make_handler(server: DashboardServer) -> type[BaseHTTPRequestHandler]:
 def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None = None) -> str:
     scan = snapshot.get("scan", {})
     portfolio = snapshot.get("portfolio", {})
+    ledger_portfolio = snapshot.get("ledger_portfolio") or {}
     report = snapshot.get("report", {})
     backtest = snapshot.get("backtest", {})
     decisions = snapshot.get("decisions", [])
@@ -496,20 +490,23 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
     watchlist = snapshot.get("watchlist", [])
     kill = snapshot.get("kill_switch", {})
     realtime_pnl = snapshot.get("realtime_pnl", {})
-    swarm_sentiment = snapshot.get("swarm_sentiment")
     generated_at = snapshot.get("generated_at", "")
 
-    portfolio_summary = portfolio.get("summary", {})
     report_summary = report.get("summary", {})
     candidates = scan.get("candidates", [])[-25:]  # most recent 25
     positions = portfolio.get("positions", [])
     performance = report.get("performance", {})
 
-    # Realized P/L: prefer the authoritative ledger value
-    # (portfolio_summary.realized_pnl); fall back to computing from
-    # strategy_results JSONL exits only if the ledger doesn't have it.
+    # Portfolio metrics from ledger (single source of truth)
+    equity = ledger_portfolio.get("equity")
+    cash = ledger_portfolio.get("cash")
+    exposure = ledger_portfolio.get("exposure", 0.0)
+    unrealized_pnl = ledger_portfolio.get("unrealized_pnl", 0.0)
+    num_positions = ledger_portfolio.get("positions", 0)
+
+    # Realized P/L from ledger order rows (authoritative)
     exits = [e for e in strategy_results if e.get("event") == "exit"]
-    ledger_realized = portfolio_summary.get("realized_pnl")
+    ledger_realized = ledger_portfolio.get("realized_pnl")
     if ledger_realized is not None:
         try:
             realized_pnl = float(ledger_realized)
@@ -523,13 +520,8 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
         len(realized_wins) / len(exits) if exits else 0.0
     )
 
-    # Net P/L: prefer report summary; fall back to realized + unrealized
-    net_pnl = report_summary.get("net_pnl")
-    if net_pnl is None:
-        try:
-            net_pnl = realized_pnl + float(portfolio_summary.get("unrealized_pnl", 0))
-        except (TypeError, ValueError):
-            net_pnl = None
+    # Net P/L: realized + unrealized from ledger
+    net_pnl = realized_pnl + float(unrealized_pnl) if unrealized_pnl is not None else realized_pnl
 
     # Circuit breaker metrics
     circuit_breaker = snapshot.get("circuit_breaker", {})
@@ -569,350 +561,674 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
 <head>
   <meta charset="utf-8">
   <meta http-equiv="refresh" content="30">
-  <title>Autonomous Trading Agent - Live</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Autonomous Trading Agent</title>
   <style>
-    body {{ margin: 24px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #101418; color: #e6edf3; }}
-    h1, h2 {{ margin: 0 0 12px; }}
-    h2 {{ margin-top: 24px; }}
-    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 16px 0; }}
-    .card {{ background: #18202a; border: 1px solid #2f3b48; border-radius: 10px; padding: 14px; }}
-    .label {{ color: #8b949e; font-size: 12px; }}
-    .value {{ font-size: 24px; margin-top: 4px; }}
-    .value.positive {{ color: #3fb950; }}
-    .value.negative {{ color: #f85149; }}
-    .banner {{ padding: 8px 12px; border-radius: 6px; margin: 12px 0; font-weight: bold; }}
-    .kill-active {{ background: #f85149; color: #fff; }}
-    .kill-inactive {{ background: #18202a; color: #8b949e; border: 1px solid #2f3b48; }}
-    table {{ width: 100%; border-collapse: collapse; margin: 8px 0 20px; }}
-    th, td {{ border-bottom: 1px solid #2f3b48; padding: 8px; text-align: left; vertical-align: top; }}
-    th {{ color: #8b949e; }}
-    .GREEN, .APPROVED, .FILLED {{ color: #3fb950; }}
-    .YELLOW {{ color: #d29922; }}
-    .REJECTED, .NO_SIGNAL {{ color: #f85149; }}
-    .timestamp {{ color: #8b949e; margin-bottom: 16px; font-size: 12px; }}
-    .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
-    @media (max-width: 900px) {{ .two-col {{ grid-template-columns: 1fr; }} }}
-    .badge {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; background: #18202a; }}
-    .feed {{ max-height: 480px; overflow-y: auto; }}
-    .btn {{ cursor: pointer; padding: 6px 14px; border: none; border-radius: 6px; font-weight: bold; font-size: 13px; margin-left: 12px; transition: opacity 0.2s, outline 0.2s; }}
-    .btn:hover:not(:disabled) {{ opacity: 0.85; }}
-    .btn:disabled {{ cursor: not-allowed; opacity: 0.5; }}
-    .btn:focus-visible {{ outline: 2px solid #58a6ff; outline-offset: 2px; }}
-    .kill-halt {{ background: #f85149; color: #fff; }}
-    #kill-banner button {{ background: #238636; color: #fff; }}
-    .pnl-positive {{ color: #3fb950; }}
-    .pnl-negative {{ color: #f85149; }}
-    .regime-badge {{ display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: bold; margin: 4px 0; }}
-    .regime-high_volatility {{ background: #f85149; color: #fff; }}
-    .regime-strong_uptrend {{ background: #3fb950; color: #fff; }}
-    .regime-weak_uptrend {{ background: #238636; color: #fff; }}
-    .regime-range_bound {{ background: var(--accent-yellow); color: #000; }}
-    .regime-weak_downtrend {{ background: #a45e00; color: #fff; }}
-    .regime-strong_downtrend {{ background: #8b0000; color: #fff; }}
-    
+    :root {{
+      --bg: #070b14;
+      --bg-card: #0e1424;
+      --bg-card-hover: #121a2e;
+      --border: #1a2340;
+      --border-hover: #253058;
+      --text: #e2e8f0;
+      --text-dim: #64748b;
+      --text-muted: #475569;
+      --amber: #f59e0b;
+      --amber-dim: rgba(245, 158, 11, 0.12);
+      --green: #22c55e;
+      --green-dim: rgba(34, 197, 94, 0.12);
+      --red: #ef4444;
+      --red-dim: rgba(239, 68, 68, 0.12);
+      --blue: #6366f1;
+      --blue-dim: rgba(99, 102, 241, 0.12);
+    }}
+
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 32px 48px;
+      min-height: 100vh;
+      background-image:
+        radial-gradient(ellipse 80% 60% at 10% 30%, rgba(245, 158, 11, 0.035) 0%, transparent 70%),
+        radial-gradient(ellipse 60% 50% at 90% 10%, rgba(99, 102, 241, 0.035) 0%, transparent 70%),
+        radial-gradient(ellipse 50% 40% at 50% 90%, rgba(34, 197, 94, 0.025) 0%, transparent 70%);
+    }}
+
+    /* ---- Header ---- */
+    .dash-header {{ margin-bottom: 28px; }}
+    .dash-title {{
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 38px;
+      font-weight: 400;
+      letter-spacing: -0.5px;
+      margin: 0 0 6px 0;
+    }}
+    .dash-title span {{ color: var(--amber); }}
+    .dash-meta {{
+      font-size: 12px;
+      color: var(--text-muted);
+      letter-spacing: 0.3px;
+    }}
+    .dash-meta .live-dot {{
+      display: inline-block;
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 6px var(--green);
+      margin-right: 6px;
+      vertical-align: middle;
+      animation: pulse-dot 2s ease-in-out infinite;
+    }}
+    @keyframes pulse-dot {{
+      0%, 100% {{ opacity: 1; }}
+      50% {{ opacity: 0.4; }}
+    }}
+
+    /* ---- Kill Banner ---- */
+    .kill-banner {{
+      padding: 14px 20px;
+      border-radius: 12px;
+      margin: 20px 0 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-weight: 600;
+      font-size: 14px;
+    }}
+    .kill-banner--active {{
+      background: var(--red-dim);
+      border: 1px solid var(--red);
+      color: var(--red);
+      animation: banner-pulse 2.5s ease-in-out infinite;
+    }}
+    @keyframes banner-pulse {{
+      0%, 100% {{ box-shadow: 0 0 0 0 rgba(239,68,68,0.15); }}
+      50% {{ box-shadow: 0 0 0 6px rgba(239,68,68,0); }}
+    }}
+    .kill-banner--inactive {{
+      background: var(--green-dim);
+      border: 1px solid var(--green);
+      color: var(--green);
+    }}
+
+    /* ---- Bento Grid ---- */
+    .bento {{
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+      margin: 0 0 28px;
+    }}
+    .bento-card {{
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px 20px;
+      position: relative;
+      overflow: hidden;
+      transition: all 0.25s ease;
+    }}
+    .bento-card::before {{
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--border-hover), transparent);
+    }}
+    .bento-card:hover {{
+      background: var(--bg-card-hover);
+      border-color: var(--border-hover);
+      transform: translateY(-1px);
+    }}
+    .bento-card--hero {{
+      grid-column: span 2;
+      grid-row: span 2;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      padding: 28px 32px;
+    }}
+    .bento-card--wide {{ grid-column: span 2; }}
+    .bento-label {{
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 1.8px;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin: 0 0 10px 0;
+    }}
+    .bento-value {{
+      font-family: "SF Mono", Monaco, "Cascadia Code", "Roboto Mono", Consolas, monospace;
+      font-size: 26px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      line-height: 1.1;
+    }}
+    .bento-card--hero .bento-value {{
+      font-size: 52px;
+      letter-spacing: -2px;
+    }}
+    .bento-card--hero .bento-label {{ font-size: 11px; margin-bottom: 14px; }}
+
+    /* Colors */
+    .c-green {{ color: var(--green); }}
+    .c-red {{ color: var(--red); }}
+    .c-amber {{ color: var(--amber); }}
+    .c-blue {{ color: var(--blue); }}
+
+    .glow-green {{ text-shadow: 0 0 18px rgba(34,197,94,0.35); }}
+    .glow-red {{ text-shadow: 0 0 18px rgba(239,68,68,0.35); }}
+    .glow-amber {{ text-shadow: 0 0 18px rgba(245,158,11,0.3); }}
+
+    /* Progress bar */
+    .prog {{
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+      margin-top: 10px;
+    }}
+    .prog-fill {{
+      height: 100%;
+      border-radius: 2px;
+      transition: width 0.6s ease;
+    }}
+    .prog-fill--green {{ background: linear-gradient(90deg, var(--green), #4ade80); }}
+    .prog-fill--amber {{ background: linear-gradient(90deg, var(--amber), #fbbf24); }}
+    .prog-fill--red {{ background: linear-gradient(90deg, var(--red), #f87171); }}
+
+    /* ---- Section Headers ---- */
+    .section-title {{
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin: 36px 0 16px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+    }}
+
+    /* ---- Two-col layout ---- */
+    .two-col {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+    }}
+
+    /* ---- Tables ---- */
+    .data-table {{
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      margin: 12px 0;
+    }}
+    .data-table thead th {{
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      background: var(--bg-card);
+      position: sticky;
+      top: 0;
+    }}
+    .data-table tbody td {{
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      font-family: "SF Mono", Monaco, "Cascadia Code", "Roboto Mono", Consolas, monospace;
+      font-size: 13px;
+    }}
+    .data-table tbody tr {{ transition: background 0.15s ease; }}
+    .data-table tbody tr:hover {{ background: rgba(255,255,255,0.015); }}
+
+    /* ---- Tabs ---- */
+    .tab-nav {{
+      display: flex;
+      gap: 2px;
+      margin: 32px 0 0;
+      border-bottom: 1px solid var(--border);
+    }}
+    .tab-btn {{
+      padding: 10px 22px;
+      border: none;
+      background: transparent;
+      color: var(--text-dim);
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      font-family: inherit;
+      border-radius: 8px 8px 0 0;
+      transition: all 0.2s ease;
+    }}
+    .tab-btn:hover {{ color: var(--text); background: rgba(255,255,255,0.02); }}
+    .tab-btn.active {{
+      color: var(--amber);
+      background: var(--amber-dim);
+      border-bottom: 2px solid var(--amber);
+    }}
+    .tab-content {{ display: none; }}
+    .tab-content.active {{ display: block; animation: fade-in 0.25s ease; }}
+    @keyframes fade-in {{ from {{ opacity: 0; transform: translateY(6px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+
+    /* ---- Inputs ---- */
+    .search-input {{
+      width: 100%;
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text);
+      font-size: 13px;
+      font-family: inherit;
+      transition: all 0.2s ease;
+      margin-bottom: 14px;
+    }}
+    .search-input:focus {{
+      outline: none;
+      border-color: var(--amber);
+      box-shadow: 0 0 0 3px var(--amber-dim);
+    }}
+    .search-input::placeholder {{ color: var(--text-muted); }}
+
+    /* ---- Buttons ---- */
+    .btn {{
+      cursor: pointer;
+      padding: 8px 18px;
+      border: none;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 12px;
+      font-family: inherit;
+      letter-spacing: 0.3px;
+      transition: all 0.2s ease;
+    }}
+    .btn--green {{ background: var(--green); color: #fff; }}
+    .btn--green:hover:not(:disabled) {{ background: #16a34a; box-shadow: 0 0 12px rgba(34,197,94,0.3); }}
+    .btn--red {{ background: var(--red); color: #fff; }}
+    .btn--red:hover:not(:disabled) {{ background: #dc2626; box-shadow: 0 0 12px rgba(239,68,68,0.3); }}
+    .btn--amber {{ background: var(--amber); color: #000; }}
+    .btn--amber:hover:not(:disabled) {{ background: #d97706; box-shadow: 0 0 12px rgba(245,158,11,0.3); }}
+    .btn:disabled {{ opacity: 0.4; cursor: not-allowed; }}
+    .btn:focus-visible {{ outline: 2px solid var(--amber); outline-offset: 2px; }}
+
+    /* ---- Badges ---- */
+    .badge {{
+      display: inline-block;
+      padding: 3px 9px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+    }}
+
+    /* ---- Feed ---- */
+    .feed {{
+      max-height: 480px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border-hover) transparent;
+    }}
+    .feed::-webkit-scrollbar {{ width: 5px; }}
+    .feed::-webkit-scrollbar-track {{ background: transparent; }}
+    .feed::-webkit-scrollbar-thumb {{ background: var(--border-hover); border-radius: 3px; }}
+
+    /* ---- Scroll-to-top ---- */
+    #scroll-top-btn {{
+      position: fixed; bottom: 24px; right: 24px;
+      width: 44px; height: 44px;
+      border-radius: 50%;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      font-size: 18px;
+      cursor: pointer;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s ease;
+      z-index: 100;
+    }}
+    #scroll-top-btn:hover {{
+      background: var(--bg-card-hover);
+      border-color: var(--amber);
+      color: var(--amber);
+    }}
+
+    /* ---- Regime ---- */
+    .regime-badge {{
+      display: inline-block;
+      padding: 5px 14px;
+      border-radius: 18px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+    }}
+    .regime-high_volatility {{ background: var(--red-dim); color: var(--red); }}
+    .regime-strong_uptrend {{ background: var(--green-dim); color: var(--green); }}
+    .regime-weak_uptrend {{ background: rgba(34,197,94,0.2); color: #4ade80; }}
+    .regime-range_bound {{ background: var(--amber-dim); color: var(--amber); }}
+    .regime-weak_downtrend {{ background: rgba(245,158,11,0.2); color: #fbbf24; }}
+    .regime-strong_downtrend {{ background: rgba(180,30,30,0.2); color: #f87171; }}
+
     .regime-metrics {{
       display: grid;
       grid-template-columns: repeat(3, 1fr);
-      gap: 12px;
-      margin-top: 16px;
+      gap: 10px;
+      margin-top: 14px;
     }}
-    
     .regime-metric {{
-      background: var(--bg-tertiary);
-      padding: 12px;
+      background: var(--bg-card);
+      padding: 10px;
       border-radius: 8px;
       text-align: center;
-      border: 1px solid var(--border-color);
+      border: 1px solid var(--border);
     }}
-    
     .regime-metric .label {{
-      font-size: 11px;
-      color: var(--text-secondary);
+      font-size: 10px;
+      color: var(--text-dim);
+      letter-spacing: 1px;
+      text-transform: uppercase;
       margin-bottom: 4px;
     }}
-    
     .regime-metric .value {{
-      font-size: 18px;
-      margin-top: 4px;
+      font-family: "SF Mono", Monaco, Consolas, monospace;
+      font-size: 17px;
       font-weight: 700;
     }}
-    
+
     .regime-explanation {{
-      font-size: 13px;
-      color: var(--text-secondary);
+      font-size: 12px;
+      color: var(--text-dim);
       margin-top: 12px;
       line-height: 1.6;
-      padding: 12px;
-      background: var(--bg-tertiary);
+      padding: 10px 14px;
+      background: var(--bg-card);
       border-radius: 8px;
-      border-left: 3px solid var(--accent-blue);
+      border-left: 3px solid var(--amber);
     }}
-    
+
+    /* ---- Strategy cards ---- */
     .strategy-card {{
-      background: var(--bg-secondary);
-      border: 1px solid var(--border-color);
+      background: var(--bg-card);
+      border: 1px solid var(--border);
       border-radius: 12px;
-      padding: 20px;
-      margin: 16px 0;
-      box-shadow: var(--card-shadow);
+      padding: 18px 20px;
+      margin: 12px 0;
     }}
-    
     .strategy-header {{
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 16px;
+      margin-bottom: 14px;
     }}
-    
     .strategy-name {{
-      font-size: 18px;
+      font-size: 15px;
       font-weight: 700;
-      color: var(--text-primary);
     }}
-    
     .strategy-badge {{
-      padding: 6px 14px;
-      border-radius: 20px;
-      font-size: 13px;
+      padding: 4px 12px;
+      border-radius: 16px;
+      font-size: 11px;
       font-weight: 700;
     }}
-    
-    .strategy-badge-win {{ background: var(--accent-green); color: #fff; }}
-    .strategy-badge-loss {{ background: var(--accent-red); color: #fff; }}
-    .strategy-badge-neutral {{ background: var(--text-secondary); color: #000; }}
-    
+    .strategy-badge-win {{ background: var(--green-dim); color: var(--green); }}
+    .strategy-badge-loss {{ background: var(--red-dim); color: var(--red); }}
+    .strategy-badge-neutral {{ background: var(--text-dim); color: #000; }}
     .strategy-metrics {{
       display: grid;
       grid-template-columns: repeat(5, 1fr);
-      gap: 16px;
-      margin-top: 16px;
+      gap: 12px;
     }}
-    
     .strategy-metric {{
       text-align: center;
-      padding: 12px;
-      background: var(--bg-tertiary);
+      padding: 10px 6px;
+      background: var(--bg);
       border-radius: 8px;
-      border: 1px solid var(--border-color);
     }}
-    
     .strategy-metric .label {{
-      font-size: 11px;
-      color: var(--text-secondary);
-      margin-bottom: 6px;
+      font-size: 10px;
+      color: var(--text-dim);
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      margin-bottom: 4px;
     }}
-    
     .strategy-metric .value {{
-      font-size: 20px;
-      margin-top: 4px;
+      font-family: "SF Mono", Monaco, Consolas, monospace;
+      font-size: 17px;
       font-weight: 700;
     }}
-    
-    .strategy-pnl {{ font-size: 22px; }}
-    
     .strategy-allocation {{
-      font-size: 14px;
-      padding: 6px 12px;
+      font-size: 12px;
+      padding: 4px 10px;
       border-radius: 6px;
       font-weight: 700;
     }}
-    
-    .allocation-full {{ background: var(--accent-green); color: #fff; }}
-    .allocation-half {{ background: var(--accent-yellow); color: #000; }}
-    .allocation-skip {{ background: var(--accent-red); color: #fff; }}
-    
-    .tab-nav {{
+    .allocation-full {{ background: var(--green-dim); color: var(--green); }}
+    .allocation-half {{ background: var(--amber-dim); color: var(--amber); }}
+    .allocation-skip {{ background: var(--red-dim); color: var(--red); }}
+
+    /* ---- Advisory ---- */
+    .advisory-banner {{
+      background: var(--blue-dim);
+      border: 1px solid var(--blue);
+      border-radius: 12px;
+      padding: 16px 20px;
+      margin: 16px 0;
+    }}
+    .advisory-banner .label {{
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: var(--blue);
+      margin-bottom: 8px;
+    }}
+    .advisory-banner .content {{
+      font-size: 13px;
+      color: var(--text);
+      line-height: 1.6;
+    }}
+
+    /* ---- Watchlist ---- */
+    .watchlist-tags {{
       display: flex;
-      gap: 4px;
-      margin: 24px 0 16px;
-      border-bottom: 2px solid var(--border-color);
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
     }}
-    
-    .tab-btn {{
-      padding: 12px 20px;
-      border: none;
-      background: transparent;
-      color: var(--text-secondary);
-      cursor: pointer;
-      border-radius: 8px 8px 0 0;
-      font-size: 14px;
-      font-weight: 600;
-      transition: all 0.2s ease;
-      font-family: inherit;
-    }}
-    
-    .tab-btn:hover {{
-      color: var(--text-primary);
-      background: var(--bg-secondary);
-    }}
-    
-    .tab-btn.active {{
-      color: var(--accent-blue);
-      background: var(--bg-secondary);
-      border-bottom: 2px solid var(--accent-blue);
-    }}
-    
-    .tab-content {{
-      display: none;
-      animation: fadeIn 0.3s ease;
-    }}
-    
-    .tab-content.active {{
-      display: block;
-    }}
-    
-    @keyframes fadeIn {{
-      from {{ opacity: 0; transform: translateY(10px); }}
-      to {{ opacity: 1; transform: translateY(0); }}
-    }}
-    
-    input[type="text"] {{
-      padding: 10px 14px;
+    .watchlist-tag {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
       border-radius: 8px;
-      border: 1px solid var(--border-color);
-      background: var(--bg-tertiary);
-      color: var(--text-primary);
-      font-size: 14px;
-      font-family: inherit;
-      transition: border-color 0.2s ease;
+      font-size: 13px;
+      font-weight: 600;
+      font-family: "SF Mono", Monaco, Consolas, monospace;
     }}
-    
-    input[type="text"]:focus {{
-      outline: none;
-      border-color: var(--accent-blue);
-      box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.1);
+    .watchlist-tag .btn {{
+      padding: 2px 8px;
+      font-size: 11px;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      border-radius: 4px;
     }}
-    
-    input[type="text"]::placeholder {{
-      color: var(--text-secondary);
+    .watchlist-tag .btn:hover {{
+      border-color: var(--red);
+      color: var(--red);
+    }}
+
+    /* ---- Responsive ---- */
+    @media (max-width: 1100px) {{
+      .bento {{ grid-template-columns: repeat(2, 1fr); }}
+      .bento-card--hero {{ grid-column: span 2; }}
+      .bento-card--wide {{ grid-column: span 2; }}
+      .bento-card--hero .bento-value {{ font-size: 40px; }}
+    }}
+    @media (max-width: 700px) {{
+      body {{ padding: 16px; }}
+      .bento {{ grid-template-columns: 1fr; }}
+      .bento-card--hero, .bento-card--wide {{ grid-column: span 1; }}
+      .two-col {{ grid-template-columns: 1fr; }}
+      .strategy-metrics {{ grid-template-columns: repeat(3, 1fr); }}
+      .regime-metrics {{ grid-template-columns: repeat(2, 1fr); }}
+      .bento-card--hero .bento-value {{ font-size: 32px; }}
+      .bento-value {{ font-size: 22px; }}
+    }}
+
+    @media (prefers-reduced-motion: reduce) {{
+      *, *::before, *::after {{
+        animation-duration: 0.01ms !important;
+        transition-duration: 0.01ms !important;
+      }}
     }}
   </style>
 </head>
 <body>
-  <h1>Autonomous Trading Agent</h1>
-  <div class="timestamp">Live dashboard - auto-refresh 30s - generated {html.escape(str(generated_at))}</div>
+  <header class="dash-header">
+    <h1 class="dash-title">Autonomous <span>Trading Agent</span></h1>
+    <div class="dash-meta"><span class="live-dot"></span>Live dashboard &middot; auto-refresh 30s &middot; {html.escape(str(generated_at))}</div>
+  </header>
+
   {kill_banner}
 
-  <section class="grid">
-    {_card("Equity", _money(portfolio_summary.get("equity")))}
-    {_card("Cash", _money(portfolio_summary.get("cash")))}
-    {_card("Exposure", _pct(portfolio_summary.get("exposure")))}
-    {_card("Unrealized P/L", _signed_money(portfolio_summary.get("unrealized_pnl")), raw=True)}
-    {_card("Realized P/L", _signed_money(realized_pnl), raw=True)}
-    {_card("Net P/L", _signed_money(net_pnl), raw=True)}
-    {_card("Open Positions", portfolio_summary.get("positions", 0))}
-    {_card("Realized Win Rate", _pct(realized_win_rate))}
-    {_card("Profit Factor", f"{float(realtime_performance.get('profit_factor', 0.0)):.2f}" if realtime_performance else "n/a")}
-    {_card("Closed Trades", realtime_pnl.get("trading", {}).get("closed_trades", 0) if isinstance(realtime_pnl, dict) else 0)}
-    {_card(cb_label, cb_value, raw=cb_raw)}
-    {_card("Drawdown (max)", f"{drawdown_max:.2f}%" if drawdown_max is not None else "n/a")}
-    {_card("Drawdown (current)", f"{drawdown_current:.2f}%" if drawdown_current is not None else "n/a")}
-  </section>
+  <!-- Bento Grid: Key Metrics -->
+  <div class="bento">
+    <div class="bento-card bento-card--hero">
+      <div class="bento-label">Total Equity</div>
+      <div class="bento-value glow-amber">{_money(equity)}</div>
+    </div>
+    <div class="bento-card">
+      <div class="bento-label">Cash</div>
+      <div class="bento-value">{_money(cash)}</div>
+    </div>
+    <div class="bento-card">
+      <div class="bento-label">Exposure</div>
+      <div class="bento-value">{_pct(exposure)}</div>
+      <div class="prog"><div class="prog-fill prog-fill--amber" style="width: {_exposure_pct(exposure)}%"></div></div>
+    </div>
+    <div class="bento-card">
+      <div class="bento-label">Realized P/L</div>
+      <div class="bento-value {_signed_money_class(realized_pnl)}">{_signed_money(realized_pnl)}</div>
+    </div>
+    <div class="bento-card">
+      <div class="bento-label">Unrealized P/L</div>
+      <div class="bento-value {_signed_money_class(unrealized_pnl)}">{_signed_money(unrealized_pnl)}</div>
+    </div>
+    <div class="bento-card">
+      <div class="bento-label">Win Rate</div>
+      <div class="bento-value">{_pct(realized_win_rate)}</div>
+      <div class="prog"><div class="prog-fill prog-fill--green" style="width: {_winrate_pct(realized_win_rate)}%"></div></div>
+    </div>
+    <div class="bento-card">
+      <div class="bento-label">Profit Factor</div>
+      <div class="bento-value">{_pf_str(realtime_performance)}</div>
+    </div>
+    <div class="bento-card">
+      <div class="bento-label">Net P/L</div>
+      <div class="bento-value {_signed_money_class(net_pnl)}">{_signed_money(net_pnl)}</div>
+    </div>
+    <div class="bento-card">
+      <div class="bento-label">Closed Trades</div>
+      <div class="bento-value">{{ realtime_pnl.get('trading', {{}}).get('closed_trades', 0) if isinstance(realtime_pnl, dict) else 0 }}</div>
+    </div>
+    <div class="bento-card">
+      <div class="bento-label">Open Positions</div>
+      <div class="bento-value">{num_positions}</div>
+    </div>
+    <div class="bento-card">
+      <div class="bento-label">{html.escape(cb_label)}</div>
+      <div class="bento-value">{cb_value if cb_raw else html.escape(str(cb_value))}</div>
+    </div>
+    <div class="bento-card">
+      <div class="bento-label">Max Drawdown</div>
+      <div class="bento-value c-red">{_drawdown_str(drawdown_max)}</div>
+    </div>
+  </div>
 
+  <!-- Widgets -->
   {_realtime_monitoring_widget(realtime_performance, realtime_strategy, realtime_alerts)}
-
-  {_swarm_sentiment_widget(swarm_sentiment)}
-
   {_market_regime_widget(snapshot.get("market_regime"))}
   {_strategy_attribution_widget(snapshot.get("strategy_attribution"))}
   {_advisory_widget(snapshot.get("advisory"))}
   {_watchlist_widget(watchlist)}
 
-  <div class="tab-nav">
-    <button class="tab-btn active" onclick="switchTab('overview')">Overview</button>
-    <button class="tab-btn" onclick="switchTab('closed-positions')">Closed Positions ({len(closed_positions)})</button>
+  <!-- Tabs -->
+  <div class="tab-nav" role="tablist">
+    <button class="tab-btn active" onclick="switchTab('overview')" role="tab" aria-selected="true">Overview</button>
+    <button class="tab-btn" onclick="switchTab('closed-positions')" role="tab" aria-selected="false">Closed Positions ({len(closed_positions)})</button>
   </div>
 
-  <div id="tab-overview" class="tab-content active">
+  <div id="tab-overview" class="tab-content active" role="tabpanel">
     <div class="two-col">
       <div>
-        <h2>Open Positions</h2>
+        <h3 class="section-title">Open Positions</h3>
         {_positions_table(positions)}
-        <h2>Recent Scan Candidates</h2>
-        <div style="margin-bottom: 12px;">
-          <input id="candidates-search" type="text" placeholder="Filter candidates..." onkeyup="filterCandidates()" style="width: 100%; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px; font-family: inherit;">
-        </div>
-        <div id="candidates-container">
-        {_table(candidates, ["ticker", "status", "quality", "confidence", "swarm_sentiment_action", "swarm_sentiment_score", "entry"])}
-        </div>
+        <h3 class="section-title">Recent Scan Candidates</h3>
+        <input id="candidates-search" class="search-input" type="text" placeholder="Filter candidates..." onkeyup="filterCandidates()" aria-label="Filter scan candidates">
+        <div id="candidates-container">{_table(candidates, ["ticker", "status", "quality", "confidence", "entry"])}</div>
       </div>
       <div>
-        <h2>Decision Feed (live)</h2>
-        <div style="margin-bottom: 12px;">
-          <input id="feed-search" type="text" placeholder="Filter decisions..." onkeyup="filterFeed()" style="width: 100%; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px; font-family: inherit;">
-        </div>
-        <div id="feed-container" class="feed">
-        {_decision_feed(decisions[-50:])}
-        </div>
+        <h3 class="section-title">Decision Feed</h3>
+        <input id="feed-search" class="search-input" type="text" placeholder="Filter decisions..." onkeyup="filterFeed()" aria-label="Filter decision feed">
+        <div id="feed-container" class="feed">{_decision_feed(decisions[-50:])}</div>
       </div>
     </div>
   </div>
 
-  <div id="tab-closed-positions" class="tab-content">
-    <h2>Closed Positions</h2>
-    <div style="margin-bottom: 16px;">
-      <input id="closed-search" type="text" placeholder="Filter by ticker..." onkeyup="filterClosedPositions()" style="width: 200px; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px; font-family: inherit;">
-    </div>
-    <div id="closed-positions-container">
-    {_closed_positions_table_from_ledger(closed_positions)}
-    </div>
+  <div id="tab-closed-positions" class="tab-content" role="tabpanel">
+    <h3 class="section-title">Closed Positions</h3>
+    <input id="closed-search" class="search-input" type="text" placeholder="Filter by ticker..." onkeyup="filterClosedPositions()" style="width: 240px;" aria-label="Filter closed positions">
+    <div id="closed-positions-container">{_closed_positions_table_from_ledger(closed_positions)}</div>
   </div>
-  </main>
 
   <script>
   function switchTab(tabName) {{
     document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-    document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
-    document.getElementById('tab-' + tabName).classList.add('active');
+    document.querySelectorAll('.tab-btn').forEach(el => {{ el.classList.remove('active'); el.setAttribute('aria-selected','false'); }});
+    const target = document.getElementById('tab-' + tabName);
+    if (target) {{ target.classList.add('active'); }}
     event.target.classList.add('active');
+    event.target.setAttribute('aria-selected','true');
   }}
 
   function filterClosedPositions() {{
-    const input = document.getElementById('closed-search');
-    const filter = input.value.toUpperCase();
+    const filter = document.getElementById('closed-search').value.toUpperCase();
     const table = document.getElementById('closed-positions-container').querySelector('table');
     if (!table) return;
-    const tr = table.getElementsByTagName('tr');
-    for (let i = 1; i < tr.length; i++) {{
-      const td = tr[i].getElementsByTagName('td')[0];
-      if (td) {{
-        const txtValue = td.textContent || td.innerText;
-        tr[i].style.display = txtValue.toUpperCase().indexOf(filter) > -1 ? '' : 'none';
-      }}
+    for (let i = 1; i < table.rows.length; i++) {{
+      table.rows[i].style.display = table.rows[i].cells[0].textContent.toUpperCase().indexOf(filter) > -1 ? '' : 'none';
     }}
   }}
 
   function filterCandidates() {{
-    const input = document.getElementById('candidates-search');
-    const filter = input.value.toUpperCase();
+    const filter = document.getElementById('candidates-search').value.toUpperCase();
     const table = document.getElementById('candidates-container').querySelector('table');
     if (!table) return;
-    const tr = table.getElementsByTagName('tr');
-    for (let i = 1; i < tr.length; i++) {{
-      const td = tr[i].getElementsByTagName('td')[0];
-      if (td) {{
-        const txtValue = td.textContent || td.innerText;
-        tr[i].style.display = txtValue.toUpperCase().indexOf(filter) > -1 ? '' : 'none';
-      }}
+    for (let i = 1; i < table.rows.length; i++) {{
+      table.rows[i].style.display = table.rows[i].cells[0].textContent.toUpperCase().indexOf(filter) > -1 ? '' : 'none';
     }}
   }}
 
   function filterFeed() {{
-    const input = document.getElementById('feed-search');
-    const filter = input.value.toUpperCase();
+    const filter = document.getElementById('feed-search').value.toUpperCase();
     const container = document.getElementById('feed-container');
     if (!container) return;
-    const rows = container.getElementsByTagName('tr');
-    for (let i = 0; i < rows.length; i++) {{
-      const row = rows[i];
-      let found = false;
-      const tds = row.getElementsByTagName('td');
-      for (let j = 0; j < tds.length; j++) {{
-        const txtValue = tds[j].textContent || tds[j].innerText;
-        if (txtValue.toUpperCase().indexOf(filter) > -1) {{
-          found = true;
-          break;
-        }}
+    for (let i = 0; i < container.rows.length; i++) {{
+      const row = container.rows[i]; let found = false;
+      for (let j = 0; j < row.cells.length; j++) {{
+        if (row.cells[j].textContent.toUpperCase().indexOf(filter) > -1) {{ found = true; break; }}
       }}
       row.style.display = found ? '' : 'none';
     }}
@@ -920,13 +1236,8 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
 
   async function toggleKillSwitch(action) {{
     const btn = document.querySelector('#kill-banner button');
-    let originalText = '';
-    if (btn) {{
-      originalText = btn.innerHTML;
-      btn.disabled = true;
-      btn.setAttribute('aria-busy', 'true');
-      btn.innerHTML = action === 'halt' ? 'Halting... ⏳' : 'Resuming... ⏳';
-    }}
+    const orig = btn ? btn.innerHTML : '';
+    if (btn) {{ btn.disabled = true; btn.setAttribute('aria-busy','true'); btn.innerHTML = action === 'halt' ? 'Halting...' : 'Resuming...'; }}
     try {{
       const resp = await fetch('/api/kill-switch', {{
         method: 'POST',
@@ -934,15 +1245,11 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
         body: JSON.stringify({{action: action, reason: 'dashboard ' + action}})
       }});
       const data = await resp.json();
-      if (data.success) {{
-        location.reload();
-      }} else {{
-        alert('Failed: ' + (data.error || 'unknown error'));
-        if (btn) {{ btn.disabled = false; btn.innerHTML = originalText; }}
-      }}
+      if (data.success) {{ location.reload(); }}
+      else {{ alert('Failed: ' + (data.error || 'unknown error')); if (btn) {{ btn.disabled = false; btn.innerHTML = orig; }} }}
     }} catch (e) {{
       alert('Network error: ' + e.message);
-      if (btn) {{ btn.disabled = false; btn.innerHTML = originalText; }}
+      if (btn) {{ btn.disabled = false; btn.innerHTML = orig; }}
     }}
   }}
 
@@ -955,31 +1262,18 @@ def _render_live_dashboard(snapshot: dict[str, Any], settings: Settings | None =
         headers: {{'Content-Type': 'application/json'}},
         body: JSON.stringify({{action: action, symbol: value}})
       }});
-      if (resp.ok) {{
-        location.reload();
-      }} else {{
-        alert(await resp.text());
-      }}
-    }} catch (e) {{
-      alert('Network error: ' + e.message);
-    }}
+      if (resp.ok) {{ location.reload(); }} else {{ alert(await resp.text()); }}
+    }} catch (e) {{ alert('Network error: ' + e.message); }}
   }}
 
-  // Scroll to top button
-  function scrollToTop() {{
-    window.scrollTo({{ top: 0, behavior: 'smooth' }});
-  }}
-
-  // Show/hide scroll to top button
+  function scrollToTop() {{ window.scrollTo({{ top: 0, behavior: 'smooth' }}); }}
   window.addEventListener('scroll', function() {{
     const btn = document.getElementById('scroll-top-btn');
-    if (btn) {{
-      btn.style.display = window.scrollY > 300 ? 'block' : 'none';
-    }}
+    if (btn) btn.style.display = window.scrollY > 300 ? 'flex' : 'none';
   }});
   </script>
 
-  <button id="scroll-top-btn" class="btn" onclick="scrollToTop()" style="position: fixed; bottom: 24px; right: 24px; background: var(--accent-blue); color: #fff; width: 48px; height: 48px; border-radius: 50%; display: none; align-items: center; justify-content: center; font-size: 20px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3); z-index: 1000;">↑</button>
+  <button id="scroll-top-btn" onclick="scrollToTop()" aria-label="Scroll to top">&#8593;</button>
 </body>
 </html>
 """
@@ -1284,55 +1578,6 @@ def _realtime_monitoring_widget(
 '''
 
 
-def _swarm_sentiment_widget(summary: dict[str, Any] | None) -> str:
-    summary = summary or {}
-    if summary.get("evidence_count", 0) <= 0:
-        return ""
-
-    top_candidates = summary.get("top_candidates", []) if isinstance(summary.get("top_candidates"), list) else []
-    top_rows = "".join(
-        "<tr>"
-        f"<td>{html.escape(str(row.get('ticker', '')))}</td>"
-        f"<td>{html.escape(str(row.get('action', '')) or 'n/a')}</td>"
-        f"<td>{float(row.get('score', 0.0)):+.2f}</td>"
-        f"<td>{float(row.get('confidence', 0.0)):.2f}</td>"
-        "</tr>"
-        for row in top_candidates
-    ) or '<tr><td colspan="4" class="label">No sentiment-ranked candidates in the current scan snapshot.</td></tr>'
-
-    closed_outcomes = summary.get("closed_outcomes", {}) if isinstance(summary.get("closed_outcomes"), dict) else {}
-    outcome_rows = "".join(
-        "<tr>"
-        f"<td>{html.escape(bucket.title())}</td>"
-        f"<td>{int(metrics.get('trades', 0))}</td>"
-        f"<td>{float(metrics.get('win_rate_pct', 0.0)):.1f}%</td>"
-        f"<td>{_signed_money(metrics.get('total_pnl'))}</td>"
-        "</tr>"
-        for bucket, metrics in closed_outcomes.items()
-    ) or '<tr><td colspan="4" class="label">No closed trades yet for sentiment outcome buckets.</td></tr>'
-
-    return f'''
-  <section class="card" style="margin: 16px 0;">
-    <h2>Swarm Sentiment</h2>
-    <div class="grid">
-      {_card("Evidence", int(summary.get('evidence_count', 0)))}
-      {_card("Bullish", int(summary.get('bullish', 0)))}
-      {_card("Neutral", int(summary.get('neutral', 0)))}
-      {_card("Bearish", int(summary.get('bearish', 0)))}
-    </div>
-    <div class="two-col">
-      <div>
-        <h2>Top Sentiment Candidates</h2>
-        <table class="data-table"><thead><tr><th>Ticker</th><th>Action</th><th>Score</th><th>Conf</th></tr></thead><tbody>{top_rows}</tbody></table>
-      </div>
-      <div>
-        <h2>Closed Outcomes by Bucket</h2>
-        <table class="data-table"><thead><tr><th>Bucket</th><th>Trades</th><th>Win Rate</th><th>P&amp;L</th></tr></thead><tbody>{outcome_rows}</tbody></table>
-      </div>
-    </div>
-  </section>
-'''
-
 
 def _load_closed_positions(settings: Settings) -> list[dict[str, Any]]:
     """Load paired BUY/SELL positions from the portfolio ledger.
@@ -1580,8 +1825,8 @@ def _enrich_positions(positions: list[dict[str, Any]], settings: Settings) -> li
     Safe to call during snapshot — errors for individual tickers are swallowed
     and a best-effort row is still returned.
     """
-    if not positions:
-        return positions
+    if not positions or not isinstance(positions, (list, tuple)):
+        return []
 
     try:
         from trading_bot.data import market_data
@@ -1647,7 +1892,6 @@ def _render_dashboard(
     report: dict[str, Any],
     backtest: dict[str, Any],
 ) -> str:
-    portfolio_summary = portfolio.get("summary", {})
     report_summary = report.get("summary", {})
     backtest_summary = backtest.get("summary", {})
     candidates = scan.get("candidates", [])
@@ -1709,14 +1953,14 @@ def _render_dashboard(
 <body>
   <header>
     <h1>Autonomous Trading Agent</h1>
-    <p class="label">Static local dashboard from JSON snapshots.</p>
+    <p class="label">Static local dashboard from ledger + JSON snapshots.</p>
   </header>
 
   <main>
     <section class="grid" aria-label="Summary Metrics">
-    {_card("Equity", _money(portfolio_summary.get("equity")))}
-    {_card("Cash", _money(portfolio_summary.get("cash")))}
-    {_card("Exposure", _pct(portfolio_summary.get("exposure")))}
+    {_card("Equity", _money(portfolio.get("equity")))}
+    {_card("Cash", _money(portfolio.get("cash")))}
+    {_card("Exposure", _pct(portfolio.get("exposure")))}
     {_card("Net P/L", _money(report_summary.get("net_pnl")))}
     {_card("Backtest Trades", backtest_summary.get("trades", "n/a"))}
     {_card("Backtest Net P/L", _money(backtest_summary.get("net_pnl")))}
@@ -1785,6 +2029,43 @@ def _signed_money(value: object) -> str:
         cls = "positive" if v >= 0 else "negative"
         return f'<span class="{cls}">{sign}${v:,.2f}</span>'
     except (TypeError, ValueError):
+        return "n/a"
+
+
+def _signed_money_class(value: object) -> str:
+    """Return a CSS color class for signed monetary values."""
+    try:
+        return "c-green" if float(value) >= 0 else "c-red"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _exposure_pct(exposure) -> str:
+    try:
+        return f"{min(float(exposure) * 100, 100):.0f}"
+    except (TypeError, ValueError):
+        return "0"
+
+
+def _winrate_pct(rate) -> str:
+    try:
+        return f"{float(rate) * 100:.0f}"
+    except (TypeError, ValueError):
+        return "0"
+
+
+def _drawdown_str(value) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.2f}%"
+
+
+def _pf_str(perf) -> str:
+    if not perf:
+        return "n/a"
+    try:
+        return f"{float(perf.get('profit_factor', 0.0)):.2f}"
+    except (TypeError, ValueError, AttributeError):
         return "n/a"
 
 
@@ -2084,7 +2365,6 @@ def _advisory_widget(data: dict[str, Any] | None) -> str:
     return f'''
   {_advisory_card_section(observations, main_recs, cheap_recs, promoted, avoided)}
   {_advisory_tables_section(main_rows, cheap_rows, promote_items, avoid_items, generated_at)}
-  </section>
 '''
 
 

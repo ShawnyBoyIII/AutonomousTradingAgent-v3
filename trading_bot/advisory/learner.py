@@ -214,7 +214,6 @@ def _event_to_observation(event: dict[str, Any]) -> AdvisoryObservation | None:
         quality=str(event.get("quality", "") or ""),
         entry_price=_optional_float(event.get("entry_price", event.get("entry"))),
         supermodel_decision=str(event.get("supermodel_decision", "") or ""),
-        swarm_decision=str(event.get("swarm_decision", "") or ""),
         consensus=str(event.get("consensus", "") or ""),
         observed_at=timestamp,
     )

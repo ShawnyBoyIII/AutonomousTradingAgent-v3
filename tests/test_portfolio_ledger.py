@@ -155,14 +155,6 @@ def test_record_fill_stores_realized_pnl(ledger: PortfolioLedger) -> None:
     assert rows[0]["pnl"] == 42.5
 
 
-def test_record_fill_stores_swarm_sentiment_bucket(ledger: PortfolioLedger) -> None:
-    ledger.record_fill(_fill(), side="BUY", swarm_sentiment_bucket="bullish")
-
-    rows = ledger.list_order_rows()
-
-    assert len(rows) == 1
-    assert rows[0]["swarm_sentiment_bucket"] == "bullish"
-
 
 def test_list_order_rows_returns_chronological(ledger: PortfolioLedger) -> None:
     ledger.record_fill(_fill(order_id="a", filled_at=datetime(2025, 1, 1, 9, 30)), side="BUY")

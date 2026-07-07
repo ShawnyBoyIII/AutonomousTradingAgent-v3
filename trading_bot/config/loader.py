@@ -84,7 +84,10 @@ def _load_tuning_overrides(settings: Settings, base_dir: Path) -> None:
     if not override_path.exists():
         return
 
-    config_text = override_path.read_text(encoding="utf-8")
+    try:
+        config_text = override_path.read_text(encoding="utf-8")
+    except OSError:
+        return
     _validate_credentials_not_in_config(config_text)
     loaded = yaml.safe_load(config_text) or {}
     if not isinstance(loaded, dict):

@@ -1387,7 +1387,7 @@ def test_scan_command_sizes_from_saved_portfolio_state(monkeypatch, tmp_path: Pa
     assert result.exit_code == 0
     assert (
         result.stdout.strip()
-        == "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout"
+        == "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=97.97 target=107.06 reasons=bullish daily regime; intraday breakout"
     )
     snapshot = json.loads((tmp_path / "state" / "scan_results.json").read_text(encoding="utf-8"))
     assert snapshot["mode"] == "scan"
@@ -1484,8 +1484,8 @@ def test_scan_command_sorts_approved_candidates_and_prints_richer_fields(
 
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
-        "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=bullish daily regime; intraday breakout",
-        "MSFT APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=201.00 qty=19 rr=2.00 conf=0.80 risk=$76.00 alloc=0.19 entry=201.00 stop=199.80 target=203.40 reasons=bullish daily regime; intraday breakout",
+        "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=97.97 target=107.06 reasons=bullish daily regime; intraday breakout",
+        "MSFT APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=201.00 qty=19 rr=2.00 conf=0.80 risk=$76.00 alloc=0.19 entry=201.00 stop=194.97 target=213.06 reasons=bullish daily regime; intraday breakout",
         "summary symbols=2 approved=2 green=2 yellow=0 rejected=0 no_signal=0 errors=0 supermodel_support=2 supermodel_caution=0 supermodel_block=0 supermodel_no_signal=0",
     ]
     log_text = (tmp_path / "logs" / "decision-log.jsonl").read_text(encoding="utf-8")
@@ -1743,7 +1743,7 @@ def test_scan_why_surfaces_swarm_sentiment_fields(tmp_path: Path) -> None:
     def fake_run_scan(symbols, settings, include_details=False):
         return {
             "lines": [
-                "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=test swarm=APPROVE:0.8 swarm_sentiment_action=BUY swarm_sentiment_confidence=0.72 swarm_sentiment_score=0.42 swarm_sentiment_news_count=2"
+                "AAPL APPROVED quality=GREEN status=fresh age=5m ts=2026-06-13T10:20:00+00:00 last=101.00 qty=39 rr=2.00 conf=0.90 risk=$156.00 alloc=0.20 entry=101.00 stop=99.80 target=103.40 reasons=test",
             ],
             "summary": {"symbols": 1, "approved": 1, "green": 1, "yellow": 0, "rejected": 0, "no_signal": 0, "errors": 0},
             "candidates": [
@@ -1753,11 +1753,6 @@ def test_scan_why_surfaces_swarm_sentiment_fields(tmp_path: Path) -> None:
                     "confidence": 0.9,
                     "quality": "GREEN",
                     "freshness": "fresh",
-                    "swarm_decision": "APPROVE",
-                    "swarm_sentiment_action": "BUY",
-                    "swarm_sentiment_confidence": 0.72,
-                    "swarm_sentiment_score": 0.42,
-                    "swarm_sentiment_news_count": 2,
                 }
             ],
         }
@@ -1770,8 +1765,6 @@ def test_scan_why_surfaces_swarm_sentiment_fields(tmp_path: Path) -> None:
 
     assert result is not None
     assert result.exit_code == 0
-    assert "swarm_sentiment_action=BUY" in result.stdout
-    assert "swarm_sentiment_score=0.42" in result.stdout
 
 
 def test_scan_command_prints_no_signal_reason(monkeypatch, tmp_path: Path) -> None:
@@ -2290,8 +2283,10 @@ def test_paper_trade_command_executes_fill_and_persists_state(monkeypatch, tmp_p
     assert state.equity == 19999.0
     assert state.positions["AAPL"].quantity == 39
     assert state.positions["AAPL"].average_cost == 101.0
-    assert state.positions["AAPL"].stop_loss == 99.8
-    assert state.positions["AAPL"].profit_target == 103.4
+    # Default min_stop_distance_pct=3.0 floor: 101 * 0.97 = 97.97
+    # (older fixtures assumed 0.0; AGENTS.md mandate requires the floor.)
+    assert state.positions["AAPL"].stop_loss == 97.97
+    assert state.positions["AAPL"].profit_target == 107.06
 
     rows = ledger.list_order_rows()
     assert len(rows) == 1
@@ -2677,6 +2672,7 @@ def test_paper_trade_dry_run_previews_without_persisting(monkeypatch, tmp_path: 
 def test_dashboard_command_builds_static_html(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir()
+    db_path = state_dir / "trading_bot.db"
     (state_dir / "scan_results.json").write_text(
         json.dumps(
             {
@@ -2694,10 +2690,6 @@ def test_dashboard_command_builds_static_html(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    (state_dir / "portfolio_summary.json").write_text(
-        json.dumps({"summary": {"cash": 10000.0, "equity": 10000.0, "exposure": 0.0}, "positions": []}),
-        encoding="utf-8",
-    )
     (state_dir / "dashboard_summary.json").write_text(
         json.dumps({"summary": {"net_pnl": 0.0}, "recent_decisions": []}),
         encoding="utf-8",
@@ -2709,13 +2701,21 @@ def test_dashboard_command_builds_static_html(tmp_path: Path) -> None:
     config_file = tmp_path / "config.yaml"
     config_file.write_text(
         "app:\n"
+        f"  state_db_path: {db_path}\n"
         "  scan_results_path: state/scan_results.json\n"
-        "  portfolio_summary_path: state/portfolio_summary.json\n"
         "  dashboard_summary_path: state/dashboard_summary.json\n"
         "  backtest_summary_path: state/backtest_summary.json\n",
         encoding="utf-8",
     )
     output = tmp_path / "dashboard.html"
+
+    # Create ledger with portfolio state
+    from trading_bot.portfolio.ledger import PortfolioLedger, PortfolioState
+
+    ledger = PortfolioLedger(db_path)
+    ledger.save_portfolio_state(
+        PortfolioState(cash=10_000.0, equity=10_000.0, realized_pnl=0.0, unrealized_pnl=0.0)
+    )
 
     result = CliRunner().invoke(
         app,
@@ -3037,7 +3037,9 @@ def test_manage_positions_executes_stop_exit(monkeypatch, tmp_path: Path) -> Non
     def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         assert interval == "5m"
-        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18T09:55:00"]), "close": [97.5]})
+        # Price 96.50 sits below the 3% widened stop (97.00) so the exit
+        # still triggers after min_stop_distance_pct enforcement.
+        return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18T09:55:00"]), "close": [96.5]})
 
     monkeypatch.setattr(market_data, "fetch_bars", fake_fetch_bars)
     config_file = tmp_path / "config.yaml"
@@ -3068,14 +3070,14 @@ def test_manage_positions_executes_stop_exit(monkeypatch, tmp_path: Path) -> Non
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
         "positions=0 actions=1 skipped=0",
-        "AAPL FILLED reason=stop qty=10 price=97.50 cash=9974.00",
+        "AAPL FILLED reason=stop qty=10 price=96.50 cash=9964.00",
     ]
 
     ledger = PortfolioLedger(db_path)
     state = ledger.load_portfolio_state()
     assert state is not None
-    assert state.cash == 9974.0
-    assert state.realized_pnl == -26.0
+    assert state.cash == 9964.0
+    assert state.realized_pnl == -36.0
     assert state.positions == {}
     assert ledger.list_order_rows()[-1]["side"] == "SELL"
 
@@ -3095,13 +3097,15 @@ def test_manage_positions_trails_stop_up_when_price_advances(monkeypatch, tmp_pa
     def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         if interval == "5m":
-            # Intraday timestamp 5 mins before "now" (10:00 ET)
-            return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18T09:55:00"]), "close": [102.0]})
+            # Price 103.0 = entry(100) + 1R of 3.0 (widened stop). Old test used
+            # 102.0 + 1R of 1.0; min_stop_distance_pct default 3.0 doubles
+            # initial_risk so the +1R threshold moves to 103.0.
+            return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18T09:55:00"]), "close": [103.0]})
         elif interval == "1d":
             # Daily bars for ATR
             return pd.DataFrame({
                 "timestamp": pd.to_datetime(["2026-06-18"]),
-                "high": [102.0], "low": [99.0], "close": [102.0], "volume": [1_000_000]
+                "high": [103.0], "low": [99.0], "close": [103.0], "volume": [1_000_000]
             })
         else:
             raise ValueError(f"Unexpected interval: {interval}")
@@ -3135,15 +3139,15 @@ def test_manage_positions_trails_stop_up_when_price_advances(monkeypatch, tmp_pa
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
         "positions=1 actions=1 skipped=0",
-        "AAPL TRAIL method=r-multiple stop=101.00 last=102.00 high=102.00",
+        "AAPL TRAIL method=r-multiple stop=100.00 last=103.00 high=103.00",
     ]
 
     state = PortfolioLedger(db_path).load_portfolio_state()
     assert state is not None
     position = state.positions["AAPL"]
-    assert position.stop_loss == 101.0
-    assert position.initial_risk == 1.0
-    assert position.highest_high == 102.0
+    assert position.stop_loss == 100.0
+    assert position.initial_risk == 3.0
+    assert position.highest_high == 103.0
 
 
 def test_manage_positions_does_not_trail_below_break_even(monkeypatch, tmp_path: Path) -> None:
@@ -3197,6 +3201,8 @@ def test_manage_positions_does_not_trail_below_break_even(monkeypatch, tmp_path:
     result = CliRunner().invoke(app, ["--config-path", str(config_file), "manage-positions"])
 
     assert result.exit_code == 0
+    # Price 100.5 is below +1R (entry 100 + initial_risk 3.0 = 103) so no
+    # ratchet trail; widening kicks in once (stop 99 → 97).
     assert result.stdout.strip().splitlines() == [
         "positions=1 actions=0 skipped=0",
         "AAPL qty=10 avg=100.00 last=100.50",
@@ -3204,7 +3210,8 @@ def test_manage_positions_does_not_trail_below_break_even(monkeypatch, tmp_path:
 
     state = PortfolioLedger(db_path).load_portfolio_state()
     assert state is not None
-    assert state.positions["AAPL"].stop_loss == 99.0
+    # After widening: stop moved from 99.0 to 97.0 (3% of entry 100).
+    assert state.positions["AAPL"].stop_loss == 97.0
     assert state.positions["AAPL"].initial_risk is None
 
 
@@ -3223,11 +3230,15 @@ def test_manage_positions_trail_is_idempotent_across_runs(monkeypatch, tmp_path:
     def fake_fetch_bars(symbol: str, period: str, interval: str, **kwargs) -> pd.DataFrame:
         assert symbol == "AAPL"
         if interval == "5m":
-            return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18T09:55:00"]), "close": [102.0]})
+            # First run: 103.0 triggers widening (99→97) and +1R trail
+            # (entry 100 + initial_risk 3.0 = 103 → stop ratchets to 100).
+            # Second run: same price; trail already applied (stop 100) so no
+            # further ratchet above the existing 100.
+            return pd.DataFrame({"timestamp": pd.to_datetime(["2026-06-18T09:55:00"]), "close": [103.0]})
         elif interval == "1d":
             return pd.DataFrame({
                 "timestamp": pd.to_datetime(["2026-06-18"]),
-                "high": [102.0], "low": [99.0], "close": [102.0], "volume": [1_000_000]
+                "high": [103.0], "low": [99.0], "close": [103.0], "volume": [1_000_000]
             })
         else:
             raise ValueError(f"Unexpected interval: {interval}")
@@ -3264,11 +3275,11 @@ def test_manage_positions_trail_is_idempotent_across_runs(monkeypatch, tmp_path:
     second = runner.invoke(app, ["--config-path", str(config_file), "manage-positions"])
     assert second.exit_code == 0
     assert "TRAIL" not in second.stdout
-    assert "AAPL qty=10 avg=100.00 last=102.00" in second.stdout
+    assert "AAPL qty=10 avg=100.00 last=103.00" in second.stdout
 
     state = PortfolioLedger(db_path).load_portfolio_state()
     assert state is not None
-    assert state.positions["AAPL"].stop_loss == 101.0
+    assert state.positions["AAPL"].stop_loss == 100.0
 
 
 def test_manage_positions_trails_via_chandelier_atr(monkeypatch, tmp_path: Path) -> None:
@@ -4420,107 +4431,6 @@ def test_trade_attribution_does_not_match_sell_to_future_buy(tmp_path: Path) -> 
     assert "60m" in result.stdout
 
 
-def test_trade_attribution_reports_swarm_sentiment_buckets(tmp_path: Path) -> None:
-    config_file = tmp_path / "config.yaml"
-    db_path = tmp_path / "state.db"
-    log_dir = tmp_path / "logs"
-    config_file.write_text(
-        "app:\n"
-        f"  state_db_path: {db_path}\n"
-        f"  log_dir: {log_dir}\n",
-        encoding="utf-8",
-    )
-    log_dir.mkdir(parents=True, exist_ok=True)
-    (log_dir / "decision-log.jsonl").write_text("", encoding="utf-8")
-
-    ledger = PortfolioLedger(db_path)
-    ledger.record_fill(
-        FillResult(
-            order_id="buy-1",
-            ticker="AAPL",
-            quantity=2,
-            fill_price=100.0,
-            fees=0.0,
-            filled_at=datetime(2026, 6, 13, 10, 0, 0),
-        ),
-        side="BUY",
-        strategy_tag="v3-trend_following",
-        swarm_sentiment_bucket="bullish",
-    )
-    ledger.record_fill(
-        FillResult(
-            order_id="sell-1",
-            ticker="AAPL",
-            quantity=2,
-            fill_price=110.0,
-            fees=0.0,
-            filled_at=datetime(2026, 6, 13, 11, 0, 0),
-        ),
-        side="SELL",
-        realized_pnl=20.0,
-        strategy_tag="v3-trend_following",
-    )
-
-    result = CliRunner().invoke(app, ["--config-path", str(config_file), "trade-attribution"])
-
-    assert result.exit_code == 0
-    assert "Swarm Sentiment" in result.stdout
-    assert "bullish" in result.stdout
-    assert "20.00" in result.stdout
-
-
-def test_db_history_filters_trades_by_swarm_sentiment(tmp_path: Path) -> None:
-    config_file = tmp_path / "config.yaml"
-    db_path = tmp_path / "state.db"
-    log_dir = tmp_path / "logs"
-    config_file.write_text(
-        "app:\n"
-        f"  state_db_path: {db_path}\n"
-        f"  log_dir: {log_dir}\n",
-        encoding="utf-8",
-    )
-    from trading_bot.db.repositories import upsert_trade
-    from trading_bot.db.session import get_session, init_db, make_session_factory
-    from trading_bot.config.loader import load_settings
-
-    settings = load_settings(config_file)
-    engine = init_db(settings)
-    session = get_session(make_session_factory(engine))
-    try:
-        upsert_trade(
-            session,
-            ticker="AAPL",
-            side="BUY",
-            order_type="market",
-            quantity=1,
-            entry_price=100.0,
-            strategy_tag="v3-trend_following",
-            swarm_sentiment_bucket="bullish",
-        )
-        upsert_trade(
-            session,
-            ticker="MSFT",
-            side="BUY",
-            order_type="market",
-            quantity=1,
-            entry_price=200.0,
-            strategy_tag="v3-trend_following",
-            swarm_sentiment_bucket="bearish",
-        )
-    finally:
-        session.close()
-        engine.dispose()
-
-    result = CliRunner().invoke(
-        app,
-        ["--config-path", str(config_file), "db-history", "--swarm-sentiment", "bullish", "--limit", "10"],
-    )
-
-    assert result.exit_code == 0
-    assert "AAPL BUY qty=1 @$100.00 sentiment=bullish" in result.stdout
-    assert "MSFT BUY qty=1 @$200.00 sentiment=bearish" not in result.stdout
-
-
 def test_db_features_command_queries_scan_features(tmp_path: Path) -> None:
     config_file = tmp_path / "config.yaml"
     db_path = tmp_path / "state.db"
@@ -4542,13 +4452,11 @@ def test_db_features_command_queries_scan_features(tmp_path: Path) -> None:
         upsert_scan_feature(
             session, ticker="AAPL", status="APPROVED", action="BUY",
             confidence=0.9, quality="GREEN", market_regime="strong_uptrend",
-            strategy_tag="v3-trend_following", swarm_sentiment_score=0.5,
-        )
+            strategy_tag="v3-trend_following",        )
         upsert_scan_feature(
             session, ticker="MSFT", status="REJECTED", action="HOLD",
             confidence=0.3, quality="RED", market_regime="strong_downtrend",
-            strategy_tag="v3-mean_reversion", swarm_sentiment_score=-0.4,
-        )
+            strategy_tag="v3-mean_reversion",        )
     finally:
         session.close()
         engine.dispose()
@@ -4583,12 +4491,10 @@ def test_db_features_command_filters_by_regime(tmp_path: Path) -> None:
     try:
         upsert_scan_feature(
             session, ticker="AAPL", status="APPROVED", action="BUY",
-            market_regime="strong_uptrend", swarm_sentiment_score=0.5,
-        )
+            market_regime="strong_uptrend",        )
         upsert_scan_feature(
             session, ticker="MSFT", status="APPROVED", action="BUY",
-            market_regime="strong_downtrend", swarm_sentiment_score=0.5,
-        )
+            market_regime="strong_downtrend",        )
     finally:
         session.close()
         engine.dispose()
@@ -4624,18 +4530,15 @@ def test_db_features_command_summary(tmp_path: Path) -> None:
         upsert_scan_feature(
             session, ticker="AAPL", status="APPROVED", action="BUY",
             quality="GREEN", market_regime="strong_uptrend",
-            strategy_tag="v3-trend_following", swarm_sentiment_score=0.5,
-        )
+            strategy_tag="v3-trend_following",        )
         upsert_scan_feature(
             session, ticker="MSFT", status="APPROVED", action="HOLD",
             quality="YELLOW", market_regime="strong_uptrend",
-            strategy_tag="v3-trend_following", swarm_sentiment_score=-0.4,
-        )
+            strategy_tag="v3-trend_following",        )
         upsert_scan_feature(
             session, ticker="GOOGL", status="REJECTED", action="SELL",
             quality="RED", market_regime="strong_downtrend",
-            strategy_tag="v3-mean_reversion", swarm_sentiment_score=-0.5,
-        )
+            strategy_tag="v3-mean_reversion",        )
     finally:
         session.close()
         engine.dispose()
@@ -4650,7 +4553,6 @@ def test_db_features_command_summary(tmp_path: Path) -> None:
     assert "Status distribution:" in result.stdout
     assert "Regime distribution:" in result.stdout
     assert "Quality distribution:" in result.stdout
-    assert "Swarm Sentiment" in result.stdout
 
 
 def test_db_features_command_json_output(tmp_path: Path) -> None:
@@ -4674,8 +4576,7 @@ def test_db_features_command_json_output(tmp_path: Path) -> None:
         upsert_scan_feature(
             session, ticker="AAPL", status="APPROVED", action="BUY",
             confidence=0.9, quality="GREEN", market_regime="strong_uptrend",
-            strategy_tag="v3-trend_following", swarm_sentiment_score=0.5,
-        )
+            strategy_tag="v3-trend_following",        )
     finally:
         session.close()
         engine.dispose()

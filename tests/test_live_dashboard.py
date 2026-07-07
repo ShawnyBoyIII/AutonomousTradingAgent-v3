@@ -127,45 +127,6 @@ class TestDashboardServerSnapshot:
         assert len(snap["strategy_results"]) == 2
         assert "realtime_pnl" in snap
 
-    def test_snapshot_includes_swarm_sentiment_summary(self, tmp_path: Path) -> None:
-        _seed_state(tmp_path)
-        log_dir = tmp_path / "burn_in"
-        log_dir.mkdir(exist_ok=True)
-        (log_dir / "decision-log.jsonl").write_text(
-            "\n".join(
-                [
-                    json.dumps({"command": "scan", "ticker": "AAPL", "status": "APPROVED", "swarm_sentiment_score": 0.5}),
-                    json.dumps({"command": "paper-trade", "ticker": "AAPL", "status": "FILLED", "fill_price": 100.0, "quantity": 10, "fees": 1.0}),
-                    json.dumps({"command": "manage-positions", "ticker": "AAPL", "status": "FILLED", "fill_price": 110.0, "quantity": 10, "fees": 1.0}),
-                ]
-            ),
-            encoding="utf-8",
-        )
-        (log_dir / "strategy_results.jsonl").write_text("", encoding="utf-8")
-        settings = _settings_in(tmp_path)
-        (tmp_path / "scan.json").write_text(json.dumps({
-            "candidates": [
-                {
-                    "ticker": "AAPL",
-                    "status": "APPROVED",
-                    "swarm_sentiment_action": "BUY",
-                    "swarm_sentiment_score": 0.5,
-                    "swarm_sentiment_confidence": 0.72,
-                }
-            ]
-        }))
-        server = DashboardServer(
-            settings,
-            decision_log_path=str(log_dir / "decision-log.jsonl"),
-            strategy_log_path=str(log_dir / "strategy_results.jsonl"),
-        )
-
-        snap = server.snapshot()
-
-        assert snap["swarm_sentiment"]["evidence_count"] == 1
-        assert snap["swarm_sentiment"]["bullish"] == 1
-        assert snap["swarm_sentiment"]["top_candidates"][0]["ticker"] == "AAPL"
-
     def test_snapshot_reads_watchlist(self, tmp_path: Path) -> None:
         settings = _settings_in(tmp_path)
         Path(settings.app.watchlist_path).write_text("aapl\nmsft\n", encoding="utf-8")
@@ -259,7 +220,7 @@ class TestRenderLiveDashboard:
     def test_includes_positions_and_candidates(self) -> None:
         snap = {
             "portfolio": {"positions": [{"ticker": "AAPL", "quantity": 5}]},
-            "scan": {"candidates": [{"ticker": "MSFT", "status": "APPROVED", "swarm_sentiment_action": "BUY", "swarm_sentiment_score": 0.42}]},
+            "scan": {"candidates": [{"ticker": "MSFT", "status": "APPROVED"}]},
             "kill_switch": {"active": False},
         }
         html_out = _render_live_dashboard(snap)
@@ -267,7 +228,6 @@ class TestRenderLiveDashboard:
         assert "AAPL" in html_out
         assert "Recent Scan Candidates" in html_out
         assert "MSFT" in html_out
-        assert "0.42" in html_out
 
     def test_includes_decision_feed(self) -> None:
         snap = {
@@ -360,7 +320,7 @@ class TestRenderLiveDashboard:
     def test_realized_pnl_prefers_ledger_over_strategy_results(self) -> None:
         """The authoritative ledger value should win over the JSONL computation."""
         snap = {
-            "portfolio": {"summary": {"realized_pnl": -106.60, "unrealized_pnl": 4.68}},
+            "ledger_portfolio": {"realized_pnl": -106.60, "unrealized_pnl": 4.68},
             "strategy_results": [
                 {"event": "exit", "pnl": -12.7, "ticker": "AFL"},
                 {"event": "exit", "pnl": 25.0, "ticker": "MSFT"},
@@ -398,40 +358,12 @@ class TestRenderLiveDashboard:
         assert "LOW_PF: example" in html_out
         assert "v3-trend_following" in html_out
 
-    def test_includes_swarm_sentiment_widget(self) -> None:
-        snap = {
-            "swarm_sentiment": {
-                "evidence_count": 3,
-                "bullish": 2,
-                "neutral": 1,
-                "bearish": 0,
-                "top_candidates": [
-                    {"ticker": "AAPL", "action": "BUY", "score": 0.5, "confidence": 0.72},
-                ],
-                "closed_outcomes": {
-                    "bullish": {"trades": 1, "win_rate_pct": 100.0, "total_pnl": 98.0},
-                },
-            },
-            "kill_switch": {"active": False},
-        }
-
-        html_out = _render_live_dashboard(snap)
-
-        assert "Swarm Sentiment" in html_out
-        assert "Top Sentiment Candidates" in html_out
-        assert "Closed Outcomes by Bucket" in html_out
-        assert "AAPL" in html_out
-
-    def test_omits_swarm_sentiment_widget_without_evidence(self) -> None:
-        html_out = _render_live_dashboard({"swarm_sentiment": {"evidence_count": 0}, "kill_switch": {"active": False}})
-        assert "Swarm Sentiment" not in html_out
-
     def test_net_pnl_computed_from_realized_plus_unrealized_when_report_missing(
         self,
     ) -> None:
         """Net P/L = realized + unrealized when report.summary is empty."""
         snap = {
-            "portfolio": {"summary": {"realized_pnl": -100.0, "unrealized_pnl": 25.0}},
+            "ledger_portfolio": {"realized_pnl": -100.0, "unrealized_pnl": 25.0},
             "report": {},
             "kill_switch": {"active": False},
         }

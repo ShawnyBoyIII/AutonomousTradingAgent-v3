@@ -262,7 +262,9 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
             if min_stop_pct > 0 and position.stop_loss is not None:
                 entry = position.average_cost
                 min_stop = round(entry * (1.0 - min_stop_pct / 100.0), 4)
-                if position.stop_loss > min_stop:
+                # Only widen stops that are still protective (below entry); a
+                # stop already ratcheted up by trailing should not be undone.
+                if position.stop_loss > min_stop and position.stop_loss < entry:
                     old_stop = position.stop_loss
                     pos = Position(
                         ticker=ticker,

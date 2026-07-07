@@ -22,3 +22,10 @@ __pycache__/
 *.db
 dynamic_watchlist.json
 .last_discover_date
+# Block OpenCode snapshotting from freezing on test/env caches
+.pytest_cache/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.cache/

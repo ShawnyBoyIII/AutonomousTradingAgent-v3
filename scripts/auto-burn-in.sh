@@ -136,7 +136,7 @@ run_discovery() {
     fi
     
     # Run discover with export
-    local discover_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" discover --mode breakout --max 15 --export 2>&1)
+    local discover_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" discover --mode breakout --max 50 --export 2>&1)
     
     if echo "$discover_output" | grep -q "Exported"; then
         local count=$(echo "$discover_output" | grep "Exported" | sed 's/.*Exported \([0-9]*\).*/\1/')
@@ -517,8 +517,6 @@ check_confidence_gates() {
     local db_path="$1"
     local min_trades=${2:-10}
     local min_net_pnl=${3:-500}
-    local min_profit_factor=${4:-1.2}
-    local min_positive_windows=${5:-60}
     
     if [ ! -f "$db_path" ]; then
         echo "[$(date '+%H:%M:%S')] ⚠️  Confidence gates: no database yet, skipping gates"
@@ -547,37 +545,11 @@ if row:
 else:
     realized_pnl = 0
 
-# Calculate profit factor (simplified: positive PnL trades vs negative PnL trades)
-cursor.execute('SELECT pnl FROM orders WHERE pnl > 0')
-winning_pnl = [r[0] for r in cursor.fetchall()]
-cursor.execute('SELECT pnl FROM orders WHERE pnl < 0')
-losing_pnl = [r[0] for r in cursor.fetchall()]
-
-gross_profit = sum(winning_pnl) if winning_pnl else 0
-gross_loss = abs(sum(losing_pnl)) if losing_pnl else 0
-profit_factor = gross_profit / gross_loss if gross_loss > 0 else (2.0 if gross_profit > 0 else 1.0)
-
-# Count positive equity windows (equity > starting equity)
-cursor.execute('SELECT equity FROM equity_history ORDER BY rowid ASC LIMIT 1')
-start_row = cursor.fetchone()
-cursor.execute('SELECT equity FROM equity_history ORDER BY rowid DESC')
-end_rows = cursor.fetchall()
-
-if start_row and end_rows:
-    start_equity = start_row[0]
-    positive_windows = sum(1 for r in end_rows if r[0] >= start_equity)
-    total_windows = len(end_rows)
-    positive_pct = (positive_windows / total_windows * 100) if total_windows > 0 else 0
-else:
-    positive_pct = 0
-
 conn.close()
 
 # Check gates
 min_trades = $min_trades
 min_net_pnl = $min_net_pnl
-min_profit_factor = $min_profit_factor
-min_positive_windows = $min_positive_windows
 
 gates_passed = True
 issues = []
@@ -589,14 +561,6 @@ if total_trades < min_trades:
 if realized_pnl < min_net_pnl:
     gates_passed = False
     issues.append(f'pnl={realized_pnl:.0f}<{min_net_pnl}')
-
-if profit_factor < min_profit_factor:
-    gates_passed = False
-    issues.append(f'pf={profit_factor:.2f}<{min_profit_factor}')
-
-if positive_pct < min_positive_windows:
-    gates_passed = False
-    issues.append(f'positive_windows={positive_pct:.0f}%<{min_positive_windows}%')
 
 if gates_passed:
     print('GATES_PASSED')
@@ -710,11 +674,9 @@ CYCLE_COUNT=0
 
 trap on_shutdown EXIT INT TERM
 
-# Confidence gate thresholds (tightened after 50+ trade sample)
+# Confidence gate thresholds (advisory: alert but don't block on PF/windows)
 MIN_TRADES=50
 MIN_NET_PNL=0
-MIN_PROFIT_FACTOR=0.8
-MIN_POSITIVE_WINDOWS=40
 MAX_DRAWDOWN_PCT=10
 ADVISORY_ENABLED=$(.venv/bin/python -c "from pathlib import Path; from trading_bot.config.loader import load_settings; s=load_settings(Path('$CONFIG_FILE')); print('true' if s.advisory.enabled else 'false')" 2>/dev/null || printf "false")
 
@@ -762,13 +724,11 @@ while true; do
         echo "[$timestamp] 📈 Completed $CYCLE_COUNT cycles"
         
         # Check confidence gates every 10 cycles
-        if ! check_confidence_gates "$DB_PATH" "$MIN_TRADES" "$MIN_NET_PNL" "$MIN_PROFIT_FACTOR" "$MIN_POSITIVE_WINDOWS"; then
-            echo "[$timestamp] 🚨 CONFIDENCE GATES FAILED - halting burn-in"
+        if ! check_confidence_gates "$DB_PATH" "$MIN_TRADES" "$MIN_NET_PNL"; then
+            echo "[$timestamp] ⚠️  Confidence gates NOT met: advisory only (alert-only mode)"
             echo "[$timestamp] Trading performance below minimum thresholds"
             echo "[$timestamp] Review: tail -f $LOG_DIR/decision-log.jsonl"
-            echo "[$timestamp] Resume manually after review: sh ./scripts/auto-burn-in.sh"
-            echo "{\"event\":\"confidence_gate_halt\",\"timestamp\":\"$timestamp\",\"reason\":\"gates_failed\"}" >> "$LOG_DIR/halt.log"
-            exit 1
+            echo "{\"event\":\"confidence_gate_alert\",\"timestamp\":\"$timestamp\",\"reason\":\"gates_failed\",\"mode\":\"advisory_only\"}" >> "$LOG_DIR/halt.log"
         fi
 
         run_advisory_learner

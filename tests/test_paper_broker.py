@@ -138,7 +138,7 @@ def test_ledger_initializes_sqlite_tables(tmp_path: Path) -> None:
             for row in conn.execute("PRAGMA table_info(orders)")
         ]
 
-    assert columns == ["id", "ticker", "side", "quantity", "fill_price", "fees", "filled_at", "pnl", "strategy_tag", "swarm_sentiment_bucket"]
+    assert columns == ["id", "ticker", "side", "quantity", "fill_price", "fees", "filled_at", "pnl", "strategy_tag"]
 
 
 def test_ledger_round_trips_portfolio_state(tmp_path: Path) -> None:

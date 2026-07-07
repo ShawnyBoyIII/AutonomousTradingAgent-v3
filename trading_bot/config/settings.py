@@ -37,6 +37,7 @@ class AppSettings(BaseModel):
     allow_yellow_mean_reversion: bool = False
     min_entry_confluence_score: float = Field(default=4.0, ge=0.0, le=12.0)
     signal_mode: str = Field(default="serial")  # "serial" or "parallel"
+    min_timeframe_alignment: int = Field(default=1, ge=1, le=3)
 
 
 class MarketDataSettings(BaseModel):
@@ -110,8 +111,10 @@ class RiskSettings(BaseModel):
     atr_stop_multiplier: float = Field(default=3.0, ge=0.5, le=10.0)
     # Absolute minimum stop distance as % of entry price.
     # Overrides both the 5-bar low and ATR floor when either
-    # produces a stop closer than this threshold. 0 = disabled.
-    min_stop_distance_pct: float = Field(default=0.0, ge=0.0, le=20.0)
+    # produces a stop closer than this threshold. AGENTS.md mandates
+    # a 5-minute-bar stop distance; default 3.0 is the universal floor
+    # (matches config.yaml; burn-in configs override to 5.0 for stricter).
+    min_stop_distance_pct: float = Field(default=3.0, ge=0.0, le=20.0)
     # V2.5: Portfolio heat limits
     max_portfolio_heat_pct: float = Field(default=0.03, gt=0.0, le=0.5)
     # V2.5: Sector concentration
@@ -300,11 +303,6 @@ class SwarmSettings(BaseModel):
     (default), the swarm acts as a read-only overlay: its committee
     decisions are logged alongside scanner results but do not affect
     trading behavior.
-
-    In ``signal_mode="parallel"``, the strategy models resolve consensus.
-    The swarm then acts as a bounded position-size modifier: APPROVE can
-    boost reduced entries, REJECT reduces them, both by ``swarm_weight`` ×
-    swarm_confidence and never above the risk-approved size.
     """
     enabled: bool = Field(default=False)
     preset: str = Field(default="investment_committee")

@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 
 def _resolve_db_path(settings: Settings) -> Path:
-    return (Path(settings.app.log_dir).parent / "state" / "trading_bot.db").resolve()
+    return Path(settings.app.state_db_path).resolve()
 
 
 def _make_engine(db_path: Path) -> any:
@@ -28,14 +28,10 @@ def init_db(settings: Settings) -> any:
     Base.metadata.create_all(engine)
     with engine.begin() as conn:
         for ddl in (
-            "ALTER TABLE trades ADD COLUMN swarm_sentiment_bucket VARCHAR(20)",
             "ALTER TABLE trades ADD COLUMN signal_quality VARCHAR(20)",
             "ALTER TABLE trades ADD COLUMN market_regime VARCHAR(40)",
             "ALTER TABLE trades ADD COLUMN supermodel_decision VARCHAR(20)",
-            "ALTER TABLE trades ADD COLUMN swarm_decision VARCHAR(30)",
             "ALTER TABLE trades ADD COLUMN consensus VARCHAR(20)",
-            "ALTER TABLE trades ADD COLUMN swarm_sentiment_score FLOAT",
-            "ALTER TABLE trades ADD COLUMN swarm_sentiment_confidence FLOAT",
             "ALTER TABLE trades ADD COLUMN entry_volume_ratio FLOAT",
             "ALTER TABLE trades ADD COLUMN entry_range_ratio FLOAT",
             "ALTER TABLE trades ADD COLUMN adaptive_rr FLOAT",
@@ -49,7 +45,8 @@ def init_db(settings: Settings) -> any:
             try:
                 conn.execute(text(ddl))
             except Exception:
-                pass
+                logger = __import__("logging").getLogger(__name__)
+                logger.warning("DDL skipped (column may already exist): %s", ddl)
     return engine
 
 

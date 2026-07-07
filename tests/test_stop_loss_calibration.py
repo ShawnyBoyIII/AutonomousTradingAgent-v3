@@ -126,5 +126,8 @@ class TestDefaultConfigValues:
     def test_atr_stop_multiplier_default_is_3(self):
         assert RiskSettings().atr_stop_multiplier == 3.0
 
-    def test_min_stop_distance_pct_default_is_0(self):
-        assert RiskSettings().min_stop_distance_pct == 0.0
+    def test_min_stop_distance_pct_default_is_3(self):
+        # AGENTS.md mandates a 5-minute-bar minimum stop distance. The default
+        # must not silently disable the rule; config.yaml's 3.0 floor is the
+        # universal floor (burn-in configs override to 5.0 for stricter runs).
+        assert RiskSettings().min_stop_distance_pct == 3.0

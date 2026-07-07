@@ -54,7 +54,6 @@ def build_stacked_signal(
         has_blocking_evidence = (
             str(details.get("consensus", "")).upper() == "SELL"
             or _as_int(details.get("rl_action")) == 2
-            or str(details.get("swarm_decision", "")).upper() == "REJECT"
             or bool(details.get("counter_thesis_block"))
         )
         if not has_blocking_evidence:
@@ -99,26 +98,6 @@ def build_stacked_signal(
             layer_weights.append(1.0)
         else:
             layers.append(StackLayer("rl", 0.5, "neutral", "RL hold vote"))
-            layer_weights.append(1.0)
-
-    swarm_decision = str(details.get("swarm_decision", "")).upper()
-    if swarm_decision:
-        swarm_confidence = _clamp(_as_float(details.get("swarm_confidence"), 0.5))
-        if swarm_decision == "APPROVE":
-            layers.append(
-                StackLayer("swarm", swarm_confidence, _verdict_from_score(swarm_confidence, settings=settings), "agent committee approve")
-            )
-            layer_weights.append(1.0)
-        elif swarm_decision == "REJECT":
-            layers.append(
-                StackLayer(
-                    "swarm", 0.35, "caution",
-                    "agent committee reject (position-size modifier only)",
-                )
-            )
-            layer_weights.append(1.0)
-        else:
-            layers.append(StackLayer("swarm", 0.5, "neutral", "agent committee hold"))
             layer_weights.append(1.0)
 
     if details.get("counter_thesis_block"):
