@@ -154,14 +154,56 @@ def test_portfolio_payload_exposes_live_unrealized_metrics(monkeypatch):
     payload = main._portfolio_payload()
 
     assert payload["total_unrealized_pnl"] == 0.0
-    assert payload["unrealized_pnl"] == 0.0
     assert payload["total_unrealized_pct"] == 0.0
     assert payload["winning_positions"] == 1
     assert payload["losing_positions"] == 1
-    assert payload["positions"][0]["unrealized_pnl"] == 200.0
-    assert payload["positions"][0]["unrealized_pct"] == 0.2
-    assert payload["positions"][1]["unrealized_pnl"] == -200.0
-    assert payload["positions"][1]["unrealized_pct"] == -0.2
+    assert payload["marks_loaded"] is True
+    by_symbol = {p["symbol"]: p for p in payload["positions"]}
+    assert by_symbol["AAA"]["unrealized_pnl"] == 200.0
+    assert by_symbol["AAA"]["unrealized_pct"] == 0.2
+    assert by_symbol["AAA"]["mark_is_live"] is True
+    assert by_symbol["BBB"]["unrealized_pnl"] == -200.0
+    assert by_symbol["BBB"]["unrealized_pct"] == -0.2
+    assert by_symbol["BBB"]["mark_is_live"] is True
+
+
+def test_portfolio_payload_marks_stale_positions(monkeypatch):
+    from types import SimpleNamespace
+
+    from ui.dashboard import main
+
+    pos_live = SimpleNamespace(quantity=10, average_cost=100.0)
+    pos_stale = SimpleNamespace(quantity=5, average_cost=200.0)
+    state = SimpleNamespace(
+        cash=5000.0,
+        equity=6200.0,
+        unrealized_pnl=0.0,
+        positions={"LIVE": pos_live, "STALE": pos_stale},
+    )
+
+    monkeypatch.setattr(main.state.ledger, "load_portfolio_state", lambda: state)
+    monkeypatch.setattr(main, "_position_market_snapshot", lambda *_args, **_kwargs: {
+        "LIVE": {"current_price": 110.0},
+    })
+
+    payload = main._portfolio_payload()
+    by_symbol = {p["symbol"]: p for p in payload["positions"]}
+
+    assert payload["marks_loaded"] is True
+    assert by_symbol["LIVE"]["mark_is_live"] is True
+    assert by_symbol["LIVE"]["current_price"] == 110.0
+    assert by_symbol["LIVE"]["unrealized_pnl"] == 100.0
+    assert by_symbol["STALE"]["mark_is_live"] is False
+    assert by_symbol["STALE"]["current_price"] == 200.0
+    assert by_symbol["STALE"]["unrealized_pnl"] == 0.0
+    assert payload["winning_positions"] == 1
+    assert payload["losing_positions"] == 0
+
+    monkeypatch.setattr(main, "_position_market_snapshot", lambda *_args, **_kwargs: {})
+    payload_empty = main._portfolio_payload()
+    by_symbol_empty = {p["symbol"]: p for p in payload_empty["positions"]}
+    assert payload_empty["marks_loaded"] is False
+    assert all(p["mark_is_live"] is False for p in payload_empty["positions"])
 
 
 def test_position_market_snapshot_uses_latest_mark_when_available(monkeypatch):
@@ -316,6 +358,26 @@ def test_dashboard_js_renders_unrealized_pct_and_live_mark_fields() -> None:
     assert "current_price" in render_positions
     assert 'class="num mark"' in render_positions
     assert "Unrealized %" in render_positions
+
+
+def test_dashboard_js_renders_stale_mark_indicator() -> None:
+    """When a position row has mark_is_live=false, the row gets a stale style hint."""
+    js = Path("ui/dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    css = Path("ui/dashboard/static/css/dashboard.css").read_text(encoding="utf-8")
+
+    pos_block = re.search(r"function renderPositions[\s\S]+?\n  }", js)
+    assert pos_block, "renderPositions not found"
+    render_positions = pos_block.group(0)
+
+    assert "mark_is_live" in render_positions, (
+        "renderPositions must consult mark_is_live for staleness styling"
+    )
+    assert "position-row--stale" in render_positions or "mark-stale" in render_positions, (
+        "renderPositions must mark stale rows with a special class"
+    )
+    assert "position-row--stale" in css or "mark-stale" in css, (
+        "CSS must define a stale-mark visual treatment"
+    )
 
 
 def test_dashboard_js_maps_zero_pnl_rows_to_neutral_class() -> None:

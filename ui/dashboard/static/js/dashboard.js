@@ -349,10 +349,14 @@
       const unrealPct = Number(p.unrealized_pct);
       const pct      = Math.abs(pnl) / totalAbs;
       const trend    = pnl > 0 ? "pnl-pos" : (pnl < 0 ? "pnl-neg" : "pnl-flat");
+      const markLive = p.mark_is_live === true;
+      const staleCls = markLive ? "" : " position-row--stale";
+      const staleTitle = markLive ? "" : ' title="Live mark unavailable — showing avg cost"';
+      const staleTag = markLive ? "" : ' <span class="mark-stale" aria-label="Live mark unavailable">~</span>';
       const sym      = escapeHTML(p.symbol || p.ticker || "—");
       return `
-        <tr class="position-row ${trend}">
-          <td class="sym">${sym}</td>
+        <tr class="position-row ${trend}${staleCls}"${staleTitle}>
+          <td class="sym">${sym}${staleTag}</td>
           <td class="num qty">${fmtInt(qty)}</td>
           <td class="num">${fmtUSD(avg)}</td>
           <td class="num mark">${fmtUSD(price)}</td>

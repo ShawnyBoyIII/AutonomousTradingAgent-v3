@@ -5,6 +5,7 @@ Read-only dashboard for portfolio monitoring with real-time updates.
 
 import asyncio
 import json
+import math
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -68,13 +69,53 @@ app.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static"
 # ---------------------------------------------------------------------------
 
 def _load_position_marks(symbols: list[str]) -> dict[str, dict[str, float]]:
-    from trading_bot.cli.app import _fetch_latest_prices
+    """Best-effort live marks for the listed symbols.
 
-    latest_prices = _fetch_latest_prices(symbols, state.settings)
-    return {
-        symbol: {"current_price": price}
-        for symbol, price in latest_prices.items()
-    }
+    Falls back to ``{}`` on any provider error so the dashboard API can
+    always render positions even when the live market-data path is slow
+    or unavailable.
+    """
+    try:
+        import concurrent.futures as _cf
+        import pandas as _pd
+        from trading_bot.data.providers.yfinance_provider import YFinanceProvider
+
+        provider = YFinanceProvider()
+    except Exception:
+        return {}
+
+    def _fetch_one(symbol: str):
+        try:
+            frame = provider.fetch_bars(symbol, "5d", "1d")
+        except Exception:
+            return None
+        if frame is None or frame.empty or "close" not in getattr(frame, "columns", _pd.Index([])):
+            return None
+        try:
+            price = float(frame.iloc[-1]["close"])
+        except Exception:
+            return None
+        if _pd.notna(price) and math.isfinite(price):
+            return price
+        return None
+
+    out: dict[str, dict[str, float]] = {}
+    if not symbols:
+        return out
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=min(8, max(1, len(symbols)))) as pool:
+            futures = {pool.submit(_fetch_one, s): s for s in symbols}
+            for fut in _cf.as_completed(futures, timeout=6):
+                sym = futures[fut]
+                try:
+                    price = fut.result()
+                except Exception:
+                    continue
+                if price is not None:
+                    out[sym] = {"current_price": price}
+    except _cf.TimeoutError:
+        return out
+    return out
 
 
 def _position_market_snapshot(pstate) -> dict[str, dict[str, float]]:
@@ -99,6 +140,7 @@ def _portfolio_payload() -> dict:
         )
 
     marks = _position_market_snapshot(pstate)
+    marks_loaded = bool(marks)
     positions = []
     total_basis = 0.0
     total_unrealized_pnl = 0.0
@@ -107,7 +149,9 @@ def _portfolio_payload() -> dict:
     for ticker, pos in pstate.positions.items():
         qty = int(pos.quantity)
         avg = float(pos.average_cost)
-        current = float(marks.get(ticker, {}).get("current_price", avg))
+        live_mark = marks.get(ticker, {}).get("current_price")
+        mark_is_live = live_mark is not None
+        current = float(live_mark) if mark_is_live else avg
         market_value = qty * current
         basis = qty * avg
         unrealized = market_value - basis
@@ -126,6 +170,7 @@ def _portfolio_payload() -> dict:
             "market_value": market_value,
             "unrealized_pnl": unrealized,
             "unrealized_pct": unrealized_pct,
+            "mark_is_live": mark_is_live,
         })
 
     total_unrealized_pct = (total_unrealized_pnl / total_basis) if total_basis > 0 else 0.0
@@ -140,6 +185,7 @@ def _portfolio_payload() -> dict:
         "total_unrealized_pct": total_unrealized_pct,
         "winning_positions": winners,
         "losing_positions": losers,
+        "marks_loaded": marks_loaded,
         "timestamp": datetime.now().isoformat(),
     }
 

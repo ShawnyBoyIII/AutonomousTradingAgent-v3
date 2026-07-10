@@ -969,6 +969,24 @@ header, main, footer, .mode-rail, .skip-link { position: relative; z-index: 1; }
 }
 .positions-table .pnl-bar > i.on { transform: scaleX(1); }
 
+.positions-table tbody tr.position-row--stale {
+  opacity: 0.7;
+  background: var(--line-soft, rgba(255, 255, 255, 0.04));
+}
+.positions-table tbody tr.position-row--stale .mark {
+  font-style: italic;
+  color: var(--ink-mute);
+}
+.positions-table .mark-stale {
+  display: inline-block;
+  margin-left: 0.35rem;
+  color: var(--warn, #d9a514);
+  font-weight: 600;
+  font-family: var(--mono, "JetBrains Mono", ui-monospace, monospace);
+  font-size: 0.85em;
+  cursor: help;
+}
+
 /* =============================================================
     BOOK — tabbed layout for Open vs Closed positions.
     Open: live (churns every 60 s on each scan).
