@@ -12,7 +12,7 @@ This repo has `.codegraph/`. Use `codegraph explore "question"` or `codegraph no
 
 AGENTS.md is a snapshot of the project's current operational reality, not a historical log.
 
-- **Update this file in the same commit as any change it describes.** If a change touches the burner, risk knobs, dashboard, scripts, configs, kill switch, persistence, or operational contracts, update the matching section here in the same commit so the file reflects the latest reality at all times.
+- **Update this file in the same commit as any change it describes.** If a change touches the burner, risk knobs, dashboard, scripts, configs, kill switch, persistence, paper-performance analytics, or operational contracts, update the matching section here in the same commit so the file reflects the latest reality at all times.
 - **No "temporary" sections.** Earlier versions of this file carried a `TEMPORARY OVERRIDES` block that listed the 2026-07-09 loose guardrail values. That block has been removed; if guardrails are loosened or tightened again, the new baseline belongs inline in this file as the documented truth, not as a "temporary" annotation.
 - **Prefer updating comments to match the code** rather than leaving a stale doc that contradicts the implementation.
 - **Live operational state, not intent.** Anything stated here is what the project currently does, not what it was supposed to do.
@@ -59,7 +59,9 @@ Never use bare `tradebot` on PATH — it may resolve to a stale global install.
 - 15% max per ticker in burn-in (`burn-in-config.yaml`), 20% in default config
 - Confidence gates are advisory at PF < 0.8 after 50+ trades (logs alert, does not halt)
 - Strategy tags recorded on all buys and sells for attribution
-- Run `./tradebot-local trade-attribution` to review P&L by strategy
+- Run `./tradebot-local paper-report` for the multi-dimensional P&L view (overall, by strategy, by hour, by ticker) — replaces the SQL probes previously needed to answer "where did today's loss come from?"
+- Run `./tradebot-local trade-attribution` for the paired BUY/SELL roster
+- Run `./tradebot-local graduation-check` for the AGENTS.md 100-trade decision gate; exits non-zero when PF < 0.8
 
 **Decision gate**: When 100 closed trades are reached, review profit factor.
 - PF > 1.3 → graduate to live trading consideration

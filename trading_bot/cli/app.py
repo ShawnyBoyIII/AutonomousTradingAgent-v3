@@ -12,6 +12,31 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+
+def _eod_marker_filename(
+    root: Path, iso_date: str, intervals: list[str] | tuple[str, ...]
+) -> Path:
+    """Build the EOD marker path for a date + interval set.
+
+    Marker filenames embed the interval set so that a backfill for one
+    interval (e.g. ``1d``) does not block a subsequent backfill for a
+    different interval (e.g. ``1m``) on the same date. The format is::
+
+        .last_eod_fetch_<YYYY-MM-DD>[_<interval1>_<interval2>...].marker
+
+    Sort the intervals so the name is deterministic regardless of call order.
+    When ``intervals`` is empty, the bare ``<date>.marker`` is returned
+    (CLI never passes empty in practice; this is a guard).
+    """
+    suffix = "_".join(sorted(intervals))
+    name = (
+        f".last_eod_fetch_{iso_date}_{suffix}.marker"
+        if suffix
+        else f".last_eod_fetch_{iso_date}.marker"
+    )
+    return Path(root) / name
+
+
 from trading_bot.config.loader import load_settings
 from trading_bot.config.settings import Settings
 from trading_bot.data.indicators import add_atr, add_rsi
@@ -30,7 +55,7 @@ from trading_bot.reports.summaries import build_daily_summary
 from trading_bot.runtime import alerts as runtime_alerts
 from trading_bot.runtime import session as runtime_session
 from trading_bot.runtime.decision_log import append_decision_event
-from trading_bot.runtime.latency import frame_last_timestamp, is_stale
+from trading_bot.runtime.latency import data_age_minutes, frame_last_timestamp, is_stale
 from trading_bot.runtime.position_exit import (
     fill_partial_take_profit_position as _shared_fill_partial_take_profit_position,
     fill_sell_position as _shared_fill_sell_position,
@@ -38,7 +63,6 @@ from trading_bot.runtime.position_exit import (
 )
 from trading_bot.runtime.snapshots import read_recent_decision_rows, write_snapshot
 from trading_bot.scout import build_scout_candidates
-from trading_bot.rl.utils import rl_model_meta_path, rl_model_symbols
 from trading_bot.strategy.trailing_stop import next_trailing_stop
 
 app = typer.Typer(help="Paper-trading CLI for stocks and ETFs.")
@@ -600,6 +624,39 @@ def continuous(
         typer.echo("continuous_loop_stopped_by_user")
 
 
+def _market_data_is_stale_for_manage(
+    last_timestamp: datetime | None,
+    manage_now: datetime,
+    max_age_minutes: int,
+) -> bool:
+    """Decide if intraday data is too stale to manage positions on.
+
+    Mirrors the after-hours awareness already used by the scan path
+    (``_market_data_status``): when the market is closed, treat any bar
+    from the last 24h as fresh (covers same-day EOD bars, yesterday's
+    close, and recent intraday bars).  Bars older than 24h (weekends,
+    holidays, multi-day gaps) are still rejected.  During market hours,
+    fall through to the standard ``is_stale`` check.
+
+    2026-07-09 fix: the prior version only allowed 12-24h old bars
+    after-hours, leaving a 4-12h dead-zone where same-day EOD bars
+    (typical after-hours check) were rejected.
+    """
+    from datetime import timedelta
+
+    from trading_bot.runtime.orchestrator import _is_us_market_open
+
+    if last_timestamp is None:
+        return True
+    age_min = data_age_minutes(last_timestamp, manage_now)
+    if age_min is None:
+        return True
+    if not _is_us_market_open(manage_now) and age_min <= 1440:
+        # After-hours: any bar from the last 24h is acceptable.
+        return False
+    return is_stale(last_timestamp, manage_now, max_age_minutes=max_age_minutes)
+
+
 def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
     """Run one position-management check (EOD, stop, target, trail).
 
@@ -680,7 +737,9 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
         last_price: float | None = None
         if not frame.empty and "close" in frame.columns:
             last_price = float(frame.iloc[-1]["close"])
-        if is_stale(last_timestamp, manage_now, max_age_minutes=ctx.obj.market_data.max_data_age_minutes):
+        if _market_data_is_stale_for_manage(
+            last_timestamp, manage_now, ctx.obj.market_data.max_data_age_minutes
+        ):
             skipped_stale += 1
             append_decision_event(
                 log_path,
@@ -981,6 +1040,40 @@ def portfolio(ctx: typer.Context) -> None:
         )
 
 
+@app.command()
+def deposit(
+    ctx: typer.Context,
+    amount: float = typer.Option(
+        ...,
+        "--amount",
+        help="Cash to add to the ledger (use a negative value to withdraw).",
+    ),
+    note: str = typer.Option(
+        "",
+        "--note",
+        help="Optional note recorded with the deposit in the decision log.",
+    ),
+) -> None:
+    """Add (or withdraw) cash from the simulated ledger for trading."""
+    ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
+    state = ledger.deposit(amount)
+    log_path = Path(ctx.obj.app.log_dir) / "decision-log.jsonl"
+    append_decision_event(
+        log_path,
+        {
+            "command": "deposit",
+            "amount": round(amount, 2),
+            "cash_after": round(state.cash, 2),
+            "equity_after": round(state.equity, 2),
+            "note": note,
+            "at": now_in_zone(ctx.obj.app.timezone).isoformat(),
+        },
+    )
+    typer.echo(
+        f"deposit={amount:+.2f} cash={state.cash:.2f} equity={state.equity:.2f}"
+    )
+
+
 @app.command(name="paper-audit")
 def paper_audit(ctx: typer.Context) -> None:
     """Check local paper-mode state for obvious drift."""
@@ -1085,6 +1178,176 @@ def trade_attribution(ctx: typer.Context) -> None:
         print("-" * 50)
         for tag in sorted(strategy_pnl, key=lambda k: strategy_pnl[k]):
             print(f"{tag[:30]:30} {strategy_count[tag]:7} {strategy_pnl[tag]:10.2f}")
+
+
+@app.command(name="paper-report")
+def paper_report(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit a JSON payload alongside the human-readable report.",
+    ),
+    since: str = typer.Option(
+        None,
+        "--since",
+        help="UTC ISO datetime; include only rows on or after this timestamp.",
+    ),
+    until: str = typer.Option(
+        None,
+        "--until",
+        help="UTC ISO datetime; include only rows on or before this timestamp.",
+    ),
+) -> None:
+    """Multi-dimensional P&L report: overall, per strategy, per hour, per ticker."""
+    from datetime import datetime as _dt
+
+    from trading_bot.analytics import format_paper_performance_report, summarize_paper_performance
+
+    since_dt = _dt.fromisoformat(since) if since else None
+    until_dt = _dt.fromisoformat(until) if until else None
+
+    if since_dt is not None and since_dt.tzinfo is None:
+        since_dt = since_dt.replace(tzinfo=__import__("datetime").timezone.utc)
+    if until_dt is not None and until_dt.tzinfo is None:
+        until_dt = until_dt.replace(tzinfo=__import__("datetime").timezone.utc)
+
+    db_path = Path(ctx.obj.app.state_db_path)
+    if not db_path.exists():
+        typer.echo(f"DB not found at {db_path}")
+        raise typer.Exit(code=1)
+
+    report = summarize_paper_performance(
+        db_path=db_path, since=since_dt, until=until_dt
+    )
+    typer.echo(format_paper_performance_report(report))
+    if json_output:
+        import json
+
+        typer.echo(
+            json.dumps(
+                {
+                    "total_trades": report.total_trades,
+                    "winning_trades": report.winning_trades,
+                    "losing_trades": report.losing_trades,
+                    "realized_pnl": report.realized_pnl,
+                    "gross_wins": report.gross_wins,
+                    "gross_losses": report.gross_losses,
+                    "profit_factor": (
+                        report.profit_factor
+                        if report.profit_factor != float("inf")
+                        else None
+                    ),
+                    "win_rate": report.win_rate,
+                    "evaluation_window": {
+                        "start": (
+                            report.evaluation_window.start.isoformat()
+                            if report.evaluation_window.start
+                            else None
+                        ),
+                        "end": (
+                            report.evaluation_window.end.isoformat()
+                            if report.evaluation_window.end
+                            else None
+                        ),
+                    },
+                    "by_strategy": [
+                        {
+                            "label": r.label,
+                            "trades": r.trades,
+                            "wins": r.wins,
+                            "losses": r.losses,
+                            "net_pnl": r.net_pnl,
+                            "profit_factor": (
+                                r.profit_factor
+                                if r.profit_factor != float("inf")
+                                else None
+                            ),
+                        }
+                        for r in report.by_strategy
+                    ],
+                    "by_hour": [
+                        {
+                            "label": r.label,
+                            "trades": r.trades,
+                            "net_pnl": r.net_pnl,
+                            "wins": r.wins,
+                            "losses": r.losses,
+                        }
+                        for r in report.by_hour
+                    ],
+                    "by_ticker": [
+                        {
+                            "label": r.label,
+                            "trades": r.trades,
+                            "net_pnl": r.net_pnl,
+                            "profit_factor": (
+                                r.profit_factor
+                                if r.profit_factor != float("inf")
+                                else None
+                            ),
+                        }
+                        for r in report.by_ticker
+                    ],
+                },
+                default=str,
+            )
+        )
+
+
+def _graduation_recommend(report) -> str:
+    """Map a report to one of the AGENTS.md decision buckets.
+
+    Uses AGENTS.md's "100 closed trades" check; before that threshold
+    the recommendation is "keep accumulating evidence" so operators do
+    not stop the run on small samples.
+    """
+    if report.total_trades < 100:
+        return (
+            f"KEEP ACCUMULATING: only {report.total_trades}/100 closed trades. "
+            "Do not stop the burn-in before AGENTS.md's 100-trade gate."
+        )
+    pf = report.profit_factor
+    if pf >= 1.3:
+        return f"GRADUATE TO LIVE CONSIDERATION: PF={pf:.2f} >= 1.3 over {report.total_trades} closed trades."
+    if pf >= 0.8:
+        return f"CONTINUE PAPER TUNING: PF={pf:.2f} in 0.8-1.3 over {report.total_trades} closed trades."
+    return f"ADVISORY: PF={pf:.2f} < 0.8 over {report.total_trades} closed trades. Review decision-log.jsonl."
+
+
+@app.command(name="graduation-check")
+def graduation_check(ctx: typer.Context) -> None:
+    """Run AGENTS.md's 100-trade graduation gate against current paper DB.
+
+    Reports overall PF/win-rate and prints a single recommendation that
+    mirrors the AGENTS.md decision flow:
+      PF > 1.3  → graduate to live trading consideration
+      0.8–1.3  → continue paper tuning
+      < 0.8     → advisory alert; review decision-log.jsonl
+    Below 100 closed trades the recommendation is to keep accumulating
+    evidence regardless of PF, so a small sample does not trigger a
+    premature stop.
+    """
+    from trading_bot.analytics import (
+        format_paper_performance_report,
+        summarize_paper_performance,
+    )
+
+    db_path = Path(ctx.obj.app.state_db_path)
+    if not db_path.exists():
+        typer.echo(f"DB not found at {db_path}")
+        raise typer.Exit(code=1)
+
+    report = summarize_paper_performance(db_path=db_path)
+    typer.echo(format_paper_performance_report(report))
+    typer.echo("")
+    typer.echo(_graduation_recommend(report))
+
+    pf = report.profit_factor
+    exit_code = 0 if pf >= 1.3 and report.total_trades >= 100 else 1
+    if pf < 0.8 and report.total_trades >= 100:
+        exit_code = 2
+    raise typer.Exit(code=exit_code)
 
 
 def _build_portfolio_view(state: PortfolioState, settings) -> dict[str, object]:
@@ -1946,55 +2209,95 @@ def tune(
     typer.echo(rendered)
 
 
-@app.command(name="advisory-learn")
-def advisory_learn(
+@app.command(name="eod-fetch")
+def eod_fetch(
     ctx: typer.Context,
-    daily_report: bool = typer.Option(False, "--daily-report", help="Write Daily report.md alongside advisory artifacts."),
+    as_of_date: str = typer.Option(
+        None,
+        "--date",
+        help="Trading date YYYY-MM-DD. Default: yesterday (ET).",
+    ),
+    backfill_days: int = typer.Option(
+        0,
+        "--backfill-days",
+        help="If >0, also fetch the previous N days (in addition to --date).",
+    ),
+    intervals: str = typer.Option(
+        None,
+        "--intervals",
+        help=(
+            "Comma-separated, e.g. '1d,1m,quotes,trades'. Default: from "
+            "eod_data_store.intervals. Valid: '1d' (day-aggregates), "
+            "'1m' (minute-aggregates), 'quotes', 'trades'."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print plan without making network calls or writes.",
+    ),
 ) -> None:
-    """Ingest scan evidence and write advisory learner artifacts."""
-    from trading_bot.advisory import run_advisory_learner
+    """Fetch massive.com S3 flat-files for the configured universe and write
+    them into the long-term data store (``state/data_store/``).
 
-    if not ctx.obj.advisory.enabled:
-        typer.echo("advisory=disabled")
+    Runs end-of-day after massive.com publishes the previous session's bars
+    (≈11:00 AM ET). Idempotent — re-runs for the same date are no-ops.
+    """
+    from datetime import date as _date, timedelta
+
+    from trading_bot.data.data_store import DataStoreManifest
+    from trading_bot.data.eod_runner import run_eod_fetch
+
+    settings = ctx.obj
+    cfg = settings.eod_data_store
+    if not cfg.enabled:
+        typer.echo("eod_data_store disabled in config")
         return
 
-    summary = run_advisory_learner(ctx.obj, write_daily_report=daily_report)
-    typer.echo(
-        " ".join(
-            [
-                f"observations_added={summary.observations_added}",
-                f"main_recommendations={summary.main_recommendations}",
-                f"cheap_recommendations={summary.cheap_recommendations}",
-            ]
-        )
+    if as_of_date is None:
+        as_of_date = (_date.today() - timedelta(days=1)).isoformat()
+    target = _date.fromisoformat(as_of_date)
+
+    universe_path = Path(settings.app.universe_path)
+    manifest_db = Path(cfg.manifest_db)
+    root = Path(cfg.store_root)
+
+    chosen_intervals = (
+        [s.strip() for s in intervals.split(",") if s.strip()]
+        if intervals
+        else list(cfg.intervals)
     )
+    marker = _eod_marker_filename(root, target.isoformat(), chosen_intervals)
 
-
-@app.command(name="advisory-report")
-def advisory_report(
-    ctx: typer.Context,
-    markdown: bool = typer.Option(False, "--markdown", help="Print the markdown daily report if available."),
-    json_output: bool = typer.Option(False, "--json", help="Print the latest learner report as JSON."),
-) -> None:
-    """Show the latest advisory learner report."""
-    from trading_bot.advisory import format_advisory_report, load_latest_advisory_report
-
-    report = load_latest_advisory_report(ctx.obj)
-    if not report:
-        typer.echo("advisory_report=empty")
+    if dry_run:
+        typer.echo(
+            f"DRY RUN: would fetch date={target} intervals={chosen_intervals} "
+            f"universe={universe_path} store_root={root}"
+        )
         return
-    if json_output:
-        typer.echo(json.dumps(report, indent=2))
-        return
-    if markdown:
-        report_path = Path(ctx.obj.app.advisory_dir) / "Daily report.md"
-        if report_path.exists():
-            typer.echo(report_path.read_text(encoding="utf-8").rstrip())
-            return
-    typer.echo(format_advisory_report(report))
+
+    written = 0
+    days = [target - timedelta(days=i) for i in range(backfill_days + 1)]
+    for day in days:
+        day_marker = _eod_marker_filename(root, day.isoformat(), chosen_intervals)
+        if day_marker.exists():
+            typer.echo(f"eod-fetch={day.isoformat()} skipped (marker exists)")
+            continue
+        manifest = DataStoreManifest(db_path=manifest_db)
+        n = run_eod_fetch(
+            settings=settings,
+            universe_path=universe_path,
+            manifest_db=manifest_db,
+            as_of_date=day,
+            marker_file=day_marker,
+            intervals=chosen_intervals,
+        )
+        written += n
+        typer.echo(f"eod-fetch={day.isoformat()} partitions={n}")
+
+    typer.echo(f"eod-fetch total_partitions={written}")
 
 
-@app.command(name="drawdown")
 def drawdown(ctx: typer.Context) -> None:
     """Show drawdown analysis from equity history."""
     from trading_bot.monitoring.drawdown import (
@@ -2591,62 +2894,6 @@ def v3_debug(
             print(f"  BLOCKED: regime not tradeable at tolerance={settings.strategy.risk_tolerance}")
 
 
-@app.command(name="counter-thesis")
-def counter_thesis(
-    ctx: typer.Context,
-    symbols: list[str] = typer.Option(
-        ...,
-        "--symbols",
-        help="Symbols to run counter-thesis analysis against.",
-    ),
-    why: bool = typer.Option(
-        False,
-        "--why",
-        help="Print each finding in full.",
-    ),
-) -> None:
-    """Run counter-thesis analysis against each symbol's BUY thesis.
-
-    For every symbol a signal (the thesis) is generated first; then each
-    counter-thesis check looks for the strongest evidence against it. A
-    blocked trade would be vetoed by the risk manager in scan/paper-trade.
-    """
-    from trading_bot.runtime.orchestrator import (
-        _build_signal_result,
-        _evaluate_counter_thesis_for_signal,
-    )
-
-    parsed_symbols = _parse_symbols(symbols)
-    for symbol in parsed_symbols:
-        typer.echo(f"{symbol} analyzing...")
-        try:
-            signal, reason, _ = _build_signal_result(symbol, ctx.obj)
-        except Exception as exc:
-            typer.echo(f"{symbol} NO_THESIS error={exc}")
-            continue
-        if signal is None:
-            typer.echo(f"{symbol} NO_THESIS reason={reason}")
-            continue
-
-        result = _evaluate_counter_thesis_for_signal(symbol, signal, ctx.obj)
-        if result is None:
-            typer.echo(f"{symbol} counter_thesis=disabled")
-            continue
-
-        typer.echo(
-            f"{symbol} counter_thesis "
-            f"severity={result.overall_severity} "
-            f"findings={len(result.findings)} "
-            f"confidence={result.confidence_multiplier:.2f} "
-            f"block={'true' if result.block_trade else 'false'}"
-        )
-        if why:
-            for finding in result.findings:
-                typer.echo(
-                    f"  - {finding.check_name}: [{finding.severity}] {finding.description}"
-                )
-
-
 @app.command(name="discover")
 def discover_symbols(
     ctx: typer.Context,
@@ -2805,243 +3052,6 @@ def screen_market(
                 typer.echo(f"    {result.reasons[0]}")
 
 
-@app.command(name="rl-train")
-def rl_train(
-    ctx: typer.Context,
-    symbols: str = typer.Option("AAPL", "--symbols", help="Comma-separated symbols to train on"),
-    train_symbols: str = typer.Option(None, "--train-symbols", help="Symbols used during training (required for --evaluate)"),
-    agent: str = typer.Option("PPO", "--agent", help="DRL agent type (PPO, A2C, DQN)"),
-    timesteps: int = typer.Option(50000, "--timesteps", help="Total training timesteps"),
-    learning_rate: float = typer.Option(3e-4, "--learning-rate", help="Learning rate"),
-    seed: int | None = typer.Option(None, "--seed", help="Random seed for reproducible training"),
-    output_dir: str = typer.Option("state/rl_logs", "--output-dir", help="Output directory for model"),
-    evaluate: bool = typer.Option(False, "--evaluate", help="Evaluate trained model instead of training"),
-    eval_episodes: int = typer.Option(10, "--eval-episodes", help="Number of evaluation episodes"),
-    verbose: int = typer.Option(1, "--verbose", help="Verbosity level (0=quiet, 1=normal, 2=debug)"),
-) -> None:
-    """Train or evaluate a DRL trading agent.
-
-    Training trains a new agent on historical market data.
-    Use --evaluate to test a trained model instead.
-
-    After training, compare strategies with:
-      ./tradebot-local backtest --symbols AAPL,MSFT --compare
-    """
-    import sys
-
-    argv = [
-        "train_rl.py",
-        "--symbols", symbols,
-        "--agent", agent,
-        "--timesteps", str(timesteps),
-        "--learning-rate", str(learning_rate),
-        "--output-dir", output_dir,
-        "--verbose", str(verbose),
-    ]
-    if seed is not None:
-        argv.extend(["--seed", str(seed)])
-
-    if train_symbols:
-        argv.extend(["--train-symbols", train_symbols])
-
-    if evaluate:
-        argv.append("--evaluate")
-        argv.extend(["--eval-episodes", str(eval_episodes)])
-
-    sys.argv = argv
-
-    from scripts.train_rl import main as train_main
-    exit_code = train_main()
-    raise typer.Exit(code=exit_code)
-
-
-@app.command(name="rl-eval")
-def rl_eval(
-    symbols: str = typer.Option("AAPL", "--symbols", help="Comma-separated symbols to evaluate"),
-    train_symbols: str = typer.Option(None, "--train-symbols", help="Symbols used during training"),
-    agent: str = typer.Option("PPO", "--agent", help="DRL agent type (PPO, A2C, DQN)"),
-    episodes: int = typer.Option(10, "--episodes", help="Number of evaluation episodes"),
-) -> None:
-    """Evaluate a trained DRL trading agent."""
-    import sys
-    argv = [
-        "train_rl.py",
-        "--evaluate",
-        "--symbols", symbols,
-        "--agent", agent,
-        "--eval-episodes", str(episodes),
-    ]
-    if train_symbols:
-        argv.extend(["--train-symbols", train_symbols])
-
-    sys.argv = argv
-
-    from scripts.train_rl import main as train_main
-    exit_code = train_main()
-    raise typer.Exit(code=exit_code)
-
-
-@app.command(name="rl-benchmark")
-def rl_benchmark(
-    ctx: typer.Context,
-    symbol: str = typer.Option("AAPL", "--symbol", help="Single symbol to benchmark"),
-    symbols: str | None = typer.Option(None, "--symbols", help="Comma-separated symbols to benchmark"),
-    start: str | None = typer.Option(None, "--start", help="Inclusive start date in YYYY-MM-DD format."),
-    end: str | None = typer.Option(None, "--end", help="Inclusive end date in YYYY-MM-DD format."),
-    model_path: str | None = typer.Option(None, "--model-path", help="Override RL model path"),
-) -> None:
-    """Run apples-to-apples V2.5 vs V3 vs RL benchmark."""
-    from trading_bot.backtest.runner import run_strategy_comparison
-
-    requested_symbols = _resolve_rl_symbols(symbols, symbol)
-    resolved_model_path = model_path or getattr(ctx.obj.rl, "model_path", None)
-    path = Path(resolved_model_path) if resolved_model_path else None
-    if path is None or not path.exists():
-        typer.echo("RL benchmark requires an existing model path. Set rl.model_path or pass --model-path.")
-        raise typer.Exit(code=1)
-    _validate_rl_model_symbols(path, requested_symbols)
-
-    try:
-        comparison = run_strategy_comparison(
-            requested_symbols,
-            ctx.obj,
-            start=start,
-            end=end,
-            strategies=["v2.5", "v3", "rl"],
-            model_path=str(path),
-        )
-    except ValueError as exc:
-        typer.echo(f"market data unavailable: {exc}")
-        raise typer.Exit(code=1) from exc
-
-    typer.echo("RL BENCHMARK")
-    typer.echo("=" * 60)
-    typer.echo(f"symbols={','.join(requested_symbols)} model_path={path}")
-    for strat, result in comparison["results"].items():
-        typer.echo(f"\n{strat.upper()}:")
-        typer.echo(f"  trades={result['trades']} wins={result['wins']} losses={result['losses']}")
-        typer.echo(f"  win_rate={result['win_rate']:.2f} net_pnl={result['net_pnl']:.2f}")
-        typer.echo(f"  {_format_backtest_diagnostics(result)}")
-    typer.echo(f"\nBest P&L: {comparison['best_pnl_strategy']}")
-    typer.echo(f"Best Win Rate: {comparison['best_winrate_strategy']}")
-
-
-@app.command(name="rl-model-info")
-def rl_model_info(
-    ctx: typer.Context,
-    model_path: str | None = typer.Option(None, "--model-path", help="Override RL model path"),
-) -> None:
-    """Show active RL model coverage without fetching market data."""
-    resolved_model_path = model_path or getattr(ctx.obj.rl, "model_path", None)
-    if not resolved_model_path:
-        typer.echo("RL model path is not configured.")
-        raise typer.Exit(code=1)
-
-    path = Path(resolved_model_path)
-    if not path.exists():
-        typer.echo(f"RL model missing: {path}")
-        raise typer.Exit(code=1)
-
-    meta_path, meta, symbols = _load_rl_model_meta(path)
-    typer.echo(f"model_path={path}")
-    typer.echo(f"metadata_path={meta_path if meta_path.exists() else 'missing'}")
-    typer.echo(f"agent={meta.get('agent', getattr(ctx.obj.rl, 'agent_type', 'unknown'))}")
-    typer.echo(f"symbols={','.join(symbols) if symbols else 'unknown'}")
-    typer.echo(f"max_symbols={meta.get('max_symbols', 'unknown')}")
-    typer.echo(f"seed={meta.get('seed', 'unknown')}")
-    typer.echo(f"reward_scheme={meta.get('reward_scheme', getattr(ctx.obj.rl, 'reward_function', 'unknown'))}")
-    if symbols:
-        typer.echo(f"supported_scan=./tradebot-local scan --symbols {','.join(symbols)} --summary --why")
-
-
-@app.command(name="rl-scan-plan")
-def rl_scan_plan(
-    ctx: typer.Context,
-    model_path: str | None = typer.Option(None, "--model-path", help="Override RL model path"),
-) -> None:
-    """Show the safe scan plan for the active RL model."""
-    resolved_model_path = model_path or getattr(ctx.obj.rl, "model_path", None)
-    if not resolved_model_path:
-        typer.echo("RL model path is not configured.")
-        raise typer.Exit(code=1)
-
-    path = Path(resolved_model_path)
-    if not path.exists():
-        typer.echo(f"RL model missing: {path}")
-        raise typer.Exit(code=1)
-
-    meta_path, _meta, symbols = _load_rl_model_meta(path)
-    typer.echo("RL SCAN PLAN")
-    typer.echo(f"model_path={path}")
-    typer.echo(f"metadata_path={meta_path if meta_path.exists() else 'missing'}")
-    typer.echo(f"symbols={','.join(symbols) if symbols else 'unknown'}")
-    if not symbols:
-        typer.echo("status=blocked_missing_metadata")
-        typer.echo("next=write model metadata with trained symbols before scanning")
-    else:
-        typer.echo("status=ready")
-        typer.echo(f"command=./tradebot-local scan --symbols {','.join(symbols)} --summary --why")
-
-
-@app.command(name="rl-walkforward")
-def rl_walkforward(
-    ctx: typer.Context,
-    symbol: str = typer.Option("AAPL", "--symbol", help="Single symbol to benchmark"),
-    symbols: str | None = typer.Option(None, "--symbols", help="Comma-separated symbols to benchmark"),
-    start: str | None = typer.Option(None, "--start", help="Inclusive start date in YYYY-MM-DD format."),
-    end: str | None = typer.Option(None, "--end", help="Inclusive end date in YYYY-MM-DD format."),
-    windows: int = typer.Option(5, "--windows", help="Number of sequential windows"),
-    model_path: str | None = typer.Option(None, "--model-path", help="Override RL model path"),
-) -> None:
-    """Run fixed-model sequential V2.5 vs V3 vs RL windows."""
-    from trading_bot.backtest.runner import run_rl_walk_forward
-
-    requested_symbols = _resolve_rl_symbols(symbols, symbol)
-    resolved_model_path = model_path or getattr(ctx.obj.rl, "model_path", None)
-    path = Path(resolved_model_path) if resolved_model_path else None
-    if path is None or not path.exists():
-        typer.echo("RL walk-forward requires an existing model path. Set rl.model_path or pass --model-path.")
-        raise typer.Exit(code=1)
-    _validate_rl_model_symbols(path, requested_symbols)
-
-    try:
-        result = run_rl_walk_forward(
-            requested_symbols,
-            ctx.obj,
-            start=start,
-            end=end,
-            windows=windows,
-            model_path=str(path),
-        )
-    except ValueError as exc:
-        typer.echo(f"market data unavailable: {exc}")
-        raise typer.Exit(code=1) from exc
-    typer.echo("RL FIXED-MODEL WALK-FORWARD")
-    typer.echo("=" * 60)
-    typer.echo(f"symbols={','.join(requested_symbols)} model_path={path} windows={windows}")
-    for window in result["windows"]:
-        typer.echo(f"\nWINDOW {window['window']}: {window['start']} -> {window['end']}")
-        for strategy_name, strategy_result in window["results"].items():
-            typer.echo(
-                f"  {strategy_name.upper()}: trades={strategy_result['trades']} "
-                f"wins={strategy_result['wins']} losses={strategy_result['losses']} "
-                f"win_rate={strategy_result['win_rate']:.2f} net_pnl={strategy_result['net_pnl']:.2f}"
-            )
-            typer.echo(f"    {_format_backtest_diagnostics(strategy_result)}")
-        typer.echo(f"  best_pnl={window['best_pnl_strategy']} best_win_rate={window['best_winrate_strategy']}")
-
-    typer.echo("\nTOTALS:")
-    for strategy_name, strategy_result in result["results"].items():
-        typer.echo(
-            f"  {strategy_name.upper()}: trades={strategy_result['trades']} "
-            f"wins={strategy_result['wins']} losses={strategy_result['losses']} "
-            f"win_rate={strategy_result['win_rate']:.2f} net_pnl={strategy_result['net_pnl']:.2f}"
-        )
-        typer.echo(f"    {_format_backtest_diagnostics(strategy_result)}")
-    typer.echo(f"\n{_format_paper_confidence_gate(result, ctx.obj.rl.backtest_starting_cash)}")
-
-
-@app.command()
 def db_history(
     ctx: typer.Context,
     ticker: str | None = typer.Option(None, "--ticker", help="Filter by ticker"),
@@ -3102,152 +3112,6 @@ def db_history(
     finally:
         if engine:
             engine.dispose()
-
-
-@app.command(name="supermodel-report")
-def supermodel_report(
-    ctx: typer.Context,
-    since: str | None = typer.Option(None, "--since", help="Start date (YYYY-MM-DD)"),
-    limit: int = typer.Option(500, "--limit", help="Max scan rows to inspect"),
-) -> None:
-    """Summarize persisted supermodel scan decisions."""
-    from collections import Counter
-    from datetime import datetime
-
-    from trading_bot.db.session import get_session, init_db, make_session_factory
-    from trading_bot.db.repositories import get_scan_results, get_trades
-
-    engine = init_db(ctx.obj)
-    session = get_session(make_session_factory(engine))
-    try:
-        rows = get_scan_results(
-            session,
-            since=datetime.fromisoformat(since) if since else None,
-            limit=limit,
-        )
-        trades = get_trades(
-            session,
-            since=datetime.fromisoformat(since) if since else None,
-            limit=limit,
-        )
-    finally:
-        session.close()
-        engine.dispose()
-
-    counts: Counter[str] = Counter()
-    actions: Counter[tuple[str, str]] = Counter()
-    hold_reasons: Counter[tuple[str, str]] = Counter()
-    consensus_pairs: Counter[tuple[str, str]] = Counter()
-    scores: dict[str, list[float]] = {}
-    missing = 0
-    for row in rows:
-        decision, score = _scan_row_supermodel(row)
-        if not decision:
-            missing += 1
-            continue
-        counts[decision] += 1
-        actions[(decision, row.action)] += 1
-        if row.action == "HOLD":
-            for reason in _scan_row_reasons(row):
-                hold_reasons[(decision, reason)] += 1
-        details = _scan_row_details(row)
-        if details and details.get("signal_mode") == "parallel":
-            consensus = str(details.get("consensus") or "")
-            if consensus:
-                consensus_pairs[(consensus, decision)] += 1
-        if score is not None:
-            scores.setdefault(decision, []).append(score)
-
-    typer.echo("SUPERMODEL REPORT")
-    typer.echo(f"scan_rows={len(rows)} stack_rows={sum(counts.values())} missing_stack={missing}")
-    for decision in ("support", "caution", "block", "no_signal"):
-        total = counts[decision]
-        if not total:
-            continue
-        values = scores.get(decision, [])
-        avg_score = sum(values) / len(values) if values else 0.0
-        typer.echo(
-            f"{decision} count={total} "
-            f"buy={actions[(decision, 'BUY')]} hold={actions[(decision, 'HOLD')]} "
-            f"avg_score={avg_score:.2f}"
-        )
-    if hold_reasons:
-        typer.echo("SCAN HOLD REASONS")
-        for (decision, reason), total in sorted(hold_reasons.items()):
-            typer.echo(f"{decision} reason={reason} count={total}")
-    if consensus_pairs:
-        typer.echo("PARALLEL CONSENSUS")
-        for (consensus, stack_decision), total in sorted(consensus_pairs.items()):
-            typer.echo(f"consensus={consensus} stack={stack_decision} count={total}")
-
-    trade_counts: Counter[str] = Counter()
-    trade_pnl: Counter[str] = Counter()
-    trade_wins: Counter[str] = Counter()
-    trade_losses: Counter[str] = Counter()
-    trade_open_counts: Counter[str] = Counter()
-    trade_consensus: Counter[tuple[str, str]] = Counter()
-    trade_consensus_pnl: Counter[tuple[str, str]] = Counter()
-    trade_consensus_wins: Counter[tuple[str, str]] = Counter()
-    trade_consensus_losses: Counter[tuple[str, str]] = Counter()
-    trade_consensus_open_counts: Counter[tuple[str, str]] = Counter()
-    open_trades = 0
-    for trade in trades:
-        decision = _trade_stack_decision(trade)
-        if not decision:
-            continue
-        if trade.pnl is None:
-            open_trades += 1
-            trade_open_counts[decision] += 1
-            consensus = _trade_consensus(trade)
-            if consensus:
-                trade_consensus_open_counts[(consensus, decision)] += 1
-            continue
-        trade_counts[decision] += 1
-        pnl = float(trade.pnl)
-        trade_pnl[decision] += pnl
-        if pnl > 0:
-            trade_wins[decision] += 1
-        elif pnl < 0:
-            trade_losses[decision] += 1
-        consensus = _trade_consensus(trade)
-        if consensus:
-            trade_consensus[(consensus, decision)] += 1
-            trade_consensus_pnl[(consensus, decision)] += pnl
-            if pnl > 0:
-                trade_consensus_wins[(consensus, decision)] += 1
-            elif pnl < 0:
-                trade_consensus_losses[(consensus, decision)] += 1
-    if trade_counts or open_trades:
-        typer.echo("TRADE OUTCOMES")
-        typer.echo(f"closed_stack_trades={sum(trade_counts.values())} open_stack_trades={open_trades}")
-        if not trade_counts and open_trades:
-            typer.echo(
-                "outcome_confidence=INSUFFICIENT reason=no_closed_stack_trades "
-                "message=paper validation needs realized exits before win-rate/P&L are meaningful"
-            )
-        for decision in ("support", "caution", "block", "no_signal"):
-            total = trade_counts[decision]
-            open_total = trade_open_counts[decision]
-            if not total and not open_total:
-                continue
-            avg_pnl = trade_pnl[decision] / total if total else 0.0
-            win_rate = trade_wins[decision] / total if total else 0.0
-            typer.echo(
-                f"{decision} closed={total} net_pnl={trade_pnl[decision]:.2f} "
-                f"avg_pnl={avg_pnl:.2f} win_rate={win_rate:.2f} "
-                f"wins={trade_wins[decision]} losses={trade_losses[decision]} open={open_total}"
-            )
-        consensus_keys = set(trade_consensus) | set(trade_consensus_open_counts)
-        for consensus, stack_decision in sorted(consensus_keys):
-            total = trade_consensus[(consensus, stack_decision)]
-            open_total = trade_consensus_open_counts[(consensus, stack_decision)]
-            win_rate = trade_consensus_wins[(consensus, stack_decision)] / total if total else 0.0
-            typer.echo(
-                f"consensus={consensus} stack={stack_decision} closed={total} "
-                f"net_pnl={trade_consensus_pnl[(consensus, stack_decision)]:.2f} "
-                f"win_rate={win_rate:.2f} wins={trade_consensus_wins[(consensus, stack_decision)]} "
-                f"losses={trade_consensus_losses[(consensus, stack_decision)]} open={open_total}"
-            )
 
 
 def _scan_row_supermodel(row) -> tuple[str | None, float | None]:
@@ -4481,428 +4345,6 @@ def bench_weights(
         typer.echo(json_module.dumps(results, default=str, indent=2))
 
 
-@app.command(name="rl-compare")
-def rl_compare(
-    ctx: typer.Context,
-    symbols: list[str] = typer.Option(
-        None,
-        "--symbols",
-        help="Symbols to compare models on. Defaults to all trained symbols.",
-    ),
-    model_path: str | None = typer.Option(
-        None,
-        "--model-path",
-        help="Primary RL model path (used as fallback for V3 comparison).",
-    ),
-    start: str | None = typer.Option(
-        None,
-        "--start",
-        help="Inclusive start date in YYYY-MM-DD format.",
-    ),
-    end: str | None = typer.Option(
-        None,
-        "--end",
-        help="Inclusive end date in YYYY-MM-DD format.",
-    ),
-    json_output: bool = typer.Option(
-        False,
-        "--json",
-        help="Output results as JSON.",
-    ),
-) -> None:
-    """Compare multiple RL models using ensemble inference.
-
-    Discovers all PPO models in state/rl_logs, runs parallel backtests,
-    and shows side-by-side comparison with V2.5/V3 baselines.
-    """
-    import json as json_module
-
-    from trading_bot.rl.ensemble import discover_rl_models, RLEnsemble
-    from trading_bot.backtest.runner import run_strategy_comparison
-    from trading_bot.data import market_data
-
-    parsed_symbols = _parse_symbols(symbols) if symbols else []
-    settings = ctx.obj
-    rl_dir = settings.rl.model_dir if hasattr(settings.rl, "model_dir") else "state/rl_logs"
-
-    models = discover_rl_models(rl_dir)
-    if not models:
-        typer.echo("No RL models found in rl_dir. Train a model first with rl-train.")
-        raise typer.Exit(code=1)
-
-    typer.echo("RL MODEL COMPARISON")
-    typer.echo("=" * 70)
-    typer.echo(f"Discovered {len(models)} model(s):")
-    for m in models:
-        typer.echo(f"  - {m}")
-
-    # Load ensemble
-    ensemble = RLEnsemble(models)
-    loaded = ensemble.load()
-    typer.echo(f"Loaded {len(loaded)}/{len(models)} models")
-    if not loaded:
-        typer.echo("No models could be loaded. Check model files.")
-        raise typer.Exit(code=1)
-
-    # Resolve symbols
-    if not parsed_symbols:
-        all_symbols: set[str] = set()
-        for path in models:
-            from trading_bot.rl.utils import rl_model_symbols
-            meta_symbols = rl_model_symbols(path) or []
-            all_symbols.update(s.upper() for s in meta_symbols)
-        parsed_symbols = sorted(all_symbols) if all_symbols else ["AAPL"]
-    typer.echo(f"Symbols: {','.join(parsed_symbols)}")
-    typer.echo("")
-
-    # Run backtest comparison
-    strategies = ["v2.5", "v3"]
-    for model_path_str in models:
-        model_name = Path(model_path_str).name
-        try:
-            result = run_strategy_comparison(
-                parsed_symbols,
-                settings,
-                start=start,
-                end=end,
-                strategies=["rl"],
-                model_path=model_path_str,
-            )
-            strategies.append(model_name)
-        except Exception as e:
-            typer.echo(f"  Warning: backtest failed for {model_name}: {e}")
-
-    try:
-        comparison = run_strategy_comparison(
-            parsed_symbols,
-            settings,
-            start=start,
-            end=end,
-            strategies=strategies,
-            model_path=models[0] if models else None,
-        )
-    except ValueError as exc:
-        typer.echo(f"Market data unavailable: {exc}")
-        raise typer.Exit(code=1) from exc
-
-    if json_output:
-        typer.echo(json_module.dumps(comparison, default=str, indent=2))
-    else:
-        typer.echo("STRATEGY COMPARISON")
-        typer.echo("=" * 70)
-        for strat, result in comparison["results"].items():
-            typer.echo(f"\n{strat.upper()}:")
-            typer.echo(f"  trades={result['trades']} wins={result['wins']} losses={result['losses']}")
-            typer.echo(f"  win_rate={result['win_rate']:.2f} net_pnl={result['net_pnl']:.2f}")
-            typer.echo(f"  {_format_backtest_diagnostics(result)}")
-        typer.echo(f"\nBest P&L: {comparison['best_pnl_strategy']}")
-        typer.echo(f"Best Win Rate: {comparison['best_winrate_strategy']}")
-
-        # Ensemble summary
-        typer.echo(f"\nENSEMBLE: {ensemble.model_count} models loaded")
-        typer.echo(f"  Models: {', '.join(ensemble.model_names)}")
-
-
-@app.command(name="rl-retrain")
-def rl_retrain(
-    ctx: typer.Context,
-    symbols: str = typer.Option(
-        "",
-        "--symbols",
-        help="Comma-separated symbols to retrain on. If empty, discovers from scanner.",
-    ),
-    train_symbols: str = typer.Option(
-        "",
-        "--train-symbols",
-        help="Existing trained symbols to keep. If empty, uses symbols above.",
-    ),
-    agent: str = typer.Option(
-        "PPO",
-        "--agent",
-        help="DRL agent type (PPO, A2C, DQN).",
-    ),
-    timesteps: int = typer.Option(
-        50000,
-        "--timesteps",
-        help="Total training timesteps.",
-    ),
-    episodes: int = typer.Option(
-        100,
-        "--episodes",
-        help="Number of training episodes.",
-    ),
-    learning_rate: float = typer.Option(
-        3e-4,
-        "--learning-rate",
-        help="Learning rate.",
-    ),
-    seed: int | None = typer.Option(
-        None,
-        "--seed",
-        help="Random seed for reproducible training.",
-    ),
-    output_dir: str = typer.Option(
-        "state/rl_logs",
-        "--output-dir",
-        help="Output directory for trained model.",
-    ),
-    discover: bool = typer.Option(
-        False,
-        "--discover",
-        help="Auto-discover untrained symbols from scanner before training.",
-    ),
-    max_symbols: int | None = typer.Option(
-        None,
-        "--max-symbols",
-        help="Fixed observation symbol capacity. Increases input layer size.",
-    ),
-    verbose: int = typer.Option(
-        1,
-        "--verbose",
-        help="Verbosity level (0=quiet, 1=normal, 2=debug).",
-    ),
-) -> None:
-    """Discover untrained symbols and retrain RL model.
-
-    With --discover: runs a quick scan, identifies symbols not covered by
-    any existing model, and trains a new model covering all symbols.
-
-    Without --discover: uses --symbols directly for training.
-    """
-    import sys
-    import os
-
-    # Discover mode: run scanner to find untrained symbols
-    discovered_symbols: list[str] = []
-    if discover:
-        typer.echo("Discovering untrained symbols from scanner...")
-        from trading_bot.rl.ensemble import discover_rl_models, load_discovered_symbols
-        from trading_bot.rl.utils import rl_model_symbols
-
-        rl_dir = output_dir
-        existing_models = discover_rl_models(rl_dir)
-        all_trained: set[str] = set()
-        for model_path in existing_models:
-            meta_symbols = rl_model_symbols(model_path) or []
-            all_trained.update(s.upper() for s in meta_symbols)
-        typer.echo(f"  Existing models cover: {','.join(sorted(all_trained)) if all_trained else 'none'}")
-
-        # Run a quick scan to find candidates
-        try:
-            from trading_bot.runtime.orchestrator import run_scan
-            # Scan a broad universe
-            universe_candidates = ["SPY", "QQQ", "IWM", "DIA"]
-            # Add sector ETFs
-            sector_etfs = ["XLF", "XLK", "XLE", "XLV", "XLI", "XLP", "XLU", "XLRE", "GLD", "TLT"]
-            scan_symbols = universe_candidates + sector_etfs
-
-            scan_result = run_scan(scan_symbols, ctx.obj, include_details=False)
-            approved = [
-                row["ticker"].upper()
-                for row in scan_result.get("candidates", [])
-                if row.get("status") == "APPROVED" and row.get("quality") == "GREEN"
-            ]
-            untrained = [s for s in approved if s not in all_trained]
-            discovered_symbols = untrained if untrained else approved
-            typer.echo(f"  Approved candidates: {','.join(approved) if approved else 'none'}")
-            typer.echo(f"  Untrained: {','.join(discovered_symbols) if discovered_symbols else 'none'}")
-        except Exception as e:
-            typer.echo(f"  Warning: discovery scan failed: {e}")
-            typer.echo("  Falling back to default symbols.")
-            discovered_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA"]
-
-    # Resolve symbols
-    if discovered_symbols:
-        symbols = ",".join(discovered_symbols)
-    elif not train_symbols and not symbols:
-        symbols = "AAPL"
-
-    # Build argv for train_rl.py
-    argv = [
-        "train_rl.py",
-        "--symbols", symbols or "AAPL",
-        "--agent", agent,
-        "--timesteps", str(timesteps),
-        "--episodes", str(episodes),
-        "--learning-rate", str(learning_rate),
-        "--output-dir", output_dir,
-        "--verbose", str(verbose),
-    ]
-    if seed is not None:
-        argv.extend(["--seed", str(seed)])
-    if max_symbols is not None:
-        argv.extend(["--max-symbols", str(max_symbols)])
-    if train_symbols:
-        argv.extend(["--train-symbols", train_symbols])
-
-    sys.argv = argv
-    os.environ.setdefault("CONFIG_PATH", str(ctx.obj.app.config_path) if hasattr(ctx.obj.app, "config_path") and ctx.obj.app.config_path else "config.yaml")
-
-    from scripts.train_rl import main as train_main
-    exit_code = train_main()
-    if exit_code == 0 and discovered_symbols:
-        from trading_bot.rl.ensemble import save_discovered_symbols
-        save_discovered_symbols(discovered_symbols)
-        typer.echo(f"\nSaved discovered symbols to state/rl_logs/discovered_symbols.txt")
-    raise typer.Exit(code=exit_code)
-
-
-@app.command(name="rl-update-model")
-def rl_update_model(
-    ctx: typer.Context,
-    model_path: str = typer.Option(
-        ...,
-        "--model-path",
-        help="Path to the trained model .zip file.",
-    ),
-    config_path: str | None = typer.Option(
-        None,
-        "--config-path",
-        help="Override config path for updating model_path.",
-    ),
-) -> None:
-    """Update the active RL model path in the config file.
-
-    Writes the model path into the config so that scanner/paper-trade
-    use the specified model for RL signals.
-    """
-    from pathlib import Path as _Path
-    import yaml
-
-    resolved_path = _Path(model_path)
-    if not resolved_path.exists():
-        typer.echo(f"Model file not found: {resolved_path}")
-        raise typer.Exit(code=1)
-
-    # Determine config path
-    config_file = config_path
-    if config_file is None:
-        config_file = ctx.obj.app.config_path if hasattr(ctx.obj.app, "config_path") else "config.yaml"
-
-    config_file = _Path(config_file)
-    if not config_file.exists():
-        typer.echo(f"Config file not found: {config_file}")
-        raise typer.Exit(code=1)
-
-    try:
-        config = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
-    except yaml.YAMLError as e:
-        typer.echo(f"Failed to parse config: {e}")
-        raise typer.Exit(code=1) from e
-
-    # Ensure rl section exists
-    if "rl" not in config:
-        config["rl"] = {}
-    config["rl"]["model_path"] = str(resolved_path)
-
-    config_file.write_text(yaml.dump(config, default_flow_style=False), encoding="utf-8")
-    typer.echo(f"Updated model_path in {config_file}: {resolved_path}")
-    typer.echo(f"  Set rl.model_path = {resolved_path}")
-
-
-@app.command(name="supermodel")
-def supermodel(
-    ctx: typer.Context,
-    symbols: str = typer.Option(
-        "",
-        "--symbols",
-        help="Comma-separated symbols to train. If empty, discovers from burn-in.",
-    ),
-    epochs: int = typer.Option(
-        100,
-        "--epochs",
-        help="Number of training episodes (default: 100).",
-    ),
-    timesteps: int = typer.Option(
-        50000,
-        "--timesteps",
-        help="Total training timesteps (default: 50000).",
-    ),
-    dry_run: bool = typer.Option(
-        False,
-        "--dry-run",
-        help="Preview what would happen without training.",
-    ),
-    db_path: str = typer.Option(
-        "state/burn_in.db",
-        "--db-path",
-        help="Path to burn-in database (default: state/burn_in.db).",
-    ),
-    rl_dir: str = typer.Option(
-        "state/rl_logs",
-        "--rl-dir",
-        help="RL models directory (default: state/rl_logs).",
-    ),
-    output_dir: str = typer.Option(
-        "state/rl_logs/supermodel",
-        "--output-dir",
-        help="Output directory for supermodel ensemble (default: state/rl_logs/supermodel).",
-    ),
-) -> None:
-    """Run daily supermodel retraining pipeline.
-
-    Collects live burn-in data, retrains RL models, and builds an ensemble
-    of the best-performing models for daily inference.
-
-    Steps:
-      1. Load burn-in statistics from database
-      2. Discover training symbols from burn-in data
-      3. Evaluate existing models
-      4. Train new supermodel
-      5. Build ensemble of all models
-    """
-    import subprocess
-    import sys
-
-    try:
-        script_path = _repo_script_path("daily_supermodel.py")
-    except FileNotFoundError as exc:
-        typer.echo(f"Supermodel pipeline script not found: {exc}")
-        raise typer.Exit(code=1)
-
-    cmd = [
-        sys.executable,
-        str(script_path),
-        "--db-path", db_path,
-        "--rl-dir", rl_dir,
-        "--output-dir", output_dir,
-        "--epochs", str(epochs),
-        "--timesteps", str(timesteps),
-    ]
-
-    if dry_run:
-        cmd.append("--dry-run")
-
-    if symbols:
-        cmd.extend(["--symbols", symbols])
-
-    typer.echo("DAILY SUPERMODEL PIPELINE")
-    typer.echo("=" * 60)
-    typer.echo(f"  DB: {db_path}")
-    typer.echo(f"  RL Dir: {rl_dir}")
-    typer.echo(f"  Output: {output_dir}")
-    typer.echo(f"  Epochs: {epochs}")
-    typer.echo(f"  Timesteps: {timesteps}")
-    if dry_run:
-        typer.echo("  Mode: DRY RUN")
-    if symbols:
-        typer.echo(f"  Symbols: {symbols}")
-    typer.echo("")
-    typer.echo("Running pipeline...")
-    typer.echo("-" * 60)
-
-    result = subprocess.run(cmd, capture_output=False)
-
-    if result.returncode == 0:
-        typer.echo("-" * 60)
-        typer.echo("Pipeline complete!")
-    else:
-        typer.echo("-" * 60)
-        typer.echo(f"Pipeline failed with exit code {result.returncode}")
-        raise typer.Exit(code=result.returncode)
-
-
-@app.command(name="live-data")
 def live_data(
     ctx: typer.Context,
     watch: bool = typer.Option(
@@ -5078,111 +4520,6 @@ def cache_data(
     typer.echo(f"Data saved to: {output_path}")
 
 
-@app.command(name="auto-retrain")
-def auto_retrain(
-    ctx: typer.Context,
-    dry_run: bool = typer.Option(
-        False,
-        "--dry-run",
-        help="Preview what would happen without training",
-    ),
-    force: bool = typer.Option(
-        False,
-        "--force",
-        help="Force retrain regardless of new symbols",
-    ),
-    universe_path: str = typer.Option(
-        "state/universe.txt",
-        "--universe-path",
-        help="Path to universe file (default: state/universe.txt).",
-    ),
-    watchlist_path: str = typer.Option(
-        "state/watchlist.txt",
-        "--watchlist-path",
-        help="Path to watchlist file (default: state/watchlist.txt).",
-    ),
-    rl_dir: str = typer.Option(
-        "state/rl_logs",
-        "--rl-dir",
-        help="RL models directory (default: state/rl_logs).",
-    ),
-    output_dir: str = typer.Option(
-        "state/rl_logs/supermodel",
-        "--output-dir",
-        help="Output directory for trained model (default: state/rl_logs/supermodel).",
-    ),
-    epochs: int = typer.Option(
-        100,
-        "--epochs",
-        help="Number of training episodes (default: 100).",
-    ),
-    timesteps: int = typer.Option(
-        50000,
-        "--timesteps",
-        help="Total timesteps to train (default: 50000).",
-    ),
-) -> None:
-    """Auto-retrain RL model when new symbols are detected.
-
-    Checks if new symbols have been added to the universe/watchlist that aren't
-    covered by any existing RL model, and triggers retraining if needed.
-
-    This ensures that any symbol added to the watchlist or universe can be
-    traded by the RL agent after a retrain cycle.
-    """
-    import subprocess
-    import sys
-
-    try:
-        script_path = _repo_script_path("auto_retrain_trigger.py")
-    except FileNotFoundError as exc:
-        typer.echo(f"Auto-retrain script not found: {exc}")
-        raise typer.Exit(code=1)
-
-    cmd = [
-        sys.executable,
-        str(script_path),
-        "--universe-path", universe_path,
-        "--watchlist-path", watchlist_path,
-        "--rl-dir", rl_dir,
-        "--output-dir", output_dir,
-        "--epochs", str(epochs),
-        "--timesteps", str(timesteps),
-    ]
-
-    if dry_run:
-        cmd.append("--dry-run")
-    if force:
-        cmd.append("--force")
-
-    typer.echo("AUTO-RETRAIN TRIGGER")
-    typer.echo("=" * 60)
-    typer.echo(f"  Universe: {universe_path}")
-    typer.echo(f"  Watchlist: {watchlist_path}")
-    typer.echo(f"  RL Dir: {rl_dir}")
-    typer.echo(f"  Output: {output_dir}")
-    typer.echo(f"  Epochs: {epochs}")
-    typer.echo(f"  Timesteps: {timesteps}")
-    if dry_run:
-        typer.echo("  Mode: DRY RUN")
-    if force:
-        typer.echo("  Mode: FORCE RETRAIN")
-    typer.echo("")
-    typer.echo("Checking for new symbols...")
-    typer.echo("-" * 60)
-
-    result = subprocess.run(cmd, capture_output=False)
-
-    if result.returncode == 0:
-        typer.echo("-" * 60)
-        typer.echo("Auto-retrain check complete!")
-    else:
-        typer.echo("-" * 60)
-        typer.echo(f"Auto-retrain failed with exit code {result.returncode}")
-        raise typer.Exit(code=result.returncode)
-
-
-@app.command(name="reset-portfolio")
 def reset_portfolio(
     ctx: typer.Context,
     confirm: bool = typer.Option(
@@ -5286,3 +4623,4 @@ def reset_portfolio(
 
     typer.echo("")
     typer.echo("Portfolio reset complete.")
+
