@@ -8,6 +8,16 @@ This repo has `.codegraph/`. Use `codegraph explore "question"` or `codegraph no
 
 ---
 
+## Keeping AGENTS.md Current
+
+AGENTS.md is a snapshot of the project's current operational reality, not a historical log.
+
+- **Update this file in the same commit as any change it describes.** If a change touches the burner, risk knobs, dashboard, scripts, configs, kill switch, persistence, or operational contracts, update the matching section here in the same commit so the file reflects the latest reality at all times.
+- **No "temporary" sections.** Earlier versions of this file carried a `TEMPORARY OVERRIDES` block that listed the 2026-07-09 loose guardrail values. That block has been removed; if guardrails are loosened or tightened again, the new baseline belongs inline in this file as the documented truth, not as a "temporary" annotation.
+- **Prefer updating comments to match the code** rather than leaving a stale doc that contradicts the implementation.
+- **Live operational state, not intent.** Anything stated here is what the project currently does, not what it was supposed to do.
+
+---
 ## Entry Point
 
 **Always use the repo-local wrapper:**
@@ -167,7 +177,9 @@ Cross-table reporting reads both `orders` and `trades` tables separately.
 ./tradebot-local sync-positions
 
 # Burn-in automation
-./scripts/auto-burn-in.sh
+./scripts/auto-burn-in.sh              # auto-starts dashboard sidecar on :8080
+                                       # AUTO_DASHBOARD=false to opt out
+                                       # DASHBOARD_PORT=N to change port
 ./scripts/burn-in-monitor.sh
 ./scripts/burn-in-weekly-review.sh
 tail -f logs/burn_in/decision-log.jsonl
