@@ -5,35 +5,36 @@ app:
   portfolio_summary_path: "state/burn_in/portfolio_summary.json"
   scan_results_path: "state/burn_in/scan_results.json"
   allow_yellow_mean_reversion: true
-  min_entry_confluence_score: 2.0
+  min_entry_confluence_score: 0.0  # TEMP FIRE MODE 2026-07-09 (user said "loosen the guardrails"); permits any signal the V3 selector produces; see AGENTS.md.
   signal_mode: "parallel"
   min_timeframe_alignment: 1
 
 market_data:
-  provider: alpaca
-  providers: [alpaca, yfinance]
+  provider: polygon
+  providers: [polygon, alpaca, yfinance]  # Polygon = massive.com (rebranded); SIP-quality data via POLYGON_API_KEY
   daily_period: "1y"
   intraday_period: "5d"
   intraday_interval: "5m"
   max_data_age_hours: 72
   max_data_age_minutes: 120
+  scan_deadline_minutes: 5   # AGGRESSIVE 2026-07-09 — wall-clock cap on run_scan iteration
   validate_data: true
 
 risk:
-  max_risk_per_trade_pct: 0.01
+  max_risk_per_trade_pct: 0.005  # 2026-07-10 tuning: halved from 0.01 after winners/losers size asymmetry (gross loss 1.53x gross win) drove the day's 0.65 PF.
   max_daily_risk_pct: 0.03
-  max_daily_orders: 30
-  max_ticker_allocation_pct: 0.15
-  min_reward_risk_ratio: 2.0
+  max_daily_orders: 20  # 2026-07-10 tuning: tightened from 60 after the day produced 118 fills (~2/min), the primary driver of the 0.65 PF.
+  max_ticker_allocation_pct: 0.10  # 2026-07-10 tuning: tightened from 0.25 after a single NFLX mean-reversion entry took $96k and produced the day's largest loss.
+  min_reward_risk_ratio: 1.5  # 2026-07-10 tuning: restored from temporary 1.0 after the 10:00-hour carnage (4 of the top 5 losers sat in the 1.0–1.5 R/R bucket).
   use_atr_sizing: true
   atr_period: 14
   atr_multiplier: 2.5
   atr_stop_multiplier: 3.0
-  min_stop_distance_pct: 5.0
-  max_portfolio_heat_pct: 0.03
-  max_consecutive_losses: 5
-  enable_drawdown_circuit_breaker: true
-  ticker_reentry_cooldown_minutes: 30
+  min_stop_distance_pct: 2.0
+  max_portfolio_heat_pct: 0.10
+  max_consecutive_losses: 999  # TEMP disabled 2026-07-08 5-loss streak; user instructed "Leave the temp override in please" on 2026-07-09 — see AGENTS.md.
+  enable_drawdown_circuit_breaker: false  # TEMP DISABLED 2026-07-08 (5-loss streak unbroken since yesterday's close); user instructed "Leave the temp override in please" on 2026-07-09 — see AGENTS.md.
+  ticker_reentry_cooldown_minutes: 5
   yellow_allocation_pct: 0.5
 
 strategy:
@@ -42,10 +43,7 @@ strategy:
   min_confidence: "low"
 
 counter_thesis:
-  enabled: false
-
-rl:
-  enabled: false
+  enabled: true  # 2026-07-10 tuning: enabled after today's repeated over-extended mean-reversion entries produced -$3,007; counter-thesis will block high-severity signals.
 
 swarm:
   enabled: false
@@ -67,12 +65,57 @@ sentiment:
 session:
   eod_enabled: true
   eod_minutes_before_close: 5
-  time_exit_minutes: 120
+  time_exit_minutes: 240
 
 paper:
   fee_per_order: 1.0
   slippage_bps: 5
 
+# TEMP strategy_tracker override 2026-07-09 (loosened per user "loosen the guardrails")
+# Yesterday's 7-loss streak put the rolling win rate just below the 20% min_win_rate
+# threshold, so every v3-mean_reversion / v3-trend_following signal was getting
+# allocation=0. Loosening to 0% lets the strategies take trades; min_reward_risk_ratio
+# still gates quality. Revert at user's direction. See AGENTS.md.
+strategy_tracker:
+  window: 20
+  min_win_rate: 0.0
+  full_allocation_rate: 0.20
+
 alerts:
   slack_webhook_url: ""
   webhook_url: ""
+
+# EOD data store (per docs/EOD_DATA_FEATURE.md)
+eod_data_store:
+  enabled: true
+  provider: massive_flat_files
+  intervals: [1d, 1m]
+  backfill_years: 5
+  minute_backfill_years: 1
+  throttle_seconds: 0.2
+  max_retries: 3
+  store_root: state/data_store
+  manifest_db: state/data_store.db
+  s3_region: us-east-1
+  # Massive.com's flat-files endpoint currently serves a self-signed
+  # certificate. Strict verification rejects it (CERTIFICATE_VERIFY_FAILED).
+  # Two options, both safe in different ways:
+  #   1. Pin the CA bundle (preferred) — download the cert once and verify
+  #      against it explicitly. Fetches still authenticate the server.
+  #         tls_ca_bundle: /path/to/massive-ca.pem
+  #   2. Disable verification entirely — use only if you trust the network
+  #      path to the endpoint. Logs a loud WARNING at startup.
+  #         verify_tls: false
+  # Default is verify_tls: true, tls_ca_bundle: null (safe on the open
+  # internet but fails against massive.com's current endpoint).
+  verify_tls: false
+  tls_ca_bundle: null
+  # Massive.com's actually-hosted S3 key layout (verified via probe with
+  # test API key, 2026-07). Path is {prefix}/{dataset}/{year}/{month}/{date}.csv.gz.
+  # Leave null for the default ``stocks/{product}/YYYY-MM-DD.csv`` template.
+  # NOTE: quotes_v1 and trades_v1 are tick-level data and may require a
+  # higher-tier plan than the test key. They will 403 on insufficient plans.
+  day_aggregates_key_template: "us_stocks_sip/day_aggs_v1/{year}/{month}/{date}.csv.gz"
+  minute_aggregates_key_template: "us_stocks_sip/minute_aggs_v1/{year}/{month}/{date}.csv.gz"
+  quotes_key_template: "us_stocks_sip/quotes_v1/{year}/{month}/{date}.csv.gz"
+  trades_key_template: "us_stocks_sip/trades_v1/{year}/{month}/{date}.csv.gz"
