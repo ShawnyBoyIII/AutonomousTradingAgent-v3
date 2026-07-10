@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0a08">
+  <title>Trading Bot — Desk 01 · {{ mode }} Mode</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT@0,9..144,300..700,0..100;1,9..144,300..700,0..100&amp;family=IBM+Plex+Sans:wght@300;400;500;600&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap">
+
+  <link rel="stylesheet" href="/static/css/dashboard.css">
+</head>
+<body data-starting-equity="350000">
+  <a class="skip-link" href="#main">Skip to main content</a>
+
+  <!-- =============================================================
+       Mode Rail — top status strip
+       ============================================================= -->
+  <div class="mode-rail" role="status" aria-live="polite">
+    <div class="mode-rail__left">
+      <span class="mode-pill mode-pill--{{ mode.lower() }}">
+        <span class="mode-pill__dot" aria-hidden="true"></span>
+        {{ mode }} Mode · Read Only
+      </span>
+      <span class="mode-rail__sep" aria-hidden="true">/</span>
+      <span class="mode-rail__label">Engine</span>
+      <span class="mode-rail__value" id="engineState">Standby</span>
+    </div>
+    <div class="mode-rail__center" aria-hidden="true">
+      <span>Autonomous Trading Agent · Local Monitor</span>
+    </div>
+    <div class="mode-rail__right">
+      <span class="mode-rail__time" id="clock" aria-label="Current time">—</span>
+      <span class="mode-rail__live" id="connectionStatus" data-state="connecting">
+        <span class="mode-rail__live-dot" aria-hidden="true"></span>
+        <span class="mode-rail__live-text" id="connectionText">Syncing</span>
+      </span>
+    </div>
+  </div>
+
+  <!-- =============================================================
+       Masthead
+       ============================================================= -->
+  <header class="masthead">
+    <div class="masthead__brand">
+      <span class="masthead__mark" aria-hidden="true">[ DESK · 01 ]</span>
+      <h1 class="masthead__title">Autonomous Trading <em>Agent</em></h1>
+    </div>
+    <div class="masthead__meta">
+      <span class="masthead__version">v{{ version }}</span>
+      <span class="masthead__sep" aria-hidden="true">·</span>
+      <span class="masthead__date" id="dateLabel">—</span>
+    </div>
+  </header>
+
+  <main id="main">
+    <!-- =============================================================
+         Hero band — equity, day-change, KPIs
+         ============================================================= -->
+    <section class="hero" aria-labelledby="heroHeading">
+      <h2 id="heroHeading" class="vh">Account equity, day change, and key portfolio metrics</h2>
+
+      <div class="hero__col">
+        <span class="hero__eyebrow">Account · Equity</span>
+        <div class="hero__equity-value">
+          <span class="currency">USD</span><span id="equityValue">—</span>
+        </div>
+        <div class="gauge" aria-hidden="true">
+          <div class="gauge__track" id="gaugeTrack">
+            <div class="gauge__neg"></div>
+            <div class="gauge__pos"></div>
+            <div class="gauge__center"></div>
+            <div class="gauge__needle" id="gaugeNeedle" data-trend="up" style="left: 50%"></div>
+          </div>
+          <div class="gauge__axis">
+            <span>−10%</span>
+            <span id="gaugeMid">0%</span>
+            <span id="gaugeMax">+10%</span>
+          </div>
+        </div>
+        <div class="hero__equity-since">
+          <span>Since burn-in start</span>
+          <strong>$350,000</strong>
+        </div>
+      </div>
+
+      <div class="hero__col">
+        <span class="hero__eyebrow">Day · P&amp;L</span>
+        <div class="hero__pnl-value" id="pnlValue" data-trend="up">—</div>
+        <div class="hero__pnl-pct" id="pnlPct" data-trend="up">—%</div>
+        <div class="sparkline" id="sparklineWrap" data-trend="flat" aria-hidden="true">
+          <svg viewBox="0 0 200 56" preserveAspectRatio="none">
+            <polygon id="sparklineFill" points=""></polygon>
+            <polyline id="sparkline" points=""></polyline>
+          </svg>
+        </div>
+      </div>
+
+      <div class="hero__col">
+        <span class="hero__eyebrow">Book · Snapshot</span>
+        <div class="kpi-grid" role="list">
+          <div class="kpi" role="listitem">
+            <span class="kpi__label">Cash</span>
+            <span class="kpi__value" id="cashValue">—</span>
+            <span class="kpi__sub">Available to deploy</span>
+          </div>
+          <div class="kpi" role="listitem">
+            <span class="kpi__label">Positions</span>
+            <span class="kpi__value" id="positionCount">—</span>
+            <span class="kpi__sub">Open contracts</span>
+          </div>
+          <div class="kpi" role="listitem">
+            <span class="kpi__label">Exposure</span>
+            <span class="kpi__value" id="exposureValue">—</span>
+            <span class="kpi__sub">Deployed / Equity</span>
+          </div>
+          <div class="kpi" role="listitem">
+            <span class="kpi__label">Trades Today</span>
+            <span class="kpi__value" id="tradesTodayValue">—</span>
+            <span class="kpi__sub">Filled orders</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="hero__live-band" aria-label="Open portfolio pulse">
+        <div class="hero-live-metric">
+          <span class="hero-live-metric__label">Open P&amp;L</span>
+          <strong class="hero-live-metric__value" id="openPnlValue">—</strong>
+          <span class="hero-live-metric__sub" id="openPnlPct">—</span>
+        </div>
+        <div class="hero-live-metric">
+          <span class="hero-live-metric__label">Winners</span>
+          <strong class="hero-live-metric__value" id="liveWinnersValue">—</strong>
+        </div>
+        <div class="hero-live-metric">
+          <span class="hero-live-metric__label">Losers</span>
+          <strong class="hero-live-metric__value" id="liveLosersValue">—</strong>
+        </div>
+        <div class="hero-live-metric">
+          <span class="hero-live-metric__label">Live Exposure</span>
+          <strong class="hero-live-metric__value" id="liveExposureValue">—</strong>
+        </div>
+      </div>
+    </section>
+
+    <!-- =============================================================
+         Bento grid — operational cards
+         ============================================================= -->
+    <div class="bento">
+
+      <!-- Kill Switch -->
+      <section class="card card--kill" aria-labelledby="killTitle">
+        <header class="card__head">
+          <span class="card__eyebrow"><b>01</b>Safety</span>
+          <h2 class="card__title" id="killTitle">Kill Switch</h2>
+          <span class="card__count" id="killBadge" data-state="ok">Armed</span>
+        </header>
+        <div class="kill">
+          <div class="kill__panel" id="killPanel" data-state="armed">
+            <div class="kill__state">
+              <div class="kill__state-label">System</div>
+              <div class="kill__state-value" id="killStateValue" data-state="armed">Armed</div>
+              <div class="kill__state-detail" id="killStateDetail">Standing by · ready to halt</div>
+            </div>
+            <button type="button" class="kill__lever" id="emergencyBtn" aria-describedby="killHelp">
+              <span class="kill__lever-cap" aria-hidden="true">
+                <span class="kill__lever-grip"></span>
+              </span>
+              <span class="kill__lever-stem" aria-hidden="true"></span>
+              <span class="kill__lever-base" aria-hidden="true"></span>
+              <span class="kill__lever-label" id="emergencyLabel">Pull to halt</span>
+            </button>
+            <div class="kill__meta">
+              <span class="kill__meta-label">Action</span>
+              <span class="kill__meta-value">Halts all new orders.<br>Cancels &amp; rejects.</span>
+            </div>
+          </div>
+          <p class="kill__help" id="killHelp">
+            Use only when behaviour diverges from plan. Engagement is reversible via
+            <span class="mono">./tradebot-local kill-switch --resume</span>.
+          </p>
+        </div>
+      </section>
+
+      <!-- Book — tabbed Open / Closed positions -->
+      <section class="card card--book" aria-labelledby="bookTitle">
+        <header class="card__head">
+          <span class="card__eyebrow"><b>02</b>Book</span>
+          <h2 class="card__title" id="bookTitle">Positions</h2>
+          <span class="card__counts" aria-hidden="false">
+            <span class="book-count" id="positionsBadge" data-state=""><span class="mono">open</span> <b id="positionsBadgeNum">0</b></span>
+            <span class="card__sep" aria-hidden="true">·</span>
+            <span class="book-count book-count--closed" id="closedBadge" data-state=""><span class="mono">closed</span> <b id="closedBadgeNum">0</b></span>
+          </span>
+        </header>
+
+        <div class="tabs" role="tablist" aria-label="Positions view">
+          <button
+            type="button"
+            class="tab is-active"
+            id="openTab"
+            role="tab"
+            aria-selected="true"
+            aria-controls="openPane"
+            tabindex="0"
+          >
+            <span class="tab__label">Open</span>
+            <span class="tab__count" id="openTabCount">0</span>
+          </button>
+          <button
+            type="button"
+            class="tab"
+            id="closedTab"
+            role="tab"
+            aria-selected="false"
+            aria-controls="closedPane"
+            tabindex="-1"
+          >
+            <span class="tab__label">Closed</span>
+            <span class="tab__count" id="closedTabCount">0</span>
+          </button>
+        </div>
+
+        <div class="tab-panes">
+          <div
+            class="tab-pane is-active"
+            id="openPane"
+            role="tabpanel"
+            aria-labelledby="openTab"
+          >
+            <div class="tab-pane__body" id="positionsList">
+              <div class="empty">No open positions</div>
+            </div>
+          </div>
+          <div
+            class="tab-pane"
+            id="closedPane"
+            role="tabpanel"
+            aria-labelledby="closedTab"
+            hidden
+          >
+            <div class="tab-pane__body" id="closedTradesList">
+              <div class="empty">No closed trades yet</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Alerts -->
+      <section class="card card--alerts" aria-labelledby="alertsTitle">
+        <header class="card__head">
+          <span class="card__eyebrow"><b>03</b>Signal</span>
+          <h2 class="card__title" id="alertsTitle">Alerts</h2>
+          <span class="card__count" id="alertBadge" data-state="ok">0</span>
+        </header>
+        <div class="alerts" id="alertsList">
+          <div class="empty">All systems nominal</div>
+        </div>
+      </section>
+
+      <!-- System Health -->
+      <section class="card card--health" aria-labelledby="healthTitle">
+        <header class="card__head">
+          <span class="card__eyebrow"><b>04</b>Health</span>
+          <h2 class="card__title" id="healthTitle">Subsystems</h2>
+          <span class="card__count" id="healthBadge" data-state="">—</span>
+        </header>
+        <div class="health" id="healthList">
+          <div class="empty">Awaiting diagnostics</div>
+        </div>
+      </section>
+
+      <!-- Engine Telemetry -->
+      <section class="card card--telemetry" aria-labelledby="telemetryTitle">
+        <header class="card__head">
+          <span class="card__eyebrow"><b>05</b>Telemetry</span>
+          <h2 class="card__title" id="telemetryTitle">Engine Telemetry</h2>
+        </header>
+        <dl class="telemetry" id="telemetryList">
+          <div class="telemetry__row">
+            <dt>Heartbeat</dt>
+            <dd id="telemetryHeartbeat">— s</dd>
+          </div>
+          <div class="telemetry__row">
+            <dt>Data Freshness</dt>
+            <dd id="telemetryDataFresh">—</dd>
+          </div>
+          <div class="telemetry__row">
+            <dt>Last Fill</dt>
+            <dd id="telemetryLastFill">—</dd>
+          </div>
+          <div class="telemetry__row">
+            <dt>Regime</dt>
+            <dd id="telemetryRegime">—</dd>
+          </div>
+        </dl>
+      </section>
+
+      <!-- Recent Trades -->
+      <section class="card card--trades" aria-labelledby="tradesTitle">
+        <header class="card__head">
+          <span class="card__eyebrow"><b>06</b>Tape</span>
+          <h2 class="card__title" id="tradesTitle">Recent Trades</h2>
+          <span class="card__count">last 20</span>
+        </header>
+        <div class="trades" id="tradesList">
+          <div class="empty">No recent trades</div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+
+  <!-- =============================================================
+       Footer
+       ============================================================= -->
+  <footer class="footer" role="contentinfo">
+    <span>127.0.0.1 · local only · no auth · v{{ version }}</span>
+    <span><span class="footer__dot" aria-hidden="true"></span><span class="footer__time" id="footerTime">—</span></span>
+  </footer>
+
+  <script src="/static/js/dashboard.js" defer></script>
+</body>
+</html>
