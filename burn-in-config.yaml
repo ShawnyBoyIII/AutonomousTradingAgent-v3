@@ -21,11 +21,11 @@ market_data:
   validate_data: true
 
 risk:
-  max_risk_per_trade_pct: 0.005  # 2026-07-10 tuning: halved from 0.01 after winners/losers size asymmetry (gross loss 1.53x gross win) drove the day's 0.65 PF.
+  max_risk_per_trade_pct: 0.01
   max_daily_risk_pct: 0.03
-  max_daily_orders: 20  # 2026-07-10 tuning: tightened from 60 after the day produced 118 fills (~2/min), the primary driver of the 0.65 PF.
-  max_ticker_allocation_pct: 0.10  # 2026-07-10 tuning: tightened from 0.25 after a single NFLX mean-reversion entry took $96k and produced the day's largest loss.
-  min_reward_risk_ratio: 1.5  # 2026-07-10 tuning: restored from temporary 1.0 after the 10:00-hour carnage (4 of the top 5 losers sat in the 1.0–1.5 R/R bucket).
+  max_daily_orders: 60
+  max_ticker_allocation_pct: 0.25
+  min_reward_risk_ratio: 1.0  # TEMP lowered 2026-07-09 (today's low-vol market produces ATR-based R/R ~1.3 — below 1.5 default); user instructed "Leave the temp override in please"; see AGENTS.md.
   use_atr_sizing: true
   atr_period: 14
   atr_multiplier: 2.5
@@ -43,7 +43,7 @@ strategy:
   min_confidence: "low"
 
 counter_thesis:
-  enabled: true  # 2026-07-10 tuning: enabled after today's repeated over-extended mean-reversion entries produced -$3,007; counter-thesis will block high-severity signals.
+  enabled: false
 
 swarm:
   enabled: false

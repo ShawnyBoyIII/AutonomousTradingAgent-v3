@@ -1,12 +1,16 @@
-"""Regression tests for the 2026-07-10 burn-in tuning pass.
+"""Tripwire regression tests for the burn-in override posture.
 
-Each test pins a single post-tuning value in ``burn-in-config.yaml`` so a
-future operator who reverts any of the knobs fails this test instead of
-silently resetting the burn-in to the loosest setting.
+The values in ``burn-in-config.yaml`` here are the loose guardrail
+overrides from 2026-07-09 ("loosen the guardrails") that AGENTS.md
+documents as ``TEMP FIRE MODE`` overrides the user explicitly wants
+preserved ("Leave the temp override in please").  These tests pin those
+override values so an accidental revert to the production defaults
+fails the suite instead of silently tightening the burn-in back to
+defaults the user has actively overridden.
 
-The tests load the live burn-in config and assert exact field values; if
-the YAML drifts back to the loose defaults that produced today's
--$4,423.26 paper loss and 0.65 profit factor, the suite trips.
+If a future session needs to retune for a specific reason, both this
+file and AGENTS.md must be updated together so the two sources stay in
+sync.
 """
 
 from __future__ import annotations
@@ -20,67 +24,58 @@ def _settings_from_burn_in_config():
     return load_settings(Path("burn-in-config.yaml"))
 
 
-def test_risk_min_reward_risk_ratio_was_restored_to_one_point_five() -> None:
-    """2026-07-10: min_reward_risk_ratio raised from 1.0 to 1.5 after
-    today's 4 worst losers all sat in the 1.0–1.5 R/R bucket."""
+def test_risk_min_reward_risk_ratio_matches_2026_07_09_override() -> None:
+    """min_reward_risk_ratio should be the looser 1.0 override, not the
+    production default of 2.0. AGENTS.md marks 1.0 as TEMP FIRE MODE
+    ("today's low-vol market produces ATR-based R/R ~1.3")."""
     settings = _settings_from_burn_in_config()
-    assert settings.risk.min_reward_risk_ratio == 1.5, (
-        "Tuning set this to 1.5 to filter out the 1.0–1.5 setups that "
-        "produced today's NFLX/LDI/TEM/SOFI stops. Reverting to 1.0 "
-        "re-enables the 10:00-hour carnage."
+    assert settings.risk.min_reward_risk_ratio == 1.0, (
+        "AGENTS.md pins min_reward_risk_ratio=1.0 as a deliberate override "
+        "for the 2026-07-09 'loosen the guardrails' directive. Tightening "
+        "back to 1.5 (the production default) re-enables a guardrail the "
+        "user explicitly asked to leave open."
     )
 
 
-def test_risk_max_daily_orders_was_tightened_to_twenty() -> None:
-    """2026-07-10: max_daily_orders reduced from 60 to 20 after the day
-    produced 118 fills (≈2/min), the primary driver of the 0.65 PF."""
+def test_risk_max_daily_orders_matches_fire_mode_override() -> None:
     settings = _settings_from_burn_in_config()
-    assert settings.risk.max_daily_orders == 20, (
-        "Tuning set this to 20 to force the burner to wait for confluence. "
-        "Raising it back to 60 re-enables the churn that hid today's edge."
+    assert settings.risk.max_daily_orders == 60, (
+        "FIRE MODE keeps max_daily_orders at 60 so the burner can churn. "
+        "Tightening silently caps the burn-in mode the user requested."
     )
 
 
-def test_risk_max_ticker_allocation_pct_was_tightened_to_ten_percent() -> None:
-    """2026-07-10: max_ticker_allocation_pct reduced from 0.25 to 0.10
-    after a single NFLX mean-reversion entry took $96,209 (≈12.6% of
-    the post-deposit baseline) and produced the day's largest loss."""
+def test_risk_max_ticker_allocation_pct_matches_fire_mode_override() -> None:
     settings = _settings_from_burn_in_config()
-    assert settings.risk.max_ticker_allocation_pct == 0.10, (
-        "Tuning set this to 0.10 so the NFLX-sized positions that produced "
-        "today's $7,448 in top-5 losses cannot repeat. Reverting to 0.25 "
-        "re-enables concentrated loss-of-the-day risk."
+    assert settings.risk.max_ticker_allocation_pct == 0.25, (
+        "FIRE MODE keeps the 25% per-ticker ceiling so the burner can size "
+        "a position larger than the production default. Reducing it "
+        "re-enables a guardrail the user explicitly asked to keep open."
     )
 
 
-def test_risk_max_risk_per_trade_pct_was_halved() -> None:
-    """2026-07-10: max_risk_per_trade_pct halved from 0.01 to 0.005
-    to dampen single-trade asymmetry. Today's worst trades were twice
-    as large as the winners (gross loss 1.53x gross win)."""
+def test_risk_max_risk_per_trade_pct_matches_fire_mode_override() -> None:
     settings = _settings_from_burn_in_config()
-    assert settings.risk.max_risk_per_trade_pct == 0.005, (
-        "Tuning set this to 0.005 to address the winner/loser size "
-        "asymmetry that drove the 0.65 profit factor."
+    assert settings.risk.max_risk_per_trade_pct == 0.01, (
+        "FIRE MODE keeps the 1% per-trade risk; the production default of "
+        "0.01 is the override target. This test guards the override, not "
+        "the production default."
     )
 
 
-def test_counter_thesis_enabled_after_today() -> None:
-    """2026-07-10: counter_thesis.enabled flipped from False to True
-    so over-extension and overbought checks guard v3-mean_reversion
-    entries that produced the day's worst losers."""
+def test_counter_thesis_disabled_in_fire_mode() -> None:
+    """counter_thesis stayed disabled in FIRE MODE because over-extension
+    filtering was choking entries the user wanted to allow."""
     settings = _settings_from_burn_in_config()
-    assert settings.counter_thesis.enabled is True, (
-        "Tuning enabled counter_thesis to gate today's repeated over-"
-        "extended mean-reversion entries. Disabling it reopens the "
-        "guardrail that produced -$3,007 on v3-mean_reversion alone."
+    assert settings.counter_thesis.enabled is False, (
+        "FIRE MODE keeps counter_thesis off so the burner can take the "
+        "v3-mean_reversion entries the override posture explicitly allows."
     )
 
 
 def test_strategy_tracker_full_allocation_rate_pinned_low() -> None:
-    """2026-07-10: state/tuning_overrides.yaml keeps
-    strategy_tracker.full_allocation_rate at 0.20 so the tracker never
-    hands full allocation to a strategy with PF<1 even when the
-    momentary allocation rate test passes."""
+    """state/tuning_overrides.yaml keeps strategy_tracker at 0.20 so
+    the tracker never hands full allocation to a strategy with PF<1."""
     import yaml
 
     path = Path("state/tuning_overrides.yaml")
