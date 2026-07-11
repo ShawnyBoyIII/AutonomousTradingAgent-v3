@@ -46,6 +46,7 @@ Never use bare `tradebot` on PATH — it may resolve to a stale global install.
 6. **Robinhood is MCP-only** — no direct auth; boundary subclasses `BrokerAdapter`, reads operator-synced JSON snapshots
 7. **Python ≥ 3.11 required** — see `pyproject.toml` `requires-python`
 8. **NumPy < 2** — pinned in `pyproject.toml`; newer versions break indicators
+9. **Burn-in health is observable** — run `./tradebot-local doctor --burn-in` before market open to confirm heartbeat, dashboard, EOD watchdog, and DB are healthy.
 
 ---
 
@@ -149,6 +150,8 @@ Cross-table reporting reads both `orders` and `trades` tables separately.
 
 # Health check
 ./tradebot-local doctor
+./tradebot-local doctor --burn-in            # burn-in reliability report
+./tradebot-local doctor --burn-in --json     # machine-readable
 
 # Scan and trade
 ./tradebot-local scan --symbols SPY,AAPL --why --summary
