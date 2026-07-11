@@ -26,6 +26,49 @@ WATCHLIST_FILE="state/watchlist.txt"
 LOG_DIR="logs"
 DB_PATH="state/burn_in.db"
 LAST_DISCOVER_FILE=".last_discover_date"
+STATE_DIR="state"
+
+# 2026-07-10: Burn-in reliability control plane. Write a heartbeat each
+# loop iteration and persist PIDs for the doctor --burn-in health checks
+# to consume (see trading_bot/health/checks.py).
+HEALTH_STATE_DIR="$STATE_DIR/burn_in"
+mkdir -p "$HEALTH_STATE_DIR"
+echo "$$" > "$HEALTH_STATE_DIR/burn_in.pid"
+HEARTBEAT_FILE="$HEALTH_STATE_DIR/heartbeat.json"
+EOD_WATCHDOG_PID_FILE="$HEALTH_STATE_DIR/eod_watchdog.pid"
+HEALTH_LOG="$LOG_DIR/health.jsonl"
+
+write_heartbeat() {
+    local fills="$1" exits="$2" rejects="$3"
+    local ts_iso
+    ts_iso=$(date -u '+%Y-%m-%dT%H:%M:%S+00:00')
+    cat > "$HEARTBEAT_FILE" <<EOF
+{"ts":"$ts_iso","cycle":$CYCLE_COUNT,"fills":$fills,"exits":$exits,"rejects":$rejects}
+EOF
+}
+
+# Sidecar monitoring dashboard
+# Override with: AUTO_DASHBOARD=false ./scripts/auto-burn-in.sh
+#                 DASHBOARD_PORT=9000 ./scripts/auto-burn-in.sh
+AUTO_DASHBOARD="${AUTO_DASHBOARD:-true}"
+DASHBOARD_PORT="${DASHBOARD_PORT:-8080}"
+DASHBOARD_PID=""
+DASHBOARD_LOG="$LOG_DIR/dashboard.log"
+
+# EOD data pipeline: nightly download of massive.com S3 flat-files.
+# Override with: EOD_DATA_STORE=false ./scripts/auto-burn-in.sh
+#                 EOD_FETCH_TIME=HH:MM (default 11:30 — after massive.com publishes)
+#                 EOD_FETCH_BACKFILL_DAYS=0
+EOD_DATA_STORE="${EOD_DATA_STORE:-true}"
+EOD_FETCH_TIME="${EOD_FETCH_TIME:-11:30}"
+EOD_FETCH_BACKFILL_DAYS="${EOD_FETCH_BACKFILL_DAYS:-0}"
+EOD_FETCH_LOG="$LOG_DIR/eod_data_store.log"
+# Per-interval-set marker (C1 2026-07-08): the marker encodes the interval set
+# so a 1d backfill does not block a 1m backfill on the same date. The interval
+# default mirrors the CLI helper in trading_bot.cli.app._eod_marker_filename.
+EOD_INTERVALS="${EOD_INTERVALS:-$(.venv/bin/python -c "from pathlib import Path; from trading_bot.config.loader import load_settings; cfg=load_settings(Path('$CONFIG_FILE')); print(','.join(cfg.eod_data_store.intervals))" 2>/dev/null || echo "1d,1m")}"
+EOD_INTERVALS_SLUG=$(echo "$EOD_INTERVALS" | tr ',' '\n' | sort | tr '\n' '_' | sed 's/_$//')
+EOD_STORE_ROOT="state/data_store"
 
 # Ensure setup exists
 if [ ! -f "$CONFIG_FILE" ]; then
@@ -373,36 +416,14 @@ echo "  4. Manage positions (stops, targets, EOD)"
 echo "  5. Log everything to $LOG_DIR"
 echo ""
 echo "To monitor:"
+echo "  Dashboard:   http://127.0.0.1:$DASHBOARD_PORT  (auto-started)"
 echo "  New terminal: sh ./scripts/burn-in-monitor.sh"
 echo "  Live log:    tail -f $LOG_DIR/decision-log.jsonl"
+echo "  Dashboard log: tail -f $DASHBOARD_LOG"
 echo ""
 echo "To stop: Press Ctrl-C"
 echo "=========================================="
 echo ""
-
-# Function to run RL model comparison
-run_rl_compare() {
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] 🤖 Running RL model comparison..."
-    
-    local rl_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" rl-compare --symbols "$SYMBOLS" 2>&1)
-    
-    if echo "$rl_output" | grep -q "No RL models found"; then
-        echo "[$timestamp] ⚪ No RL models available for comparison"
-        return 0
-    fi
-    
-    if echo "$rl_output" | grep -q "Best P&L"; then
-        local best_pnl=$(echo "$rl_output" | grep "Best P&L" | sed 's/.*Best P&L: //')
-        local best_wr=$(echo "$rl_output" | grep "Best Win Rate" | sed 's/.*Best Win Rate: //')
-        echo "[$timestamp] 🤖 RL comparison complete - Best P&L: $best_pnl, Best Win Rate: $best_wr"
-        
-        # Log RL comparison result
-        echo "{\"event\":\"rl_compare\",\"timestamp\":\"$timestamp\",\"best_pnl_strategy\":\"$best_pnl\",\"best_winrate_strategy\":\"$best_wr\"}" >> "$LOG_DIR/rl_comparison.log"
-    else
-        echo "[$timestamp] ⚠️  RL comparison had issues"
-    fi
-}
 
 # Function to refresh tuning overrides from recent paper results
 run_nightly_tuning() {
@@ -424,28 +445,319 @@ run_nightly_tuning() {
     return 0
 }
 
-# Function to refresh advisory learner artifacts
-run_advisory_learner() {
-    if [ "$ADVISORY_ENABLED" != "true" ]; then
+# Function to run the burn-in reliability health check.
+# Mirrors run_nightly_tuning(): capture stdout to a log, never exit 1 on
+# failure (the heartbeats themselves expose health; we don't want the
+# check pipeline to take down the burn-in).
+run_health_check() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local rc=0
+    local output
+    output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" doctor --burn-in --json 2>&1) || rc=$?
+    echo "$output" >> "$HEALTH_LOG" 2>/dev/null || true
+    if [ "$rc" -ne 0 ]; then
+        echo "[$timestamp] ⚠️  Health check exit=$rc (see $HEALTH_LOG)"
+    fi
+    return 0
+}
+
+# Function to fetch EOD data from massive.com S3 into the long-term store.
+# Idempotent per interval set (C1 2026-07-08): skip only when a marker for
+# THIS interval set exists for today's date — a 1d backfill does not block
+# a 1m backfill on the same date.
+run_eod_data_download() {
+    if [ "$EOD_DATA_STORE" != "true" ]; then
         return 0
     fi
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] 📚 Running advisory learner..."
 
-    local learner_output
-    learner_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" advisory-learn 2>&1)
-    echo "$learner_output" >> "$LOG_DIR/advisory.log"
+    # Gate on time window — wait for massive.com to publish (≈11:00 ET) plus a buffer.
+    local current_time=$(date '+%H:%M')
+    if [ "$current_time" \< "$EOD_FETCH_TIME" ]; then
+        return 0
+    fi
+
+    local today_ymd=$(date '+%Y-%m-%d')
+    # Per-interval marker path matches the CLI helper convention:
+    # ".last_eod_fetch_<YYYY-MM-DD>_<sorted_intervals>.marker".
+    local marker="${EOD_STORE_ROOT}/.last_eod_fetch_${today_ymd}_${EOD_INTERVALS_SLUG}.marker"
+
+    # Skip if a marker for THIS interval set exists.
+    if [ -f "$marker" ]; then
+        echo "[$timestamp] Ⓜ️  EOD already fetched for $today_ymd intervals=$EOD_INTERVALS_SLUG (skipping)"
+        return 0
+    fi
+
+    echo "[$timestamp] 📥 Fetching EOD data (target=$today_ymd, intervals=$EOD_INTERVALS_SLUG, backfill=$EOD_FETCH_BACKFILL_DAYS days)..."
+
+    local fetch_output
+    # Default to yesterday's date — the CLI uses the previous trading day
+    # because massive.com publishes day-T's bars at 11:00 AM ET on day T+1.
+    # Operator can override with --date if they want a different target.
+    fetch_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" eod-fetch \
+        --date "$(date -v -1d '+%Y-%m-%d' 2>/dev/null || date -d 'yesterday' '+%Y-%m-%d')" \
+        --backfill-days "$EOD_FETCH_BACKFILL_DAYS" 2>&1)
+    local status=$?
+
+    echo "$fetch_output" >> "$EOD_FETCH_LOG"
+    if [ $status -ne 0 ]; then
+        echo "[$timestamp] ⚠️  EOD fetch failed (see $EOD_FETCH_LOG); continuing"
+        return 0
+    fi
+
+    # Only mark complete if the CLI reported at least one partition written
+    # (avoids idempotency lock-out when the network is down — see code review).
+    if echo "$fetch_output" | grep -q "total_partitions=0$"; then
+        echo "[$timestamp] ⚠️  EOD fetch returned zero partitions; not marking complete (will retry)"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$marker")"
+    echo "$today_ymd" > "$marker"
+    echo "[$timestamp] ✅ EOD fetch complete (marker: $(basename "$marker"), see $EOD_FETCH_LOG)"
+    return 0
+}
+
+# Function to refresh advisory learner artifacts
+run_advisory_learner() {
+    # 2026-07-09 review fix: `advisory-learn` was removed in Phase 2.5
+    # cleanup. The function used to invoke the removed CLI command every
+    # 10 cycles; under `set -e` that kills the burn-in when an operator
+    # enables `advisory.enabled`. Log a one-line notice and return 0 so
+    # the main loop is unaffected.  AGENTS.md frames advisory as a
+    # research lane, not part of the active burn-in vote path.
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] ℹ️  advisory-learn is no longer wired into the burn-in (Phase 2.5 cleanup)"
     return 0
 }
 
 on_shutdown() {
+    stop_eod_watchdog
+    stop_dashboard
+    # 2026-07-09 review fix: same — advisory-learn was removed in
+    # Phase 2.5; the prior `|| true` made this a silent failure. Now
+    # we skip cleanly without invoking the missing command.
     if [ "$ADVISORY_ENABLED" != "true" ]; then
         return 0
     fi
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] 📝 Writing Daily report.md before shutdown..."
-    sh ./tradebot-local --config-path "$CONFIG_FILE" advisory-learn --daily-report >> "$LOG_DIR/advisory.log" 2>&1 || true
+    echo "[$timestamp] ℹ️  advisory-learn --daily-report is no longer wired (Phase 2.5 cleanup); skipping"
+    return 0
 }
+
+# --- Monitoring dashboard sidecar -----------------------------------------
+# Start a sidecar dashboard process so the user can monitor the burn-in in a
+# browser at http://127.0.0.1:$DASHBOARD_PORT. The dashboard is read-only and
+# binds to localhost; it never affects trading.
+
+ensure_dashboard() {
+    if [ "$AUTO_DASHBOARD" != "true" ]; then
+        return 0
+    fi
+    # Already running?
+    if [ -n "$DASHBOARD_PID" ] && kill -0 "$DASHBOARD_PID" 2>/dev/null; then
+        return 0
+    fi
+
+    if [ ! -x "./scripts/start-dashboard.sh" ]; then
+        echo "[$(date '+%H:%M:%S')] ⚠️  scripts/start-dashboard.sh missing — skipping dashboard sidecar"
+        return 0
+    fi
+
+    # 2026-07-09 fix: detect and clear orphan port holders (e.g. a previous
+    # session's uvicorn whose listener died but the process is still alive).
+    # A 1-second health check is enough to distinguish a real dashboard
+    # (responds fast) from a zombie (no listener / refused connection).
+    if command -v lsof >/dev/null 2>&1 && lsof -ti :"$DASHBOARD_PORT" >/dev/null 2>&1; then
+        local timestamp=$(date '+%H:%M:%S')
+        # Try a quick health check first
+        if ! curl -sf -m 1 "http://127.0.0.1:$DASHBOARD_PORT/api/health" >/dev/null 2>&1; then
+            echo "[$timestamp] 🧹 Found orphan on port $DASHBOARD_PORT (no /api/health response); clearing"
+            local orphan_pids=$(lsof -ti :"$DASHBOARD_PORT" 2>/dev/null)
+            if [ -n "$orphan_pids" ]; then
+                echo "$orphan_pids" | xargs kill -9 2>/dev/null || true
+                sleep 0.5
+            fi
+        else
+            echo "[$timestamp] ⚠️  Port $DASHBOARD_PORT already serves a healthy dashboard; skipping sidecar"
+            DASHBOARD_PID=""
+            return 0
+        fi
+    fi
+
+    echo "[$(date '+%H:%M:%S')] 📊 Starting monitoring dashboard on port $DASHBOARD_PORT..."
+    CONFIG_PATH="$CONFIG_FILE" ./scripts/start-dashboard.sh \
+        --config "$CONFIG_FILE" \
+        --port "$DASHBOARD_PORT" \
+        > "$DASHBOARD_LOG" 2>&1 &
+    DASHBOARD_PID=$!
+
+    # Wait briefly for it to bind (or fail).
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if ! kill -0 "$DASHBOARD_PID" 2>/dev/null; then
+            echo "[$(date '+%H:%M:%S')] ⚠️  Dashboard exited during startup (see $DASHBOARD_LOG); continuing without it"
+            DASHBOARD_PID=""
+            return 0
+        fi
+        if grep -q "Uvicorn running" "$DASHBOARD_LOG" 2>/dev/null; then
+            break
+        fi
+        sleep 0.3
+    done
+
+    if kill -0 "$DASHBOARD_PID" 2>/dev/null; then
+        echo "[$(date '+%H:%M:%S')] ✅ Dashboard live: http://127.0.0.1:$DASHBOARD_PORT  (pid=$DASHBOARD_PID, log=$DASHBOARD_LOG)"
+    else
+        echo "[$(date '+%H:%M:%S')] ⚠️  Dashboard did not become ready; continuing without it (see $DASHBOARD_LOG)"
+        DASHBOARD_PID=""
+    fi
+}
+
+stop_dashboard() {
+    if [ -z "$DASHBOARD_PID" ]; then
+        return 0
+    fi
+    if ! kill -0 "$DASHBOARD_PID" 2>/dev/null; then
+        DASHBOARD_PID=""
+        return 0
+    fi
+    echo "[$(date '+%H:%M:%S')] 📊 Stopping dashboard (pid=$DASHBOARD_PID)..."
+    kill "$DASHBOARD_PID" 2>/dev/null || true
+    # Give it a moment to exit cleanly.
+    for _ in 1 2 3 4 5; do
+        if ! kill -0 "$DASHBOARD_PID" 2>/dev/null; then
+            DASHBOARD_PID=""
+            return 0
+        fi
+        sleep 0.3
+    done
+    kill -9 "$DASHBOARD_PID" 2>/dev/null || true
+    DASHBOARD_PID=""
+}
+
+# --------------------------------------------------------------------- #
+# manage-positions concurrency lock (2026-07-09 review fix)
+# --------------------------------------------------------------------- #
+# The EOD watchdog and the main burn-in loop can both call
+# `./tradebot-local manage-positions` at 15:55 ET.  The watchdog
+# polls every 30s and the main loop runs manage-positions on each
+# 60s cycle, so the overlap window is real (15:55-16:00 daily).  The
+# `ledger.record_fill` INSERT uses fresh UUIDs (no PK conflict), so
+# duplicate calls produce duplicate SELL rows that double-count
+# realized P&L and corrupt the profit-factor graduation gate.
+#
+# `flock` is not available on macOS (this is the burn-in host).
+# `mkdir` is atomic on macOS HFS+/APFS and Linux ext4, so we use
+# directory creation as the lock primitive.  The PID is stored inside
+# the lock directory so a crashed lock-holder's lock can be reclaimed.
+_MANAGE_LOCK_DIR="state/.manage.lock"
+_manage_lock_acquire() {
+    if [ -d "$_MANAGE_LOCK_DIR" ]; then
+        local holder_pid=$(cat "$_MANAGE_LOCK_DIR/pid" 2>/dev/null)
+        if [ -n "$holder_pid" ] && kill -0 "$holder_pid" 2>/dev/null; then
+            return 1  # held by a live process — caller must skip
+        fi
+        # Stale lock (holder crashed, SIGKILL'd, or OOM'd). Reclaim it.
+        rm -rf "$_MANAGE_LOCK_DIR"
+    fi
+    mkdir "$_MANAGE_LOCK_DIR" 2>/dev/null || return 1
+    echo $$ > "$_MANAGE_LOCK_DIR/pid"
+    return 0
+}
+
+_manage_lock_release() {
+    # Only remove if WE hold the lock (PID matches), so a slow caller
+    # never wipes out a successor's lock.
+    if [ -f "$_MANAGE_LOCK_DIR/pid" ] && [ "$(cat "$_MANAGE_LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
+        rm -rf "$_MANAGE_LOCK_DIR"
+    fi
+}
+
+# --------------------------------------------------------------------- #
+# EOD-exit watchdog (2026-07-09 fix)
+# --------------------------------------------------------------------- #
+# 2026-07-09: the burn-in's main loop hung for 7+ hours at the Polygon
+# scan step, blocking the 15:55 ET EOD exit.  This watchdog runs in a
+# background subshell so it survives even when the main loop is hung.
+# It polls every 30 seconds, fires once at 15:55 ET on weekdays (using
+# a marker file for idempotency), and stops cleanly on shutdown.
+EOD_WATCHDOG_PID=""
+start_eod_watchdog() {
+    local config_file="$CONFIG_FILE"
+    local state_dir="state"
+    local eod_minute=$((15 * 60 + 55))  # 15:55 ET
+    (
+        while true; do
+            local now_h=$(date +%H)
+            local now_m=$(date +%M)
+            local now_dow=$(date +%u)  # 1=Mon..7=Sun
+            local today=$(date +%Y-%m-%d)
+            local now_min=$((10#$now_h * 60 + 10#$now_m))
+            local marker="$state_dir/.last_eod_watchdog_fire_${today}.marker"
+
+            if [ "$now_dow" -le 5 ] \
+                && [ "$now_min" -ge "$eod_minute" ] \
+                && [ ! -f "$marker" ]; then
+                local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+                echo "[$timestamp] 🛡️  EOD watchdog firing (15:55 ET safety net)"
+                # 2026-07-09 review fix: capture output + exit code separately
+                # so a failing manage-positions does NOT touch the marker.
+                # Without this, the pipeline `| head | sed` returns sed's exit
+                # code (always 0), masking any upstream failure and silently
+                # marking the day "complete" — blocking retry for the rest
+                # of the day and leaving EOD positions open past close.
+                #
+                # 2026-07-09 review fix #2: serialize against the main loop
+                # via _manage_lock_acquire/release. If the main loop is
+                # currently running manage-positions, skip this iteration
+                # and mark the day complete (the main loop is handling it).
+                # Without this, both processes can write duplicate SELL
+                # orders with distinct UUIDs (no PK conflict) — corrupting
+                # realized P&L and the profit-factor graduation gate.
+                local eod_output eod_rc
+                if _manage_lock_acquire; then
+                    eod_output=$(sh ./tradebot-local --config-path "$config_file" manage-positions 2>&1)
+                    eod_rc=$?
+                    _manage_lock_release
+                else
+                    echo "[$timestamp] ℹ️  manage-positions already running (main loop?), EOD watchdog skipping; marking day complete"
+                    eod_rc=0
+                fi
+                printf '%s\n' "$eod_output" | head -100 | sed "s/^/[$timestamp]    /"
+                if [ "$eod_rc" -eq 0 ]; then
+                    touch "$marker"
+                    echo "[$timestamp] ✅ EOD watchdog complete (marker=$marker)"
+                else
+                    # Marker intentionally NOT touched — the next 30s poll
+                    # will retry. This prevents losing the EOD exit to a
+                    # transient failure (db lock, etc.).
+                    echo "[$timestamp] ⚠️  EOD watchdog manage-positions FAILED (rc=$eod_rc); marker NOT created, will retry next cycle"
+                fi
+            fi
+            sleep 30
+        done
+    ) &
+    EOD_WATCHDOG_PID=$!
+    echo "$EOD_WATCHDOG_PID" > "$EOD_WATCHDOG_PID_FILE" 2>/dev/null || true
+    echo "[$(date '+%H:%M:%S')] 🛡️  EOD watchdog started (pid=$EOD_WATCHDOG_PID, fires daily at 15:55 ET)"
+}
+
+stop_eod_watchdog() {
+    if [ -z "$EOD_WATCHDOG_PID" ]; then
+        return 0
+    fi
+    if kill -0 "$EOD_WATCHDOG_PID" 2>/dev/null; then
+        echo "[$(date '+%H:%M:%S')] 🛡️  Stopping EOD watchdog (pid=$EOD_WATCHDOG_PID)..."
+        kill "$EOD_WATCHDOG_PID" 2>/dev/null || true
+    fi
+    EOD_WATCHDOG_PID=""
+}
+
+# Boot the sidecar monitoring dashboard (idempotent; respects AUTO_DASHBOARD).
+# Called AFTER ensure_dashboard is defined above.
+ensure_dashboard
+start_eod_watchdog
+run_health_check   # one-time baseline on boot
 
 # Function to scan and trade
 scan_and_trade() {
@@ -482,7 +794,16 @@ scan_and_trade() {
                 local reason=$(echo "$trade_output" | grep "REJECTED" | head -1)
                 echo "[$timestamp] ❌ Rejected: $symbol - $reason"
             elif echo "$trade_output" | grep -q "NO_SIGNAL"; then
-                echo "[$timestamp] ⚪ No signal: $symbol (stale data)"
+                # A3 (2026-07-08): parse the actual reason from paper-trade output
+                # instead of the misleading hardcoded "stale data" label. The
+                # paper-trade CLI prints "NO_SIGNAL reason=<text>"; extract that.
+                local nosig_reason=$(echo "$trade_output" \
+                    | grep "NO_SIGNAL" | head -1 \
+                    | sed 's/.*reason=//' \
+                    | awk '{print $1}' \
+                    | sed 's/[;,].*//')
+                [ -z "$nosig_reason" ] && nosig_reason="unknown"
+                echo "[$timestamp] ⚪ No signal: $symbol (reason=$nosig_reason)"
             fi
         done
     else
@@ -490,8 +811,18 @@ scan_and_trade() {
     fi
     
     # Always run manage-positions to check stops/targets/EOD
+    # 2026-07-09 review fix: serialize with the EOD watchdog via
+    # _manage_lock_acquire/release. If the watchdog currently holds
+    # the lock, skip this cycle (the watchdog handles EOD exit);
+    # the next main-loop iteration will pick up slack management.
     echo "[$timestamp] Managing positions..."
-    local manage_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" manage-positions 2>&1)
+    local manage_output=""
+    if _manage_lock_acquire; then
+        manage_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" manage-positions 2>&1)
+        _manage_lock_release
+    else
+        echo "[$timestamp] ℹ️  manage-positions already running (EOD watchdog?), main loop skipping"
+    fi
     
     # Log summary
     if echo "$manage_output" | grep -q "actions=0"; then
@@ -532,18 +863,11 @@ db_path = '$db_path'
 conn = sqlite3.connect(db_path)
 cursor = conn.cursor()
 
-# Get total trades
-cursor.execute('SELECT COUNT(*) FROM orders')
+cursor.execute('SELECT COUNT(*) FROM trades WHERE exit_price IS NOT NULL')
 total_trades = cursor.fetchone()[0]
 
-# Get realized PnL from latest portfolio_state
-cursor.execute('SELECT payload FROM portfolio_state ORDER BY id DESC LIMIT 1')
-row = cursor.fetchone()
-if row:
-    state = json.loads(row[0])
-    realized_pnl = state.get('realized_pnl', 0)
-else:
-    realized_pnl = 0
+cursor.execute('SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE exit_price IS NOT NULL')
+realized_pnl = cursor.fetchone()[0]
 
 conn.close()
 
@@ -677,13 +1001,21 @@ trap on_shutdown EXIT INT TERM
 # Confidence gate thresholds (advisory: alert but don't block on PF/windows)
 MIN_TRADES=50
 MIN_NET_PNL=0
-MAX_DRAWDOWN_PCT=10
+# Honor the burn-in config's disabled drawdown circuit breaker by default.
+# Operators can still override via env var for one-off sessions.
+ENABLE_DRAWDOWN_CIRCUIT_BREAKER=$(.venv/bin/python -c "from pathlib import Path; from trading_bot.config.loader import load_settings; s=load_settings(Path('$CONFIG_FILE')); print('true' if s.risk.enable_drawdown_circuit_breaker else 'false')" 2>/dev/null || printf "true")
+if [ "$ENABLE_DRAWDOWN_CIRCUIT_BREAKER" = "false" ]; then
+    MAX_DRAWDOWN_PCT=${MAX_DRAWDOWN_PCT:-999}
+else
+    MAX_DRAWDOWN_PCT=${MAX_DRAWDOWN_PCT:-10}
+fi
 ADVISORY_ENABLED=$(.venv/bin/python -c "from pathlib import Path; from trading_bot.config.loader import load_settings; s=load_settings(Path('$CONFIG_FILE')); print('true' if s.advisory.enabled else 'false')" 2>/dev/null || printf "false")
 
 while true; do
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     CYCLE_COUNT=$((CYCLE_COUNT + 1))
-    
+    write_heartbeat 0 0 0  # fills/exits/rejects tracked later; placeholder for now
+
     # Check if we should run discovery (hybrid: daily + conditional mid-day)
     if should_discover; then
         # Determine trigger reason for logging
@@ -691,6 +1023,9 @@ while true; do
             run_discovery "midday"
         else
             run_discovery "daily"
+            # EOD fetch happens AFTER discovery (so the universe file is fresh)
+            # and BEFORE tuning/retraining (so learning loops consume fresh data).
+            run_eod_data_download
             run_nightly_tuning
         fi
         load_symbols
@@ -715,14 +1050,17 @@ while true; do
     
     # Market is open - run cycle
     scan_and_trade
-    
+
+    # Restart the dashboard sidecar if it died for any reason.
+    ensure_dashboard
+
     # Check drawdown after each cycle
     check_max_drawdown "$DB_PATH" "$MAX_DRAWDOWN_PCT"
     
-    # Show cycle summary every 10 cycles and run RL comparison
+    # Show cycle summary every 10 cycles
     if [ $((CYCLE_COUNT % 10)) -eq 0 ]; then
         echo "[$timestamp] 📈 Completed $CYCLE_COUNT cycles"
-        
+
         # Check confidence gates every 10 cycles
         if ! check_confidence_gates "$DB_PATH" "$MIN_TRADES" "$MIN_NET_PNL"; then
             echo "[$timestamp] ⚠️  Confidence gates NOT met: advisory only (alert-only mode)"
@@ -732,10 +1070,21 @@ while true; do
         fi
 
         run_advisory_learner
-
-        run_rl_compare
     fi
-    
+
+    # 30-minute health check cadence
+    if [ $((CYCLE_COUNT % 30)) -eq 0 ]; then
+        run_health_check
+    fi
+    # 15:50 ET pre-EOD hard check (5 min before EOD exit)
+    local pre_eod_h=$(date +%H)
+    local pre_eod_m=$(date +%M)
+    local pre_eod_dow=$(date +%u)
+    if [ "$pre_eod_dow" -le 5 ] \
+        && [ $((10#$pre_eod_h * 60 + 10#$pre_eod_m)) -eq $((15 * 60 + 50)) ]; then
+        run_health_check
+    fi
+
     echo ""
     echo "[$timestamp] Sleeping 60 seconds (1 min)..."
     sleep 60
