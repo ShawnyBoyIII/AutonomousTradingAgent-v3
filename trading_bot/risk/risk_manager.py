@@ -171,6 +171,18 @@ def evaluate_signal(
         position_size = max(1, int(position_size * multiplier))
         dollar_risk = dollar_risk * multiplier
 
+    # 2026-07-10: Per-ticker share-count cap (final clamp).
+    # After ATR sizing, fixed-stop sizing, Kelly scaling, correlation
+    # scaling, and counter-thesis scaling — apply the absolute share
+    # limit. Dollar risk is scaled proportionally so a tighter share
+    # count carries proportionally less risk. This is the LAST gate
+    # before approval.
+    if position_size > 0 and settings.max_shares_per_position > 0:
+        if position_size > settings.max_shares_per_position:
+            share_ratio = settings.max_shares_per_position / position_size
+            position_size = settings.max_shares_per_position
+            dollar_risk = dollar_risk * share_ratio
+
     return RiskDecision(
         approved=position_size > 0,
         reason="approved" if position_size > 0 else "invalid size",
