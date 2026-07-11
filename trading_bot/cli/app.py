@@ -103,9 +103,54 @@ def main(
 
 
 @app.command()
-def doctor(ctx: typer.Context) -> None:
+def doctor(
+    ctx: typer.Context,
+    burn_in: bool = typer.Option(
+        False,
+        "--burn-in",
+        help="Run the burn-in reliability health checks (network-free).",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit machine-readable JSON (implies --burn-in).",
+    ),
+) -> None:
     """Check local app readiness without fetching market data."""
-    typer.echo(_format_doctor(ctx.obj))
+    if not burn_in and not json_output:
+        typer.echo(_format_doctor(ctx.obj))
+        return
+
+    from trading_bot.health.runner import run_health_checks
+    from trading_bot.health.types import HealthReport
+
+    state_dir_setting = Path(getattr(ctx.obj.app, "state_dir", None) or Path(ctx.obj.app.state_db_path).parent)
+    db_path = Path(ctx.obj.app.state_db_path)
+    dashboard_port = int(getattr(ctx.obj.app, "dashboard_port", 8080))
+    eod_watchdog_pid_file = state_dir_setting / "eod_watchdog.pid"
+
+    report: HealthReport = run_health_checks(
+        state_dir=state_dir_setting,
+        db_path=db_path,
+        dashboard_port=dashboard_port,
+        eod_watchdog_pid_file=eod_watchdog_pid_file,
+    )
+
+    if json_output:
+        typer.echo(json.dumps(report.to_dict()))
+    else:
+        for check in report.checks:
+            typer.echo(f"[burn-in] {check.name:<28} {check.status:<5} {check.detail}")
+        typer.echo(
+            f"Summary: worst={report.worst_status()}  "
+            f"PASS={sum(1 for c in report.checks if c.status=='PASS')}  "
+            f"WARN={sum(1 for c in report.checks if c.status=='WARN')}  "
+            f"FAIL={sum(1 for c in report.checks if c.status=='FAIL')}"
+        )
+
+    raise typer.Exit(
+        code={"PASS": 0, "WARN": 1, "FAIL": 2}[report.worst_status()]
+    )
 
 
 @app.command()
