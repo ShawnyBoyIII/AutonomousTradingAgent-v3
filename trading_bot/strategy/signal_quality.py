@@ -332,8 +332,10 @@ def _signal_timestamp(signal: TradeSignal | None, frame: "pd.DataFrame") -> date
     now_utc = datetime.now(tz=timezone.utc)
 
     # Decide whether the bar is fresh enough to trust as the reference timestamp.
-    # An intra-day bar up to 6h stale is fine (matches intraday data lag).
-    # Anything older falls back to wall-clock.
+    # - Future-dated bars (negative age, e.g. test fixtures or provider clock skew)
+    #   are trusted as-is.
+    # - Intra-day bars up to 6h stale are fine (matches intraday data lag).
+    # - Anything older than 6h falls through to the wall-clock fallback below.
     fresh_frame_ts: datetime | None = None
     if frame_timestamp is not None:
         ts_aware = (
@@ -342,7 +344,7 @@ def _signal_timestamp(signal: TradeSignal | None, frame: "pd.DataFrame") -> date
             else frame_timestamp.replace(tzinfo=ZoneInfo("UTC"))
         )
         age_seconds = (now_utc - ts_aware).total_seconds()
-        if 0 <= age_seconds < _INTRA_DAY_STALE_TOLERANCE_SECONDS:
+        if age_seconds < _INTRA_DAY_STALE_TOLERANCE_SECONDS:
             fresh_frame_ts = frame_timestamp
 
     if signal is not None and fresh_frame_ts is not None:
@@ -363,7 +365,7 @@ def _signal_timestamp(signal: TradeSignal | None, frame: "pd.DataFrame") -> date
             else signal.timestamp.replace(tzinfo=ZoneInfo("UTC"))
         )
         sig_age = (now_utc - sig_aware).total_seconds()
-        if 0 <= sig_age < _INTRA_DAY_STALE_TOLERANCE_SECONDS:
+        if sig_age < _INTRA_DAY_STALE_TOLERANCE_SECONDS:
             return signal.timestamp
     # Final fallback: bar and signal timestamps were both stale or missing.
     # Return wall-clock so the avoid-window check evaluates against current time.

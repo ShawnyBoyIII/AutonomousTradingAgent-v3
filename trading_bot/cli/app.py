@@ -2270,6 +2270,7 @@ def eod_fetch(
     typer.echo(f"eod-fetch total_partitions={written}")
 
 
+@app.command()
 def drawdown(ctx: typer.Context) -> None:
     """Show drawdown analysis from equity history."""
     from trading_bot.monitoring.drawdown import (
@@ -2287,6 +2288,52 @@ def drawdown(ctx: typer.Context) -> None:
             f"{ctx.obj.monitoring.max_drawdown_pct:.2f}%"
         )
         raise typer.Exit(code=1)
+
+
+@app.command(name="advisory-learn")
+def advisory_learn(
+    ctx: typer.Context,
+    daily_report: bool = typer.Option(
+        False,
+        "--daily-report",
+        help="Also write a markdown daily report.",
+    ),
+) -> None:
+    """Run the advisory learner once.
+
+    Reads recent decision-log events, derives a main_midcap + cheap_stocks
+    recommendation report, and writes the latest report + scout override
+    YAML. Opt-in via ``advisory.enabled``; no-ops cleanly when disabled.
+    """
+    from trading_bot.advisory import run_advisory_learner
+
+    settings = ctx.obj
+    if not settings.advisory.enabled:
+        typer.echo("advisory=disabled")
+        return
+
+    summary = run_advisory_learner(settings, write_daily_report=daily_report)
+    typer.echo(
+        f"observations_added={summary.observations_added} "
+        f"main={summary.main_recommendations} "
+        f"cheap={summary.cheap_recommendations} "
+        f"promote={len(summary.promoted_symbols)} "
+        f"avoid={len(summary.avoided_symbols)}"
+    )
+
+
+@app.command(name="advisory-report")
+def advisory_report(ctx: typer.Context) -> None:
+    """Print the most recent advisory learner report."""
+    from trading_bot.advisory import load_latest_advisory_report
+    from trading_bot.advisory.reporting import format_advisory_report
+
+    settings = ctx.obj
+    report = load_latest_advisory_report(settings)
+    if not report:
+        typer.echo("No advisory report available yet — run advisory-learn first.")
+        return
+    typer.echo(format_advisory_report(report))
 
 
 @app.command(name="correlation")
