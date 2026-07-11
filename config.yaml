@@ -18,6 +18,7 @@ market_data:
   max_price_jump_pct: 1000.0
   max_volume_jump_pct: 1000.0
   min_bars_for_signal: 5
+  scan_deadline_minutes: 5   # AGGRESSIVE 2026-07-09 — wall-clock cap on run_scan iteration
 
 scout:
   screeners:
@@ -35,6 +36,7 @@ risk:
   max_daily_risk_pct: 0.03
   max_daily_orders: 3
   max_ticker_allocation_pct: 0.15
+  max_shares_per_position: 50   # 2026-07-10 — user-specified per-ticker share cap (replaces max_open_positions)
   min_reward_risk_ratio: 2.0
   use_atr_sizing: true
   atr_period: 14
@@ -102,15 +104,26 @@ counter_thesis:
   check_extension: true
   extension_pct: 5.0
 
-# RL-based trading (disabled by default)
-rl:
-  enabled: false
-  agent_type: PPO
-  feature_set: standard
-  reward_function: risk_adjusted
-  model_path: state/rl_logs/sector_diversity/PPO_seed_789.zip
-  backtest_starting_cash: 100000.0
-  backtest_max_shares: 150
-  backtest_stop_loss_pct: 0.03
-  backtest_profit_target_pct: 0.08
-  action_confidence_threshold: 0.4
+# EOD data store: pulls massive.com S3 flat-files nightly, stores them in
+# state/data_store/ as Parquet partitions, consumed by tuning_overrides and
+# daily_supermodel for the nightly learning loop.
+# Credentials live in .env (MASSIVE_S3_*); see .env.example.
+eod_data_store:
+  enabled: true
+  provider: massive_flat_files
+  intervals:
+    - 1d
+    - 1m
+  backfill_years: 5
+  minute_backfill_years: 1
+  throttle_seconds: 0.2
+  max_retries: 3
+  store_root: state/data_store
+  manifest_db: state/data_store.db
+  s3_region: us-east-1
+  # TLS verification. Default true (safe on the open internet). Massive.com's
+  # flat-files endpoint serves a self-signed cert as of 2026-07, so to fetch
+  # from there you'll need to either pin the CA bundle (preferred) or set
+  # verify_tls: false. See burn-in-config.yaml for the full comment.
+  verify_tls: true
+  tls_ca_bundle: null

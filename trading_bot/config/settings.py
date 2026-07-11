@@ -67,6 +67,10 @@ class MarketDataSettings(BaseModel):
     intraday_interval: str = "5m"
     max_data_age_hours: int = Field(default=72, ge=1)
     max_data_age_minutes: int = Field(default=30, ge=1)  # For intraday bars
+    # Wall-clock cap on a single scan iteration.  2026-07-09 incident:
+    # scan hung for 7+ hours at the Polygon call chain with no global
+    # deadline, blocking the burn-in's main loop and skipping EOD exits.
+    scan_deadline_minutes: int = Field(default=5, ge=1, le=60)
     # V2.5: Data validation settings
     validate_data: bool = Field(default=True)
     max_price_jump_pct: float = Field(default=1000.0, ge=100.0, le=5000.0)
@@ -119,6 +123,15 @@ class RiskSettings(BaseModel):
     max_portfolio_heat_pct: float = Field(default=0.03, gt=0.0, le=0.5)
     # V2.5: Sector concentration
     max_sector_concentration_pct: float = Field(default=0.20, gt=0.0, le=1.0)
+    # 2026-07-10: Per-ticker share-count cap. The previous
+    # `max_open_positions` field was rolled back per user feedback:
+    # "we should be able to trade 100+ stocks; I want to limit the
+    # total counts of trades per stock. Each stock can hold a maximum
+    # of 50."  This cap is the absolute share limit applied AFTER ATR
+    # sizing / fixed-stop sizing / Kelly scaling. It complements
+    # `max_ticker_allocation_pct` (percentage cap) and
+    # `max_sector_concentration_pct` (sector cap).
+    max_shares_per_position: int = Field(default=50, ge=1, le=100000)
     # V3.1: Circuit breaker — halt trading on consecutive losses
     max_consecutive_losses: int = Field(default=5, ge=0)
     # V3.1: Circuit breaker — halt on max drawdown (% from peak)
@@ -209,6 +222,62 @@ class StrategyTrackerSettings(BaseModel):
     full_allocation_rate: float = Field(default=0.50, ge=0.0, le=1.0)
 
 
+class EodDataStoreSettings(BaseModel):
+    """Settings for the end-of-day data store populated from massive.com S3 flat-files.
+
+    Credentials live in environment variables (``MASSIVE_S3_*``), loaded via
+    ``python-dotenv`` in ``trading_bot/main.py``. The settings object exposes
+    runtime knobs only — never secrets — to keep the loader's
+    "no credentials in config" guard intact.
+    """
+
+    enabled: bool = Field(default=True)
+    provider: str = Field(default="massive_flat_files")
+    intervals: list[str] = Field(default_factory=lambda: ["1d", "1m"])
+    # Backfill windows. Starter plan = 5y daily, 1y minute.
+    backfill_years: int = Field(default=5, ge=1, le=50)
+    minute_backfill_years: int = Field(default=1, ge=0, le=10)
+    # Throttle between S3 GETs. Daily batch is O(days) calls so this is light.
+    throttle_seconds: float = Field(default=0.2, ge=0.0)
+    max_retries: int = Field(default=3, ge=1)
+    # Filesystem layout (paths relative to repo root).
+    store_root: str = Field(default="state/data_store")
+    manifest_db: str = Field(default="state/data_store.db")
+    # Region the S3 endpoint uses. Massive.com's S3-compatible layer defaults
+    # to us-east-1; override in config if your account is elsewhere.
+    s3_region: str = Field(default="us-east-1")
+    # TLS verification. Default is strict (verify=True) — safe on the open
+    # internet. Set ``verify_tls: false`` only for trusted self-signed
+    # endpoints (massive.com's flat-files endpoint as of 2026-07 serves a
+    # self-signed cert). The alternative is to pin the endpoint's CA via
+    # ``tls_ca_bundle: "/path/to/ca.pem"`` and leave ``verify_tls`` at its
+    # True default.
+    verify_tls: bool = Field(default=True)
+    tls_ca_bundle: str | None = Field(default=None)
+    # Auth mode. ``"sigv4"`` (default) signs requests with AWS Signature V4 —
+    # works against real AWS S3 and most S3-compatible gateways. ``"bearer"``
+    # sends ``Authorization: Bearer <access_key>`` instead — useful for
+    # gateways (like massive.com's flat-files endpoint as of 2026-07) that
+    # expose S3-like paths but authenticate via REST-API keys.
+    auth_mode: str = Field(default="sigv4")
+    # S3 addressing style. ``"path"`` (default) — requests go to
+    # ``https://<endpoint>/<bucket>/<key>``. Required for massive.com's
+    # flat-files gateway as of 2026-07, which routes virtual-hosted requests
+    # to its REST API gateway and rejects the SigV4 signature. Set to
+    # ``"virtual"`` for real AWS S3 (``https://<bucket>.<endpoint>/<key>``).
+    addressing_style: str = Field(default="path")
+    # S3 key templates per product. Default templates mirror the public
+    # massive.com docs example. For the actually-hosted bucket (as of
+    # 2026-07), override to ``us_stocks_sip/day_aggs_v1/{year}/{month}/{date}.csv.gz``
+    # etc. Supported placeholders: ``{product}``, ``{date}``, ``{year}``,
+    # ``{month}``, ``{day}``. Set to null to use the default template for
+    # that product.
+    day_aggregates_key_template: str | None = Field(default=None)
+    minute_aggregates_key_template: str | None = Field(default=None)
+    quotes_key_template: str | None = Field(default=None)
+    trades_key_template: str | None = Field(default=None)
+
+
 class MonitoringSettings(BaseModel):
     """V3: Risk monitoring and alerting configuration.
 
@@ -261,40 +330,6 @@ class CounterThesisSettings(BaseModel):
     extension_pct: float = Field(default=5.0, gt=0.0)  # price-vs-EMA20 percent
 
 
-class RLSettings(BaseModel):
-    """RL-based trading configuration.
-
-    When ``enabled``, the orchestrator uses a trained DRL agent to generate
-    trading signals instead of rule-based engines. The agent receives normalized
-    feature vectors from FeatureEngineer and outputs discrete actions
-    (HOLD=0, BUY=1, SELL=2).
-
-    Agent types: "PPO", "A2C", "SAC", "TD3", "DDPG"
-    Feature sets: "standard" (19 features), "extended" (24 features)
-    Reward functions: "risk_adjusted", "simple_profit", "compound_daily", "sharpe", "drawdown_penalty"
-    """
-
-    enabled: bool = Field(default=False)
-    agent_type: str = Field(default="PPO")  # PPO, A2C, SAC, TD3, DDPG
-    feature_set: str = Field(default="standard")  # standard, extended
-    reward_function: str = Field(default="risk_adjusted")
-    model_path: str = Field(default="trained_models/rl_agent.zip")
-    model_paths: list[str] = Field(default_factory=list)
-    # Unknown symbols fail closed by default; opt in only for explicit research.
-    allow_untrained_symbol_inference: bool = Field(default=False)
-    # For opted-in symbols outside model metadata, discount confidence before thresholding.
-    untrained_confidence_threshold_multiplier: float = Field(default=0.8, gt=0.0, le=1.0)
-    training_episodes: int = Field(default=100, ge=1)
-    training_timesteps: int = Field(default=100000, ge=1000)
-    learning_rate: float = Field(default=3e-4, gt=0.0)
-    max_position_pct: float = Field(default=0.20, gt=0.0, le=1.0)
-    backtest_starting_cash: float = Field(default=10000.0, gt=0.0)
-    backtest_max_shares: int = Field(default=100, ge=1)
-    backtest_stop_loss_pct: float = Field(default=0.05, gt=0.0, lt=1.0)
-    backtest_profit_target_pct: float = Field(default=0.08, gt=0.0, lt=1.0)
-    action_confidence_threshold: float = Field(default=0.5, gt=0.0, le=1.0)
-
-
 class SwarmSettings(BaseModel):
     """Multi-agent swarm analysis configuration.
 
@@ -338,8 +373,9 @@ class Settings(BaseModel):
     strategy: StrategySettings = Field(default_factory=StrategySettings)
     supermodel: SupermodelSettings = Field(default_factory=SupermodelSettings)
     strategy_tracker: StrategyTrackerSettings = Field(default_factory=StrategyTrackerSettings)
+    eod_data_store: EodDataStoreSettings = Field(default_factory=EodDataStoreSettings)
     monitoring: MonitoringSettings = Field(default_factory=MonitoringSettings)
     counter_thesis: CounterThesisSettings = Field(default_factory=CounterThesisSettings)
-    rl: RLSettings = Field(default_factory=RLSettings)
+    rl: dict[str, object] = Field(default_factory=dict)
     swarm: SwarmSettings = Field(default_factory=SwarmSettings)
     sentiment: SentimentSettings = Field(default_factory=SentimentSettings)

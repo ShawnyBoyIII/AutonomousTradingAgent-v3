@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -53,7 +54,67 @@ def propose_tuning_overrides(
                 2,
             )
 
+    # Data-store nudge: if recent bars in the long-term store show realised
+    # volatility spiking above what the strategy_tracker is sized for, raise
+    # the window so we look at more trades before changing sizing. This is
+    # intentionally conservative — the long-term store is opt-in and may be
+    # empty on first runs.
+    _maybe_nudge_window_from_data_store(settings, proposal)
+
     return proposal
+
+
+def _maybe_nudge_window_from_data_store(
+    settings: Settings,
+    proposal: dict[str, dict[str, float | int]],
+) -> None:
+    """If the EOD data store has recent bars, use them to nudge the window.
+
+    Reads daily bars for the last 30 days and computes a coarse realised
+    volatility proxy (mean |daily return|). High volatility suggests more
+    trades are needed to draw a conclusion — nudge ``window`` up.
+    """
+    try:
+        from trading_bot.data.data_store import (
+            DataStoreManifest,
+            read_bars,
+        )
+
+        cfg = settings.eod_data_store
+        if not cfg.enabled:
+            return
+        root = Path(cfg.store_root)
+        manifest = DataStoreManifest(db_path=Path(cfg.manifest_db))
+        symbol = manifest.first_symbol()
+        if not symbol:
+            return
+        end = date.today()
+        start = end - timedelta(days=30)
+        df = read_bars(symbol, "1d", start, end, root)
+        if df.empty or len(df) < 5:
+            return
+        avg_abs_return = _avg_abs_return(df)
+        # Threshold tuned empirically: > 3% daily move is "elevated".
+        if avg_abs_return > 0.03:
+            proposal["strategy_tracker"]["window"] = min(
+                settings.strategy_tracker.window + 5, 60
+            )
+    except Exception:  # noqa: BLE001
+        # Data store is opt-in; never let it break the override proposal.
+        return
+
+
+def _avg_abs_return(df) -> float:
+    """Mean of |close-to-close return| for the rows in df."""
+    if df.empty or "close" not in df.columns:
+        return 0.0
+    closes = df["close"].astype(float)
+    if len(closes) < 2:
+        return 0.0
+    returns = closes.pct_change().dropna().abs()
+    if returns.empty:
+        return 0.0
+    return float(returns.mean())
 
 
 def write_tuning_overrides(path: Path, proposal: dict[str, dict[str, float | int]]) -> None:
