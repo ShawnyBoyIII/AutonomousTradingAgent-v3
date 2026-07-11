@@ -49,7 +49,7 @@ class PaperBrokerAdapter(BrokerAdapter):
         self.settings = settings
         self.ledger = ledger or PortfolioLedger(settings.app.state_db_path)
         self._paper_broker = PaperBroker(
-            starting_cash=settings.rl.backtest_starting_cash,
+            starting_cash=10_000.0,
             fee_per_order=settings.paper.fee_per_order,
             slippage_bps=settings.paper.slippage_bps,
             dynamic_slippage_enabled=settings.paper.dynamic_slippage_enabled,
@@ -76,7 +76,7 @@ class PaperBrokerAdapter(BrokerAdapter):
     def get_account(self) -> BrokerAccount:
         """Fetch account from local ledger."""
         portfolio = self.ledger.ensure_portfolio_state(
-            starting_cash=self.settings.rl.backtest_starting_cash
+            starting_cash=10_000.0
         )
         
         return BrokerAccount(
@@ -91,7 +91,7 @@ class PaperBrokerAdapter(BrokerAdapter):
     def get_positions(self) -> list[BrokerPosition]:
         """Fetch positions from local ledger."""
         portfolio = self.ledger.ensure_portfolio_state(
-            starting_cash=self.settings.rl.backtest_starting_cash
+            starting_cash=10_000.0
         )
         positions = []
         

@@ -154,6 +154,23 @@ class PortfolioLedger:
         self.save_portfolio_state(state)
         return state
 
+    def deposit(self, amount: float, timestamp: datetime | None = None) -> PortfolioState:
+        """Add ``amount`` of cash to the ledger (a capital deposit).
+
+        Increases both ``cash`` and ``equity`` by ``amount`` and persists the
+        updated state plus an equity snapshot so the deposit shows up in
+        drawdown / VaR history. ``amount`` may be negative for a withdrawal.
+        """
+        if amount == 0:
+            return self.ensure_portfolio_state()
+        self.initialize()
+        state = self.ensure_portfolio_state()
+        state.cash = round(state.cash + amount, 2)
+        state.equity = round(state.equity + amount, 2)
+        self.save_portfolio_state(state)
+        self.record_equity_snapshot(state, timestamp=timestamp)
+        return state
+
     def save_portfolio_state(self, state: PortfolioState) -> None:
         self.initialize()
         self._execute_write(
@@ -348,4 +365,32 @@ class PortfolioLedger:
                 "unrealized_pnl": row[4] if row[4] is not None else 0.0,
             }
             for row in rows
+        ]
+
+    def list_recent_equity_history(
+        self,
+        limit: int = 500,
+    ) -> list[dict[str, object]]:
+        """Return the newest equity snapshots in chronological order."""
+        self.initialize()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT timestamp, equity, cash, realized_pnl, unrealized_pnl
+                FROM equity_history
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (max(limit, 1),),
+            ).fetchall()
+
+        return [
+            {
+                "timestamp": row[0],
+                "equity": row[1],
+                "cash": row[2],
+                "realized_pnl": row[3] if row[3] is not None else 0.0,
+                "unrealized_pnl": row[4] if row[4] is not None else 0.0,
+            }
+            for row in reversed(rows)
         ]

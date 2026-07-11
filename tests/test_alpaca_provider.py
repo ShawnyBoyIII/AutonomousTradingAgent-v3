@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from trading_bot.data.providers.alpaca_provider import (
+    AlpacaProvider,
     _normalize_symbol,
     _parse_interval,
     _period_to_start_end,
@@ -78,9 +80,9 @@ class TestParseInterval:
 
 class TestPeriodToStartEnd:
     def test_returns_end_near_now(self) -> None:
-        before = datetime.now()
+        before = datetime.now(timezone.utc)
         start, end = _period_to_start_end("1mo")
-        after = datetime.now()
+        after = datetime.now(timezone.utc)
         assert before <= end <= after
 
     def test_one_year_approx_365_days(self) -> None:
@@ -106,3 +108,57 @@ class TestPeriodToStartEnd:
         # Regression: "1mo" previously raised ValueError on int("1m")
         start, end = _period_to_start_end("1mo")
         assert end > start
+
+    def test_start_and_end_are_tz_aware_utc(self) -> None:
+        # Regression: Alpaca SDK interprets naive datetimes as UTC, which
+        # cuts off intraday requests by the bot server's local UTC offset
+        # (e.g., 4h behind during EDT). Both boundaries must be UTC-aware.
+        start, end = _period_to_start_end("1d")
+        assert start.tzinfo is not None
+        assert end.tzinfo is not None
+        assert start.utcoffset() == timedelta(0)
+        assert end.utcoffset() == timedelta(0)
+
+
+class TestFetchBarsTimezone:
+    def test_passes_tz_aware_utc_window_to_sdk(self) -> None:
+        # Mock the Alpaca SDK client and capture what we send to StockBarsRequest.
+        captured: dict[str, object] = {}
+
+        class _FakeBarsResponse:
+            data: dict[str, list[object]] = {"SPY": []}
+
+        def _capture_request(*args: object, **kwargs: object) -> object:
+            # StockBarsRequest accepts kwargs (start, end, ...) — capture them.
+            if kwargs:
+                captured.update(kwargs)
+            elif args and isinstance(args[0], dict):
+                captured.update(args[0])
+            return MagicMock()
+
+        provider = AlpacaProvider()
+        mock_client = MagicMock()
+        mock_client.get_stock_bars.return_value = _FakeBarsResponse()
+
+        with patch.object(provider, "_get_client", return_value=mock_client):
+            with patch(
+                "alpaca.data.requests.StockBarsRequest",
+                side_effect=_capture_request,
+            ):
+                try:
+                    provider.fetch_bars("SPY", "1d", "5m")
+                except Exception:
+                    # Empty bars → provider raises ValueError, that's fine —
+                    # we only care about the captured request payload.
+                    pass
+
+        start = captured.get("start")
+        end = captured.get("end")
+        assert isinstance(start, datetime), f"start captured as {type(start).__name__}"
+        assert isinstance(end, datetime), f"end captured as {type(end).__name__}"
+        assert start.tzinfo is not None, "start must be tz-aware"
+        assert end.tzinfo is not None, "end must be tz-aware"
+        assert start.utcoffset() == timedelta(0), "start must be UTC"
+        assert end.utcoffset() == timedelta(0), "end must be UTC"
+        # Sanity: end should be at or after start.
+        assert end >= start

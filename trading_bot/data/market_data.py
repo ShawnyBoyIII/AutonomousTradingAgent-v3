@@ -25,7 +25,12 @@ def normalize_ohlcv_frame(frame: pd.DataFrame) -> pd.DataFrame:
             "Volume": "volume",
         }
     ).reset_index(names="timestamp")
-    return renamed[["timestamp", "open", "high", "low", "close", "volume"]]
+    # Preserve the bar timestamps as the DataFrame's DatetimeIndex so that
+    # downstream consumers (e.g. signal_quality's evaluate_entry_timing)
+    # can read bar times via .index[-1] instead of getting epoch-zero
+    # integer indices from reset_index.
+    result = renamed.set_index("timestamp", drop=False)
+    return result[["timestamp", "open", "high", "low", "close", "volume"]]
 
 
 def _prioritize_provider_names(
@@ -43,7 +48,7 @@ def _prioritize_provider_names(
     if not is_intraday:
         return names
 
-    priority = {"alpaca": 0, "polygon": 1, "finnhub": 2, "yfinance": 3}
+    priority = {"polygon": 0, "alpaca": 1, "finnhub": 2, "yfinance": 3}  # Polygon=massive.com first for SIP-quality data
     return sorted(names, key=lambda name: (priority.get(str(name).strip().lower(), 99), names.index(name)))
 
 
@@ -108,7 +113,7 @@ def _fallback_fetch(
             continue
         try:
             return provider.fetch_bars(symbol, period, interval, start=start, end=end)
-        except (ValueError, ConnectionError, OSError, TimeoutError) as exc:
+        except Exception as exc:
             last_error = exc
             logger.warning(
                 f"fetch_failed symbol={symbol} provider={type(provider).__name__} error={exc}"

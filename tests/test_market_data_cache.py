@@ -397,12 +397,16 @@ class TestIntegration:
         settings = MarketDataSettings(providers=["yfinance", "polygon", "alpaca"])
         market_data.fetch_bars("AAPL", "5d", "5m", settings=settings)
 
-        assert called == ["alpaca"]
+        # Since 2026-07-08 polygon (massive.com) is prioritized for
+        # intraday bars — provider priority dict: polygon=0, alpaca=1.
+        assert called == ["polygon"]
 
     def test_intraday_cache_namespace_uses_effective_provider_order(self):
         from trading_bot.data.market_data import _cache_namespace
 
         settings = MarketDataSettings(providers=["yfinance", "polygon", "alpaca"])
 
-        assert _cache_namespace(settings, "5m") == "providers=alpaca,polygon,yfinance"
+        # Intraday uses the priority dict (polygon first since 2026-07-08);
+        # daily uses config order verbatim.
+        assert _cache_namespace(settings, "5m") == "providers=polygon,alpaca,yfinance"
         assert _cache_namespace(settings, "1d") == "providers=yfinance,polygon,alpaca"

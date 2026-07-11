@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -48,8 +48,14 @@ def _parse_interval(interval: str) -> tuple[int, str]:
 
 
 def _period_to_start_end(period: str) -> tuple[datetime, datetime]:
-    """Convert a yfinance-style period string to start/end datetimes."""
-    end = datetime.now()
+    """Convert a yfinance-style period string to start/end datetimes.
+
+    Both boundaries are returned as tz-aware UTC datetimes. The Alpaca SDK
+    interprets naive datetimes as UTC, which silently cuts off the request by
+    the bot server's local UTC offset (e.g., 4 hours during EDT) — see
+    ``TestFetchBarsTimezone`` for the regression test.
+    """
+    end = datetime.now(timezone.utc)
     value, unit_char = _split_period(period)
     if unit_char == "d":
         start = end - timedelta(days=value)
@@ -122,6 +128,8 @@ class AlpacaProvider:
             start_dt = datetime.fromisoformat(start) if "T" in start else datetime.combine(
                 date.fromisoformat(start), datetime.min.time()
             )
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
         else:
             start_dt, _ = _period_to_start_end(period)
 
@@ -129,8 +137,10 @@ class AlpacaProvider:
             end_dt = datetime.fromisoformat(end) if "T" in end else datetime.combine(
                 date.fromisoformat(end), datetime.min.time()
             )
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
         else:
-            end_dt = datetime.now()
+            end_dt = datetime.now(timezone.utc)
 
         request = StockBarsRequest(
             symbol_or_symbols=alpaca_symbol,
