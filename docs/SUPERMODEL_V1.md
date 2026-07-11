@@ -4,7 +4,7 @@ Smallest useful version: a read-only advisory layer that stacks evidence already
 
 ## What It Does
 
-- Combines local setup confidence, V3 confluence, RL vote, and counter-thesis guardrails.
+- Combines local setup confidence, V3 confluence, and counter-thesis guardrails.
 - Emits `supermodel=<decision>:<score>` in `scan --why` when a real local signal exists.
 - Adds summary counts when details are requested: support, caution, block, no_signal.
 - Changes no trade execution, no sizing, no Robinhood path, and no live behavior.
@@ -25,7 +25,7 @@ Smallest useful version: a read-only advisory layer that stacks evidence already
 Look for:
 
 ```text
-supermodel=support:0.78 supermodel_layers=setup:support:0.82,v3:support:0.79,rl:support:0.72
+supermodel=support:0.78 supermodel_layers=setup:support:0.82,v3:support:0.79
 ```
 
 ## Next Gates

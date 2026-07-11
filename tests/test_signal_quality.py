@@ -46,7 +46,12 @@ def _intraday_frame(
 ) -> pd.DataFrame:
     closes = closes or [100.0, 100.1, 100.2, 100.3, 100.5, 100.8]
     rows = len(closes)
-    timestamp = timestamp or datetime(2026, 7, 2, 10, 0, tzinfo=ET)
+    # Default to *fresh* bar at 10:15 ET today; reflects a real intraday bar
+    # that the A1 wall-clock fallback would treat as fresh. Tests that
+    # want a stale-bar edge case can pass `timestamp=<old date>` explicitly.
+    timestamp = timestamp or datetime.now(tz=ET).replace(
+        hour=10, minute=15, second=0, microsecond=0
+    ) - pd.Timedelta(minutes=5 * (rows - 1))  # noqa
     index = pd.date_range(end=timestamp, periods=rows, freq="5min")
     highs = [value + 0.2 for value in closes]
     lows = [value - 0.2 for value in closes]
@@ -83,6 +88,12 @@ def _hourly_frame(aligned: bool = True) -> pd.DataFrame:
 
 
 def _signal(quality: str = "GREEN") -> TradeSignal:
+    # Use a *fresh* timestamp inside the morning preferred window
+    # (9:45–11:30 ET) so tests reflect the actual happy-path of the
+    # entry-timing module, regardless of when tests are run. The 2026-07-02
+    # fixture that was here is 6 days stale by now, which causes A1's
+    # wall-clock fallback to land in the 11:57 dead zone between
+    # windows — historically the test passed only by accident.
     return TradeSignal(
         ticker="AAPL",
         timeframe="intraday",
@@ -94,7 +105,7 @@ def _signal(quality: str = "GREEN") -> TradeSignal:
         confidence=0.8,
         reasons=["intraday breakout"],
         strategy_tag="test",
-        timestamp=datetime(2026, 7, 2, 10, 0, tzinfo=ET),
+        timestamp=datetime.now(tz=ET).replace(hour=10, minute=15, second=0, microsecond=0),
         quality=quality,
     )
 
@@ -193,32 +204,51 @@ def test_adaptive_stop_target_uses_high_volatility_geometry() -> None:
     assert any("adaptive regime=high_volatility" in reason for reason in adapted.reasons)
 
 
-def test_serial_rl_signal_is_gated_by_phase1_quality(monkeypatch) -> None:
-    from trading_bot.data import market_data
-    from trading_bot.runtime import orchestrator
+def test_signal_timestamp_falls_back_to_wall_clock_on_stale_bar() -> None:
+    """A1 (Tier 1, 2026-07-08): when the latest bar is from a previous
+    trading session (or much older — the bar's date is *not* today),
+    _signal_timestamp must NOT return that stale bar — it should return
+    a fresh, tz-aware timestamp near wall-clock, so the avoid-window
+    check evaluates against NOW, not against yesterday's close.
+    """
+    from datetime import timedelta
+    from trading_bot.strategy.signal_quality import _signal_timestamp
 
-    settings = Settings(rl={"enabled": True})
-    rl_signal = _signal()
+    # 7 hours back — beyond the 6h intra-day tolerance but still "today"
+    # in calendar terms; we test the wider tolerance.
+    stale_ts = datetime.now(ET) - timedelta(hours=7)
+    df = pd.DataFrame(
+        {
+            "timestamp": [stale_ts],
+            "close": [100.0],
+            "volume": [1000],
+        }
+    )
+    result = _signal_timestamp(signal=None, frame=df)
+    assert result is not None
+    age_seconds = (datetime.now(ET) - result).total_seconds()
+    assert age_seconds < 60, (
+        f"timestamp should be near wall-clock when the bar is stale; got age={age_seconds:.0f}s"
+    )
+    assert result.tzinfo is not None, "returned timestamp must be tz-aware"
 
-    monkeypatch.setattr(
-        orchestrator,
-        "_build_rl_signal_result",
-        lambda symbol, settings: (rl_signal, "rl approved", {"rl_action": 1}),
+
+def test_signal_timestamp_uses_fresh_bar() -> None:
+    """Counter-test: a fresh bar (<5 min old) should still be used as-is."""
+    from datetime import timedelta
+    from trading_bot.strategy.signal_quality import _signal_timestamp
+
+    fresh_ts = datetime.now(ET) - timedelta(seconds=30)
+    df = pd.DataFrame(
+        {
+            "timestamp": [fresh_ts],
+            "close": [100.0],
+            "volume": [1000],
+        }
+    )
+    result = _signal_timestamp(signal=None, frame=df)
+    assert result == fresh_ts, (
+        "fresh bar (<5min) should be returned verbatim"
     )
 
-    def fake_fetch(symbol, period, interval, settings):
-        if interval == "1d":
-            return _daily_frame(), ValidationResult(valid=True, reason="ok")
-        if interval == "1h":
-            return _hourly_frame(), ValidationResult(valid=True, reason="ok")
-        return _intraday_frame(), ValidationResult(valid=True, reason="ok")
 
-    monkeypatch.setattr(market_data, "fetch_and_validate_bars", fake_fetch)
-
-    signal, reason, details = orchestrator._build_signal_result("AAPL", settings)
-
-    assert signal is not None
-    assert reason == "rl approved"
-    assert details["signal_quality_passed"] is True
-    assert details["mtf_aligned"] >= 2
-    assert "adaptive_stop_loss" in details

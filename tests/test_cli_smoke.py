@@ -143,24 +143,6 @@ def test_swarm_command_passes_saved_portfolio_state(monkeypatch, tmp_path: Path)
     assert captured["portfolio_state"]["positions"]["MSFT"]["quantity"] == 5
 
 
-def test_scan_summary_includes_rl_counts_when_present() -> None:
-    assert _format_scan_summary(
-        {
-            "symbols": 3,
-            "approved": 1,
-            "green": 1,
-            "yellow": 0,
-            "rejected": 0,
-            "no_signal": 2,
-            "errors": 0,
-            "rl_buy": 1,
-            "rl_hold": 1,
-            "rl_sell": 1,
-            "rl_unsupported": 2,
-            "rl_avg_confidence": 0.62,
-        }
-    ).endswith("rl_buy=1 rl_hold=1 rl_sell=1 rl_unsupported=2 rl_avg_conf=0.62")
-
 
 def test_watchlist_file_adds_and_removes_symbols(tmp_path: Path) -> None:
     path = tmp_path / "state" / "watchlist.txt"
@@ -171,335 +153,6 @@ def test_watchlist_file_adds_and_removes_symbols(tmp_path: Path) -> None:
     assert read_watchlist(path) == ["MSFT", "BRK.B"]
     assert remove_symbol(path, "msft") == ["BRK.B"]
 
-
-def test_rl_signal_rejects_symbols_outside_model_metadata(monkeypatch, tmp_path: Path) -> None:
-    import types
-
-    import trading_bot.runtime.orchestrator as orchestrator
-    from trading_bot.config.settings import Settings
-
-    model_path = tmp_path / "model.zip"
-    model_path.write_bytes(b"")
-    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
-    settings = Settings()
-    settings.app.log_dir = str(tmp_path / "logs")
-    settings.rl.enabled = True
-    settings.rl.model_path = "model.zip"
-    settings.rl.allow_untrained_symbol_inference = True
-    settings.rl.action_confidence_threshold = 0.5
-
-    captured: dict[str, object] = {}
-
-    class FakeAgent:
-        def predict_signal(self, **kwargs):
-            captured["symbols"] = kwargs["symbols"]
-            captured["market_frames"] = sorted(kwargs["market_frames"])
-            return 0, 0.75
-
-    monkeypatch.setattr("trading_bot.rl.agent.RLAgent.load", lambda model_path: FakeAgent())
-
-    frame = pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2026-06-01", periods=30, freq="D"),
-            "open": [100.0 + index for index in range(30)],
-            "high": [101.0 + index for index in range(30)],
-            "low": [99.0 + index for index in range(30)],
-            "close": [100.0 + index for index in range(30)],
-            "volume": [1_000_000 for _ in range(30)],
-        }
-    )
-
-    def fake_fetch(symbol: str, *args, **kwargs):
-        return frame.copy(), types.SimpleNamespace(valid=True, reason=None)
-
-    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fake_fetch)
-
-    signal, reason, details = orchestrator._build_rl_signal_result("MSFT", settings)
-
-    assert signal is None
-    assert "RL agent predicts HOLD" in reason
-    assert details["rl_trained_symbols"] == ["AAPL"]
-    assert details["rl_untrained_symbol"] is True
-    assert captured["symbols"] == ["AAPL", "MSFT"]
-
-
-def test_rl_signal_rejects_untrained_symbol_by_default(monkeypatch, tmp_path: Path) -> None:
-    import trading_bot.runtime.orchestrator as orchestrator
-    from trading_bot.config.settings import Settings
-
-    model_path = tmp_path / "model.zip"
-    model_path.write_bytes(b"")
-    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
-    settings = Settings()
-    settings.app.log_dir = str(tmp_path / "logs")
-    settings.rl.enabled = True
-    settings.rl.model_path = "model.zip"
-
-    def fail_fetch(*args, **kwargs):
-        raise AssertionError("untrained RL symbol should fail before market data fetch")
-
-    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fail_fetch)
-
-    signal, reason, details = orchestrator._build_rl_signal_result("MSFT", settings)
-
-    assert signal is None
-    assert reason == "RL model not trained for MSFT"
-    assert details["rl_trained_symbols"] == ["AAPL"]
-    assert details["rl_untrained_symbol"] is True
-    assert details["rl_models"] == 0
-
-
-def test_rl_signal_rejects_missing_model_metadata_before_fetch(monkeypatch, tmp_path: Path) -> None:
-    import trading_bot.runtime.orchestrator as orchestrator
-    from trading_bot.config.settings import Settings
-
-    model_path = tmp_path / "model.zip"
-    model_path.write_bytes(b"")
-    settings = Settings()
-    settings.app.log_dir = str(tmp_path / "logs")
-    settings.rl.enabled = True
-    settings.rl.model_path = "model.zip"
-
-    def fail_fetch(*args, **kwargs):
-        raise AssertionError("missing RL metadata should fail before market data fetch")
-
-    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fail_fetch)
-
-    signal, reason, details = orchestrator._build_rl_signal_result("AAPL", settings)
-
-    assert signal is None
-    assert "RL model metadata missing or empty:" in reason
-    assert details == {}
-
-
-def test_rl_signal_rejects_empty_model_metadata_before_fetch(monkeypatch, tmp_path: Path) -> None:
-    import trading_bot.runtime.orchestrator as orchestrator
-    from trading_bot.config.settings import Settings
-
-    model_path = tmp_path / "model.zip"
-    model_path.write_bytes(b"")
-    (tmp_path / "model_meta.json").write_text('{"symbols": []}', encoding="utf-8")
-    settings = Settings()
-    settings.app.log_dir = str(tmp_path / "logs")
-    settings.rl.enabled = True
-    settings.rl.model_path = "model.zip"
-
-    def fail_fetch(*args, **kwargs):
-        raise AssertionError("empty RL metadata should fail before market data fetch")
-
-    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fail_fetch)
-
-    signal, reason, details = orchestrator._build_rl_signal_result("AAPL", settings)
-
-    assert signal is None
-    assert "RL model metadata missing or empty:" in reason
-    assert details == {}
-
-
-def test_rl_signal_passes_all_trained_symbol_frames(monkeypatch, tmp_path: Path) -> None:
-    import types
-
-    import trading_bot.runtime.orchestrator as orchestrator
-    from trading_bot.config.settings import Settings
-
-    model_path = tmp_path / "model.zip"
-    model_path.write_bytes(b"")
-    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL", "MSFT"]}', encoding="utf-8")
-    settings = Settings()
-    settings.app.log_dir = str(tmp_path / "logs")
-    settings.rl.enabled = True
-    settings.rl.model_path = "model.zip"
-
-    captured: dict[str, object] = {}
-
-    class FakeAgent:
-        def predict_signal(self, **kwargs):
-            captured["symbols"] = kwargs["symbols"]
-            captured["market_frames"] = sorted(kwargs["market_frames"])
-            return 0, 0.75
-
-    monkeypatch.setattr("trading_bot.rl.agent.RLAgent.load", lambda model_path: FakeAgent())
-
-    frame = pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2026-06-01", periods=30, freq="D"),
-            "open": [100.0 + index for index in range(30)],
-            "high": [101.0 + index for index in range(30)],
-            "low": [99.0 + index for index in range(30)],
-            "close": [100.0 + index for index in range(30)],
-            "volume": [1_000_000 + index for index in range(30)],
-        }
-    )
-
-    def fake_fetch(symbol, period, interval, settings):
-        return frame.copy(deep=True), types.SimpleNamespace(valid=True, reason="")
-
-    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fake_fetch)
-    monkeypatch.setattr(
-        orchestrator.market_data,
-        "fetch_bars",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("HOLD should not fetch a separate current price")),
-    )
-
-    signal, reason, details = orchestrator._build_rl_signal_result("AAPL", settings)
-
-    assert signal is None
-    assert "RL agent predicts HOLD" in reason
-    assert captured["symbols"] == ["AAPL", "MSFT"]
-    assert captured["market_frames"] == ["AAPL", "MSFT"]
-    assert details["rl_action"] == 0
-
-
-def test_rl_signal_rejects_buy_when_current_price_unavailable(monkeypatch, tmp_path: Path) -> None:
-    import types
-
-    import trading_bot.runtime.orchestrator as orchestrator
-    from trading_bot.config.settings import Settings
-
-    model_path = tmp_path / "model.zip"
-    model_path.write_bytes(b"")
-    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
-    settings = Settings()
-    settings.app.log_dir = str(tmp_path / "logs")
-    settings.rl.enabled = True
-    settings.rl.model_path = "model.zip"
-    settings.rl.action_confidence_threshold = 0.5
-
-    class FakeAgent:
-        def predict_signal(self, **kwargs):
-            return 1, 0.9
-
-    monkeypatch.setattr("trading_bot.rl.agent.RLAgent.load", lambda model_path: FakeAgent())
-
-    frame = pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2026-06-01", periods=30, freq="D"),
-            "open": [100.0 + index for index in range(30)],
-            "high": [101.0 + index for index in range(30)],
-            "low": [99.0 + index for index in range(30)],
-            "close": [100.0 + index for index in range(29)] + [0.0],
-            "volume": [1_000_000 for _ in range(30)],
-        }
-    )
-
-    def fake_fetch_validate(symbol, period, interval, settings):
-        return frame.copy(deep=True), types.SimpleNamespace(valid=True, reason="")
-
-    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fake_fetch_validate)
-    monkeypatch.setattr(
-        orchestrator.market_data,
-        "fetch_bars",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("RL should use the validated target frame price")),
-    )
-
-    signal, reason, details = orchestrator._build_rl_signal_result("AAPL", settings)
-
-    assert signal is None
-    assert reason == "RL current price unavailable"
-    assert details["rl_action"] == 1
-    assert details["rl_confidence"] == 0.9
-
-
-def test_rl_signal_penalizes_untrained_symbol_confidence(monkeypatch, tmp_path: Path) -> None:
-    import types
-
-    import trading_bot.runtime.orchestrator as orchestrator
-    from trading_bot.config.settings import Settings
-
-    model_path = tmp_path / "model.zip"
-    model_path.write_bytes(b"")
-    (tmp_path / "model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
-    settings = Settings()
-    settings.app.log_dir = str(tmp_path / "logs")
-    settings.rl.enabled = True
-    settings.rl.model_path = "model.zip"
-    settings.rl.action_confidence_threshold = 0.5
-    settings.rl.untrained_confidence_threshold_multiplier = 0.8
-    settings.rl.allow_untrained_symbol_inference = True
-
-    class FakeAgent:
-        def predict_signal(self, **kwargs):
-            return 1, 0.6
-
-    monkeypatch.setattr("trading_bot.rl.agent.RLAgent.load", lambda model_path: FakeAgent())
-
-    frame = pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2026-06-01", periods=30, freq="D"),
-            "open": [100.0 + index for index in range(30)],
-            "high": [101.0 + index for index in range(30)],
-            "low": [99.0 + index for index in range(30)],
-            "close": [100.0 + index for index in range(30)],
-            "volume": [1_000_000 for _ in range(30)],
-        }
-    )
-
-    def fake_fetch_validate(symbol, period, interval, settings):
-        return frame.copy(deep=True), types.SimpleNamespace(valid=True, reason="")
-
-    monkeypatch.setattr(orchestrator.market_data, "fetch_and_validate_bars", fake_fetch_validate)
-
-    signal, reason, details = orchestrator._build_rl_signal_result("MSFT", settings)
-
-    assert signal is None
-    assert reason == "RL confidence 0.48 below threshold 0.5"
-    assert details["rl_confidence"] == 0.6
-    assert details["rl_effective_confidence"] == 0.48
-    assert details["rl_untrained_symbol"] is True
-
-
-def test_rl_signal_rejects_ensemble_action_tie(monkeypatch, tmp_path: Path) -> None:
-    import types
-
-    import trading_bot.runtime.orchestrator as orchestrator
-    from trading_bot.config.settings import Settings
-
-    buy_model = tmp_path / "buy_model.zip"
-    sell_model = tmp_path / "sell_model.zip"
-    buy_model.write_bytes(b"")
-    sell_model.write_bytes(b"")
-    (tmp_path / "buy_model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
-    (tmp_path / "sell_model_meta.json").write_text('{"symbols": ["AAPL"]}', encoding="utf-8")
-    settings = Settings()
-    settings.app.log_dir = str(tmp_path / "logs")
-    settings.rl.enabled = True
-    settings.rl.model_path = "buy_model.zip"
-    settings.rl.model_paths = ["buy_model.zip", "sell_model.zip"]
-
-    class FakeAgent:
-        def __init__(self, action: int) -> None:
-            self.action = action
-
-        def predict_signal(self, **kwargs):
-            return self.action, 0.8
-
-    def fake_load(model_path):
-        return FakeAgent(1 if "buy_model" in str(model_path) else 2)
-
-    frame = pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2026-06-01", periods=30, freq="D"),
-            "open": [100.0 + index for index in range(30)],
-            "high": [101.0 + index for index in range(30)],
-            "low": [99.0 + index for index in range(30)],
-            "close": [100.0 + index for index in range(30)],
-            "volume": [1_000_000 for _ in range(30)],
-        }
-    )
-
-    monkeypatch.setattr("trading_bot.rl.agent.RLAgent.load", fake_load)
-    monkeypatch.setattr(
-        orchestrator.market_data,
-        "fetch_and_validate_bars",
-        lambda *args, **kwargs: (frame.copy(deep=True), types.SimpleNamespace(valid=True, reason="")),
-    )
-
-    signal, reason, details = orchestrator._build_rl_signal_result("AAPL", settings)
-
-    assert signal is None
-    assert reason == "RL ensemble action tie ([1, 2])"
-    assert details["rl_action"] == 0
-    assert details["rl_vote_tie"] == [1, 2]
 
 
 def test_read_only_analysis_commands_render_cleanly_with_empty_state(tmp_path: Path) -> None:
@@ -3699,6 +3352,29 @@ def test_manage_positions_skips_empty_intraday_frame(monkeypatch, tmp_path: Path
     assert state.cash == 9_000.0
 
 
+def test_market_data_is_stale_for_manage_after_hours_prior_close_is_fresh() -> None:
+    from datetime import timedelta
+
+    from zoneinfo import ZoneInfo
+
+    from trading_bot.cli.app import _market_data_is_stale_for_manage
+
+    et = ZoneInfo("America/New_York")
+    after_close = datetime(2026, 6, 18, 19, 0, tzinfo=et)  # Thursday, after 16:00 ET
+    prior_close_bar = after_close - timedelta(hours=18)  # yesterday's close
+    assert _market_data_is_stale_for_manage(prior_close_bar, after_close, 120) is False
+
+    weekend = datetime(2026, 6, 20, 12, 0, tzinfo=et)  # Saturday
+    weekend_bar = weekend - timedelta(hours=40)
+    assert _market_data_is_stale_for_manage(weekend_bar, weekend, 120) is True
+
+    market_open = datetime(2026, 6, 18, 12, 0, tzinfo=et)
+    stale_in_hours = market_open - timedelta(minutes=130)
+    assert _market_data_is_stale_for_manage(stale_in_hours, market_open, 120) is True
+    fresh_in_hours = market_open - timedelta(minutes=5)
+    assert _market_data_is_stale_for_manage(fresh_in_hours, market_open, 120) is False
+
+
 def test_manage_positions_eod_can_be_disabled_via_config(monkeypatch, tmp_path: Path) -> None:
     import sys
     import trading_bot.data.market_data as market_data
@@ -4934,78 +4610,3 @@ def test_cache_data_command_from_watchlist(monkeypatch, tmp_path: Path) -> None:
     assert captured_provider_stacks == [["alpaca", "polygon"], ["alpaca", "polygon"]]
 
 
-def test_supermodel_command_resolves_pipeline_script_from_repo(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """The supermodel command should work even when invoked outside the repo cwd."""
-    import subprocess
-
-    captured: dict[str, object] = {}
-
-    def fake_run(cmd, capture_output=False):
-        captured["cmd"] = cmd
-        captured["capture_output"] = capture_output
-        return SimpleNamespace(returncode=0)
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    result = CliRunner().invoke(app, ["supermodel", "--dry-run", "--symbols", "AAPL"])
-
-    assert result.exit_code == 0
-    cmd = captured["cmd"]
-    assert Path(cmd[1]).is_absolute()
-    assert Path(cmd[1]).name == "daily_supermodel.py"
-    assert Path(cmd[1]).parent.name == "scripts"
-    assert "--dry-run" in cmd
-    assert cmd[-2:] == ["--symbols", "AAPL"]
-
-
-def test_live_data_command_resolves_collector_script_from_repo(
-    monkeypatch, tmp_path: Path
-) -> None:
-    import subprocess
-
-    captured: dict[str, object] = {}
-
-    def fake_run(cmd, capture_output=False):
-        captured["cmd"] = cmd
-        captured["capture_output"] = capture_output
-        return SimpleNamespace(returncode=0)
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    result = CliRunner().invoke(app, ["live-data", "--buffer"])
-
-    assert result.exit_code == 0
-    cmd = captured["cmd"]
-    assert Path(cmd[1]).is_absolute()
-    assert Path(cmd[1]).name == "live_data_collector.py"
-    assert Path(cmd[1]).parent.name == "scripts"
-    assert "--buffer" in cmd
-
-
-def test_auto_retrain_command_resolves_trigger_script_from_repo(
-    monkeypatch, tmp_path: Path
-) -> None:
-    import subprocess
-
-    captured: dict[str, object] = {}
-
-    def fake_run(cmd, capture_output=False):
-        captured["cmd"] = cmd
-        captured["capture_output"] = capture_output
-        return SimpleNamespace(returncode=0)
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    result = CliRunner().invoke(app, ["auto-retrain", "--dry-run"])
-
-    assert result.exit_code == 0
-    cmd = captured["cmd"]
-    assert Path(cmd[1]).is_absolute()
-    assert Path(cmd[1]).name == "auto_retrain_trigger.py"
-    assert Path(cmd[1]).parent.name == "scripts"
-    assert "--dry-run" in cmd

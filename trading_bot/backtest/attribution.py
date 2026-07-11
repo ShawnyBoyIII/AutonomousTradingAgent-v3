@@ -32,7 +32,7 @@ def run_attribution(
     """Run comprehensive post-backtest attribution analysis.
 
     Args:
-        backtest_result: Output from run_backtest() or run_rl_backtest().
+        backtest_result: Output from run_backtest().
         market_data: Optional dict of symbol -> DataFrame for regime analysis.
         benchmark_symbol: Benchmark ticker for beta calculation.
         benchmark_data: Optional benchmark DataFrame for beta calculation.

@@ -225,34 +225,8 @@ def discover_training_symbols(db_path: str, burn_in_stats: dict) -> list[str]:
 
 
 def evaluate_existing_models(rl_dir: str, max_drawdown_pct: float, min_trades: int) -> list[dict]:
-    """Evaluate existing RL models and filter by performance."""
-    from trading_bot.rl.ensemble import discover_rl_models, rl_model_symbols
-
-    model_paths = discover_rl_models(rl_dir)
-    evaluated = []
-
-    for path_str in model_paths:
-        path = Path(path_str)
-        try:
-            symbols = rl_model_symbols(path) or []
-            meta_path = path.with_suffix(".json")
-            if meta_path.exists():
-                meta = json.loads(meta_path.read_text())
-            else:
-                meta = {"symbols": symbols, "agent": "PPO", "seed": None}
-
-            evaluated.append({
-                "path": str(path),
-                "symbols": symbols,
-                "agent": meta.get("agent", "PPO"),
-                "seed": meta.get("seed"),
-                "name": path.name,
-                "age_days": (datetime.now() - datetime.fromtimestamp(path.stat().st_mtime)).days,
-            })
-        except Exception as e:
-            logger.warning(f"Failed to evaluate {path}: {e}")
-
-    return evaluated
+    """No-op: RL model evaluation was removed with the RL teardown."""
+    return []
 
 
 def train_supermodel(
@@ -264,7 +238,13 @@ def train_supermodel(
     replay_entries: list[dict] | None = None,
     replay_weight: float = 0.3,
 ) -> dict:
-    """Train a new supermodel on the given symbols."""
+    """No-op after the RL teardown.
+
+    The RL supermodel training pipeline was removed; the rest of the
+    burn-in plumbing still calls this function for symmetry with the
+    historical 5-step pipeline. We keep the same return shape so the
+    caller in :func:`main` can write the pipeline result without changes.
+    """
     if dry_run:
         logger.info(f"[DRY RUN] Would train supermodel on: {', '.join(symbols)}")
         logger.info(f"[DRY RUN] Epochs: {epochs}, Timesteps: {timesteps}")
@@ -279,135 +259,57 @@ def train_supermodel(
             "replay_weight": replay_weight,
         }
 
-    from trading_bot.rl.agent import RLAgent, RLAgentConfig
-    from trading_bot.rl.env import TradingConfig
-    from trading_bot.rl.trainer import TrainingConfig as RLTrainingConfig
-
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    env_config = TradingConfig(
-        symbols=symbols,
-        bar_period="1y",
-        bar_interval="1d",
-        observer_window=10,
-        starting_cash=100_000.0,
-        fee_per_order=1.0,
-        slippage_bps=5,
-        max_positions=10,
-        max_episode_steps=500,
+    # Long-term data store inventory (per docs/EOD_DATA_FEATURE.md).
+    # Surface the data-store status so operators see whether the nightly EOD
+    # fetch is keeping up with the universe.
+    try:
+        from trading_bot.config.loader import load_settings
+        from trading_bot.data.data_store import DataStoreManifest
+
+        loaded = load_settings(Path(args.db_path) if hasattr(args, "db_path") else None)
+        store_cfg = loaded.eod_data_store
+        if store_cfg.enabled:
+            manifest = DataStoreManifest(db_path=Path(store_cfg.manifest_db))
+            coverage = []
+            for symbol in symbols[:10]:
+                last_d = manifest.last_fetched(symbol, "1d")
+                if last_d:
+                    coverage.append(f"{symbol}={last_d.isoformat()}")
+            if coverage:
+                logger.info(
+                    "EOD data store coverage (1d bars, top %d): %s",
+                    len(coverage), ", ".join(coverage),
+                )
+            else:
+                logger.info(
+                    "EOD data store: no 1d bars yet for training symbols — run "
+                    "`./tradebot-local eod-fetch` after market close"
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("EOD data store inventory failed (non-fatal): %s", exc)
+
+    logger.info(
+        "Supermodel training skipped — RL subsystem was removed in the 2026-07-10 teardown. "
+        "This script now only logs EOD data-store coverage."
     )
-
-    training_config = RLTrainingConfig(
-        env_config=env_config,
-        model_type="PPO",
-        total_timesteps=timesteps,
-        learning_rate=3e-4,
-        n_epochs=10,
-        batch_size=64,
-        n_steps=128,
-        gamma=0.995,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.05,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        verbose=1,
-        seed=None,
-        log_dir=str(output_path),
-        eval_freq=5000,
-        checkpoint_freq=10000,
-    )
-
-    agent_config = RLAgentConfig(
-        enabled=True,
-        env_config=env_config,
-        training=training_config,
-        prediction_mode="deterministic",
-    )
-
-    agent = RLAgent(config=agent_config)
-
-    # Replay buffer analysis
-    replay_info = {}
-    if replay_entries:
-        stats = replay_buffer_stats(replay_entries)
-        replay_info = stats
-        logger.info(f"Replay buffer: {stats['count']} trades across {stats['unique_tickers']} tickers")
-        logger.info(f"  Win rate: {stats['win_rate']:.1f}%, Total PnL: ${stats['total_pnl']:,.2f}")
-        logger.info(f"  Tickers: {', '.join(stats['tickers'][:10])}")
-        logger.info(f"  Replay weight: {replay_weight:.0%} of training data")
-
-    logger.info(f"Training supermodel on {', '.join(symbols)}...")
-    
-    trainer = agent.train()
-    
-    if replay_entries:
-        logger.info(f"Replay buffer data available: {len(replay_entries)} entries")
-        logger.info(f"Training will use experience replay with weight {replay_weight:.0%}")
-
-    model_path = output_path / "PPO_supermodel_final"
-    agent.save(model_path)
-
-    # Save metadata
-    meta = {
-        "symbols": symbols,
-        "agent": "PPO",
-        "max_symbols": len(symbols),
-        "seed": None,
-        "reward_scheme": env_config.reward_scheme,
-        "trained_at": datetime.now().isoformat(),
-        "epochs": epochs,
-        "timesteps": timesteps,
-    }
-    meta_path = output_path / "PPO_supermodel_final_meta.json"
-    meta_path.write_text(json.dumps(meta, indent=2))
-
-    logger.info(f"Supermodel saved to: {model_path}")
-    logger.info(f"Metadata saved to: {meta_path}")
 
     return {
-        "status": "trained",
-        "path": str(model_path),
+        "status": "skipped",
         "symbols": symbols,
         "epochs": epochs,
         "timesteps": timesteps,
-        "replay_buffer": replay_info,
+        "replay_buffer": {},
         "replay_weight": replay_weight,
     }
 
 
 def build_ensemble(rl_dir: str, output_dir: str) -> list[str]:
-    """Build an ensemble of the best performing models."""
-    from trading_bot.rl.ensemble import RLEnsemble, discover_rl_models
-
-    model_paths = discover_rl_models(rl_dir)
-
-    # Filter to include supermodel if it exists
-    supermodel_path = Path(output_dir) / "PPO_supermodel_final"
-    if supermodel_path.exists():
-        model_paths.insert(0, str(supermodel_path))
-
-    if not model_paths:
-        logger.warning("No models found for ensemble")
-        return []
-
-    logger.info(f"Building ensemble with {len(model_paths)} models...")
-
-    ensemble = RLEnsemble(model_paths)
-    loaded = ensemble.load()
-
-    # Save ensemble manifest
-    manifest = {
-        "models": loaded,
-        "model_count": len(loaded),
-        "built_at": datetime.now().isoformat(),
-    }
-    manifest_path = Path(output_dir) / "ensemble_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-
-    logger.info(f"Ensemble built: {loaded}")
-    return loaded
+    """No-op after the RL teardown: returns an empty model list."""
+    logger.info("Ensemble building skipped — RL subsystem was removed in the 2026-07-10 teardown.")
+    return []
 
 
 def main() -> int:

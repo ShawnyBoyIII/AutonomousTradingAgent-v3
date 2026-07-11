@@ -123,12 +123,27 @@ Expected: `doctor live_trading=false provider=alpaca provider_auth=ok`
 ```
 
 ### Live Dashboard
+
+Two dashboards are available — pick one:
+
+**A. Rich UI (recommended for desk monitoring)** — Bloomberg-style interface with
+real-time SSE updates, sparkline, kill-switch lever, and bento layout:
+
 ```bash
-# Serve a live, auto-refreshing dashboard
+./scripts/start-dashboard.sh
+# → open http://127.0.0.1:8080
+```
+
+See **[`ui/dashboard/README.md`](ui/dashboard/README.md)** for the full guide.
+
+**B. CLI snapshot dashboard** — simpler, built into the CLI:
+
+```bash
 ./tradebot-local serve
 # → open http://127.0.0.1:8000
 ```
-Shows: equity, positions, P&L, kill-switch status, live decision feed, recent exits. Auto-refreshes every 5 seconds.
+
+Both bind to localhost only (127.0.0.1) and never expose authentication.
 
 ---
 
@@ -156,7 +171,12 @@ This will:
 ### Monitor Burn-In
 
 ```bash
-# Live dashboard (recommended)
+# Rich UI dashboard (recommended)
+./scripts/start-dashboard.sh --config burn-in-config.yaml
+# → open http://127.0.0.1:8080
+# See ui/dashboard/README.md for full guide
+
+# Simpler CLI dashboard (alternative)
 ./tradebot-local serve
 # → open http://127.0.0.1:8000
 
@@ -247,14 +267,6 @@ open state/dashboard.html  # macOS
 ```bash
 # Run backtest on date range
 ./tradebot-local backtest --symbols AAPL --start 2025-01-01 --end 2025-06-01
-
-# Check active RL model coverage
-./tradebot-local rl-model-info
-./tradebot-local rl-scan-plan
-
-# Apples-to-apples RL comparison
-./tradebot-local rl-benchmark --symbol AAPL --start 2025-01-01 --end 2025-06-01
-./tradebot-local rl-benchmark --symbols AAPL,MSFT --start 2025-01-01 --end 2025-06-01
 ```
 
 ---

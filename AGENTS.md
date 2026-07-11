@@ -55,7 +55,7 @@ Never use bare `tradebot` on PATH — it may resolve to a stale global install.
 **Target**: Profit factor > 1.3 over 100 closed trades on paper with $100K starting capital.
 
 - Burn-in runs daily via `./scripts/auto-burn-in.sh`
-- Parallel signal mode is V3 + V2.5 consensus; RL is not in the active burn-in vote path. The swarm engine is no longer in the automated scan/vote path — it remains as a manual/advisory tool (`./tradebot-local swarm`) only.
+- Parallel signal mode is V3 + V2.5 consensus. The swarm engine is no longer in the automated scan/vote path — it remains as a manual/advisory tool (`./tradebot-local swarm`) only.
 - 5% minimum stop distance on 5-minute bars (intraday noise protection)
 - 15% max per ticker in burn-in (`burn-in-config.yaml`), 20% in default config
 - Confidence gates are advisory at PF < 0.8 after 50+ trades (logs alert, does not halt)
@@ -172,10 +172,6 @@ Cross-table reporting reads both `orders` and `trades` tables separately.
 
 # Dashboard
 ./tradebot-local --config-path burn-in-config.yaml serve --port 8000
-
-# RL (research lane, disabled in burn-in)
-./tradebot-local rl-model-info
-./tradebot-local rl-benchmark --symbol AAPL --start 2025-01-01 --end 2025-06-01
 
 # V3: Robinhood MCP (read-only)
 ./tradebot-local robinhood-status

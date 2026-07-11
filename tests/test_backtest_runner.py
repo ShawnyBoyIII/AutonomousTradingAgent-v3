@@ -5,7 +5,7 @@ import types
 
 from trading_bot.config.settings import Settings, StrategySettings
 from trading_bot.backtest.metrics import compute_win_rate
-from trading_bot.backtest.runner import _filter_frame_by_date, _run_symbol_backtest, iterate_bars, run_backtest, run_rl_backtest, run_rl_walk_forward, run_walk_forward
+from trading_bot.backtest.runner import _filter_frame_by_date, _run_symbol_backtest, iterate_bars, run_backtest, run_walk_forward
 
 
 def test_iterate_bars_yields_chronological_slices() -> None:
@@ -63,107 +63,6 @@ def test_filter_frame_by_date_handles_mixed_offset_timestamps() -> None:
     filtered = _filter_frame_by_date(frame, start="2026-11-02", end="2026-11-05")
 
     assert list(filtered["close"]) == [2.0]
-
-
-def test_run_rl_backtest_single_symbol_aggregates_results(monkeypatch, tmp_path) -> None:
-    """run_rl_backtest calls RLBacktestRunner.run_backtest and aggregates its output."""
-    import trading_bot.data.market_data as market_data
-    from trading_bot.rl.backtest import RLBacktestRunner
-
-    daily = pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2026-01-01", periods=20, freq="D"),
-            "open": [100.0] * 20,
-            "high": [101.0] * 20,
-            "low": [99.0] * 20,
-            "close": [100.0 + i for i in range(20)],
-            "volume": [1000] * 20,
-        }
-    )
-
-    monkeypatch.setattr(
-        market_data,
-        "fetch_bars",
-        lambda symbol, period, interval, **kwargs: daily.copy(deep=True),
-    )
-
-    def fake_run_backtest(self, *args, **kwargs):
-        return {"trades": 1, "wins": 1, "losses": 0, "net_pnl": 1500.0}
-
-    monkeypatch.setattr(RLBacktestRunner, "run_backtest", fake_run_backtest)
-
-    class FakeModel:
-        def predict(self, obs, deterministic=True):
-            return 0, None
-
-    monkeypatch.setitem(
-        sys.modules,
-        "stable_baselines3",
-        types.SimpleNamespace(PPO=types.SimpleNamespace(load=lambda path: FakeModel())),
-    )
-
-    settings = Settings()
-    settings.rl.agent_type = "PPO"
-    model_path = tmp_path / "ppo.zip"
-    model_path.write_bytes(b"")
-
-    result = run_rl_backtest(["AAPL"], settings, model_path=str(model_path))
-
-    assert result["trades"] == 1
-    assert result["wins"] == 1
-    assert result["losses"] == 0
-    assert result["net_pnl"] == 1500.0
-
-
-def test_run_rl_backtest_single_symbol_returns_zero_when_no_trades(
-    monkeypatch, tmp_path,
-) -> None:
-    """run_rl_backtest returns zeroes when the runner produces no trades."""
-    import trading_bot.data.market_data as market_data
-    from trading_bot.rl.backtest import RLBacktestRunner
-
-    daily = pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2026-01-01", periods=20, freq="D"),
-            "open": [100.0] * 20,
-            "high": [101.0] * 20,
-            "low": [99.0] * 20,
-            "close": [100.0 + i for i in range(20)],
-            "volume": [1000] * 20,
-        }
-    )
-
-    monkeypatch.setattr(
-        market_data,
-        "fetch_bars",
-        lambda symbol, period, interval, **kwargs: daily.copy(deep=True),
-    )
-
-    def fake_run_backtest(self, *args, **kwargs):
-        return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
-
-    monkeypatch.setattr(RLBacktestRunner, "run_backtest", fake_run_backtest)
-
-    class FakeModel:
-        def predict(self, obs, deterministic=True):
-            return 0, None
-
-    monkeypatch.setitem(
-        sys.modules,
-        "stable_baselines3",
-        types.SimpleNamespace(PPO=types.SimpleNamespace(load=lambda path: FakeModel())),
-    )
-
-    settings = Settings()
-    settings.rl.agent_type = "PPO"
-    model_path = tmp_path / "ppo.zip"
-    model_path.write_bytes(b"")
-
-    result = run_rl_backtest(["AAPL"], settings, model_path=str(model_path))
-
-    assert result["trades"] == 0
-    assert result["net_pnl"] == 0.0
-    assert result["win_rate"] == 0.0
 
 
 def test_run_symbol_backtest_counts_stop_hit_as_loss_even_if_final_close_recovers() -> None:
@@ -667,35 +566,6 @@ def test_run_walk_forward_aggregates_across_windows(monkeypatch) -> None:
     assert result["windows"][0]["window"] == 1
     assert result["windows"][1]["window"] == 2
     assert result["windows"][2]["window"] == 3
-
-
-def test_run_rl_walk_forward_aggregates_strategy_windows(monkeypatch) -> None:
-    def fake_compare(symbols, settings, start=None, end=None, strategies=None, model_path=None):
-        return {
-            "results": {
-                "v2.5": {"trades": 1, "wins": 1, "losses": 0, "win_rate": 1.0, "net_pnl": 10.0},
-                "v3": {"trades": 2, "wins": 1, "losses": 1, "win_rate": 0.5, "net_pnl": 5.0},
-                "rl": {"trades": 3, "wins": 2, "losses": 1, "win_rate": 2/3, "net_pnl": 7.5},
-            },
-            "best_pnl_strategy": "v2.5",
-            "best_winrate_strategy": "v2.5",
-        }
-
-    monkeypatch.setattr("trading_bot.backtest.runner.run_strategy_comparison", fake_compare)
-
-    result = run_rl_walk_forward(
-        ["AAPL"],
-        Settings(),
-        start="2026-01-01",
-        end="2026-03-31",
-        windows=3,
-        model_path="state/rl_logs/PPO_final.zip",
-    )
-
-    assert len(result["windows"]) == 3
-    assert result["results"]["v2.5"]["trades"] == 3
-    assert result["results"]["v3"]["trades"] == 6
-    assert result["results"]["rl"]["trades"] == 9
 
 
 def test_run_backtest_passes_market_data_settings_to_fetches(monkeypatch) -> None:

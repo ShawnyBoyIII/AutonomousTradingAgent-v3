@@ -58,9 +58,6 @@ tail -f logs/burn_in/decision-log.jsonl # Live decision feed
 | `paper-trade --symbols AAPL` | Execute paper trades |
 | `manage-positions` | Check stops/targets/EOD |
 | `backtest --symbols AAPL --start YYYY-MM-DD --end YYYY-MM-DD` | Replay one strategy |
-| `rl-model-info` / `rl-scan-plan` | Show RL model coverage and safe scan command |
-| `rl-benchmark --symbol AAPL --start YYYY-MM-DD --end YYYY-MM-DD` | Compare V2.5 vs V3 vs RL |
-| `rl-benchmark --symbols AAPL,MSFT --start YYYY-MM-DD --end YYYY-MM-DD` | Compare multi-symbol RL models |
 | `portfolio` | View holdings + P&L |
 | `performance --daily` | Performance metrics |
 | `health` | System status |

@@ -411,7 +411,7 @@ def backtest(
     strategy: str = typer.Option(
         None,
         "--strategy",
-        help="Strategy to use: v2.5, v3, or rl.",
+        help="Strategy to use: v2.5 or v3.",
     ),
     compare: bool = typer.Option(
         False,
@@ -425,7 +425,7 @@ def backtest(
     and run an independent backtest on each. Consistent performance across
     all windows = robust strategy. High variance = fragile / overfit.
 
-    Use --strategy to select v2.5, v3, or rl. Use --compare to run all
+    Use --strategy to select v2.5 or v3. Use --compare to run all
     available strategies and show a side-by-side comparison.
     """
     parsed_symbols = _parse_symbols(symbols)
@@ -451,12 +451,7 @@ def backtest(
     elif compare:
         from trading_bot.backtest.runner import run_strategy_comparison
         strategies = ["v2.5", "v3"]
-        model_path = None
-        configured_model = getattr(ctx.obj.rl, "model_path", None)
-        if ctx.obj.rl.enabled and configured_model and Path(configured_model).exists():
-            strategies.append("rl")
-            model_path = configured_model
-        comparison = run_strategy_comparison(parsed_symbols, ctx.obj, start=start, end=end, strategies=strategies, model_path=model_path)
+        comparison = run_strategy_comparison(parsed_symbols, ctx.obj, start=start, end=end, strategies=strategies)
         typer.echo("STRATEGY COMPARISON")
         typer.echo("=" * 60)
         for strat, result in comparison["results"].items():
@@ -467,12 +462,8 @@ def backtest(
         typer.echo(f"\nBest P&L: {comparison['best_pnl_strategy']}")
         typer.echo(f"Best Win Rate: {comparison['best_winrate_strategy']}")
     elif strategy:
-        if strategy == "rl":
-            from trading_bot.backtest.runner import run_rl_backtest
-            summary = run_rl_backtest(parsed_symbols, ctx.obj, start=start, end=end)
-        else:
-            from trading_bot.backtest.runner import run_backtest
-            summary = run_backtest(parsed_symbols, ctx.obj, start=start, end=end)
+        from trading_bot.backtest.runner import run_backtest
+        summary = run_backtest(parsed_symbols, ctx.obj, start=start, end=end)
         typer.echo(
             " ".join(
                 [
@@ -1586,63 +1577,9 @@ def _format_backtest_diagnostics(result: dict) -> str:
 
 
 def _format_paper_confidence_gate(result: dict, starting_cash: float = 10_000.0) -> str:
-    rl = result.get("results", {}).get("rl", {})
-    windows = result.get("windows", [])
-    window_count = len(windows)
-    positive_windows = sum(
-        1
-        for window in windows
-        if window.get("results", {}).get("rl", {}).get("net_pnl", 0.0) > 0
-    )
-    required_positive = max(1, math.ceil(window_count * 0.6)) if window_count else 1
-    pnl_target = starting_cash * 0.05
-    checks = {
-        "trades>=10": int(rl.get("trades", 0)) >= 10,
-        f"net_pnl>={pnl_target:.0f}": float(rl.get("net_pnl", 0.0)) >= pnl_target,
-        "profit_factor>=1.20": float(rl.get("profit_factor", 0.0)) >= 1.20,
-        "positive_windows>=60pct": positive_windows >= required_positive,
-    }
-    verdict = "PASS" if all(checks.values()) else "FAIL"
-    failed = [name for name, passed in checks.items() if not passed]
-    suffix = "" if not failed else f" failed={','.join(failed)}"
-    return (
-        f"PAPER CONFIDENCE: {verdict} "
-        f"rl_trades={int(rl.get('trades', 0))} "
-        f"rl_net_pnl=${float(rl.get('net_pnl', 0.0)):.2f} "
-        f"rl_profit_factor={float(rl.get('profit_factor', 0.0)):.2f} "
-        f"positive_windows={positive_windows}/{window_count}{suffix}"
-    )
-
-
-def _load_rl_model_meta(path: Path) -> tuple[Path, dict[str, object], list[str]]:
-    meta_path = rl_model_meta_path(path)
-    meta: dict[str, object] = {}
-    if meta_path.exists():
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    symbols = [str(value).upper() for value in meta.get("symbols", [])]
-    return meta_path, meta, symbols
-
-
-def _resolve_rl_symbols(raw_symbols: str | None, fallback_symbol: str) -> list[str]:
-    parsed = _parse_symbols([raw_symbols or fallback_symbol])
-    if not parsed:
-        return [fallback_symbol.upper().strip()]
-    return [symbol.upper().strip() for symbol in parsed]
-
-
-def _validate_rl_model_symbols(path: Path, requested_symbols: list[str]) -> list[str]:
-    model_symbols = rl_model_symbols(path)
-    if not model_symbols:
-        typer.echo(f"RL model metadata missing or empty: {rl_model_meta_path(path)}")
-        raise typer.Exit(code=1)
-    missing = [symbol for symbol in requested_symbols if symbol not in model_symbols]
-    if missing:
-        typer.echo(
-            f"RL model not trained for {','.join(missing)} "
-            f"(trained_symbols={','.join(model_symbols)})"
-        )
-        raise typer.Exit(code=1)
-    return model_symbols
+    """Stub kept for backward import compatibility; the RL-driven paper
+    confidence gate was removed with the RL teardown."""
+    return "PAPER CONFIDENCE: n/a (RL teardown)"
 
 
 def _build_universe_file(settings) -> dict[str, object]:
@@ -2054,16 +1991,6 @@ def _format_scan_summary(summary: dict[str, object]) -> str:
         f"no_signal={summary['no_signal']}",
         f"errors={summary['errors']}",
     ]
-    if "rl_buy" in summary:
-        parts.extend(
-            [
-                f"rl_buy={summary['rl_buy']}",
-                f"rl_hold={summary['rl_hold']}",
-                f"rl_sell={summary['rl_sell']}",
-                f"rl_unsupported={summary.get('rl_unsupported', 0)}",
-                f"rl_avg_conf={summary.get('rl_avg_confidence', 0.0)}",
-            ]
-        )
     if "supermodel_support" in summary:
         parts.extend(
             [
@@ -3157,20 +3084,6 @@ def db_history(
     finally:
         if engine:
             engine.dispose()
-
-
-def _scan_row_supermodel(row) -> tuple[str | None, float | None]:
-    details = _scan_row_details(row)
-    if not details:
-        return None, None
-    decision = details.get("supermodel_decision")
-    if not decision:
-        return None, None
-    try:
-        score = float(details.get("supermodel_score"))
-    except (TypeError, ValueError):
-        score = None
-    return str(decision), score
 
 
 def _scan_row_reasons(row) -> list[str]:
@@ -4388,84 +4301,6 @@ def bench_weights(
 
     if json_output and action not in ("show",):
         typer.echo(json_module.dumps(results, default=str, indent=2))
-
-
-def live_data(
-    ctx: typer.Context,
-    watch: bool = typer.Option(
-        False,
-        "--watch",
-        help="Continuously monitor for new trades",
-    ),
-    buffer: bool = typer.Option(
-        False,
-        "--buffer",
-        help="Show current replay buffer statistics",
-    ),
-    db_path: str = typer.Option(
-        "state/burn_in.db",
-        "--db-path",
-        help="Path to burn-in database (default: state/burn_in.db).",
-    ),
-    buffer_path: str = typer.Option(
-        "state/rl_logs/replay_buffer.jsonl",
-        "--buffer-path",
-        help="Path to replay buffer file (default: state/rl_logs/replay_buffer.jsonl).",
-    ),
-    interval: int = typer.Option(
-        300,
-        "--interval",
-        help="Watch interval in seconds (default: 300).",
-    ),
-) -> None:
-    """Collect live trade data for continual RL model training.
-
-    Monitors burn-in trades and collects market data + outcomes to build
-    a replay buffer for continual learning.
-
-    Modes:
-      - Default: Collect new trades once
-      - --watch: Continuously monitor for new trades
-      - --buffer: Show replay buffer statistics
-    """
-    import subprocess
-    import sys
-
-    try:
-        script_path = _repo_script_path("live_data_collector.py")
-    except FileNotFoundError as exc:
-        typer.echo(f"Live data collector script not found: {exc}")
-        raise typer.Exit(code=1)
-
-    cmd = [
-        sys.executable,
-        str(script_path),
-        "--db-path", db_path,
-        "--buffer-path", buffer_path,
-    ]
-
-    if watch:
-        cmd.append("--watch")
-        cmd.extend(["--interval", str(interval)])
-    elif buffer:
-        cmd.append("--buffer")
-
-    typer.echo("LIVE DATA COLLECTOR")
-    typer.echo("=" * 60)
-    typer.echo(f"  DB: {db_path}")
-    typer.echo(f"  Buffer: {buffer_path}")
-    if watch:
-        typer.echo(f"  Mode: WATCH (interval={interval}s)")
-    elif buffer:
-        typer.echo("  Mode: BUFFER STATS")
-    else:
-        typer.echo("  Mode: COLLECT ONCE")
-    typer.echo("")
-
-    result = subprocess.run(cmd, capture_output=False)
-
-    if result.returncode != 0:
-        raise typer.Exit(code=result.returncode)
 
 
 @app.command(name="cache-data")
