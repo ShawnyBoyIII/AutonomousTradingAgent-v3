@@ -24,8 +24,9 @@ def run_health_checks(
 ) -> HealthReport:
     """Run all burn-in checks; never raises. Failures degrade to FAIL."""
     now = now_utc or datetime.now(timezone.utc)
-    pid_file = state_dir / "burn_in.pid"
-    heartbeat = state_dir / "heartbeat.json"
+    health_state_dir = state_dir / "burn_in"
+    pid_file = health_state_dir / "burn_in.pid"
+    heartbeat = health_state_dir / "heartbeat.json"
 
     results: list[CheckResult] = []
     results.append(check_pid_alive(pid_file))

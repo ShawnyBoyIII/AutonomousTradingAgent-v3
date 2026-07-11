@@ -37,10 +37,10 @@ def test_runner_all_pass(tmp_path: Path):
     db = tmp_path / "b.db"
     _seed_empty(db)
     state_dir = tmp_path / "state"
-    state_dir.mkdir()
-    (state_dir / "burn_in.pid").write_text(str(os.getpid()))  # self
+    (state_dir / "burn_in").mkdir(parents=True)
+    (state_dir / "burn_in" / "burn_in.pid").write_text(str(os.getpid()))  # self
     h = {"ts": datetime.now(timezone.utc).isoformat(), "cycle": 1, "fills": 0, "exits": 0, "rejects": 0}
-    (state_dir / "heartbeat.json").write_text(json.dumps(h))
+    (state_dir / "burn_in" / "heartbeat.json").write_text(json.dumps(h))
     report = run_health_checks(
         state_dir=state_dir,
         db_path=db,
@@ -59,11 +59,11 @@ def test_runner_one_warn(tmp_path: Path):
     db = tmp_path / "b.db"
     _seed_empty(db)
     state_dir = tmp_path / "state"
-    state_dir.mkdir()
-    (state_dir / "burn_in.pid").write_text("1")  # PID 1 always alive
+    (state_dir / "burn_in").mkdir(parents=True)
+    (state_dir / "burn_in" / "burn_in.pid").write_text("1")  # PID 1 always alive
     # Stale heartbeat to force a WARN
     old_iso = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
-    (state_dir / "heartbeat.json").write_text(json.dumps({"ts": old_iso, "cycle": 1}))
+    (state_dir / "burn_in" / "heartbeat.json").write_text(json.dumps({"ts": old_iso, "cycle": 1}))
     report = run_health_checks(
         state_dir=state_dir,
         db_path=db,
@@ -78,7 +78,7 @@ def test_runner_with_missing_pid_file(tmp_path: Path):
     db = tmp_path / "b.db"
     _seed_empty(db)
     state_dir = tmp_path / "state"
-    state_dir.mkdir()
+    (state_dir / "burn_in").mkdir(parents=True)
     report = run_health_checks(
         state_dir=state_dir,
         db_path=db,
