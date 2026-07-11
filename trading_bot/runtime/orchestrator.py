@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 import json
 import math
@@ -30,7 +31,6 @@ from trading_bot.strategy.signal_quality import (
     evaluate_signal_quality,
 )
 from trading_bot.strategy.supermodel import build_stacked_signal
-from trading_bot.rl.utils import rl_model_meta_path, rl_model_symbols
 
 logger = logging.getLogger(__name__)
 
@@ -162,10 +162,16 @@ def run_scan(
     open_tickers = set(state.positions)
     correlation_history_cache: dict[str, list[float]] = {}
     log_path = Path(settings.app.log_dir) / "decision-log.jsonl"
-    rl_action_counts = {"hold": 0, "buy": 0, "sell": 0}
-    rl_confidence_total = 0.0
-    rl_confidence_count = 0
-    rl_unsupported = 0
+
+    # Wall-clock deadline to prevent a single hung provider from blocking
+    # the burn-in's main loop (2026-07-09 incident: 7+ hour hang at scan).
+    # Note: deadline is a soft cap — the *current* symbol's call is allowed
+    # to complete, but the next iteration will be skipped.  This avoids
+    # the awkward case of mid-call interruption.
+    _scan_t0 = time.monotonic()
+    _scan_deadline_seconds = float(settings.market_data.scan_deadline_minutes) * 60.0
+    _deadline_exceeded = False
+    _deadline_skipped_symbols: list[str] = []
 
     # V2.5: Calculate portfolio heat before scanning
     portfolio_heat = _calculate_portfolio_heat(state, settings)
@@ -211,18 +217,30 @@ def run_scan(
         }
 
 
-    for symbol in (value.strip() for value in symbols if value.strip()):
+    pending_symbols = [value.strip() for value in symbols if value.strip()]
+    while pending_symbols:
+        if time.monotonic() - _scan_t0 > _scan_deadline_seconds:
+            _deadline_exceeded = True
+            _deadline_skipped_symbols = list(pending_symbols)
+            append_decision_event(
+                log_path,
+                {
+                    "command": "scan",
+                    "status": "DEADLINE_EXCEEDED",
+                    "deadline_minutes": settings.market_data.scan_deadline_minutes,
+                    "elapsed_seconds": round(time.monotonic() - _scan_t0, 1),
+                    "skipped_symbols": _deadline_skipped_symbols,
+                },
+            )
+            other_results.append(
+                f"SCAN_DEADLINE_EXCEEDED after {time.monotonic() - _scan_t0:.1f}s; "
+                f"skipped {len(_deadline_skipped_symbols)} symbols: "
+                f"{', '.join(_deadline_skipped_symbols)}",
+            )
+            break
+        symbol = pending_symbols.pop(0)
         try:
             signal, no_signal_reason, details = _build_signal_result(symbol, settings)
-            rl_action = details.get("rl_action")
-            if rl_action in (0, 1, 2):
-                rl_action_counts[{0: "hold", 1: "buy", 2: "sell"}[int(rl_action)]] += 1
-                confidence = _finite_float(details.get("rl_confidence"))
-                if confidence is not None:
-                    rl_confidence_total += confidence
-                    rl_confidence_count += 1
-            elif "rl_trained_symbols" in details:
-                rl_unsupported += 1
             counter_result = _evaluate_counter_thesis_for_signal(symbol, signal, settings)
             if counter_result is not None:
                 _augment_details_with_counter_thesis(details, counter_result)
@@ -416,6 +434,7 @@ def run_scan(
     approved_results.sort(key=lambda item: _scan_row_sort_key(item[0]), reverse=True)
     candidate_rows.sort(key=_scan_row_sort_key, reverse=True)
     lines = [value for _, value in approved_results] + other_results
+    _elapsed = time.monotonic() - _scan_t0
     summary = {
         "symbols": len([value for value in symbols if value.strip()]),
         "approved": sum(1 for row in candidate_rows if row["status"] == "APPROVED"),
@@ -424,22 +443,13 @@ def run_scan(
         "rejected": sum(1 for row in candidate_rows if row["status"] == "REJECTED"),
         "no_signal": sum(1 for row in candidate_rows if row["status"] == "NO_SIGNAL"),
         "errors": sum(1 for row in candidate_rows if row["status"] == "ERROR"),
+        "elapsed_seconds": round(_elapsed, 1),
+        "deadline_minutes": settings.market_data.scan_deadline_minutes,
+        "deadline_exceeded": _deadline_exceeded,
+        "deadline_skipped_count": len(_deadline_skipped_symbols),
+        "deadline_skipped_symbols": _deadline_skipped_symbols,
     }
-    if getattr(settings, "rl", None) is not None and settings.rl.enabled:
-        summary.update(
-            {
-                "rl_buy": rl_action_counts["buy"],
-                "rl_hold": rl_action_counts["hold"],
-                "rl_sell": rl_action_counts["sell"],
-                "rl_unsupported": rl_unsupported,
-                "rl_avg_confidence": round(
-                    rl_confidence_total / rl_confidence_count,
-                    2,
-                )
-                if rl_confidence_count
-                else 0.0,
-            }
-        )
+    
     supermodel_decisions = [row["supermodel_decision"] for row in candidate_rows if row.get("supermodel_decision")]
     if supermodel_decisions:
         summary.update(
@@ -589,7 +599,12 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                         **_paper_evidence_fields(details),
                     },
                 )
-                results.append(f"{symbol} NO_SIGNAL")
+                # A3 (2026-07-08): include the upstream reject reason so the
+                # bash wrapper (auto-burn-in.sh) can label NO_SIGNAL events
+                # correctly instead of hardcoding "stale data".
+                results.append(
+                    f"{symbol} NO_SIGNAL reason={no_signal_reason or 'no signal'}"
+                )
                 continue
 
             counter_result = _evaluate_counter_thesis_for_signal(symbol, signal, settings)
@@ -961,7 +976,14 @@ def _apply_phase1_signal_quality(
     )
     details.update(verdict.to_details())
     if not verdict.passed:
-        return None, f"signal quality rejected: {verdict.reason}", details
+        # AGGRESSIVE 2026-07-08 (B1): do NOT kill the signal here.
+        # Phase-1 quality is now ADVISORY: record pass=false + reason in details
+        # and let downstream gates (counter-thesis, supermodel block, risk
+        # manager, sector concentration) make the actual trade-or-skip decision.
+        # Revert this block to `return None, "signal quality rejected: ..."`,
+        # details` to restore the previous hard-reject behavior.
+        details["signal_quality_passed"] = False
+        details["signal_quality_reason"] = verdict.reason
 
     adapted_signal = adapt_signal_to_volatility_regime(
         signal,
@@ -976,15 +998,6 @@ def _apply_phase1_signal_quality(
 
 
 def _build_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal | None, str, dict]:
-    # RL path: use RL model if enabled AND trained for this symbol.
-    # If RL is enabled but the symbol isn't trained, fall through to V3.
-    if getattr(settings, "rl", None) is not None and settings.rl.enabled:
-        result = _build_rl_signal_result(symbol, settings)
-        if result[0] is not None:
-            return _apply_phase1_to_existing_signal(symbol, result[0], result[1], result[2], settings)
-        if "rl_trained_symbols" not in result[2]:
-            return result
-
     if getattr(settings, "strategy", None) is not None and settings.strategy.use_v3_signals:
         return _build_v3_signal_result(symbol, settings)
 
@@ -1038,313 +1051,6 @@ def _build_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal |
         hourly_frame=hourly_frame,
         settings=settings,
     )
-
-
-def _apply_phase1_to_existing_signal(
-    symbol: str,
-    signal: TradeSignal,
-    reason: str,
-    details: dict,
-    settings: Settings,
-) -> tuple[TradeSignal | None, str, dict]:
-    daily_frame, daily_valid = market_data.fetch_and_validate_bars(
-        symbol,
-        settings.market_data.daily_period,
-        "1d",
-        settings.market_data,
-    )
-    if not daily_valid.valid:
-        return None, f"daily data validation failed: {daily_valid.reason}", details
-
-    intraday_frame, intraday_valid = market_data.fetch_and_validate_bars(
-        symbol,
-        settings.market_data.intraday_period,
-        settings.market_data.intraday_interval,
-        settings.market_data,
-    )
-    if not intraday_valid.valid:
-        return None, f"intraday data validation failed: {intraday_valid.reason}", details
-
-    daily_frame = add_ema(daily_frame, period=20, column_name="ema_20")
-    daily_frame = add_sma(daily_frame, period=50, column_name="sma_50")
-    intraday_frame = _drop_trailing_zero_volume_bars(intraday_frame)
-    intraday_frame = intraday_frame.copy()
-    intraday_frame["volume_avg_5"] = intraday_frame["volume"].rolling(5).mean()
-    intraday_frame = add_atr(intraday_frame, period=settings.risk.atr_period)
-    intraday_frame = add_rsi(intraday_frame, period=14)
-    intraday_frame = add_bollinger_bands(intraday_frame, period=20, std_dev=2.0)
-    intraday_frame = add_vwap(intraday_frame)
-    details.update(_scan_details(daily_frame, intraday_frame))
-    details["quality"] = getattr(signal, "quality", "GREEN")
-    hourly_frame = _fetch_hourly_alignment_frame(symbol, settings)
-    return _apply_phase1_signal_quality(
-        symbol,
-        signal,
-        reason,
-        details,
-        daily_frame=daily_frame,
-        intraday_frame=intraday_frame,
-        hourly_frame=hourly_frame,
-        settings=settings,
-    )
-
-
-def _build_rl_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal | None, str, dict]:
-    """RL-based signal generation using trained DRL agent.
-
-    Loads one or more trained models (via ``model_paths`` or ``model_path``)
-    and uses ensemble prediction when multiple models cover the same symbol.
-    Converts BUY actions to TradeSignal objects with risk management parameters.
-    """
-    from trading_bot.rl.agent import RLAgent
-
-    model_paths = _resolve_rl_model_paths(symbol, settings)
-    if not model_paths:
-        return None, "no RL models configured", {}
-
-    has_meta = any(rl_model_symbols(p) for p in model_paths)
-    if not has_meta:
-        return None, f"RL model metadata missing or empty: {model_paths[0] if model_paths else 'none'}", {}
-
-    # Load matching models and collect predictions
-    predictions: list[dict] = []
-    target_intraday_frame = None
-    rl_trained_symbols: list[str] = []
-    for mp in model_paths:
-        trained_symbols = rl_model_symbols(mp) or []
-        if not trained_symbols:
-            logger.debug("RL model skipped path=%s metadata missing or empty", mp)
-            continue
-        for ts in trained_symbols:
-            if ts not in rl_trained_symbols:
-                rl_trained_symbols.append(ts)
-
-        symbol_upper = symbol.upper().strip()
-        is_trained = symbol_upper in trained_symbols
-        if not is_trained and not getattr(settings.rl, "allow_untrained_symbol_inference", False):
-            logger.debug("RL model skipped path=%s symbol=%s not in metadata", mp, symbol_upper)
-            continue
-
-        try:
-            agent = RLAgent.load(model_path=mp)
-        except Exception as e:
-            logger.debug("RL model load failed path=%s error=%s", mp, e)
-            continue
-
-        symbols_for_inference = list(trained_symbols)
-        if not is_trained:
-            symbols_for_inference.append(symbol_upper)
-
-        daily_frames: dict[str, Any] = {}
-        intraday_frames: dict[str, Any] = {}
-        for sym in symbols_for_inference:
-            daily_frame, daily_valid = market_data.fetch_and_validate_bars(
-                sym, settings.market_data.daily_period, "1d", settings.market_data,
-            )
-            if not daily_valid.valid:
-                break
-            intraday_frame, intraday_valid = market_data.fetch_and_validate_bars(
-                sym, settings.market_data.intraday_period,
-                settings.market_data.intraday_interval, settings.market_data,
-            )
-            if not intraday_valid.valid:
-                break
-            daily_frames[sym] = daily_frame
-            intraday_frames[sym] = intraday_frame
-        else:
-            daily_frame = daily_frames[symbol_upper]
-            intraday_frame = intraday_frames[symbol_upper]
-            daily_frame = daily_frame.copy()
-            daily_frame = add_ema(daily_frame, period=20, column_name="ema_20")
-            daily_frame = add_sma(daily_frame, period=50, column_name="sma_50")
-            daily_frame = add_atr(daily_frame, period=settings.risk.atr_period)
-            daily_frame = add_bollinger_bands(daily_frame, period=20)
-            intraday_frame = _drop_trailing_zero_volume_bars(intraday_frame)
-            intraday_frame = intraday_frame.copy()
-            intraday_frame["volume_avg_5"] = intraday_frame["volume"].rolling(5).mean()
-            intraday_frame = add_rsi(intraday_frame, period=14)
-            intraday_frame = add_atr(intraday_frame, period=settings.risk.atr_period)
-            action, confidence = agent.predict_signal(
-                daily_frame=daily_frame,
-                ticker=symbol_upper,
-                portfolio_weight=0.0,
-                unrealized_pnl_pct=0.0,
-                cash_ratio=1.0,
-                symbols=symbols_for_inference,
-                market_frames=daily_frames,
-            )
-            predictions.append({
-                "action": action,
-                "confidence": float(confidence),
-                "is_trained": is_trained,
-                "model": str(mp),
-            })
-            target_intraday_frame = intraday_frame
-            continue
-        # One or more frames failed validation for this model — skip it
-        logger.debug("RL model skipped path=%s data validation failed", mp)
-
-    if not predictions:
-        if rl_trained_symbols:
-            return None, f"RL model not trained for {symbol.upper()}", {
-                "rl_trained_symbols": rl_trained_symbols,
-                "rl_untrained_symbol": True,
-                "rl_models": 0,
-            }
-        return None, "RL agent failed: no models produced valid predictions", {}
-
-    # Ensemble: majority action, average confidence
-    action_votes: dict[int, int] = {}
-    total_conf = 0.0
-    trained_count = 0
-    for p in predictions:
-        act = int(p["action"])
-        action_votes[act] = action_votes.get(act, 0) + 1
-        total_conf += p["confidence"]
-        if p["is_trained"]:
-            trained_count += 1
-    avg_confidence = total_conf / len(predictions)
-    model_count = len(predictions)
-    top_votes = max(action_votes.values())
-    top_actions = sorted(action for action, count in action_votes.items() if count == top_votes)
-    if len(top_actions) > 1:
-        _persist_rl_prediction_to_db(symbol, 0, avg_confidence, settings)
-        return None, f"RL ensemble action tie ({top_actions})", {
-            "rl_action": 0,
-            "rl_confidence": round(avg_confidence, 3),
-            "rl_trained_symbols": rl_trained_symbols,
-            "rl_untrained_symbol": symbol.upper() not in rl_trained_symbols,
-            "rl_models": model_count,
-            "rl_vote_tie": top_actions,
-        }
-    best_action = top_actions[0]
-
-    # Apply untrained penalty. Unknown symbols must clear the normal threshold
-    # after confidence is discounted, not receive an easier threshold.
-    confidence_mult = settings.rl.untrained_confidence_threshold_multiplier if hasattr(settings.rl, 'untrained_confidence_threshold_multiplier') else 0.8
-    effective_confidence = avg_confidence
-    effective_threshold = settings.rl.action_confidence_threshold
-    if trained_count == 0:
-        effective_confidence *= confidence_mult
-
-    if effective_confidence < effective_threshold or best_action != 1:
-        _persist_rl_prediction_to_db(symbol, best_action, avg_confidence, settings)
-        details: dict[str, object] = {
-            "rl_action": best_action,
-            "rl_confidence": round(avg_confidence, 3),
-            "rl_effective_confidence": round(effective_confidence, 3),
-            "rl_trained_symbols": rl_trained_symbols,
-            "rl_untrained_symbol": symbol.upper() not in rl_trained_symbols,
-            "rl_models": model_count,
-        }
-        if best_action == 0:
-            return None, f"RL agent predicts HOLD (confidence={avg_confidence:.2f})", details
-        elif best_action == 2:
-            return None, f"RL agent predicts SELL (confidence={avg_confidence:.2f})", details
-        return None, f"RL confidence {effective_confidence:.2f} below threshold {effective_threshold}", details
-
-    current_price = 0.0
-    if target_intraday_frame is not None and not target_intraday_frame.empty and "close" in target_intraday_frame.columns:
-        current_price = float(target_intraday_frame["close"].iloc[-1])
-    if not math.isfinite(current_price) or current_price <= 0:
-        _persist_rl_prediction_to_db(symbol, best_action, avg_confidence, settings)
-        return None, "RL current price unavailable", {
-            "rl_action": best_action,
-            "rl_confidence": round(avg_confidence, 3),
-            "rl_effective_confidence": round(effective_confidence, 3),
-            "rl_trained_symbols": rl_trained_symbols,
-            "rl_untrained_symbol": symbol.upper() not in rl_trained_symbols,
-            "rl_models": model_count,
-        }
-
-    atr_col = f"atr_{settings.risk.atr_period}"
-    atr = (
-        float(target_intraday_frame[atr_col].iloc[-1])
-        if target_intraday_frame is not None
-        and not target_intraday_frame.empty
-        and atr_col in target_intraday_frame.columns
-        else current_price * 0.02
-    )
-    if not math.isfinite(atr) or atr <= 0:
-        atr = current_price * 0.02
-    stop_distance = atr * settings.risk.atr_multiplier
-    stop_loss = current_price - stop_distance
-    target = current_price + (stop_distance * settings.risk.min_reward_risk_ratio)
-
-    if not trained_count:
-        details = {
-            "rl_action": best_action,
-            "rl_confidence": round(avg_confidence, 3),
-            "rl_effective_confidence": round(effective_confidence, 3),
-            "rl_untrained_symbol": True,
-            "rl_models": model_count,
-        }
-        signal = TradeSignal(
-            ticker=symbol.upper(),
-            timeframe="intraday",
-            action="BUY",
-            entry_price=current_price,
-            stop_loss=stop_loss,
-            profit_target=target,
-            risk_reward_ratio=settings.risk.min_reward_risk_ratio,
-            confidence=effective_confidence,
-            reasons=[f"RL ensemble ({model_count} models)"],
-            strategy_tag=f"rl_{settings.rl.agent_type}",
-            timestamp=datetime.now(timezone.utc),
-        )
-        _persist_rl_prediction_to_db(symbol, best_action, avg_confidence, settings)
-        return signal, "rl ensemble untrained", details
-
-    details = {
-        "rl_action": best_action,
-        "rl_confidence": round(avg_confidence, 3),
-        "rl_effective_confidence": round(effective_confidence, 3),
-        "rl_models": model_count,
-    }
-    signal = TradeSignal(
-        ticker=symbol.upper(),
-        timeframe="intraday",
-        action="BUY",
-        entry_price=current_price,
-        stop_loss=stop_loss,
-        profit_target=target,
-        risk_reward_ratio=settings.risk.min_reward_risk_ratio,
-        confidence=avg_confidence,
-        reasons=[f"RL ensemble ({model_count} models)"],
-        strategy_tag=f"rl_{settings.rl.agent_type}",
-        timestamp=datetime.now(timezone.utc),
-    )
-    _persist_rl_prediction_to_db(symbol, best_action, avg_confidence, settings)
-    return signal, "rl ensemble approved", details
-
-
-def _resolve_rl_model_paths(symbol: str, settings: Settings) -> list[Path]:
-    """Resolve which RL model(s) to use for a given symbol.
-
-    Returns an ordered list of model paths that cover the target symbol.
-    When ``model_paths`` is configured, uses those paths. Otherwise falls
-    back to the single ``model_path``.
-    """
-    base = Path(settings.app.log_dir).parent
-    paths = settings.rl.model_paths or []
-    if not paths:
-        default = base / settings.rl.model_path
-        return [default] if default.exists() else []
-
-    matching: list[Path] = []
-    for p in paths:
-        full = base / p
-        if not full.exists():
-            continue
-        symbols = rl_model_symbols(full)
-        if symbols and symbol.upper() in symbols:
-            matching.append(full)
-
-    if matching:
-        return matching
-
-    default = base / settings.rl.model_path
-    return [default] if default.exists() else []
 
 
 def _build_v3_signal_result(
@@ -2162,29 +1868,3 @@ def _paper_evidence_fields(details: dict | None) -> dict[str, object]:
     compact.update({key: value for key, value in details.items() if str(key).startswith("vote_")})
     return compact
 
-
-def _persist_rl_prediction_to_db(
-    symbol: str,
-    action: int,
-    confidence: float,
-    settings: Settings,
-) -> None:
-    try:
-        from trading_bot.db.session import init_db, make_session_factory, get_session
-        from trading_bot.db.repositories import upsert_prediction
-        engine = init_db(settings)
-        session_factory = make_session_factory(engine)
-        session = get_session(session_factory)
-        try:
-            upsert_prediction(
-                session=session,
-                ticker=symbol.upper(),
-                action=int(action),
-                confidence=float(confidence),
-                model_path=str(settings.rl.model_path),
-            )
-        finally:
-            session.close()
-            engine.dispose()
-    except Exception:
-        logger.debug("Failed to persist RL prediction to database")

@@ -308,6 +308,18 @@ def _safe_regime(frame: "pd.DataFrame") -> MarketRegime:
         return MarketRegime.RANGE_BOUND
 
 
+# A1 (2026-07-08): when the latest bar is from a *previous* trading session
+# (or older), fall back to wall-clock time so the avoid-window check
+# evaluates against NOW, not against a bar from a prior session's close
+# (which would incorrectly trip the "outside allowed intraday window"
+# reason during the morning open or after long pauses).
+#
+# Bars from *today's* session — even a few hours stale — are trusted: this
+# matches real-world Polygon SIP data freshness (intraday bars are
+# always a few minutes old).
+_INTRA_DAY_STALE_TOLERANCE_SECONDS = 6 * 3600  # 6 hours; bars older fall back
+
+
 def _signal_timestamp(signal: TradeSignal | None, frame: "pd.DataFrame") -> datetime | None:
     frame_timestamp: datetime | None = None
     if not frame.empty:
@@ -316,20 +328,46 @@ def _signal_timestamp(signal: TradeSignal | None, frame: "pd.DataFrame") -> date
         else:
             candidate = frame.index[-1]
         frame_timestamp = candidate if isinstance(candidate, datetime) else None
-    if signal is not None and frame_timestamp is not None:
+
+    now_utc = datetime.now(tz=timezone.utc)
+
+    # Decide whether the bar is fresh enough to trust as the reference timestamp.
+    # An intra-day bar up to 6h stale is fine (matches intraday data lag).
+    # Anything older falls back to wall-clock.
+    fresh_frame_ts: datetime | None = None
+    if frame_timestamp is not None:
+        ts_aware = (
+            frame_timestamp
+            if frame_timestamp.tzinfo
+            else frame_timestamp.replace(tzinfo=ZoneInfo("UTC"))
+        )
+        age_seconds = (now_utc - ts_aware).total_seconds()
+        if 0 <= age_seconds < _INTRA_DAY_STALE_TOLERANCE_SECONDS:
+            fresh_frame_ts = frame_timestamp
+
+    if signal is not None and fresh_frame_ts is not None:
         signal_wall_time = signal.timestamp
         if signal_wall_time.tzinfo is not None:
             signal_wall_time = signal_wall_time.replace(tzinfo=None)
-        frame_wall_time = frame_timestamp
+        frame_wall_time = fresh_frame_ts
         if frame_wall_time.tzinfo is not None:
             frame_wall_time = frame_wall_time.replace(tzinfo=None)
         if frame_wall_time == signal_wall_time:
-            return frame_timestamp
-    elif frame_timestamp is not None:
-        return frame_timestamp
-    if signal is not None:
-        return signal.timestamp
-    return None
+            return fresh_frame_ts
+    if fresh_frame_ts is not None:
+        return fresh_frame_ts
+    if signal is not None and signal.timestamp is not None:
+        sig_aware = (
+            signal.timestamp
+            if signal.timestamp.tzinfo
+            else signal.timestamp.replace(tzinfo=ZoneInfo("UTC"))
+        )
+        sig_age = (now_utc - sig_aware).total_seconds()
+        if 0 <= sig_age < _INTRA_DAY_STALE_TOLERANCE_SECONDS:
+            return signal.timestamp
+    # Final fallback: bar and signal timestamps were both stale or missing.
+    # Return wall-clock so the avoid-window check evaluates against current time.
+    return now_utc
 
 
 def _is_avoid_time(timestamp: datetime) -> bool:
