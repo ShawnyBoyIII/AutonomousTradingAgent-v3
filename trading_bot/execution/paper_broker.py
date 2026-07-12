@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from trading_bot.execution.fills import apply_slippage, effective_slippage_bps
@@ -69,7 +69,7 @@ class PaperBroker:
             quantity=order.quantity,
             fill_price=fill_price,
             fees=self.fee_per_order,
-            filled_at=datetime.now(),
+            filled_at=datetime.now(timezone.utc),
         )
 
         self.cash = next_cash

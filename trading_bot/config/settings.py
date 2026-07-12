@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -168,6 +170,7 @@ class PaperSettings(BaseModel):
     partial_take_profit_enabled: bool = Field(default=False)
     partial_take_profit_fraction: float = Field(default=0.5, gt=0.0, lt=1.0)
     partial_take_profit_min_qty: int = Field(default=2, ge=1)
+    graduation_since: datetime | None = None
 
 
 class AlertsSettings(BaseModel):

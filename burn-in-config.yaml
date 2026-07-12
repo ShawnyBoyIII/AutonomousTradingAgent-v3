@@ -70,6 +70,7 @@ session:
 paper:
   fee_per_order: 1.0
   slippage_bps: 5
+  graduation_since: "2026-07-11T00:00:00+00:00"
 
 # TEMP strategy_tracker override 2026-07-09 (loosened per user "loosen the guardrails")
 # Yesterday's 7-loss streak put the rolling win rate just below the 20% min_win_rate
