@@ -105,7 +105,7 @@ def compute_drawdown_from_ledger(
     Returns:
         DrawdownMetrics for the equity time series.
     """
-    rows = ledger.list_equity_history(limit=limit)
+    rows = ledger.list_recent_equity_history(limit=limit)
     if not rows:
         return DrawdownMetrics()
 

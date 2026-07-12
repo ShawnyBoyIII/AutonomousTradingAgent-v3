@@ -159,7 +159,7 @@ def calculate_realtime_pnl(
     positions_heat_pct = (positions_heat / equity * 100) if equity > 0 else 0
 
     # Compute session drawdown from equity history
-    equity_rows = ledger.list_equity_history(limit=500)
+    equity_rows = ledger.list_recent_equity_history(limit=500)
     equity_series = [float(row["equity"]) for row in equity_rows]
     from trading_bot.monitoring.drawdown import compute_session_drawdown
     session_high, session_low, session_max_dd = compute_session_drawdown(
