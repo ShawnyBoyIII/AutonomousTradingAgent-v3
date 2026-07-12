@@ -14,10 +14,12 @@ from trading_bot.data import market_data
 from trading_bot.data.indicators import add_atr, add_bollinger_bands, add_ema, add_rsi, add_sma
 from trading_bot.execution.order_manager import submit_signal_as_order
 from trading_bot.execution.paper_broker import PaperBroker
+from trading_bot.models.order import OrderRequest
 from trading_bot.runtime.decision_log import append_decision_event, should_append_backtest_entry
 from trading_bot.runtime.snapshots import write_snapshot
 from trading_bot.strategy.daily_signal_engine import generate_daily_signal
 from trading_bot.strategy.intraday_signal_engine import generate_signal
+from trading_bot.strategy.supermodel import build_stacked_signal
 
 logger = logging.getLogger(__name__)
 
@@ -295,15 +297,23 @@ def _run_symbol_backtest(
     if len(intraday_frame) < 5:
         return {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0, "equity_curve": []}
 
-    broker = PaperBroker(starting_cash=10_000.0, fee_per_order=1.0, slippage_bps=0)
+    broker = PaperBroker(
+        starting_cash=10_000.0,
+        fee_per_order=settings.paper.fee_per_order,
+        slippage_bps=settings.paper.slippage_bps,
+        dynamic_slippage_enabled=settings.paper.dynamic_slippage_enabled,
+        dynamic_slippage_notional_bps_per_10k=settings.paper.dynamic_slippage_notional_bps_per_10k,
+        dynamic_slippage_low_price_boost_bps=settings.paper.dynamic_slippage_low_price_boost_bps,
+        dynamic_slippage_max_extra_bps=settings.paper.dynamic_slippage_max_extra_bps,
+    )
     trades = 0
     wins = 0
     losses = 0
     net_pnl = 0.0
     gross_profit = 0.0
     gross_loss = 0.0
-    entry_blocked_until = -1
     trade_records: list[dict[str, float | int]] = []
+    open_trade: dict[str, Any] | None = None
 
     use_v3 = (
         getattr(settings, "strategy", None) is not None
@@ -318,71 +328,160 @@ def _run_symbol_backtest(
         selector.atr_stop_multiplier = settings.risk.atr_stop_multiplier
         selector.min_stop_distance_pct = settings.risk.min_stop_distance_pct
 
-    for end_index, window in enumerate(iterate_bars(intraday_frame, warmup=5), start=5):
-        if end_index <= entry_blocked_until:
+    def close_open_trade(exit_price: float, exit_index: int, submitted_at: Any) -> None:
+        nonlocal open_trade, trades, wins, losses, net_pnl, gross_profit, gross_loss
+        assert open_trade is not None
+        quantity = int(open_trade["quantity"])
+        exit_fill = broker.submit_order(
+            OrderRequest(
+                ticker=symbol,
+                side="SELL",
+                order_type="market",
+                quantity=quantity,
+                submitted_at=pd.Timestamp(submitted_at).to_pydatetime(),
+            ),
+            market_price=exit_price,
+        )
+        entry_fill = open_trade["fill"]
+        entry_value = float(entry_fill.fill_price) * quantity
+        exit_value = float(exit_fill.fill_price) * quantity
+        trade_pnl = exit_value - entry_value - entry_fill.fees - exit_fill.fees
+        trade_records.append(
+            {
+                "entry_index": int(open_trade["entry_index"]),
+                "exit_index": exit_index,
+                "quantity": quantity,
+                "entry_price": float(entry_fill.fill_price),
+                "exit_price": float(exit_fill.fill_price),
+                "entry_fees": float(entry_fill.fees),
+                "exit_fees": float(exit_fill.fees),
+            }
+        )
+        net_pnl += trade_pnl
+        trades += 1
+        if trade_pnl > 0:
+            wins += 1
+            gross_profit += trade_pnl
+        else:
+            losses += 1
+            gross_loss += trade_pnl
+        open_trade = None
+
+    for end_index in range(5, len(intraday_frame) + 1):
+        window = intraday_frame.iloc[:end_index].copy()
+        bar_index = end_index - 1
+        current_bar = window.iloc[-1]
+
+        if open_trade is not None and bar_index > int(open_trade["entry_index"]):
+            signal = open_trade["signal"]
+            exit_result = _bar_exit(signal, current_bar)
+            if exit_result is not None:
+                exit_price, exit_reason = exit_result
+                close_open_trade(exit_price, bar_index, current_bar.get("timestamp", signal.timestamp))
+                if exit_reason == "stop":
+                    continue
+
+        if open_trade is not None:
             continue
 
-        if use_v3 and selector is not None:
-            selection = selector.select_strategy(symbol, daily_frame, window)
+        if bar_index == len(intraday_frame) - 1:
+            continue
+
+        daily_window = _daily_frame_before_bar(daily_frame, current_bar.get("timestamp"))
+        if daily_window.empty:
+            continue
+
+        details: dict[str, object] = {}
+        if settings.app.signal_mode == "parallel":
+            from trading_bot.runtime.orchestrator import _build_parallel_signal_result
+
+            signal, _, details = _build_parallel_signal_result(
+                symbol,
+                settings,
+                daily_frame=daily_window,
+                intraday_frame=window,
+                hourly_frame=None,
+            )
+        elif use_v3 and selector is not None:
+            selection = selector.select_strategy(symbol, daily_window, window)
             if not selection.should_trade or selection.signal_score is None:
                 continue
             signal = selection_to_signal(symbol, selection, window)
             if signal is None:
                 continue
+            details["v3_total_score"] = round(selection.signal_score.total_score, 2)
         else:
-            signal = generate_signal(symbol, daily_frame, window)
+            signal = generate_signal(symbol, daily_window, window)
         if signal is None:
             continue
 
         counter_result = _evaluate_counter_thesis_for_backtest(
-            symbol, signal, daily_frame, window, settings
+            symbol, signal, daily_window, window, settings
         )
+        if counter_result is not None:
+            from trading_bot.runtime.orchestrator import _augment_details_with_counter_thesis
+
+            _augment_details_with_counter_thesis(details, counter_result)
+
+        stacked = build_stacked_signal(
+            symbol,
+            signal,
+            details,
+            settings=settings.supermodel,
+        )
+        if stacked.decision == "block":
+            continue
+
+        position_size_override = None
+        if details.get("is_half_size"):
+            from trading_bot.risk.risk_manager import evaluate_signal
+
+            sizing = evaluate_signal(
+                signal=signal,
+                account_equity=10_000.0,
+                open_tickers={
+                    ticker
+                    for ticker, quantity in broker.positions.items()
+                    if quantity > 0
+                },
+                portfolio_heat_pct=0.0,
+                risk_settings=settings.risk,
+                counter_thesis=counter_result,
+            )
+            if not sizing.approved:
+                continue
+            position_size_override = max(1, int(sizing.position_size * 0.5))
 
         fill = submit_signal_as_order(
             signal=signal,
             broker=broker,
             account_equity=10_000.0,
-            open_tickers=set(broker.positions),
+            open_tickers={
+                ticker for ticker, quantity in broker.positions.items() if quantity > 0
+            },
             risk_settings=settings.risk,
             counter_thesis=counter_result,
+            position_size_override=position_size_override,
         )
         if fill is None:
             continue
-
-        entry_index = len(window) - 1
-        # NOTE: _resolve_exit looks at the full intraday_frame for exit
-        # resolution.  This introduces look-ahead bias (the backtest sees
-        # future bars) because refactoring to a true event-driven model is
-        # a larger change.  The backtest is intended for rough estimation,
-        # not precise real-time simulation.
-        exit_price, exit_index = _resolve_exit(signal, intraday_frame, entry_index)
         quantity = broker.positions.get(symbol, 0)
-        trade_records.append({
-            "entry_index": entry_index,
-            "exit_index": exit_index,
+        open_trade = {
+            "signal": signal,
+            "fill": fill,
             "quantity": quantity,
-            "entry_price": fill.fill_price,
-            "exit_price": exit_price,
-            "entry_fees": fill.fees,
-            "exit_fees": broker.fee_per_order,
-        })
-        entry_value = fill.fill_price * quantity
-        exit_value = exit_price * quantity
-        trade_pnl = exit_value - entry_value - fill.fees - broker.fee_per_order
-        net_pnl += trade_pnl
-        if trade_pnl > 0:
-            gross_profit += trade_pnl
-        else:
-            gross_loss += trade_pnl
-        trades += 1
-        if trade_pnl > 0:
-            wins += 1
-        else:
-            losses += 1
+            "entry_index": bar_index,
+        }
 
-        broker.cash = round(broker.cash + exit_value - broker.fee_per_order, 2)
-        broker.positions.pop(symbol, None)
-        entry_blocked_until = exit_index
+    if open_trade is not None:
+        final_index = len(intraday_frame) - 1
+        final_bar = intraday_frame.iloc[final_index]
+        signal = open_trade["signal"]
+        close_open_trade(
+            float(final_bar["close"]),
+            final_index,
+            final_bar.get("timestamp", signal.timestamp),
+        )
 
     closes = intraday_frame["close"].astype(float).reset_index(drop=True).values
     equity_curve = _build_equity_curve(closes, trade_records, 10_000.0)
@@ -404,6 +503,24 @@ def _run_symbol_backtest(
             gross_loss=gross_loss,
         ),
     }
+
+
+def _daily_frame_before_bar(daily_frame: Any, bar_timestamp: Any) -> Any:
+    """Return completed daily rows available before an intraday bar."""
+    if "timestamp" not in daily_frame.columns or bar_timestamp is None:
+        return daily_frame
+    daily_dates = pd.to_datetime(daily_frame["timestamp"], utc=True).dt.date
+    bar_date = pd.to_datetime(bar_timestamp, utc=True).date()
+    return daily_frame.loc[daily_dates < bar_date].copy()
+
+
+def _bar_exit(signal: Any, bar: Any) -> tuple[float, str] | None:
+    """Apply conservative stop-before-target priority to one observed bar."""
+    if float(bar["low"]) <= signal.stop_loss:
+        return float(signal.stop_loss), "stop"
+    if float(bar["high"]) >= signal.profit_target:
+        return float(signal.profit_target), "target"
+    return None
 
 
 def _run_symbol_backtest_daily(
@@ -569,31 +686,6 @@ def _filter_frame_by_date(frame: Any, start: str | None, end: str | None) -> Any
     return filtered.drop(columns=["_ts"]).reset_index(drop=True)
 
 
-def _resolve_exit(signal, intraday_frame: Any, entry_index: int) -> tuple[float, int]:
-    """Resolve exit price/index from bars after the entry bar.
-
-    Looks at the full ``intraday_frame`` starting from ``entry_index + 1``.
-    This introduces look-ahead bias (the backtest sees future bars) because
-    refactoring to a true event-driven model is a larger change.  The
-    backtest is intended for rough estimation, not precise real-time
-    simulation.
-    """
-    after = intraday_frame.iloc[entry_index + 1 :]
-    if after.empty:
-        # No future bars to check; exit at entry bar close.
-        return float(intraday_frame.iloc[entry_index]["close"]), entry_index
-
-    # Optimization: use itertuples(index=False) which is much faster than iterrows
-    for row_index, row in enumerate(after.itertuples(index=False), start=entry_index + 1):
-        if float(row.low) <= signal.stop_loss:
-            return signal.stop_loss, row_index
-        if float(row.high) >= signal.profit_target:
-            return signal.profit_target, row_index
-
-    last_idx = entry_index + len(after) - 1
-    return float(after.iloc[-1]["close"]), last_idx
-
-
 def run_walk_forward(
     symbols: list[str],
     settings: Settings,
@@ -715,6 +807,7 @@ def run_strategy_comparison(
         logger.info("Running %s backtest...", strategy)
         import copy
         strategy_settings = copy.deepcopy(settings)
+        strategy_settings.app.signal_mode = "serial"
         if getattr(strategy_settings, "strategy", None) is not None:
             strategy_settings.strategy.use_v3_signals = strategy == "v3"
         result = run_backtest(symbols, strategy_settings, start=start, end=end)

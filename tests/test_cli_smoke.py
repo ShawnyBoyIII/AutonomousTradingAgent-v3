@@ -4276,7 +4276,7 @@ def test_backtest_command_replays_data_and_prints_summary(monkeypatch, tmp_path:
 
     daily = pd.DataFrame(
         {
-            "timestamp": pd.date_range("2026-05-01", periods=60, freq="D"),
+            "timestamp": pd.date_range("2026-04-01", periods=60, freq="D"),
             "open": [100.0 + index for index in range(60)],
             "high": [101.0 + index for index in range(60)],
             "low": [99.0 + index for index in range(60)],
@@ -4608,5 +4608,4 @@ def test_cache_data_command_from_watchlist(monkeypatch, tmp_path: Path) -> None:
     assert (output_dir / "AAPL.csv").exists()
     assert (output_dir / "GOOGL.csv").exists()
     assert captured_provider_stacks == [["alpaca", "polygon"], ["alpaca", "polygon"]]
-
 

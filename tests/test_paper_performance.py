@@ -12,11 +12,14 @@ from datetime import datetime, timezone
 
 import sqlite3
 
+from typer.testing import CliRunner
+
 from trading_bot.analytics.paper_performance import (
     PaperPerformanceReport,
     format_paper_performance_report,
     summarize_paper_performance,
 )
+from trading_bot.cli.app import app
 
 
 def _fill_orders_table(conn: sqlite3.Connection) -> None:
@@ -169,3 +172,59 @@ def test_format_paper_performance_report_shows_top_losers_and_strategy_table(tmp
     assert "DDD" in text
     assert "v3-mean_reversion" in text
     assert "-50" in text or "-50.0" in text
+
+
+def _write_graduation_config(tmp_path, db_path: str, graduation_since: str) -> str:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "app:\n"
+        f"  state_db_path: {db_path}\n"
+        "paper:\n"
+        f"  graduation_since: '{graduation_since}'\n",
+        encoding="utf-8",
+    )
+    return str(config)
+
+
+def test_graduation_check_uses_configured_evidence_cohort(tmp_path) -> None:
+    db_path = _seed_burn_in_db(tmp_path)
+    config_path = _write_graduation_config(
+        tmp_path,
+        db_path,
+        "2026-07-10T14:00:00+00:00",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["--config-path", config_path, "graduation-check"],
+    )
+
+    assert result.exit_code == 1
+    assert "2026-07-10T14:00:00+00:00" in result.stdout
+    assert "Overall: trades=2" in result.stdout
+    assert "only 2/100 closed trades" in result.stdout
+
+
+def test_graduation_check_explicit_since_overrides_configured_cohort(tmp_path) -> None:
+    db_path = _seed_burn_in_db(tmp_path)
+    config_path = _write_graduation_config(
+        tmp_path,
+        db_path,
+        "2026-07-10T14:00:00+00:00",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "--config-path",
+            config_path,
+            "graduation-check",
+            "--since",
+            "2026-07-10T15:00:00+00:00",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "2026-07-10T15:00:00+00:00" in result.stdout
+    assert "Overall: trades=1" in result.stdout
+    assert "only 1/100 closed trades" in result.stdout

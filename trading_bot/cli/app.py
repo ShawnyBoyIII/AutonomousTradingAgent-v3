@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 import math
 from pathlib import Path
@@ -463,7 +463,18 @@ def backtest(
         typer.echo(f"Best Win Rate: {comparison['best_winrate_strategy']}")
     elif strategy:
         from trading_bot.backtest.runner import run_backtest
-        summary = run_backtest(parsed_symbols, ctx.obj, start=start, end=end)
+
+        if strategy not in {"v2.5", "v3"}:
+            raise typer.BadParameter("strategy must be v2.5 or v3", param_hint="--strategy")
+        strategy_settings = ctx.obj.model_copy(deep=True)
+        strategy_settings.app.signal_mode = "serial"
+        strategy_settings.strategy.use_v3_signals = strategy == "v3"
+        summary = run_backtest(
+            parsed_symbols,
+            strategy_settings,
+            start=start,
+            end=end,
+        )
         typer.echo(
             " ".join(
                 [
@@ -1116,7 +1127,7 @@ def paper_audit(ctx: typer.Context) -> None:
     ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
     state = ledger.ensure_portfolio_state()
     orders = ledger.list_order_rows()
-    equity_history = ledger.list_equity_history(limit=1)
+    equity_history = ledger.list_recent_equity_history(limit=1)
     snapshot = _load_json_snapshot(Path(ctx.obj.app.portfolio_summary_path))
     issues = _collect_paper_audit_issues(state, orders, equity_history, snapshot)
 
@@ -1236,17 +1247,10 @@ def paper_report(
     ),
 ) -> None:
     """Multi-dimensional P&L report: overall, per strategy, per hour, per ticker."""
-    from datetime import datetime as _dt
-
     from trading_bot.analytics import format_paper_performance_report, summarize_paper_performance
 
-    since_dt = _dt.fromisoformat(since) if since else None
-    until_dt = _dt.fromisoformat(until) if until else None
-
-    if since_dt is not None and since_dt.tzinfo is None:
-        since_dt = since_dt.replace(tzinfo=__import__("datetime").timezone.utc)
-    if until_dt is not None and until_dt.tzinfo is None:
-        until_dt = until_dt.replace(tzinfo=__import__("datetime").timezone.utc)
+    since_dt = _parse_utc_datetime(since)
+    until_dt = _parse_utc_datetime(until)
 
     db_path = Path(ctx.obj.app.state_db_path)
     if not db_path.exists():
@@ -1351,8 +1355,27 @@ def _graduation_recommend(report) -> str:
     return f"ADVISORY: PF={pf:.2f} < 0.8 over {report.total_trades} closed trades. Review decision-log.jsonl."
 
 
+def _parse_utc_datetime(value: str | datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value) if isinstance(value, str) else value
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+
 @app.command(name="graduation-check")
-def graduation_check(ctx: typer.Context) -> None:
+def graduation_check(
+    ctx: typer.Context,
+    since: str | None = typer.Option(
+        None,
+        "--since",
+        help="UTC ISO datetime; overrides paper.graduation_since.",
+    ),
+    until: str | None = typer.Option(
+        None,
+        "--until",
+        help="UTC ISO datetime; include only rows on or before this timestamp.",
+    ),
+) -> None:
     """Run AGENTS.md's 100-trade graduation gate against current paper DB.
 
     Reports overall PF/win-rate and prints a single recommendation that
@@ -1374,7 +1397,15 @@ def graduation_check(ctx: typer.Context) -> None:
         typer.echo(f"DB not found at {db_path}")
         raise typer.Exit(code=1)
 
-    report = summarize_paper_performance(db_path=db_path)
+    since_dt = _parse_utc_datetime(
+        since if since is not None else ctx.obj.paper.graduation_since
+    )
+    until_dt = _parse_utc_datetime(until)
+    report = summarize_paper_performance(
+        db_path=db_path,
+        since=since_dt,
+        until=until_dt,
+    )
     typer.echo(format_paper_performance_report(report))
     typer.echo("")
     typer.echo(_graduation_recommend(report))
@@ -4550,4 +4581,3 @@ def reset_portfolio(
 
     typer.echo("")
     typer.echo("Portfolio reset complete.")
-
