@@ -171,7 +171,24 @@ def test_entry_timing_rejects_yellow_without_two_bar_confirmation() -> None:
     assert "YELLOW signal lacks 2-bar confirmation" in verdict.reasons
 
 
-def test_signal_quality_combines_alignment_and_entry_timing() -> None:
+def test_signal_quality_combines_alignment_and_entry_timing(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pin wall-clock to 10:15 ET today so _signal_timestamp returns a
+    # timestamp inside the morning preferred window regardless of when
+    # the test runs. Avoids the 4pm-after-hours false-positive that
+    # makes `verdict.passed is True` time-of-day dependent.
+    now_et = datetime.now(tz=ET).replace(hour=10, minute=15, second=0, microsecond=0)
+    now_utc = now_et.astimezone(ZoneInfo("UTC"))
+    from datetime import timezone as _tz
+
+    class _FrozenDatetime:
+        @classmethod
+        def now(cls, tz: _tz | None = None) -> datetime:
+            if tz is None:
+                return now_utc.replace(tzinfo=None)
+            return now_utc.astimezone(tz) if tz else now_utc.replace(tzinfo=None)
+
+    monkeypatch.setattr("trading_bot.strategy.signal_quality.datetime", _FrozenDatetime)
+
     verdict = evaluate_signal_quality(
         daily_frame=_daily_frame(),
         hourly_frame=_hourly_frame(),
