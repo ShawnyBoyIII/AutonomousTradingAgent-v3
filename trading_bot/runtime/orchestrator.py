@@ -907,6 +907,156 @@ def _build_signal_with_reason(symbol: str, settings: Settings) -> tuple[TradeSig
     return signal, reason
 
 
+def _build_parallel_signal_result(
+    symbol: str,
+    settings: Settings,
+    daily_frame: pd.DataFrame | None = None,
+    intraday_frame: pd.DataFrame | None = None,
+    hourly_frame: pd.DataFrame | None = None,
+) -> tuple[TradeSignal | None, str, dict]:
+    """Resolve V3 and V2.5 votes from one shared market-data snapshot."""
+    if daily_frame is None or intraday_frame is None:
+        daily_frame, daily_valid = market_data.fetch_and_validate_bars(
+            symbol,
+            settings.market_data.daily_period,
+            "1d",
+            settings.market_data,
+        )
+        if not daily_valid.valid:
+            return None, f"daily data validation failed: {daily_valid.reason}", {
+                "signal_mode": "parallel",
+                "consensus": "NO_TRADE",
+            }
+        intraday_frame, intraday_valid = market_data.fetch_and_validate_bars(
+            symbol,
+            settings.market_data.intraday_period,
+            settings.market_data.intraday_interval,
+            settings.market_data,
+        )
+        if not intraday_valid.valid:
+            return None, f"intraday data validation failed: {intraday_valid.reason}", {
+                "signal_mode": "parallel",
+                "consensus": "NO_TRADE",
+            }
+        hourly_frame = _fetch_hourly_alignment_frame(symbol, settings)
+
+    shared_daily = daily_frame.copy(deep=True)
+    if "ema_20" not in shared_daily.columns:
+        shared_daily = add_ema(shared_daily, period=20, column_name="ema_20")
+    if "sma_50" not in shared_daily.columns:
+        shared_daily = add_sma(shared_daily, period=50, column_name="sma_50")
+
+    shared_intraday = _drop_trailing_zero_volume_bars(intraday_frame)
+    shared_intraday["volume_avg_5"] = shared_intraday["volume"].rolling(5).mean()
+    shared_intraday = add_atr(shared_intraday, period=settings.risk.atr_period)
+    shared_intraday = add_rsi(shared_intraday, period=14)
+    shared_intraday = add_bollinger_bands(shared_intraday, period=20, std_dev=2.0)
+    shared_intraday = add_vwap(shared_intraday)
+
+    v25_signal, _ = generate_recent_signal_with_reason(
+        symbol,
+        shared_daily,
+        shared_intraday,
+        atr_stop_multiplier=settings.risk.atr_stop_multiplier,
+        min_stop_distance_pct=settings.risk.min_stop_distance_pct,
+    )
+    v25_details = _scan_details(shared_daily, shared_intraday)
+    if settings.app.allow_yellow_mean_reversion:
+        from trading_bot.strategy.setup_rules import is_valid_mean_reversion_setup
+
+        v25_details["is_mean_reversion"] = is_valid_mean_reversion_setup(shared_intraday)
+
+    v3_enabled = settings.strategy.use_v3_signals
+    v3_signal: TradeSignal | None = None
+    v3_details: dict = {}
+    if v3_enabled:
+        v3_signal, _, v3_details = _build_v3_signal_result(
+            symbol,
+            settings,
+            daily_frame=shared_daily,
+            intraday_frame=shared_intraday,
+            hourly_frame=hourly_frame,
+            fetch_hourly=False,
+        )
+
+    source_votes: list[dict[str, object]] = []
+    for source, signal, enabled in (
+        ("v3", v3_signal, v3_enabled),
+        ("v2.5", v25_signal, True),
+    ):
+        if not enabled:
+            continue
+        action = signal.action if signal is not None else "HOLD"
+        source_votes.append(
+            {
+                "source": source,
+                "action": action,
+                "confidence": float(signal.confidence) if signal is not None else 0.0,
+                "signal": signal,
+            }
+        )
+
+    public_votes = [
+        {
+            "source": str(vote["source"]),
+            "action": str(vote["action"]),
+            "confidence": round(float(vote["confidence"]), 4),
+        }
+        for vote in source_votes
+    ]
+    details: dict[str, object] = {
+        **v25_details,
+        **v3_details,
+        "source_votes": public_votes,
+        "signal_mode": "parallel",
+    }
+    for vote in public_votes:
+        details[f"vote_{vote['source']}"] = (
+            f"{vote['action']}:{vote['confidence']:.2f}"
+        )
+
+    sell_votes = [vote for vote in source_votes if vote["action"] == "SELL"]
+    if sell_votes:
+        source = str(sell_votes[0]["source"])
+        details["consensus"] = "SELL"
+        details["consensus_reason"] = f"veto by {source}"
+        return None, f"parallel veto: SELL from {source}", details
+
+    buy_votes = [vote for vote in source_votes if vote["action"] == "BUY"]
+    vote_count = len(source_votes)
+    if buy_votes:
+        best = max(buy_votes, key=lambda vote: float(vote["confidence"]))
+        details["consensus"] = "BUY"
+        details["consensus_count"] = len(buy_votes)
+        details["consensus_votes"] = vote_count
+        details["is_full_size"] = len(buy_votes) >= 2
+        details["is_half_size"] = len(buy_votes) == 1
+        signal = _copy_signal_with_confidence(
+            best["signal"],
+            float(best["confidence"]),
+        )
+        reason = (
+            f"parallel consensus ({len(buy_votes)}/{vote_count})"
+            if len(buy_votes) >= 2
+            else f"parallel single-source ({best['source']})"
+        )
+        return _apply_phase1_signal_quality(
+            symbol,
+            signal,
+            reason,
+            details,
+            daily_frame=shared_daily,
+            intraday_frame=shared_intraday,
+            hourly_frame=hourly_frame,
+            settings=settings,
+        )
+
+    details["consensus"] = "NO_TRADE"
+    details["consensus_votes"] = vote_count
+    sources = ", ".join(str(vote["source"]) for vote in source_votes)
+    return None, f"parallel no consensus ({sources})", details
+
+
 
 def _copy_signal_with_confidence(signal: TradeSignal, confidence: float) -> TradeSignal:
     return TradeSignal(
@@ -998,6 +1148,9 @@ def _apply_phase1_signal_quality(
 
 
 def _build_signal_result(symbol: str, settings: Settings) -> tuple[TradeSignal | None, str, dict]:
+    if settings.app.signal_mode == "parallel":
+        return _build_parallel_signal_result(symbol, settings)
+
     if getattr(settings, "strategy", None) is not None and settings.strategy.use_v3_signals:
         return _build_v3_signal_result(symbol, settings)
 
@@ -1058,6 +1211,8 @@ def _build_v3_signal_result(
     settings: Settings,
     daily_frame: pd.DataFrame | None = None,
     intraday_frame: pd.DataFrame | None = None,
+    hourly_frame: pd.DataFrame | None = None,
+    fetch_hourly: bool = True,
 ):
     """V3 strategy path: regime detection + 5-factor confluence scoring.
 
@@ -1137,7 +1292,8 @@ def _build_v3_signal_result(
     details["quality"] = signal.quality
     if settings.app.allow_yellow_mean_reversion:
         details["is_mean_reversion"] = selection.strategy_type == "mean_reversion"
-    hourly_frame = _fetch_hourly_alignment_frame(symbol, settings)
+    if hourly_frame is None and fetch_hourly:
+        hourly_frame = _fetch_hourly_alignment_frame(symbol, settings)
     return _apply_phase1_signal_quality(
         symbol,
         signal,
@@ -1173,7 +1329,11 @@ def _frame_through_timestamp(frame: pd.DataFrame, timestamp: datetime) -> pd.Dat
     frame_ts = frame["timestamp"]
     if hasattr(frame_ts, "dt") and frame_ts.dt.tz is not None:
         frame_ts = frame_ts.dt.tz_localize(None)
-    matches = frame.index[frame_ts == ts].tolist()
+    matches = [
+        index
+        for index, matched in enumerate((frame_ts == ts).tolist())
+        if matched
+    ]
     if not matches:
         return frame
     return frame.iloc[: matches[-1] + 1]
@@ -1867,4 +2027,3 @@ def _paper_evidence_fields(details: dict | None) -> dict[str, object]:
     }
     compact.update({key: value for key, value in details.items() if str(key).startswith("vote_")})
     return compact
-
