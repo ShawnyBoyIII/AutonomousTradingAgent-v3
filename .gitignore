@@ -29,3 +29,6 @@ venv/
 __pycache__/
 *.pyc
 .cache/
+# Workspace-local state (CortexKit magic-context + test fixture sandbox)
+.cortexkit/
+ignored-by-fixture/
