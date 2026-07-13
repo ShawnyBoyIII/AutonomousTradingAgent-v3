@@ -53,16 +53,18 @@ Never use bare `tradebot` on PATH — it may resolve to a stale global install.
 ## Paper Validation Goal
 
 **Target**: Profit factor > 1.3 over 100 closed trades on paper with $100K starting capital.
+Graduation evidence starts at `paper.graduation_since`; the burn-in cohort is
+currently `2026-07-11T00:00:00+00:00`, after the 50-share cap was introduced.
 
 - Burn-in runs daily via `./scripts/auto-burn-in.sh`
 - Parallel signal mode is V3 + V2.5 consensus. The swarm engine is no longer in the automated scan/vote path — it remains as a manual/advisory tool (`./tradebot-local swarm`) only.
 - 5% minimum stop distance on 5-minute bars (intraday noise protection)
-- 15% max per ticker in burn-in (`burn-in-config.yaml`), 20% in default config
+- Fire-mode burn-in keeps a 25% ticker-allocation ceiling and a hard 50-share cap; default config uses 20%
 - Confidence gates are advisory at PF < 0.8 after 50+ trades (logs alert, does not halt)
 - Strategy tags recorded on all buys and sells for attribution
 - Run `./tradebot-local paper-report` for the multi-dimensional P&L view (overall, by strategy, by hour, by ticker) — replaces the SQL probes previously needed to answer "where did today's loss come from?"
 - Run `./tradebot-local trade-attribution` for the paired BUY/SELL roster
-- Run `./tradebot-local graduation-check` for the AGENTS.md 100-trade decision gate; exits non-zero when PF < 0.8
+- Run `./tradebot-local graduation-check` for the configured cohort's 100-trade decision gate; explicit `--since`/`--until` values override the configured window
 
 **Decision gate**: When 100 closed trades are reached, review profit factor.
 - PF > 1.3 → graduate to live trading consideration
@@ -96,8 +98,9 @@ app:
 
 risk:
   max_risk_per_trade_pct: 0.01
-  max_ticker_allocation_pct: 0.15  # 15% in burn-in, 20% in default config
-  max_portfolio_heat_pct: 0.03     # Blocks at 3% unrealized loss
+  max_ticker_allocation_pct: 0.25  # Fire-mode burn-in; default config uses 20%
+  max_portfolio_heat_pct: 0.10     # Fire-mode burn-in; default config uses 3%
+  max_shares_per_position: 50      # Hard per-ticker share cap
 
 market_data:
   validate_data: true  # V2.5: fail-fast
@@ -187,7 +190,6 @@ tail -f logs/burn_in/decision-log.jsonl
 
 # Tuning and reporting
 ./tradebot-local tune --dry-run
-./tradebot-local supermodel-report
 ./tradebot-local db-features --summary
 ./tradebot-local trade-attribution
 ./tradebot-local risk-report
@@ -259,9 +261,12 @@ Fail-fast: stops on first validation error.
 ## Session Gotchas
 
 - When calling `trading_bot.runtime.position_exit` helpers outside CLI entrypoints, pass the active `settings` object explicitly so exit persistence uses the intended DB/log paths.
+- Intraday backtests are causal: signals receive only completed prior-day context, exits are evaluated one bar at a time, same-bar stop/target collisions choose the stop, and configured paper fees/slippage apply. When `app.signal_mode=parallel`, replay and paper mode share the V3 + V2.5 consensus, counter-thesis, supermodel veto, and one-source half-sizing path. Portfolio-wide correlation, sector exposure, cooldown, and adaptive strategy-tracker state remain paper-runtime concerns; only the configured paper cohort counts toward graduation.
+- New paper fills are persisted as timezone-aware UTC timestamps. Legacy order rows before the `2026-07-11` cohort may contain naive America/New_York wall time and must not be mixed into UTC-window conclusions.
+- `list_equity_history()` retains legacy oldest-first semantics; monitoring and audits must use `list_recent_equity_history()` when requesting a bounded recent window.
 - `./tradebot-local tune` writes `state/tuning_overrides.yaml`; loader applies only allowlisted supermodel + strategy-tracker fields and still forces `live_trading_enabled=false`
 - Swarm worker votes (when running the manual `./tradebot-local swarm` command) are logged to `logs/worker_votes.jsonl`; use this file for per-worker weight tuning
-- Decision-log and paper-trade rows preserve compact supermodel evidence even on rejects and `NO_SIGNAL`; use `supermodel-report`, `trade-attribution`, and `db-features` for paper review before adding new logging.
+- Decision-log and paper-trade rows preserve compact supermodel evidence even on rejects and `NO_SIGNAL`; use `paper-report`, `trade-attribution`, and `db-features` for paper review before adding new logging.
 
 ---
 
