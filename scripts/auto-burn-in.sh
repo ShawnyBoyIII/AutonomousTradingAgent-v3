@@ -10,6 +10,17 @@
 
 set -e
 
+# Self-rewrap in caffeinate so the burn-in keeps running when the lid
+# is closed or the Mac locks while on AC power. -s prevents system
+# sleep, -i prevents idle sleep, -m prevents disk sleep. The exported
+# guard makes the inner invocation a no-op so we don't loop forever.
+if [[ -z "${_BURN_IN_CAFFEINATED:-}" ]]; then
+    if command -v caffeinate >/dev/null 2>&1; then
+        export _BURN_IN_CAFFEINATED=1
+        exec caffeinate -s -i -m "$0" "$@"
+    fi
+fi
+
 echo "=========================================="
 echo "FULLY AUTOMATED Paper Burn-In (V3 + Swarm)"
 echo "Date: $(date)"
