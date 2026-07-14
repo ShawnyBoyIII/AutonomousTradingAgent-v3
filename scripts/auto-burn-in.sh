@@ -1088,9 +1088,10 @@ while true; do
         run_health_check
     fi
     # 15:50 ET pre-EOD hard check (5 min before EOD exit)
-    local pre_eod_h=$(date +%H)
-    local pre_eod_m=$(date +%M)
-    local pre_eod_dow=$(date +%u)
+    # NOTE: not a function — `local` would error out here.
+    pre_eod_h=$(date +%H)
+    pre_eod_m=$(date +%M)
+    pre_eod_dow=$(date +%u)
     if [ "$pre_eod_dow" -le 5 ] \
         && [ $((10#$pre_eod_h * 60 + 10#$pre_eod_m)) -eq $((15 * 60 + 50)) ]; then
         run_health_check
