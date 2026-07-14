@@ -160,3 +160,112 @@ def test_run_health_check_function_present():
     contents = script_path.read_text()
     assert "run_health_check()" in contents
     assert "doctor --burn-in --json" in contents
+
+
+def test_no_local_outside_functions_in_burn_in_script() -> None:
+    """Regression: 'local' is only valid inside bash functions.
+
+    2026-07-13 incident — auto-burn-in.sh used 'local pre_eod_h=...' at the
+    bottom of the main while-loop, which is top-level code, not a function.
+    The script crashed with:
+
+        ./scripts/auto-burn-in.sh: line 1091: local: can only be used in a function
+
+    on every cycle once execution reached that block. Both fills that morning
+    (BKSY + CDNS) lost their EOD exit because the crash happened between
+    paper-trade (9:30:45 ET) and the 15:55 ET safety net.
+
+    This test parses the script as a brace-depth scanner: 'local' is only
+    legal at brace_depth > 0 (i.e. inside a function body). It is NOT a
+    full bash parser — heredocs, eval'd strings, and case-branch bodies
+    inside functions are best-effort approximations — but it catches the
+    class of bug we just saw.
+    """
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "auto-burn-in.sh"
+    contents = script_path.read_text(encoding="utf-8")
+
+    violations: list[tuple[int, str]] = []
+    brace_depth = 0
+    in_heredoc_marker: str | None = None
+    in_heredoc_count = 0  # lines remaining until heredoc terminator
+
+    for line_number, raw_line in enumerate(contents.splitlines(), start=1):
+        line = raw_line.strip()
+
+        # Skip blank lines and comments.
+        if not line or line.startswith("#"):
+            continue
+
+        # Track heredoc state. Heredoc markers look like:
+        #     cat > "$FILE" <<EOF
+        # We start a heredoc and consume all lines until we see the marker.
+        if in_heredoc_marker is not None:
+            if line == in_heredoc_marker:
+                in_heredoc_marker = None
+            continue
+        if "<<" in line:
+            # Crude marker extractor: <<EOF, <<'EOF', <<-EOF, <<- 'EOF'
+            after = line.split("<<", 1)[1].lstrip("-").strip().strip("'\"")
+            # The marker may be on a later line (e.g. `cat <<EOF`), but most
+            # uses in auto-burn-in.sh are inline. Take the first whitespace-
+            # delimited token after <<.
+            marker = after.split()[0] if after else ""
+            if marker and marker.isidentifier():
+                in_heredoc_marker = marker
+                continue
+
+        # Track brace depth at top-level (leading whitespace matters here):
+        # bash function definitions look like `func_name() {` at column 0
+        # and the closing `}` is also at column 0. Inside the function body,
+        # control structures add one brace level; we don't need to count
+        # those accurately — only need to know "are we inside a function?".
+        leading_spaces = len(raw_line) - len(raw_line.lstrip())
+
+        if leading_spaces == 0 and line.endswith("{"):
+            brace_depth += 1
+            continue
+        if leading_spaces == 0 and line == "}":
+            brace_depth = max(brace_depth - 1, 0)
+            continue
+
+        # Detect top-level 'local' usage. We only flag it when the line
+        # is NOT inside a function (brace_depth == 0). Inside functions
+        # (brace_depth >= 1) `local` is the correct keyword.
+        if brace_depth == 0 and (line.startswith("local ") or line == "local"):
+            violations.append((line_number, raw_line))
+
+    assert not violations, (
+        "Found 'local' declarations outside any function in "
+        "scripts/auto-burn-in.sh:\n"
+        + "\n".join(f"  line {n}: {line!r}" for n, line in violations)
+        + "\n\n'local' is only valid inside bash function bodies. Drop the "
+        "'local' keyword for top-level variables."
+    )
+
+
+def test_pre_eod_block_in_main_loop_uses_plain_assignments() -> None:
+    """Targeted regression: pre_eod_* declarations must be plain assignments.
+
+    The 2026-07-13 incident was specifically about these three lines.
+    Even if someone reorders or refactors the surrounding code, these
+    variables must not pick up a 'local' prefix.
+    """
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "auto-burn-in.sh"
+    contents = script_path.read_text(encoding="utf-8")
+
+    for var in ("pre_eod_h", "pre_eod_m", "pre_eod_dow"):
+        # Find any line that assigns the variable, optionally prefixed
+        # with 'local' — that's exactly the bug we want to catch.
+        matches = [
+            line.strip()
+            for line in contents.splitlines()
+            if line.lstrip().startswith(f"{var}=")
+            or line.lstrip().startswith(f"local {var}=")
+        ]
+        assert matches, f"{var} must be assigned in auto-burn-in.sh"
+        assert len(matches) == 1, f"{var} assigned multiple times: {matches!r}"
+        line = matches[0]
+        assert not line.startswith("local "), (
+            f"{var} must not be 'local' (top-level code, not a function): "
+            f"{line!r} — the 2026-07-13 burn-in crash started here."
+        )
