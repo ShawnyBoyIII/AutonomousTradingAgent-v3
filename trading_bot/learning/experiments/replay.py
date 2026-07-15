@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from pydantic import BaseModel, Field
 
+from trading_bot.backtest.runner import run_backtest
+from trading_bot.config.settings import Settings
 from trading_bot.data.data_store import DataStoreManifest, read_bars
+from trading_bot.learning.experiments.models import MetricSet, ParameterChange
 
 # When the caller asks for one of these intervals, the loader may need to
 # read finer-grained data from the store (e.g. 1m bars for a 5m request) and
@@ -116,3 +120,123 @@ class StoredBarLoader:
         )
         df = df.set_index(ts_index)
         return df.resample(rule).agg(_RESAMPLE_AGG).dropna(subset=["open"])
+
+
+class OfflineEvaluation(BaseModel):
+    """Result of replaying a candidate against a baseline over train/validation."""
+
+    accepted: bool
+    reasons: list[str] = Field(default_factory=list)
+    baseline_train: MetricSet
+    candidate_train: MetricSet
+    baseline_validation: MetricSet
+    candidate_validation: MetricSet
+
+
+def evaluate_offline(
+    *,
+    settings: Settings,
+    change: ParameterChange,
+    symbols: list[str],
+    start: date,
+    end: date,
+    bar_loader: "StoredBarLoader",
+    train_fraction: float = 0.7,
+) -> OfflineEvaluation:
+    """Replay baseline and candidate over a chronological train/validation split.
+
+    Runs ``run_backtest`` four times — baseline/candidate × train/validation —
+    using ``bar_loader`` as the bar source (never the network). Accepts the
+    candidate only when *all* gates pass; otherwise returns the first
+    rejection reason(s) for the audit trail.
+    """
+    baseline_settings = settings.model_copy(deep=True)
+    candidate_settings = settings.model_copy(deep=True)
+    _apply_change(baseline_settings, change, change.baseline)
+    _apply_change(candidate_settings, change, change.candidate)
+
+    train_end = start + timedelta(days=int((end - start).days * train_fraction))
+    baseline_train = _summarize(
+        run_backtest(
+            symbols,
+            baseline_settings,
+            start=start.isoformat(),
+            end=train_end.isoformat(),
+            bar_loader=bar_loader,
+        )
+    )
+    candidate_train = _summarize(
+        run_backtest(
+            symbols,
+            candidate_settings,
+            start=start.isoformat(),
+            end=train_end.isoformat(),
+            bar_loader=bar_loader,
+        )
+    )
+    baseline_validation = _summarize(
+        run_backtest(
+            symbols,
+            baseline_settings,
+            start=train_end.isoformat(),
+            end=end.isoformat(),
+            bar_loader=bar_loader,
+        )
+    )
+    candidate_validation = _summarize(
+        run_backtest(
+            symbols,
+            candidate_settings,
+            start=train_end.isoformat(),
+            end=end.isoformat(),
+            bar_loader=bar_loader,
+        )
+    )
+
+    reasons: list[str] = []
+    if candidate_validation.trades < 20:
+        reasons.append("validation trades < 20")
+    if (
+        candidate_validation.profit_factor
+        < baseline_validation.profit_factor + 0.10
+    ):
+        reasons.append("candidate PF not >= baseline PF + 0.10")
+    if candidate_validation.net_pnl <= baseline_validation.net_pnl:
+        reasons.append("candidate net P&L not > baseline")
+    if (
+        candidate_validation.max_drawdown_pct
+        > baseline_validation.max_drawdown_pct + 5.0
+    ):
+        reasons.append("candidate drawdown > baseline + 5pp")
+    if candidate_validation.trades < int(baseline_validation.trades * 0.8):
+        reasons.append("candidate trade count < 80% of baseline")
+
+    return OfflineEvaluation(
+        accepted=not reasons,
+        reasons=reasons,
+        baseline_train=baseline_train,
+        candidate_train=candidate_train,
+        baseline_validation=baseline_validation,
+        candidate_validation=candidate_validation,
+    )
+
+
+def _apply_change(settings: Settings, change: ParameterChange, value: float) -> None:
+    section = getattr(settings, change.section)
+    setattr(section, change.field, value)
+
+
+def _summarize(summary: dict[str, Any]) -> MetricSet:
+    """Map a ``run_backtest`` result dict into a ``MetricSet``.
+
+    Limitation: ``run_backtest`` does not compute ``max_drawdown_pct`` today,
+    so we default it to ``0.0``. Until the backtest runner reports drawdown,
+    the drawdown-vs-baseline gate is effectively a no-op (0 <= 5pp always
+    passes). The next iteration will wire the metric through the runner.
+    """
+    return MetricSet(
+        trades=int(summary.get("trades", 0)),
+        profit_factor=float(summary.get("profit_factor", 0.0)),
+        net_pnl=float(summary.get("net_pnl", 0.0)),
+        max_drawdown_pct=float(summary.get("max_drawdown_pct", 0.0)),
+    )
