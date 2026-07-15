@@ -24,6 +24,9 @@ from trading_bot.strategy.supermodel import build_stacked_signal
 logger = logging.getLogger(__name__)
 
 
+BarLoader = Any  # avoids forcing an import at module top level
+
+
 def _fetch_bars_compat(fetch_fn: Any, symbol: str, period: str, interval: str, **kwargs: Any) -> Any:
     """Call fetch_bars, falling back to no-settings signature for test mocks."""
     try:
@@ -75,7 +78,10 @@ def run_backtest(
     settings: Settings,
     start: str | None = None,
     end: str | None = None,
+    *,
+    bar_loader: BarLoader | None = None,
 ) -> dict[str, float | int | list[dict[str, float | int | str | None]]]:
+    fetch_fn = bar_loader.fetch_bars if bar_loader is not None else market_data.fetch_bars
     trades = 0
     wins = 0
     losses = 0
@@ -88,7 +94,7 @@ def run_backtest(
 
     for symbol in (value.strip() for value in symbols if value.strip()):
         daily_frame = _fetch_bars_compat(
-            market_data.fetch_bars,
+            fetch_fn,
             symbol,
             settings.market_data.daily_period,
             "1d",
@@ -98,7 +104,7 @@ def run_backtest(
         )
         try:
             intraday_frame = _fetch_bars_compat(
-                market_data.fetch_bars,
+                fetch_fn,
                 symbol,
                 settings.market_data.intraday_period,
                 settings.market_data.intraday_interval,
@@ -110,7 +116,7 @@ def run_backtest(
             # Try 1h data (730 days available)
             try:
                 intraday_frame = _fetch_bars_compat(
-                    market_data.fetch_bars,
+                    fetch_fn,
                     symbol, "1y", "1h", start=start, end=end, settings=settings.market_data
                 )
                 logger.info("Note: Using 1h data for %s (5m unavailable for date range)", symbol)
@@ -225,7 +231,7 @@ def run_backtest(
         if benchmark_symbol := getattr(settings.app, "benchmark_symbol", None):
             try:
                 benchmark_data = _fetch_bars_compat(
-                    market_data.fetch_bars,
+                    fetch_fn,
                     benchmark_symbol,
                     settings.market_data.daily_period,
                     "1d",

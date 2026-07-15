@@ -141,6 +141,22 @@ class DataStoreManifest:
             finally:
                 conn.close()
 
+    def symbols(self) -> list[str]:
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT DISTINCT symbol FROM fetched ORDER BY symbol"
+                ).fetchall()
+            finally:
+                conn.close()
+        return [row["symbol"] for row in rows] if rows else []
+
+
+def _all_known_symbols(db_path: Path) -> list[str]:
+    """Helper used by tests/legacy callers; delegates to manifest.symbols()."""
+    return DataStoreManifest(db_path=db_path).symbols()
+
 
 # ---------------------------------------------------------------------------
 # Partition layout: {root}/parquet/{symbol}/{interval}/{YYYY}/{MM}/{YYYY-MM-DD}.parquet
