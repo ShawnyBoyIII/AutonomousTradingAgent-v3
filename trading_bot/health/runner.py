@@ -10,6 +10,7 @@ from trading_bot.health.checks import (
     check_market_data_freshness,
     check_open_positions_consistent,
     check_pid_alive,
+    check_tuning_experiment,
 )
 from trading_bot.health.types import CheckResult, HealthReport
 
@@ -35,5 +36,6 @@ def run_health_checks(
     results.append(check_eod_watchdog(pid_file=eod_watchdog_pid_file, now_utc=now))
     results.append(check_open_positions_consistent(db_path=db_path, heartbeat_path=heartbeat))
     results.append(check_market_data_freshness(db_path=db_path, now_utc=now))
+    results.append(check_tuning_experiment(state_dir=state_dir, now_utc=now))
 
     return HealthReport(checks=results, generated_at=now.isoformat())

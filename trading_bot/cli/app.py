@@ -127,7 +127,7 @@ def doctor(
     state_dir_setting = Path(getattr(ctx.obj.app, "state_dir", None) or Path(ctx.obj.app.state_db_path).parent)
     db_path = Path(ctx.obj.app.state_db_path)
     dashboard_port = int(getattr(ctx.obj.app, "dashboard_port", 8080))
-    eod_watchdog_pid_file = state_dir_setting / "eod_watchdog.pid"
+    eod_watchdog_pid_file = state_dir_setting / "burn_in" / "eod_watchdog.pid"
 
     report: HealthReport = run_health_checks(
         state_dir=state_dir_setting,
@@ -2190,10 +2190,22 @@ def tune(
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview overrides without writing them."),
 ) -> None:
     """Generate safe burn-in tuning overrides from recent paper results."""
+    from trading_bot.learning.experiments.store import ExperimentStore
     from trading_bot.learning.tuning_overrides import (
         propose_tuning_overrides,
         write_tuning_overrides,
     )
+
+    if not dry_run:
+        experiment_store = ExperimentStore(
+            root=Path(ctx.obj.app.state_db_path).parent / "tuning_experiments"
+        )
+        if experiment_store.load_current() is not None:
+            typer.echo(
+                "Tuning experiment is active; run `tune-experiment evaluate` "
+                "or `rollback` instead."
+            )
+            raise typer.Exit(code=2)
 
     proposal = propose_tuning_overrides(
         Path(ctx.obj.app.log_dir),
@@ -2210,6 +2222,100 @@ def tune(
     write_tuning_overrides(output_path, proposal)
     typer.echo(f"Wrote tuning overrides to {output_path}")
     typer.echo(rendered)
+
+
+def _format_tune_experiment_status(payload: dict) -> str:
+    """Render ``controller.status()`` for human consumption.
+
+    Operators need a single, copy-pasteable block per state. The empty
+    state stays quiet ("No active experiment") so dashboards and CI logs
+    do not flag it as an anomaly.
+    """
+    if not payload.get("active"):
+        return "tune_experiment active=false\nNo active experiment."
+    lines = [
+        f"tune_experiment active=true id={payload.get('experiment_id', '?')}",
+        f"status={payload.get('status', '?')}",
+        f"change={payload.get('change', {}).get('section', '?')}.{payload.get('change', {}).get('field', '?')} "
+        f"baseline={payload.get('change', {}).get('baseline', '?')} "
+        f"candidate={payload.get('change', {}).get('candidate', '?')}",
+        f"canary_closed_trades={payload.get('canary_closed_trades', 0)}",
+    ]
+    return "\n".join(lines)
+
+
+@app.command(name="tune-experiment")
+def tune_experiment(
+    ctx: typer.Context,
+    action: str = typer.Argument(..., help="propose | status | evaluate | rollback"),
+    reason: str | None = typer.Option(None, "--reason", help="Operator note for rollback."),
+    json_output: bool = typer.Option(False, "--json", help="JSON output."),
+) -> None:
+    """Drive the tuning experiment controller."""
+    from trading_bot.learning.experiments.controller import ExperimentController
+    from trading_bot.learning.experiments.replay import StoredBarLoader
+    from trading_bot.learning.experiments.store import ExperimentStore
+
+    settings = ctx.obj
+    store = ExperimentStore(
+        root=Path(settings.app.state_db_path).parent / "tuning_experiments"
+    )
+    bar_loader = (
+        StoredBarLoader(
+            root=Path(settings.eod_data_store.store_root),
+            manifest_db=Path(settings.eod_data_store.manifest_db),
+        )
+        if settings.eod_data_store.enabled
+        else None
+    )
+    overrides_path = Path(
+        getattr(settings.app, "tuning_overrides_path", None)
+        or (Path(settings.app.state_db_path).parent / "tuning_overrides.yaml")
+    )
+    controller = ExperimentController(
+        settings=settings,
+        store=store,
+        bar_loader=bar_loader,
+        overrides_path=overrides_path,
+    )
+
+    if action == "status":
+        payload = controller.status()
+        if json_output:
+            typer.echo(json.dumps(payload, indent=2, default=str))
+            return
+        typer.echo(_format_tune_experiment_status(payload))
+        return
+
+    if action == "propose":
+        state = controller.propose()
+        if state is None:
+            typer.echo(
+                "No experiment started (active experiment already exists, "
+                "or no proposed change)."
+            )
+            raise typer.Exit(code=0)
+        typer.echo(f"Proposed experiment {state.experiment_id}")
+        typer.echo(state.change.model_dump_json(indent=2))
+        return
+
+    if action == "evaluate":
+        state = controller.evaluate()
+        if state is None:
+            typer.echo("No active experiment to evaluate.")
+            raise typer.Exit(code=2)
+        typer.echo(_format_tune_experiment_status(controller.status()))
+        return
+
+    if action == "rollback":
+        state = controller.rollback(reason=reason)
+        if state is None:
+            typer.echo("No active experiment to roll back.")
+            raise typer.Exit(code=2)
+        typer.echo(f"Rolled back experiment {state.experiment_id}")
+        return
+
+    raise typer.BadParameter(f"unknown action {action!r}")
 
 
 @app.command(name="eod-fetch")

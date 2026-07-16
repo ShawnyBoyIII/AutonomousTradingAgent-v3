@@ -351,3 +351,52 @@ def check_market_data_freshness(db_path: Path, *, now_utc: datetime) -> CheckRes
         detail=f"market data {int(age_minutes)}m old",
         observed={"age_minutes": round(age_minutes, 1)},
     )
+
+
+def check_tuning_experiment(state_dir: Path, now_utc: datetime) -> CheckResult:
+    """Verify the active tuning experiment is in a healthy state.
+
+    Reads ``state/tuning_experiments/current.json`` when present. No
+    current.json is the expected steady state and is reported as PASS.
+    A state file with a non-pass terminal status surfaces as WARN
+    (INCONCLUSIVE) or FAIL (ERROR) so the burn-in loop's ``doctor``
+    command can flag it before operators get paged.
+    """
+    path = state_dir / "tuning_experiments" / "current.json"
+    if not path.exists():
+        return CheckResult(
+            name="tuning_experiment",
+            status="PASS",
+            detail="no active experiment",
+            observed={},
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return CheckResult(
+            name="tuning_experiment",
+            status="FAIL",
+            detail=f"corrupt state: {exc}",
+            observed={"path": str(path)},
+        )
+    status = payload.get("status") if isinstance(payload, dict) else None
+    if status == "INCONCLUSIVE":
+        return CheckResult(
+            name="tuning_experiment",
+            status="WARN",
+            detail="last experiment inconclusive",
+            observed={"path": str(path), "status": status},
+        )
+    if status == "ERROR":
+        return CheckResult(
+            name="tuning_experiment",
+            status="FAIL",
+            detail="experiment error state",
+            observed={"path": str(path), "status": status},
+        )
+    return CheckResult(
+        name="tuning_experiment",
+        status="PASS",
+        detail=f"experiment {str(status).lower() if status else 'active'}",
+        observed={"path": str(path), "status": status},
+    )
