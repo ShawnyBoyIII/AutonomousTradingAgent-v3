@@ -122,9 +122,8 @@ class ExperimentController:
         decision = self._decide(state)
         state.status = decision
         if decision == "KEPT":
-            self.overrides_path.parent.mkdir(parents=True, exist_ok=True)
             overrides = self._current_overrides()
-            yaml.safe_dump(overrides, self.overrides_path.open("w", encoding="utf-8"))
+            self.store.write_overrides_atomic(self.overrides_path, overrides)
             self.store.save_current(state)
         elif decision in {"ROLLED_BACK", "INCONCLUSIVE", "ERROR"}:
             self.store.restore_baseline(state.experiment_id, self.overrides_path)

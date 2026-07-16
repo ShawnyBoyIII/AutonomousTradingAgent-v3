@@ -417,3 +417,95 @@ def test_run_offline_raises_when_loader_is_none(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="StoredBarLoader required"):
         controller._run_offline(fake)
+
+
+def test_write_overrides_atomic_replaces_existing_file(tmp_path: Path) -> None:
+    """Atomic override write replaces an existing file with the new payload.
+
+    Regression test for the non-atomic KEPT-branch write in
+    ``controller.evaluate()``: a SIGKILL mid-write used to truncate
+    ``tuning_overrides.yaml`` to a zero-byte or partial YAML. Routing the
+    write through ``ExperimentStore.write_overrides_atomic`` must replace
+    the old file with the new payload atomically.
+    """
+    store = ExperimentStore(root=tmp_path / "experiments")
+    overrides_path = tmp_path / "state" / "tuning_overrides.yaml"
+    overrides_path.parent.mkdir(parents=True, exist_ok=True)
+
+    initial_payload = {"supermodel": {"counter_veto_weight": 0.5}}
+    store.write_overrides_atomic(overrides_path, initial_payload)
+    assert overrides_path.exists()
+    assert (
+        yaml.safe_load(overrides_path.read_text(encoding="utf-8"))
+        == initial_payload
+    )
+
+    new_payload = {
+        "supermodel": {
+            "support_threshold": 0.7,
+            "block_threshold": 0.3,
+            "counter_veto_weight": 0.75,
+        },
+        "strategy_tracker": {
+            "window": 20,
+            "min_win_rate": 0.2,
+            "full_allocation_rate": 0.5,
+        },
+    }
+    store.write_overrides_atomic(overrides_path, new_payload)
+
+    assert overrides_path.exists()
+    loaded = yaml.safe_load(overrides_path.read_text(encoding="utf-8"))
+    assert loaded == new_payload
+
+
+def test_write_overrides_atomic_replaces_payload_completely(tmp_path: Path) -> None:
+    """A second atomic write fully replaces the first; no partial YAML.
+
+    Proxies the crash-mid-write case: even though we cannot kill the process
+    from a unit test, two sequential writes with structurally different
+    payloads prove the file is always replaced wholesale. If the writer
+    truncated-then-wrote (the prior behaviour), a crash between truncation
+    and flush would leave the caller with stale or empty contents.
+    """
+    store = ExperimentStore(root=tmp_path / "experiments")
+    overrides_path = tmp_path / "state" / "tuning_overrides.yaml"
+
+    first_payload = {"supermodel": {"counter_veto_weight": 0.25}}
+    store.write_overrides_atomic(overrides_path, first_payload)
+
+    second_payload = {
+        "supermodel": {
+            "support_threshold": 0.8,
+            "block_threshold": 0.25,
+            "counter_veto_weight": 1.5,
+        },
+        "strategy_tracker": {
+            "window": 30,
+            "min_win_rate": 0.15,
+            "full_allocation_rate": 0.6,
+        },
+    }
+    store.write_overrides_atomic(overrides_path, second_payload)
+
+    loaded = yaml.safe_load(overrides_path.read_text(encoding="utf-8"))
+    assert loaded is not None
+    assert loaded == second_payload
+    assert loaded["supermodel"]["counter_veto_weight"] == 1.5
+    assert "strategy_tracker" in loaded
+    assert loaded["strategy_tracker"]["window"] == 30
+
+
+def test_write_overrides_atomic_creates_file_when_missing(tmp_path: Path) -> None:
+    """Atomic override write creates the file when it does not yet exist."""
+    store = ExperimentStore(root=tmp_path / "experiments")
+    overrides_path = tmp_path / "state" / "tuning_overrides.yaml"
+
+    payload = {
+        "supermodel": {"counter_veto_weight": 0.75},
+        "strategy_tracker": {"window": 20},
+    }
+    store.write_overrides_atomic(overrides_path, payload)
+
+    assert overrides_path.exists()
+    assert yaml.safe_load(overrides_path.read_text(encoding="utf-8")) == payload

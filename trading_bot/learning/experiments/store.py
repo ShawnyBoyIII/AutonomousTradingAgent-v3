@@ -89,3 +89,12 @@ class ExperimentStore:
     def clear_current(self) -> None:
         if self.current_path.exists():
             self.current_path.unlink()
+
+    def write_overrides_atomic(self, path: Path, payload: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, delete=False
+        ) as handle:
+            yaml.safe_dump(payload, handle, sort_keys=False)
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
