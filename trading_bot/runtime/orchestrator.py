@@ -32,6 +32,8 @@ from trading_bot.strategy.signal_quality import (
 )
 from trading_bot.strategy.supermodel import build_stacked_signal
 
+from trading_bot.learning.experiments.shadow import ShadowFill, ShadowLedger
+
 logger = logging.getLogger(__name__)
 
 _sector_cache: dict[str, str] = {}
@@ -147,6 +149,32 @@ def _recently_exited(ticker: str, state, cooldown_minutes: int) -> bool:
         return False
     now = datetime.now(timezone.utc) if exited_at.tzinfo else datetime.now()
     return (now - exited_at).total_seconds() < cooldown_minutes * 60
+
+
+def _maybe_record_shadow_fill(
+    candidate_fill: dict, baseline_signal: dict, shadow: ShadowLedger | None
+) -> None:
+    """Mirror a real BUY fill into the paired-baseline shadow ledger.
+
+    No-op when no experiment is active (``shadow is None``) or when the
+    fill is a SELL (v1 only shadows entries; exits are replayed later via
+    baseline signals). ``baseline_signal`` is accepted for API symmetry
+    with future canary logic that needs to compare candidate vs baseline.
+    """
+    if shadow is None:
+        return
+    side = candidate_fill.get("side", "BUY")
+    if side != "BUY":
+        return
+    shadow.record(
+        ShadowFill(
+            ticker=candidate_fill["ticker"],
+            side="BUY",
+            quantity=int(candidate_fill["quantity"]),
+            fill_price=float(candidate_fill["fill_price"]),
+            fees=float(candidate_fill["fees"]),
+        )
+    )
 
 
 def run_scan(
@@ -840,6 +868,17 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 fill,
                 side="BUY",
                 strategy_tag=strategy_tag,
+            )
+            _maybe_record_shadow_fill(
+                {
+                    "ticker": fill.ticker,
+                    "side": "BUY",
+                    "quantity": fill.quantity,
+                    "fill_price": fill.fill_price,
+                    "fees": fill.fees,
+                },
+                baseline_signal=details,
+                shadow=None,
             )
             _persist_trade_to_db(fill, signal, settings, details)
             updated_state = _portfolio_state_from_broker(
