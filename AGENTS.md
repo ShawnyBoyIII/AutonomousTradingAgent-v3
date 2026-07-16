@@ -194,6 +194,10 @@ tail -f logs/burn_in/decision-log.jsonl
 ./tradebot-local trade-attribution
 ./tradebot-local risk-report
 
+# Tuning experiments persist to state/tuning_experiments/; the shadow baseline
+# canary appends fills/equity lines to <artifacts_dir>/shadow-fills.jsonl and
+# shadow-equity.jsonl (JSONL, one record per line).
+
 # Advisory learner (paper-only; opt-in via advisory.enabled)
 ./tradebot-local advisory-learn
 ./tradebot-local advisory-learn --daily-report
