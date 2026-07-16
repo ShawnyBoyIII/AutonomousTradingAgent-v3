@@ -34,6 +34,33 @@ def test_shadow_ledger_does_not_touch_burn_in_db(tmp_path: Path) -> None:
     assert burn_in_db.stat().st_size == initial_size
 
 
+def test_shadow_ledger_appends_all_fills_to_jsonl(tmp_path: Path) -> None:
+    artifacts_dir = tmp_path / "shadow"
+    ledger = ShadowLedger(artifacts_dir=artifacts_dir, starting_cash=100_000.0)
+    fills = [
+        ShadowFill(ticker="AAPL", side="BUY", quantity=1, fill_price=10.0, fees=1.0),
+        ShadowFill(ticker="MSFT", side="BUY", quantity=2, fill_price=20.0, fees=1.0),
+        ShadowFill(ticker="NVDA", side="BUY", quantity=3, fill_price=30.0, fees=1.0),
+    ]
+    for fill in fills:
+        ledger.record(fill)
+
+    fills_path = artifacts_dir / "shadow-fills.jsonl"
+    equity_path = artifacts_dir / "shadow-equity.jsonl"
+    assert fills_path.exists()
+    assert equity_path.exists()
+
+    fill_lines = fills_path.read_text(encoding="utf-8").splitlines()
+    equity_lines = equity_path.read_text(encoding="utf-8").splitlines()
+    assert len(fill_lines) == 3
+    assert len(equity_lines) == 3
+
+    import json
+
+    decoded_fills = [json.loads(line) for line in fill_lines]
+    assert [entry["ticker"] for entry in decoded_fills] == ["AAPL", "MSFT", "NVDA"]
+
+
 def test_maybe_record_shadow_fill_records_buy_when_shadow_active() -> None:
     from trading_bot.runtime.orchestrator import _maybe_record_shadow_fill
 

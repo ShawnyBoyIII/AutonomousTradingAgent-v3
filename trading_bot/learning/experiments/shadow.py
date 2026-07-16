@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from typing import Literal
 
 from trading_bot.learning.experiments.models import MetricSet
@@ -70,7 +69,5 @@ class ShadowLedger:
 
     def _append_line(self, path: Path, payload: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
-            temp_path = Path(handle.name)
-        temp_path.replace(path)
