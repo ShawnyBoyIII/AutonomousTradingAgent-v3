@@ -13,6 +13,13 @@ def test_auto_burn_in_runs_nightly_tune_after_daily_discovery() -> None:
     assert 'run_nightly_tuning' in script
 
 
+def test_auto_burn_in_runs_tune_experiment_evaluate_in_nightly() -> None:
+    script = Path("scripts/auto-burn-in.sh").read_text(encoding="utf-8")
+    assert "run_tune_experiment_step" in script
+    assert 'sh ./tradebot-local --config-path "$CONFIG_FILE" tune-experiment evaluate' in script
+    assert 'sh ./tradebot-local --config-path "$CONFIG_FILE" tune-experiment propose' in script
+
+
 def test_auto_burn_in_runs_advisory_learner_periodically_and_on_shutdown() -> None:
     script = Path("scripts/auto-burn-in.sh").read_text(encoding="utf-8")
 

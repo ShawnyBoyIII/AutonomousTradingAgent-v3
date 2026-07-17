@@ -73,6 +73,33 @@ currently `2026-07-11T00:00:00+00:00`, after the 50-share cap was introduced.
 
 ---
 
+## Tuning Experiment Controller
+
+The nightly burn-in step delegates tuning changes to a validated
+experiment controller. Each experiment proposes exactly one allowlisted
+parameter change:
+
+- `supermodel.support_threshold` (step 0.05)
+- `supermodel.block_threshold` (step 0.05)
+- `supermodel.counter_veto_weight` (step 0.25)
+- `strategy_tracker.full_allocation_rate` (step 0.05)
+
+Validation pipeline:
+1. Offline replay against the local EOD store with a 70/30 chronological split.
+   The candidate must beat baseline by at least 0.10 PF, hold net P&L,
+   keep drawdown within 5pp, and maintain ≥80% of baseline trade count.
+2. 20-closed-trade paper canary with a paired shadow baseline running
+   the same signals through an isolated ledger.
+3. Keep only if the candidate still beats the shadow by ≥0.10 PF,
+   net P&L > shadow, and drawdown within 5pp. Otherwise rollback.
+
+State lives under `state/tuning_experiments/current.json` with an
+append-only `events.jsonl`. Rollbacks restore the baseline bytes from
+the experiment's snapshot. The plain `./tradebot-local tune` command
+prints a notice and exits non-zero while an experiment is active.
+
+---
+
 ## Testing
 
 ```bash
@@ -193,6 +220,13 @@ tail -f logs/burn_in/decision-log.jsonl
 ./tradebot-local db-features --summary
 ./tradebot-local trade-attribution
 ./tradebot-local risk-report
+
+# Tuning experiment controller
+./tradebot-local tune-experiment propose
+./tradebot-local tune-experiment status
+./tradebot-local tune-experiment evaluate
+./tradebot-local tune-experiment rollback --reason "operator note"
+./tradebot-local tune-experiment status --json
 
 # Tuning experiments persist to state/tuning_experiments/; the shadow baseline
 # canary appends fills/equity lines to <artifacts_dir>/shadow-fills.jsonl and

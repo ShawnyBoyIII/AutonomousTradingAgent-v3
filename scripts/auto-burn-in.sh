@@ -441,19 +441,40 @@ run_nightly_tuning() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[$timestamp] 🧠 Running nightly tuning..."
 
-    local tune_output
-    tune_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" tune 2>&1)
-    local status=$?
+    run_tune_experiment_step
+    return 0
+}
 
-    if [ $status -ne 0 ]; then
-        echo "[$timestamp] ⚠️  Nightly tuning failed"
-        echo "$tune_output" >> "$LOG_DIR/tuning.log"
-        return 0
+run_tune_experiment_step() {
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local eval_log="$LOG_DIR/tune_experiment.log"
+
+    set +e
+    eval_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" tune-experiment evaluate 2>&1)
+    local eval_rc=$?
+    set -e
+
+    if [ $eval_rc -ne 0 ]; then
+        # No active experiment (exit 2) is normal — fall through to propose.
+        if [ $eval_rc -ne 2 ]; then
+            echo "[$timestamp] ⚠️  tune-experiment evaluate exit=$eval_rc (see $eval_log)"
+            echo "$eval_output" >> "$eval_log"
+        fi
     fi
 
-    echo "$tune_output" >> "$LOG_DIR/tuning.log"
-    echo "[$timestamp] ✅ Nightly tuning complete"
-    return 0
+    set +e
+    propose_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" tune-experiment propose 2>&1)
+    local propose_rc=$?
+    set -e
+
+    if [ $propose_rc -ne 0 ]; then
+        echo "[$timestamp] ⚠️  tune-experiment propose exit=$propose_rc (see $eval_log)"
+        echo "$propose_output" >> "$eval_log"
+    fi
+
+    # Manual `tune` is now gated by an active experiment. We skip running
+    # `tune` here because the controller owns this nightly step.
 }
 
 # Function to run the burn-in reliability health check.
