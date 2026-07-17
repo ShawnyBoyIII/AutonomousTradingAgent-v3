@@ -554,7 +554,7 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
 
     for symbol in (value.strip() for value in symbols if value.strip()):
         try:
-            if _daily_loss_limit_hit(state, settings):
+            if _daily_loss_limit_hit(ledger, state, settings):
                 append_decision_event(
                     log_path,
                     {
@@ -1532,9 +1532,28 @@ def _scan_row_sort_key(row: dict[str, object]) -> tuple[int, int, int, float, fl
     )
 
 
-def _daily_loss_limit_hit(state: PortfolioState, settings: Settings) -> bool:
+def _daily_loss_limit_hit(
+    ledger: PortfolioLedger,
+    state: PortfolioState,
+    settings: Settings,
+    now: datetime | None = None,
+) -> bool:
+    from zoneinfo import ZoneInfo
+
+    local_tz = ZoneInfo(settings.app.timezone)
+    current_date = (now or datetime.now(local_tz)).astimezone(local_tz).date()
+    sell_rows = [row for row in ledger.list_order_rows() if row["side"] == "SELL"]
+    # Legacy state can contain realized P&L without reconstructable fill rows.
+    daily_realized_pnl = state.realized_pnl if not sell_rows else 0.0
+    for row in sell_rows:
+        filled_at = datetime.fromisoformat(str(row["filled_at"]))
+        if filled_at.tzinfo is None:
+            filled_at = filled_at.replace(tzinfo=local_tz)
+        if filled_at.astimezone(local_tz).date() == current_date:
+            daily_realized_pnl += float(row["pnl"] or 0.0)
+
     limit = state.equity * settings.risk.max_daily_risk_pct
-    return state.realized_pnl <= -limit
+    return daily_realized_pnl <= -limit
 
 
 def _daily_order_limit_hit(ledger: PortfolioLedger, settings: Settings) -> bool:

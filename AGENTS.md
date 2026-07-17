@@ -61,6 +61,7 @@ currently `2026-07-11T00:00:00+00:00`, after the 50-share cap was introduced.
 - 5% minimum stop distance on 5-minute bars (intraday noise protection)
 - Fire-mode burn-in keeps a 25% ticker-allocation ceiling and a hard 50-share cap; default config uses 20%
 - Confidence gates are advisory at PF < 0.8 after 50+ trades (logs alert, does not halt)
+- The daily loss guard resets by configured trading date and sums that day's realized SELL P&L; cumulative historical P&L does not block a new session when dated SELL history is available
 - Strategy tags recorded on all buys and sells for attribution
 - Run `./tradebot-local paper-report` for the multi-dimensional P&L view (overall, by strategy, by hour, by ticker) — replaces the SQL probes previously needed to answer "where did today's loss come from?"
 - Run `./tradebot-local trade-attribution` for the paired BUY/SELL roster
