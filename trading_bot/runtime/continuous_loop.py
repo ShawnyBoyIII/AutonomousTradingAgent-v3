@@ -266,17 +266,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                 # stop already ratcheted up by trailing should not be undone.
                 if position.stop_loss > min_stop and position.stop_loss < entry:
                     old_stop = position.stop_loss
-                    pos = Position(
-                        ticker=ticker,
-                        quantity=position.quantity,
-                        average_cost=position.average_cost,
-                        stop_loss=min_stop,
-                        profit_target=position.profit_target,
-                        highest_high=position.highest_high,
-                        initial_risk=position.initial_risk,
-                        entry_at=position.entry_at,
-                        strategy_tag=position.strategy_tag,
-                    )
+                    pos = position.model_copy(update={"stop_loss": min_stop})
                     state.positions[ticker] = pos
                     position = pos
                     line_parts.append(f"stop_widened {old_stop:.4f}->{min_stop:.4f}")
@@ -444,17 +434,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
 
             # No exit triggered - update highest_high
             if position.highest_high is None or current_price > position.highest_high:
-                updated_position = Position(
-                    ticker=ticker,
-                    quantity=position.quantity,
-                    average_cost=position.average_cost,
-                    stop_loss=position.stop_loss,
-                    profit_target=position.profit_target,
-                    highest_high=current_price,
-                    initial_risk=position.initial_risk,
-                    entry_at=position.entry_at,
-                    strategy_tag=position.strategy_tag,
-                )
+                updated_position = position.model_copy(update={"highest_high": current_price})
                 state.positions[ticker] = updated_position
 
             highest_high = state.positions[ticker].highest_high
