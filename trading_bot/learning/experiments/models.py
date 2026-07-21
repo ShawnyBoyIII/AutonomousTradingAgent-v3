@@ -42,3 +42,6 @@ class ExperimentState(BaseModel):
     shadow_metrics: MetricSet | None = None
     last_error: str | None = None
     rolled_back_at: datetime | None = None
+    candidate_checksum: str | None = None
+    baseline_checksum: str | None = None
+    baseline_was_absent: bool = False

@@ -34,6 +34,12 @@ def _load_env_overrides(settings: Settings) -> None:
     daily_loss = os.getenv("ROBINHOOD_DAILY_LOSS_LIMIT")
     if daily_loss and daily_loss.strip():
         settings.robinhood.daily_loss_limit = float(daily_loss)
+    dashboard_port = os.getenv("DASHBOARD_PORT")
+    if dashboard_port and dashboard_port.strip():
+        try:
+            settings.app.dashboard_port = int(dashboard_port)
+        except ValueError:
+            pass
 
 
 def _validate_credentials_not_in_config(config_text: str) -> None:
@@ -94,7 +100,12 @@ def _load_tuning_overrides(settings: Settings, base_dir: Path) -> None:
         return
 
     allowed: dict[str, set[str]] = {
-        "supermodel": {"support_threshold", "block_threshold", "counter_veto_weight"},
+        "supermodel": {
+            "support_threshold",
+            "block_threshold",
+            "counter_veto_weight",
+            "range_bound_trend_caution_multiplier",
+        },
         "strategy_tracker": {"window", "min_win_rate", "full_allocation_rate"},
     }
 

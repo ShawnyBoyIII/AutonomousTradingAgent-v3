@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from trading_bot.config.settings import SupermodelSettings
@@ -9,6 +9,9 @@ from trading_bot.config.settings import SupermodelSettings
 
 LayerVerdict = Literal["support", "caution", "block", "neutral"]
 StackDecision = Literal["support", "caution", "block", "no_signal"]
+
+
+RANGE_BOUND_TREND_CAUTION_POLICY = "range_bound_trend_caution"
 
 
 @dataclass(frozen=True)
@@ -190,3 +193,116 @@ def _as_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+# ----------------------------------------------------------------------------
+# V3-only conditional entry policy
+# ----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EntryPolicyDecision:
+    """Result of applying a single tunable entry-size policy."""
+
+    multiplier: float
+    policy_name: str
+    applied: bool
+    reason: str
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+def select_source_metadata(public_votes: list[dict[str, object]]) -> dict[str, object]:
+    """Extract the top-confidence BUY source metadata for downstream policy logic.
+
+    Returns ``{"selected_source": ..., "selected_strategy": ...,
+    "selected_confidence": float, "selected_action": str}``.
+
+    V3 metadata (regime/strategy tags) is intentionally NOT consumed here —
+    the predicate below keys only on the *selected* source so a V2.5 vote
+    can never accidentally trigger the V3-only policy.
+    """
+    buy_votes = [
+        vote
+        for vote in public_votes
+        if str(vote.get("action", "")).upper() == "BUY"
+    ]
+    if not buy_votes:
+        return {
+            "selected_source": None,
+            "selected_strategy": None,
+            "selected_confidence": 0.0,
+            "selected_action": "HOLD",
+        }
+    best = max(buy_votes, key=lambda vote: float(vote.get("confidence", 0.0)))
+    return {
+        "selected_source": str(best.get("source", "")),
+        "selected_strategy": str(best.get("strategy", "")),
+        "selected_confidence": round(float(best.get("confidence", 0.0)), 6),
+        "selected_action": "BUY",
+    }
+
+
+def compute_entry_policy_multiplier(
+    *,
+    selected_source: str | None,
+    selected_strategy: str | None,
+    regime: object | None,
+    supermodel_decision: str | None,
+    settings: SupermodelSettings | None = None,
+) -> EntryPolicyDecision:
+    """Pure helper that maps a fixed predicate to a tunable multiplier.
+
+    Predicate (all four conditions required):
+        selected_source == "v3"
+        selected_strategy == "v3-trend_following"
+        regime.value == "RANGE_BOUND"  (MarketRegime.RANGE_BOUND)
+        supermodel_decision == "caution"
+
+    Default multiplier is 1.0 (no scaling). A candidate value below 1.0 is
+    activated ONLY by the validated experiment controller — direct config
+    edits will be filtered by the loader's allowlist.
+    """
+    settings = settings or SupermodelSettings()
+
+    regime_value = getattr(regime, "value", regime) if regime is not None else None
+
+    conditions = {
+        "selected_source_is_v3": selected_source == "v3",
+        "selected_strategy_is_v3_trend_following": selected_strategy
+        == "v3-trend_following",
+        "regime_is_range_bound": regime_value == "range_bound",
+        "supermodel_decision_is_caution": supermodel_decision == "caution",
+    }
+    matched = all(conditions.values())
+    multiplier = float(settings.range_bound_trend_caution_multiplier)
+    if matched:
+        return EntryPolicyDecision(
+            multiplier=multiplier,
+            policy_name=RANGE_BOUND_TREND_CAUTION_POLICY,
+            applied=multiplier != 1.0,
+            reason=(
+                f"{RANGE_BOUND_TREND_CAUTION_POLICY} matched; multiplier={multiplier:.2f}"
+                if multiplier != 1.0
+                else f"{RANGE_BOUND_TREND_CAUTION_POLICY} matched but multiplier=1.0 (no-op)"
+            ),
+            metadata={
+                "selected_source": selected_source,
+                "selected_strategy": selected_strategy,
+                "regime": regime_value,
+                "supermodel_decision": supermodel_decision,
+                **conditions,
+            },
+        )
+    return EntryPolicyDecision(
+        multiplier=1.0,
+        policy_name=RANGE_BOUND_TREND_CAUTION_POLICY,
+        applied=False,
+        reason=f"{RANGE_BOUND_TREND_CAUTION_POLICY} not matched; multiplier=1.0",
+        metadata={
+            "selected_source": selected_source,
+            "selected_strategy": selected_strategy,
+            "regime": regime_value,
+            "supermodel_decision": supermodel_decision,
+            **conditions,
+        },
+    )

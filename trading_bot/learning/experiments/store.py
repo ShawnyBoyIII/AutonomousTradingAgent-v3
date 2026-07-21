@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,6 +57,35 @@ class ExperimentStore:
         with self.events_path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 
+    def snapshot_overrides_bytes(
+        self, experiment_id: str, name: str, raw_bytes: bytes
+    ) -> Path:
+        """Record the original bytes of an override file verbatim.
+
+        Used by ``propose`` so rollback can restore the exact operator-authored
+        contents (including comments, key order, and quoting) rather than a
+        YAML re-dump of the parsed structure.
+        """
+        self._ensure_root()
+        target_dir = self.root / experiment_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"{name}.yaml"
+        with NamedTemporaryFile("wb", dir=target_dir, delete=False) as handle:
+            handle.write(raw_bytes)
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
+        return path
+
+    def snapshot_absent_baseline(self, experiment_id: str) -> Path:
+        """Mark the baseline as 'the overrides file did not exist at
+        propose time' so rollback can leave it absent."""
+        self._ensure_root()
+        target_dir = self.root / experiment_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        marker = target_dir / "baseline.absent"
+        marker.write_text("", encoding="utf-8")
+        return marker
+
     def snapshot_overrides(
         self, experiment_id: str, name: str, overrides: dict[str, object]
     ) -> Path:
@@ -71,6 +101,17 @@ class ExperimentStore:
         temp_path.replace(path)
         return path
 
+    @staticmethod
+    def checksum(path: Path) -> str:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    def write_overrides_bytes_atomic(self, target: Path, raw_bytes: bytes) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile("wb", dir=target.parent, delete=False) as handle:
+            handle.write(raw_bytes)
+            temp_path = Path(handle.name)
+        temp_path.replace(target)
+
     def restore_baseline(
         self, experiment_id: str, target_path: Path
     ) -> bool:
@@ -85,6 +126,50 @@ class ExperimentStore:
             temp_path = Path(handle.name)
         temp_path.replace(target_path)
         return True
+
+    def restore_baseline_exact(
+        self, experiment_id: str, target: Path
+    ) -> bool:
+        """Restore baseline verbatim: exact bytes if present, deletion if
+        the original file was absent, no-op otherwise.
+
+        Returns True when the operation succeeded, False when no snapshot
+        exists for this experiment id.
+        """
+        absent_marker = self.root / experiment_id / "baseline.absent"
+        snapshot = self.root / experiment_id / "baseline.yaml"
+        if absent_marker.exists():
+            if target.exists():
+                target.unlink()
+            return True
+        if not snapshot.exists():
+            return False
+        self.write_overrides_bytes_atomic(target, snapshot.read_bytes())
+        return True
+
+    def activate_candidate(self, experiment_id: str, target: Path) -> bool:
+        """Write the candidate snapshot bytes to the active overrides path.
+
+        Used by ``evaluate`` when an experiment transitions to CANARY.
+        Returns False if the candidate snapshot is missing.
+        """
+        snapshot = self.root / experiment_id / "candidate.yaml"
+        if not snapshot.exists():
+            return False
+        self.write_overrides_bytes_atomic(target, snapshot.read_bytes())
+        return True
+
+    def detect_candidate_drift(
+        self, experiment_id: str, expected_checksum: str | None
+    ) -> bool:
+        """True when the live candidate snapshot has been mutated away
+        from the bytes recorded at proposal time."""
+        snapshot = self.root / experiment_id / "candidate.yaml"
+        if not snapshot.exists():
+            return True
+        if expected_checksum is None:
+            return False
+        return self.checksum(snapshot) != expected_checksum
 
     def clear_current(self) -> None:
         if self.current_path.exists():

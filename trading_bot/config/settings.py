@@ -40,6 +40,7 @@ class AppSettings(BaseModel):
     min_entry_confluence_score: float = Field(default=4.0, ge=0.0, le=12.0)
     signal_mode: str = Field(default="serial")  # "serial" or "parallel"
     min_timeframe_alignment: int = Field(default=1, ge=1, le=3)
+    dashboard_port: int = Field(default=8000, ge=1, le=65535)
 
 
 class MarketDataSettings(BaseModel):
@@ -171,6 +172,7 @@ class PaperSettings(BaseModel):
     partial_take_profit_fraction: float = Field(default=0.5, gt=0.0, lt=1.0)
     partial_take_profit_min_qty: int = Field(default=2, ge=1)
     graduation_since: datetime | None = None
+    equity_evaluation_since: datetime | None = None
 
 
 class AlertsSettings(BaseModel):
@@ -217,6 +219,12 @@ class SupermodelSettings(BaseModel):
     support_threshold: float = Field(default=0.72, ge=0.0, le=1.0)
     block_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
     counter_veto_weight: float = Field(default=1.0, ge=0.0, le=1.0)
+    # V3-only candidate policy: scale down entries where V3 was selected,
+    # regime is range_bound, the chosen strategy is v3-trend_following,
+    # and the supermodel returned `caution` (i.e., not strong support).
+    # Default 1.0 = disabled. Only the validated experiment controller
+    # should activate non-1.0 values.
+    range_bound_trend_caution_multiplier: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
 class StrategyTrackerSettings(BaseModel):
