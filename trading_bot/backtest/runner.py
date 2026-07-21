@@ -415,7 +415,18 @@ def _run_symbol_backtest(
             signal = selection_to_signal(symbol, selection, window)
             if signal is None:
                 continue
+            # Mirror the orchestrator's metadata propagation so the
+            # conditional entry-policy helper sees the same fields in the
+            # backtest as it does in paper trading. Without this, the
+            # range_bound_trend_caution predicate can never fire during
+            # replay and candidate experiments cannot differentiate.
             details["v3_total_score"] = round(selection.signal_score.total_score, 2)
+            details["v3_confidence"] = selection.signal_score.confidence
+            details["v3_strategy"] = selection.strategy_type
+            if selection.regime is not None:
+                details["v3_regime"] = getattr(selection.regime, "value", None)
+            if selection.setup_name:
+                details["v3_setup"] = selection.setup_name
         else:
             signal = generate_signal(symbol, daily_window, window)
         if signal is None:
@@ -435,6 +446,14 @@ def _run_symbol_backtest(
             details,
             settings=settings.supermodel,
         )
+        # Surface the stacked decision so the conditional entry-policy
+        # helper can read supermodel_decision from details, mirroring the
+        # paper-trade parity contract in test_entry_policy_execution_parity.
+        details.update(stacked.to_details())
+        # Mirror the orchestrator's "regime" key so the entry-policy helper
+        # can find the regime via the existing cascade in backtest/runner.
+        if "regime" not in details and "v3_regime" in details:
+            details["regime"] = details["v3_regime"]
         if stacked.decision == "block":
             continue
 
@@ -457,6 +476,74 @@ def _run_symbol_backtest(
             if not sizing.approved:
                 continue
             position_size_override = max(1, int(sizing.position_size * 0.5))
+
+        # Apply the conditional entry-policy multiplier (same logic as
+        # paper-trade) so offline replay actually reflects the candidate.
+        from trading_bot.strategy.supermodel import (
+            compute_entry_policy_multiplier,
+            select_source_metadata,
+        )
+
+        source_metadata = select_source_metadata(
+            [dict(v) for v in details.get("source_votes", []) or []]
+        )
+        if not source_metadata.get("selected_source"):
+            strategy_tag = getattr(signal, "strategy_tag", "") or ""
+            if strategy_tag.startswith("v3-"):
+                source_metadata["selected_source"] = "v3"
+            elif strategy_tag.startswith("v25-") or strategy_tag == "intraday-signal-engine":
+                source_metadata["selected_source"] = "v2.5"
+        source_metadata["strategy"] = getattr(signal, "strategy_tag", "")
+        regime_value = (
+            details.get("regime")
+            or details.get("v3_regime")
+            or details.get("mtf_regime")
+        )
+        policy_decision = compute_entry_policy_multiplier(
+            selected_source=source_metadata.get("selected_source"),
+            selected_strategy=source_metadata.get("selected_strategy")
+            or source_metadata.get("strategy"),
+            regime=regime_value,
+            supermodel_decision=details.get("supermodel_decision"),
+            settings=settings.supermodel,
+        )
+        if policy_decision.applied and policy_decision.multiplier <= 0:
+            # Zero multiplier means explicit block in paper; honor it here too.
+            continue
+        if policy_decision.applied:
+            # Re-evaluate sizing if we don't already have an override, so we
+            # can multiply by the policy multiplier.
+            if position_size_override is None:
+                from trading_bot.risk.risk_manager import evaluate_signal
+
+                sizing = evaluate_signal(
+                    signal=signal,
+                    account_equity=10_000.0,
+                    open_tickers={
+                        ticker
+                        for ticker, quantity in broker.positions.items()
+                        if quantity > 0
+                    },
+                    portfolio_heat_pct=0.0,
+                    risk_settings=settings.risk,
+                    counter_thesis=counter_result,
+                )
+                if not sizing.approved:
+                    continue
+                position_size_override = max(
+                    1, int(sizing.position_size * policy_decision.multiplier)
+                )
+            else:
+                position_size_override = max(
+                    1, int(position_size_override * policy_decision.multiplier)
+                )
+            details["entry_policy"] = {
+                "name": policy_decision.policy_name,
+                "applied": True,
+                "multiplier": policy_decision.multiplier,
+                "reason": policy_decision.reason,
+                **policy_decision.metadata,
+            }
 
         fill = submit_signal_as_order(
             signal=signal,

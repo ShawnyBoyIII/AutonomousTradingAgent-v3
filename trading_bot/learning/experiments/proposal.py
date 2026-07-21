@@ -6,6 +6,7 @@ PRIORITY = (
     ("supermodel", "counter_veto_weight"),
     ("supermodel", "block_threshold"),
     ("supermodel", "support_threshold"),
+    ("supermodel", "range_bound_trend_caution_multiplier"),
     ("strategy_tracker", "full_allocation_rate"),
 )
 
@@ -13,6 +14,9 @@ STEP_RULES = {
     ("supermodel", "counter_veto_weight"): 0.25,
     ("supermodel", "block_threshold"): 0.05,
     ("supermodel", "support_threshold"): 0.05,
+    # First-step reducer: a discrete 0.5 reduction (1.0 -> 0.5) replaces
+    # fractional creep so we measure the policy intervention cleanly.
+    ("supermodel", "range_bound_trend_caution_multiplier"): 0.5,
     ("strategy_tracker", "full_allocation_rate"): 0.05,
 }
 

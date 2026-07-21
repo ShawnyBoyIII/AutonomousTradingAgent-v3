@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -9,6 +9,17 @@ import yaml
 
 from trading_bot.config.settings import Settings
 from trading_bot.strategy.strategy_tracker import strategy_summary
+
+
+# Reducer block: defaults chosen for first-step safety. The offline replay
+# gate in Plan B still gates every candidate; this hook only determines
+# whether the *proposal* should surface the trend multiplier change.
+TREND_REDUCER_STRATEGY_TAG = "v3-trend_following"
+TREND_REDUCER_FIRST_STEP = 0.5
+TREND_REDUCER_MIN_SELL_TRADES = 15
+TREND_REDUCER_MAX_WIN_RATE = 0.50
+TREND_REDUCER_EVIDENCE_LOOKBACK_HOURS = 36
+TREND_REDUCER_MIN_AVG_PNL = 0.0
 
 
 def propose_tuning_overrides(
@@ -21,6 +32,9 @@ def propose_tuning_overrides(
             "support_threshold": settings.supermodel.support_threshold,
             "block_threshold": settings.supermodel.block_threshold,
             "counter_veto_weight": settings.supermodel.counter_veto_weight,
+            "range_bound_trend_caution_multiplier": (
+                settings.supermodel.range_bound_trend_caution_multiplier
+            ),
         },
         "strategy_tracker": {
             "window": settings.strategy_tracker.window,
@@ -54,6 +68,8 @@ def propose_tuning_overrides(
                 2,
             )
 
+    _maybe_apply_trend_reducer(settings, proposal)
+
     # Data-store nudge: if recent bars in the long-term store show realised
     # volatility spiking above what the strategy_tracker is sized for, raise
     # the window so we look at more trades before changing sizing. This is
@@ -62,6 +78,83 @@ def propose_tuning_overrides(
     _maybe_nudge_window_from_data_store(settings, proposal)
 
     return proposal
+
+
+def _maybe_apply_trend_reducer(
+    settings: Settings,
+    proposal: dict[str, dict[str, float | int]],
+) -> None:
+    """Surface a multiplier reduction when the cohort evidence supports it.
+
+    The proposal still has to clear the offline replay + canary gates in
+    Plan B; this hook merely lets the nightly tuner *offer* a candidate.
+    It is intentionally additive: it never raises the multiplier, only
+    proposes a single discrete first-step reduction (1.0 → 0.5).
+    """
+    current = float(settings.supermodel.range_bound_trend_caution_multiplier)
+    if current <= TREND_REDUCER_FIRST_STEP:
+        # Already at or below the first step; don't keep halving.
+        return
+
+    evidence = _trend_evidence_lookup(settings)
+    if evidence is None:
+        return
+
+    n_sells, win_rate, avg_pnl = evidence
+    if n_sells < TREND_REDUCER_MIN_SELL_TRADES:
+        return
+    if win_rate > TREND_REDUCER_MAX_WIN_RATE:
+        return
+    if avg_pnl >= TREND_REDUCER_MIN_AVG_PNL:
+        return
+
+    proposal["supermodel"]["range_bound_trend_caution_multiplier"] = (
+        TREND_REDUCER_FIRST_STEP
+    )
+
+
+def _trend_evidence_lookup(
+    settings: Settings,
+) -> tuple[int, float, float] | None:
+    """Return (n_sells, win_rate, avg_pnl) for the targeted bucket.
+
+    Looks at the cohort's persisted SELL rows for the targeted strategy tag.
+    Returns None if the state DB is missing or unreadable so the reducer
+    never breaks the override proposal pipeline.
+    """
+    db_path = Path(settings.app.state_db_path)
+    if not db_path.exists():
+        return None
+    try:
+        import sqlite3
+
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(hours=TREND_REDUCER_EVIDENCE_LOOKBACK_HOURS)
+        ).isoformat()
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS n_sells,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS n_wins,
+                    AVG(pnl) AS avg_pnl
+                FROM orders
+                WHERE side = 'SELL'
+                  AND strategy_tag = ?
+                  AND filled_at >= ?
+                """,
+                (TREND_REDUCER_STRATEGY_TAG, cutoff),
+            ).fetchone()
+        if row is None or row[0] == 0:
+            return None
+        n_sells = int(row[0])
+        n_wins = int(row[1] or 0)
+        avg_pnl = float(row[2] or 0.0)
+        win_rate = n_wins / n_sells if n_sells else 0.0
+        return n_sells, win_rate, avg_pnl
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _maybe_nudge_window_from_data_store(

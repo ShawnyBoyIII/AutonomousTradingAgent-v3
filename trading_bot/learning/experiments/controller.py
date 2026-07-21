@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import shutil
 from datetime import date, datetime, timezone
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 import yaml
@@ -61,6 +64,7 @@ class ExperimentController:
             return None
 
         baseline_overrides = self._current_overrides()
+        baseline_was_absent = not self.overrides_path.exists()
         proposed = propose_tuning_overrides(
             Path(self.settings.app.log_dir),
             self.base_settings,
@@ -71,9 +75,25 @@ class ExperimentController:
             return None
 
         experiment_id = self._make_id(change)
-        self.store.snapshot_overrides(experiment_id, "baseline", baseline_overrides)
+
+        # Capture exact baseline bytes (or sentinel for absence) so rollback
+        # restores the operator-authored file verbatim.
+        if baseline_was_absent:
+            self.store.snapshot_absent_baseline(experiment_id)
+            baseline_checksum = ""
+        else:
+            raw = self.overrides_path.read_bytes()
+            self.store.snapshot_overrides_bytes(experiment_id, "baseline", raw)
+            baseline_checksum = self.store.checksum(
+                self.store.root / experiment_id / "baseline.yaml"
+            )
+
         candidate_overrides = self._apply_to_overrides(baseline_overrides, change)
         self.store.snapshot_overrides(experiment_id, "candidate", candidate_overrides)
+        candidate_checksum = self.store.checksum(
+            self.store.root / experiment_id / "candidate.yaml"
+        )
+
         state = ExperimentState(
             experiment_id=experiment_id,
             status="PROPOSED",
@@ -82,6 +102,9 @@ class ExperimentController:
             baseline_metrics=None,
             candidate_metrics=None,
             shadow_metrics=None,
+            candidate_checksum=candidate_checksum,
+            baseline_checksum=baseline_checksum,
+            baseline_was_absent=baseline_was_absent,
         )
         self.store.save_current(state)
         self.store.append_event({"event": "proposed", "experiment_id": experiment_id, "change": change.model_dump()})
@@ -89,6 +112,37 @@ class ExperimentController:
         return state
 
     # --- evaluation -----------------------------------------------------
+    @staticmethod
+    def _filter_fully_covered_symbols(
+        symbols: list[str], bar_loader: Any, start: date, end: date
+    ) -> list[str]:
+        """Restrict the replay universe to symbols that have at least the
+        first quarter of the requested window as local bars.
+
+        ``available_symbols`` returns every symbol in the manifest, but the
+        EOD store does not guarantee full coverage for every symbol;
+        insufficient bars cause the per-symbol ``fetch_bars`` call to
+        raise and abort the whole replay. Filtering up front keeps the
+        replay deterministic and avoids silently dropping eligible
+        symbols because of an unrelated data gap.
+        """
+        from trading_bot.data.data_store import read_bars
+
+        root = Path(getattr(bar_loader, "root", ""))
+        if not root:
+            return list(symbols)
+        cutoff = start + (end - start) / 4
+        kept: list[str] = []
+        for sym in symbols:
+            try:
+                df = read_bars(sym, "1d", start, cutoff, root)
+            except Exception:  # noqa: BLE001
+                continue
+            if df.empty or len(df) < 5:
+                continue
+            kept.append(sym)
+        return kept
+
     def evaluate(self) -> ExperimentState | None:
         state = self.store.load_current()
         if state is None:
@@ -96,6 +150,20 @@ class ExperimentController:
 
         # Offline stage
         if state.status == "PROPOSED":
+            # Drift check: refuse to advance if someone hand-edited the
+            # candidate between propose and evaluate.
+            if self.store.detect_candidate_drift(
+                state.experiment_id, state.candidate_checksum
+            ):
+                state.status = "ERROR"
+                state.last_error = "candidate snapshot drifted from proposal"
+                self.store.save_current(state)
+                self.store.append_event({
+                    "event": "candidate_drift",
+                    "experiment_id": state.experiment_id,
+                })
+                return state
+
             evaluation = self._run_offline(state)
             self.store.append_event({
                 "event": "offline_evaluated",
@@ -108,11 +176,31 @@ class ExperimentController:
                 state.candidate_metrics = evaluation.candidate_validation
                 state.baseline_metrics = evaluation.baseline_validation
                 self.store.save_current(state)
-                self.store.clear_current()
+                self._archive_to_terminal(state, "OFFLINE_REJECTED")
                 return state
             state.baseline_metrics = evaluation.baseline_validation
             state.candidate_metrics = evaluation.candidate_validation
             state.status = "CANARY"
+
+            # Atomic activation: copy candidate snapshot bytes verbatim to
+            # the live overrides path. After this line the next bot process
+            # will load the candidate, not the baseline.
+            activated = self.store.activate_candidate(
+                state.experiment_id, self.overrides_path
+            )
+            if not activated:
+                state.status = "ERROR"
+                state.last_error = "candidate snapshot missing at activation"
+                self.store.save_current(state)
+                self.store.append_event({
+                    "event": "candidate_missing",
+                    "experiment_id": state.experiment_id,
+                })
+                # Restore baseline so we don't leave a partial state.
+                self.store.restore_baseline_exact(
+                    state.experiment_id, self.overrides_path
+                )
+                return state
             self.store.save_current(state)
             self.store.append_event({"event": "canary_started", "experiment_id": state.experiment_id})
 
@@ -122,14 +210,15 @@ class ExperimentController:
         decision = self._decide(state)
         state.status = decision
         if decision == "KEPT":
-            overrides = self._current_overrides()
-            self.store.write_overrides_atomic(self.overrides_path, overrides)
             self.store.save_current(state)
+            self._archive_to_terminal(state, "KEPT")
         elif decision in {"ROLLED_BACK", "INCONCLUSIVE", "ERROR"}:
-            self.store.restore_baseline(state.experiment_id, self.overrides_path)
+            self.store.restore_baseline_exact(
+                state.experiment_id, self.overrides_path
+            )
             state.rolled_back_at = datetime.now(timezone.utc)
             self.store.save_current(state)
-            self.store.clear_current()
+            self._archive_to_terminal(state, decision)
         self.store.append_event({"event": decision.lower(), "experiment_id": state.experiment_id})
         return state
 
@@ -137,12 +226,14 @@ class ExperimentController:
         state = self.store.load_current()
         if state is None:
             return None
-        ok = self.store.restore_baseline(state.experiment_id, self.overrides_path)
+        ok = self.store.restore_baseline_exact(
+            state.experiment_id, self.overrides_path
+        )
         state.status = "ROLLED_BACK"
         state.rolled_back_at = datetime.now(timezone.utc)
         state.last_error = reason
         if ok:
-            self.store.clear_current()
+            self._archive_to_terminal(state, "ROLLED_BACK")
         self.store.append_event({
             "event": "rolled_back",
             "experiment_id": state.experiment_id,
@@ -150,6 +241,27 @@ class ExperimentController:
             "reason": reason,
         })
         return state
+
+    def _archive_to_terminal(
+        self, state: ExperimentState, status: str
+    ) -> None:
+        """Move the active experiment state to archived/<id>/ rather than
+        deleting it. Terminal outcomes (KEPT/ROLLED_BACK/INCONCLUSIVE/ERROR/
+        OFFLINE_REJECTED) must remain auditable."""
+        archived = self.store.root / "archived" / state.experiment_id
+        archived.mkdir(parents=True, exist_ok=True)
+        # Persist the *terminal* status (not the pre-terminal one), then move.
+        state.status = status  # type: ignore[assignment]
+        self.store.save_current(state)
+        target_state = archived / "current.json"
+        if self.store.current_path.exists():
+            shutil.move(str(self.store.current_path), str(target_state))
+        src = self.store.root / state.experiment_id
+        if src.exists():
+            target_files = archived / "files"
+            if target_files.exists():
+                shutil.rmtree(target_files)
+            shutil.move(str(src), str(target_files))
 
     def status(self) -> dict[str, Any]:
         state = self.store.load_current()
@@ -200,6 +312,9 @@ class ExperimentController:
         end_date = date.today()
         start_date = end_date.replace(year=end_date.year - 2)
         symbols = self.bar_loader.available_symbols()
+        symbols = self._filter_fully_covered_symbols(
+            symbols, self.bar_loader, start_date, end_date
+        )
         return evaluate_offline(
             settings=self.settings,
             change=state.change,
@@ -237,3 +352,100 @@ class ExperimentController:
     def _make_id(self, change: ParameterChange) -> str:
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         return f"{stamp}__{change.section}.{change.field}-{change.baseline:g}-to-{change.candidate:g}"
+
+    # ------------------------------------------------------------------
+    # Plan C step 1: archival + exact-byte rollback + version drift
+    # detection. These helpers are classmethods so callers can invoke
+    # them without instantiating a full controller (mirroring the
+    # pattern used by the rest of the module).
+    # ------------------------------------------------------------------
+
+    ARCHIVED_DIRNAME = "archived"
+
+    @classmethod
+    def archive_terminal(
+        cls,
+        store: ExperimentStore,
+        *,
+        status: str,
+        reason: str | None = None,
+    ) -> ExperimentState | None:
+        """Move the current state to ``archived/<experiment_id>`` instead of
+        deleting it. Terminal outcomes (KEPT / ROLLED_BACK / INCONCLUSIVE /
+        ERROR) must remain auditable; clearing the row leaves no trace."""
+        state = store.load_current()
+        if state is None:
+            return None
+        state.status = status
+        if reason:
+            state.last_error = reason
+        archived = store.root / cls.ARCHIVED_DIRNAME / state.experiment_id
+        archived.mkdir(parents=True, exist_ok=True)
+        # Move both the current state JSON and the per-experiment dir.
+        if store.current_path.exists():
+            shutil.move(str(store.current_path), str(archived / "current.json"))
+        src = store.root / state.experiment_id
+        if src.exists():
+            target = archived / "files"
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.move(str(src), str(target))
+        store.append_event({
+            "event": status.lower(),
+            "experiment_id": state.experiment_id,
+            "archived_to": str(archived),
+            "reason": reason,
+        })
+        return state
+
+    @classmethod
+    def restore_baseline_to_target(
+        cls,
+        *,
+        store: ExperimentStore,
+        experiment_id: str,
+        target: Path,
+    ) -> bool:
+        """Restore the baseline snapshot exactly.
+
+        If the baseline snapshot is marked "absent" (a sentinel file left
+        at archive time), the target must be deleted instead of overwritten
+        so callers can tell "no override was ever active" apart from
+        "an empty override is active".
+        """
+        snapshot = store.root / experiment_id / "baseline.yaml"
+        absent_marker = store.root / experiment_id / "baseline.absent"
+        if absent_marker.exists():
+            if target.exists():
+                target.unlink()
+            return True
+        if not snapshot.exists():
+            return False
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Preserve exact snapshot bytes to satisfy "exact original
+        # override-byte snapshot" from Plan C.
+        with NamedTemporaryFile(
+            "wb", dir=target.parent, delete=False
+        ) as handle:
+            handle.write(snapshot.read_bytes())
+            temp_path = Path(handle.name)
+        temp_path.replace(target)
+        return True
+
+    @classmethod
+    def detect_candidate_drift(
+        cls,
+        store: ExperimentStore,
+        experiment_id: str,
+        *,
+        expected_checksum: str | None = None,
+    ) -> bool:
+        """True when the live candidate snapshot has been mutated away
+        from the bytes recorded at proposal time."""
+        snapshot = store.root / experiment_id / "candidate.yaml"
+        if not snapshot.exists():
+            return True
+        actual = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+        if expected_checksum is None:
+            return False
+        return actual != expected_checksum
