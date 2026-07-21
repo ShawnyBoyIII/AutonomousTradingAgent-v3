@@ -171,18 +171,23 @@ class ShadowLedger:
         BUY costs), positions, closed-trade P&L history, and the equity
         curve. If artifacts are absent or malformed, the ledger starts
         fresh from ``starting_cash``.
+
+        Malformed tail handling: parse line-by-line so a torn final record
+        does not discard every previously valid entry. The valid prefix is
+        preserved; the malformed tail is skipped silently (caller has the
+        raw file if forensic recovery is needed).
         """
         if not self._fills_path.exists():
             return
-        try:
-            lines = [
-                json.loads(line)
-                for line in self._fills_path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-        except json.JSONDecodeError:
-            return
-        for entry in lines:
+        for line in self._fills_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                # Skip the malformed line; keep going with whatever valid
+                # records remain after it.
+                continue
             try:
                 fill = ShadowFill(
                     ticker=str(entry["ticker"]),
