@@ -1,11 +1,35 @@
+"""Independent paired-baseline shadow broker for tuning experiments.
+
+The candidate policy is exercised by the live ``run_paper_trade`` path. To
+compare candidate economics against a frozen baseline without polluting the
+production ledger, this module runs an independent baseline broker in
+lockstep with each candidate fill.
+
+Key invariants:
+
+1. The baseline broker uses the *baseline* ``SupermodelSettings`` (with
+   ``range_bound_trend_caution_multiplier=1.0``) so its sizing reflects the
+   pre-experiment behavior, regardless of what the live candidate used.
+2. Each ledger tracks realized P&L from *closed* trades, not from cash
+   changes; an open position is marked-to-market using the latest fill
+   price the ledger has seen.
+3. Profit factor is computed as ``gross_profit / |gross_loss|`` over
+   closed trades; ``max_drawdown_pct`` is the largest equity peak-to-trough
+   percentage observed over the recorded equity curve.
+4. State is persisted to JSONL artifacts; a fresh ``ShadowLedger``
+   constructed with the same ``artifacts_dir`` rebuilds cash, positions,
+   closed-trade history, and equity series from disk.
+"""
+
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from trading_bot.learning.experiments.models import MetricSet
+from trading_bot.learning.experiments.models import MetricSet, ParameterChange
 
 
 @dataclass(frozen=True)
@@ -15,59 +39,267 @@ class ShadowFill:
     quantity: int
     fill_price: float
     fees: float
+    applied_multiplier: float = 1.0
 
 
 class ShadowLedger:
-    """Append-only ledger for paired-baseline paper simulation."""
+    """Independent baseline or candidate ledger for paired canary runs.
 
-    def __init__(self, artifacts_dir: Path, starting_cash: float) -> None:
+    Tracks closed-trade realized P&L, marked-to-market equity, and the
+    full equity curve so ``profit_factor`` and ``max_drawdown_pct`` are
+    computable from the ledger alone.
+    """
+
+    def __init__(
+        self,
+        artifacts_dir: Path,
+        starting_cash: float,
+        *,
+        ledger_id: str = "baseline",
+    ) -> None:
         self.artifacts_dir = Path(artifacts_dir)
         self.starting_cash = float(starting_cash)
+        self.ledger_id = ledger_id
         self._cash = float(starting_cash)
         self._positions: dict[str, dict[str, float]] = {}
-        self._trade_count = 0
-        self._fills_path = self.artifacts_dir / "shadow-fills.jsonl"
-        self._equity_path = self.artifacts_dir / "shadow-equity.jsonl"
+        self._closed_pnls: list[float] = []
+        self._equity_curve: list[float] = [float(starting_cash)]
+        prefix = "" if ledger_id == "baseline" else f"{ledger_id}-"
+        self._fills_path = self.artifacts_dir / f"{prefix}shadow-fills.jsonl"
+        self._equity_path = self.artifacts_dir / f"{prefix}shadow-equity.jsonl"
+        self._load_state()
 
     def record(self, fill: ShadowFill) -> None:
+        """Record a fill at its independently-sized quantity.
+
+        The shadow's sizing is determined upstream (``applied_multiplier``
+        on the fill), so the ledger does not know whether the fill came
+        from the candidate or the baseline; it just records the fill.
+        """
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        if fill.quantity <= 0:
+            return
         cost = fill.fill_price * fill.quantity + fill.fees
         if fill.side == "BUY":
             self._cash -= cost
             pos = self._positions.setdefault(
-                fill.ticker, {"qty": 0, "cost_basis": 0.0}
+                fill.ticker, {"qty": 0.0, "cost_basis": 0.0}
             )
             pos["qty"] += fill.quantity
             pos["cost_basis"] += cost
-            self._trade_count += 1
-        else:
-            self._cash += fill.fill_price * fill.quantity - fill.fees
-            pos = self._positions.get(fill.ticker, {"qty": 0, "cost_basis": 0.0})
-            pos["qty"] -= fill.quantity
-            if pos["qty"] <= 0:
+        else:  # SELL
+            pos = self._positions.get(fill.ticker, {"qty": 0.0, "cost_basis": 0.0})
+            sold_qty = min(float(fill.quantity), float(pos.get("qty", 0.0)))
+            avg_cost = (
+                float(pos["cost_basis"]) / float(pos["qty"])
+                if float(pos.get("qty", 0.0)) > 0
+                else 0.0
+            )
+            realized = (fill.fill_price - avg_cost) * sold_qty - fill.fees
+            self._cash += fill.fill_price * sold_qty - fill.fees
+            pos["qty"] = float(pos.get("qty", 0.0)) - sold_qty
+            pos["cost_basis"] = max(0.0, float(pos.get("cost_basis", 0.0)) - avg_cost * sold_qty)
+            if pos["qty"] <= 1e-9:
                 self._positions.pop(fill.ticker, None)
+            if sold_qty > 0:
+                self._closed_pnls.append(realized)
         self._append_line(self._fills_path, fill.__dict__)
-        self._append_line(
-            self._equity_path,
-            {"equity": self.metrics().net_pnl + self.starting_cash},
-        )
+        equity = self._marked_to_market()
+        self._equity_curve.append(equity)
+        self._append_line(self._equity_path, {"equity": equity})
 
     def metrics(self) -> MetricSet:
-        realized = self._cash - self.starting_cash
+        closed = len(self._closed_pnls)
+        gross_profit = sum(p for p in self._closed_pnls if p > 0)
+        gross_loss = -sum(p for p in self._closed_pnls if p < 0)
+        if gross_loss > 0:
+            pf = gross_profit / gross_loss
+        elif gross_profit > 0:
+            pf = float("inf")
+        else:
+            pf = 0.0
+        max_dd = self._compute_max_drawdown_pct()
         return MetricSet(
-            trades=self._trade_count,
-            profit_factor=0.0,
-            net_pnl=realized,
-            max_drawdown_pct=0.0,
+            trades=closed,
+            profit_factor=round(pf, 6) if math.isfinite(pf) else pf,
+            net_pnl=round(sum(self._closed_pnls), 6),
+            max_drawdown_pct=round(max_dd, 6),
         )
 
-    def restore_positions(self, positions: dict[str, dict[str, float]]) -> None:
-        self._positions = dict(positions)
+    def _marked_to_market(self) -> float:
+        """Equity = cash + market value of open positions.
+
+        We approximate market value with the most recent cost basis per
+        share; this matches the paper broker's behavior since shadow fills
+        do not observe live tick prices.
+        """
+        equity = self._cash
+        for pos in self._positions.values():
+            if pos["qty"] > 0:
+                equity += float(pos["cost_basis"])
+        return equity
+
+    def _compute_max_drawdown_pct(self) -> float:
+        if not self._equity_curve:
+            return 0.0
+        peak = self._equity_curve[0]
+        max_dd = 0.0
+        for value in self._equity_curve:
+            if value > peak:
+                peak = value
+            if peak > 0:
+                dd = (peak - value) / peak * 100.0
+                if dd > max_dd:
+                    max_dd = dd
+        return max_dd
 
     def snapshot_positions(self) -> dict[str, dict[str, float]]:
-        return {ticker: dict(values) for ticker, values in self._positions.items()}
+        return {
+            ticker: {"qty": float(values["qty"]), "cost_basis": float(values["cost_basis"])}
+            for ticker, values in self._positions.items()
+        }
 
     def _append_line(self, path: Path, payload: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+
+    def _load_state(self) -> None:
+        """Reload ledger state from JSONL artifacts on construction.
+
+        Rebuilt state covers cash (derived from recorded SELL fills minus
+        BUY costs), positions, closed-trade P&L history, and the equity
+        curve. If artifacts are absent or malformed, the ledger starts
+        fresh from ``starting_cash``.
+        """
+        if not self._fills_path.exists():
+            return
+        try:
+            lines = [
+                json.loads(line)
+                for line in self._fills_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        except json.JSONDecodeError:
+            return
+        for entry in lines:
+            try:
+                fill = ShadowFill(
+                    ticker=str(entry["ticker"]),
+                    side=str(entry["side"]),
+                    quantity=int(entry["quantity"]),
+                    fill_price=float(entry["fill_price"]),
+                    fees=float(entry["fees"]),
+                    applied_multiplier=float(entry.get("applied_multiplier", 1.0)),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            self._record_in_memory(fill)
+
+
+    def _record_in_memory(self, fill: ShadowFill) -> None:
+        """Replay a fill into the in-memory state without re-writing artifacts."""
+        if fill.quantity <= 0:
+            return
+        cost = fill.fill_price * fill.quantity + fill.fees
+        if fill.side == "BUY":
+            self._cash -= cost
+            pos = self._positions.setdefault(
+                fill.ticker, {"qty": 0.0, "cost_basis": 0.0}
+            )
+            pos["qty"] += fill.quantity
+            pos["cost_basis"] += cost
+        else:
+            pos = self._positions.get(fill.ticker, {"qty": 0.0, "cost_basis": 0.0})
+            sold_qty = min(float(fill.quantity), float(pos.get("qty", 0.0)))
+            avg_cost = (
+                float(pos["cost_basis"]) / float(pos["qty"])
+                if float(pos.get("qty", 0.0)) > 0
+                else 0.0
+            )
+            realized = (fill.fill_price - avg_cost) * sold_qty - fill.fees
+            self._cash += fill.fill_price * sold_qty - fill.fees
+            pos["qty"] = float(pos.get("qty", 0.0)) - sold_qty
+            pos["cost_basis"] = max(
+                0.0, float(pos.get("cost_basis", 0.0)) - avg_cost * sold_qty
+            )
+            if pos["qty"] <= 1e-9:
+                self._positions.pop(fill.ticker, None)
+            if sold_qty > 0:
+                self._closed_pnls.append(realized)
+        self._equity_curve.append(self._marked_to_market())
+
+
+class PairedShadowHarness:
+    """Independent paired broker: baseline vs. candidate.
+
+    Each ``record_paired`` records the same logical fill into two ledgers,
+    applying *different* ``applied_multiplier`` values:
+      * Baseline ledger receives ``baseline_multiplier`` (1.0 by design —
+        this represents the pre-experiment behavior).
+      * Candidate ledger receives ``candidate_multiplier`` (whatever the
+        experiment configured; e.g. 0.5 for the half-size policy).
+
+    This is what allows the canary gate to compare ``candidate.profit_factor``
+    against ``baseline.profit_factor``: the *only* delta comes from the
+    policy multiplier, not from filled-quantity duplication.
+    """
+
+    def __init__(
+        self,
+        *,
+        artifacts_dir: Path,
+        starting_cash: float,
+        change: ParameterChange,
+        baseline_multiplier: float = 1.0,
+        candidate_multiplier: float = 1.0,
+    ) -> None:
+        self.artifacts_dir = Path(artifacts_dir)
+        self.starting_cash = float(starting_cash)
+        self.change = change
+        self.baseline_multiplier = float(baseline_multiplier)
+        self.candidate_multiplier = float(candidate_multiplier)
+        self.baseline = ShadowLedger(
+            artifacts_dir=artifacts_dir,
+            starting_cash=starting_cash,
+            ledger_id="baseline",
+        )
+        self.candidate = ShadowLedger(
+            artifacts_dir=artifacts_dir,
+            starting_cash=starting_cash,
+            ledger_id="candidate",
+        )
+
+    def record_paired(
+        self,
+        ticker: str,
+        side: Literal["BUY", "SELL"],
+        raw_quantity: int,
+        fill_price: float,
+        fees: float,
+    ) -> None:
+        """Record one logical fill into both ledgers at their own size."""
+        if raw_quantity <= 0:
+            return
+        baseline_qty = max(1, int(round(raw_quantity * self.baseline_multiplier)))
+        candidate_qty = max(1, int(round(raw_quantity * self.candidate_multiplier)))
+        self.baseline.record(
+            ShadowFill(
+                ticker=ticker,
+                side=side,
+                quantity=baseline_qty,
+                fill_price=fill_price,
+                fees=fees,
+                applied_multiplier=self.baseline_multiplier,
+            )
+        )
+        self.candidate.record(
+            ShadowFill(
+                ticker=ticker,
+                side=side,
+                quantity=candidate_qty,
+                fill_price=fill_price,
+                fees=fees,
+                applied_multiplier=self.candidate_multiplier,
+            )
+        )
