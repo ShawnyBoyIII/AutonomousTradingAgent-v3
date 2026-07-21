@@ -171,6 +171,28 @@ class ExperimentStore:
             return False
         return self.checksum(snapshot) != expected_checksum
 
+    def detect_baseline_drift(
+        self, target: Path, expected_checksum: str | None, baseline_was_absent: bool
+    ) -> bool:
+        """True when the live overrides file has been mutated away from
+        the bytes recorded at proposal time.
+
+        ``expected_checksum`` is the baseline checksum recorded when the
+        experiment was proposed; ``baseline_was_absent`` flags whether the
+        baseline file did not exist at proposal time. This guards against
+        the controller silently overwriting an operator's hand-edits at
+        activation or rollback.
+        """
+        if baseline_was_absent:
+            # If baseline was absent at proposal time, the only "drift" we
+            # worry about is the operator creating the file from scratch.
+            return target.exists()
+        if not target.exists():
+            return True  # original baseline existed but is now missing
+        if expected_checksum is None:
+            return False  # nothing to compare against; treat as no drift
+        return self.checksum(target) != expected_checksum
+
     def clear_current(self) -> None:
         if self.current_path.exists():
             self.current_path.unlink()

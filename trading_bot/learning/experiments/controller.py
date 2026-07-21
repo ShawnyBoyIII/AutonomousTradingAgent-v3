@@ -182,6 +182,22 @@ class ExperimentController:
             state.candidate_metrics = evaluation.candidate_validation
             state.status = "CANARY"
 
+            # Drift guard: if the operator hand-edited the live overrides
+            # since proposal, log it before we overwrite with candidate bytes.
+            # We don't refuse activation (operator edits during canary are
+            # the operator's call), but we record the event so audit
+            # can show what was overwritten.
+            if self.store.detect_baseline_drift(
+                self.overrides_path,
+                state.baseline_checksum,
+                state.baseline_was_absent,
+            ):
+                self.store.append_event({
+                    "event": "baseline_drift_detected",
+                    "experiment_id": state.experiment_id,
+                    "phase": "activation",
+                })
+
             # Atomic activation: copy candidate snapshot bytes verbatim to
             # the live overrides path. After this line the next bot process
             # will load the candidate, not the baseline.
@@ -226,6 +242,20 @@ class ExperimentController:
         state = self.store.load_current()
         if state is None:
             return None
+        # Drift guard: log if the live overrides have been mutated away
+        # from the bytes we recorded at proposal time. This protects
+        # operators from silent overwrites of post-activation edits.
+        if self.store.detect_baseline_drift(
+            self.overrides_path,
+            state.baseline_checksum,
+            state.baseline_was_absent,
+        ):
+            self.store.append_event({
+                "event": "baseline_drift_detected",
+                "experiment_id": state.experiment_id,
+                "phase": "rollback",
+                "reason": reason,
+            })
         ok = self.store.restore_baseline_exact(
             state.experiment_id, self.overrides_path
         )
