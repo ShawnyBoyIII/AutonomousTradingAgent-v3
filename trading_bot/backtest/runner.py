@@ -73,6 +73,27 @@ def _aggregate_strategy_returns(equity_curves: list[list[float]]) -> list[float]
     return returns.tolist()
 
 
+def _portfolio_max_drawdown_pct(equity_curves: list[list[float]]) -> float:
+    """Compute portfolio-level max drawdown from per-symbol equity curves.
+
+    Aggregates per-symbol equity into a single portfolio curve and runs
+    ``compute_drawdown`` over the chronological series. Returns 0.0 when
+    there are no curves or fewer than two points (insufficient evidence).
+    """
+    if not equity_curves:
+        return 0.0
+    min_len = min((len(c) for c in equity_curves), default=0)
+    if min_len < 2:
+        return 0.0
+    combined = np.zeros(min_len)
+    for curve in equity_curves:
+        combined += np.array(curve[:min_len], dtype=float)
+    from trading_bot.monitoring.drawdown import compute_drawdown
+
+    metrics = compute_drawdown(combined.tolist())
+    return float(metrics.max_drawdown_pct)
+
+
 def run_backtest(
     symbols: list[str],
     settings: Settings,
@@ -225,6 +246,7 @@ def run_backtest(
 
     # Run attribution analysis
     summary["strategy_returns"] = _aggregate_strategy_returns(equity_curves)
+    summary["max_drawdown_pct"] = _portfolio_max_drawdown_pct(equity_curves)
     try:
         from trading_bot.backtest.attribution import run_attribution
         benchmark_data = None
