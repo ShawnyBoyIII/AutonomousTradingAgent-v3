@@ -17,6 +17,7 @@ from trading_bot.advisory import load_scout_override, load_latest_advisory_repor
 from trading_bot.config.settings import Settings
 from trading_bot.portfolio.ledger import PortfolioLedger
 from trading_bot.runtime.watchlist import add_symbol, read_watchlist, remove_symbol
+from trading_bot.safety.circuit_breaker import cohort_boundary
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +226,16 @@ class DashboardServer:
         drawdown_metrics = None
         if ledger and "compute_drawdown_from_ledger" in deps:
             try:
-                drawdown_metrics = deps["compute_drawdown_from_ledger"](ledger)
+                equity_boundary = cohort_boundary(self.settings)
+                naive_timezone = getattr(
+                    self.settings.app, "timezone", None
+                )
+                drawdown_metrics = deps["compute_drawdown_from_ledger"](
+                    ledger,
+                    limit=None,
+                    since=equity_boundary,
+                    naive_timezone=naive_timezone,
+                )
             except Exception:
                 logger.debug("Failed to compute drawdown metrics")
 
@@ -288,8 +298,22 @@ class DashboardServer:
             },
             "circuit_breaker": {
                 "consecutive_losses": consecutive_losses,
-                "drawdown_current_pct": round(drawdown_metrics.current_drawdown_pct, 2) if drawdown_metrics else None,
-                "drawdown_max_pct": round(drawdown_metrics.max_drawdown_pct, 2) if drawdown_metrics else None,
+                "drawdown_current_pct": (
+                    round(drawdown_metrics.current_drawdown_pct, 2)
+                    if drawdown_metrics and drawdown_metrics.sufficient_evidence
+                    else None
+                ),
+                "drawdown_max_pct": (
+                    round(drawdown_metrics.max_drawdown_pct, 2)
+                    if drawdown_metrics and drawdown_metrics.sufficient_evidence
+                    else None
+                ),
+                "drawdown_sufficient_evidence": bool(
+                    drawdown_metrics and drawdown_metrics.sufficient_evidence
+                ),
+                "drawdown_sample_size": (
+                    drawdown_metrics.sample_size if drawdown_metrics else 0
+                ),
             },
             "realtime_pnl": realtime_pnl,
             "market_regime": market_regime,

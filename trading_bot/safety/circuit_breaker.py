@@ -13,6 +13,22 @@ from typing import TYPE_CHECKING
 from trading_bot.monitoring.drawdown import compute_drawdown_from_ledger
 from trading_bot.safety.kill_switch import KillSwitchReason, halt_trading
 
+
+def cohort_boundary(settings: "Settings") -> str | None:
+    """Resolve the equity-evaluation boundary with cohort fallback.
+
+    Returns ``paper.equity_evaluation_since`` when set, otherwise falls back to
+    ``paper.graduation_since``. Both boundaries are valid cohort start points;
+    the equity boundary is preferred because it excludes legacy peak equity
+    data that can falsely trip the drawdown circuit breaker.
+    """
+    paper = getattr(settings, "paper", None)
+    if paper is None:
+        return None
+    return getattr(paper, "equity_evaluation_since", None) or getattr(
+        paper, "graduation_since", None
+    )
+
 if TYPE_CHECKING:
     from trading_bot.config.settings import Settings
     from trading_bot.portfolio.ledger import PortfolioLedger
@@ -67,9 +83,19 @@ def check_circuit_breakers(
     # 2. Drawdown
     enable_dd = getattr(settings.risk, "enable_drawdown_circuit_breaker", True)
     if enable_dd:
-        drawdown_metrics = compute_drawdown_from_ledger(ledger)
+        equity_boundary = cohort_boundary(settings)
+        naive_timezone = getattr(settings.app, "timezone", None)
+        drawdown_metrics = compute_drawdown_from_ledger(
+            ledger,
+            limit=None,
+            since=equity_boundary,
+            naive_timezone=naive_timezone,
+        )
         max_drawdown = getattr(settings.monitoring, "max_drawdown_pct", 10.0)
-        if drawdown_metrics.max_drawdown_pct >= max_drawdown:
+        if (
+            drawdown_metrics.sufficient_evidence
+            and drawdown_metrics.max_drawdown_pct >= max_drawdown
+        ):
             reason = (
                 f"circuit breaker: max drawdown {drawdown_metrics.max_drawdown_pct:.2f}% "
                 f"(limit {max_drawdown:.1f}%)"
