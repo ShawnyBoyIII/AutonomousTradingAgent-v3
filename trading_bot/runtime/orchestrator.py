@@ -1093,6 +1093,11 @@ def run_paper_trade(
                 fill_price=fill.fill_price,
                 filled_at=fill.filled_at,
             )
+            from trading_bot.runtime.mark_to_market import mark_to_market
+            updated_state = mark_to_market(
+                updated_state,
+                prices={fill.ticker: fill.fill_price},
+            )
             ledger.save_portfolio_state(updated_state)
             ledger.record_equity_snapshot(updated_state, timestamp=fill.filled_at)
             state = updated_state

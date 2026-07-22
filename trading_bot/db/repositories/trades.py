@@ -73,7 +73,11 @@ def update_trade_exit(
     trade.exit_price = exit_price
     trade.exit_fees = exit_fees
     trade.exited_at = datetime.now(timezone.utc)
-    trade.pnl = pnl
+    accumulated = float(getattr(trade, "partial_pnl_accumulated", 0.0) or 0.0)
+    if accumulated and pnl is not None:
+        trade.pnl = round(float(pnl) + accumulated, 2)
+    else:
+        trade.pnl = pnl
     trade.exit_rsi = exit_rsi
     trade.exit_atr = exit_atr
     trade.hold_duration_minutes = hold_duration_minutes
@@ -90,6 +94,28 @@ def get_open_trades(session: Session) -> list[Trade]:
     return session.execute(
         select(Trade).where(Trade.status == "FILLED")
     ).scalars().all()
+
+
+def accumulate_partial_exit(
+    session: Session,
+    trade_id: int,
+    partial_pnl: float,
+) -> Trade:
+    """Add ``partial_pnl`` to the open trade's accumulated partial P&L.
+
+    The trade stays open (``status = FILLED``) because the position
+    has not been fully closed. ``partial_exit_count`` increments so
+    reports can distinguish partial exits from full exits.
+    """
+    trade = session.get(Trade, trade_id)
+    if trade is None:
+        raise ValueError(f"Trade {trade_id} not found")
+    existing = float(getattr(trade, "partial_pnl_accumulated", 0.0) or 0.0)
+    trade.partial_pnl_accumulated = round(existing + float(partial_pnl), 2)
+    trade.partial_exit_count = int(getattr(trade, "partial_exit_count", 0) or 0) + 1
+    session.commit()
+    session.refresh(trade)
+    return trade
 
 
 def get_trades(

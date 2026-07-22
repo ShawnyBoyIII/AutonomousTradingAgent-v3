@@ -152,6 +152,8 @@ def fill_sell_position(
     if mark_exit_timestamp:
         new_state.last_exited_at = dict(state.last_exited_at)
         new_state.last_exited_at[ticker] = fill.filled_at.isoformat()
+    from trading_bot.runtime.mark_to_market import mark_to_market
+    new_state = mark_to_market(new_state, prices={ticker: fill.fill_price})
     ledger.save_portfolio_state(new_state)
     ledger.record_equity_snapshot(new_state, timestamp=fill.filled_at)
 
@@ -223,6 +225,39 @@ def fill_partial_take_profit_position(
         mark_exit_timestamp=False,
         settings=settings,
     )
+
+    try:
+        from trading_bot.db.repositories import accumulate_partial_exit
+        from trading_bot.db.session import get_session, init_db, make_session_factory
+        from trading_bot.db.models import Trade
+        from sqlalchemy import select
+
+        if settings is None:
+            from trading_bot.cli.app import load_settings
+
+            settings = load_settings()
+        engine = init_db(settings)
+        session_factory = make_session_factory(engine)
+        session = get_session(session_factory)
+        try:
+            trade = session.execute(
+                select(Trade).where(
+                    Trade.ticker == ticker.upper(),
+                    Trade.status == "FILLED",
+                ).order_by(Trade.filled_at.desc())
+            ).scalars().first()
+            if trade is not None:
+                accumulate_partial_exit(
+                    session=session,
+                    trade_id=trade.id,
+                    partial_pnl=float(event.get("realized_pnl", 0.0) or 0.0),
+                )
+        finally:
+            session.close()
+            engine.dispose()
+    except Exception:
+        logger.exception("Failed to accumulate partial exit for %s", ticker)
+
     remaining = new_state.positions.get(ticker)
     if remaining is not None:
         break_even_stop = max(remaining.average_cost, remaining.stop_loss or 0.0)

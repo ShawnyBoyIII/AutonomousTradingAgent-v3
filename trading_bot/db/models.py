@@ -91,6 +91,8 @@ class Trade(Base):
     exit_regime = Column(String(40), nullable=True)
     exit_strategy = Column(String(200), nullable=True)
     exit_reason = Column(String(50), nullable=True)
+    partial_exit_count = Column(Integer, nullable=False, default=0)
+    partial_pnl_accumulated = Column(Float, nullable=False, default=0.0)
 
 
 class ScanFeature(Base):
