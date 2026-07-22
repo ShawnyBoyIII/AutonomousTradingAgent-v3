@@ -46,7 +46,7 @@ Never use bare `tradebot` on PATH — it may resolve to a stale global install.
 6. **Robinhood is MCP-only** — no direct auth; boundary subclasses `BrokerAdapter`, reads operator-synced JSON snapshots
 7. **Python ≥ 3.11 required** — see `pyproject.toml` `requires-python`
 8. **NumPy < 2** — pinned in `pyproject.toml`; newer versions break indicators
-9. **Burn-in health is observable** — run `./tradebot-local doctor --burn-in` before market open to confirm heartbeat, dashboard, EOD watchdog, and DB are healthy.
+9. **Burn-in health is observable** — run `./tradebot-local doctor --burn-in` before market open to confirm heartbeat, dashboard, EOD watchdog, scan freshness, and DB are healthy.
 
 ---
 
@@ -55,6 +55,13 @@ Never use bare `tradebot` on PATH — it may resolve to a stale global install.
 **Target**: Profit factor > 1.3 over 100 closed trades on paper with $100K starting capital.
 Graduation evidence starts at `paper.graduation_since`; the burn-in cohort is
 currently `2026-07-11T00:00:00+00:00`, after the 50-share cap was introduced.
+
+Equity-risk evidence (drawdown, peak, return) starts at the dedicated
+`paper.equity_evaluation_since` boundary. The current value is
+`2026-07-15T22:29:45.354846-04:00`, the moment the live burn-in database
+was reset to the $100K paper cohort. Pre-cohort equity rows (including
+the legacy $1.27M peak) are excluded from cohort drawdown so a stale
+peak cannot trip the circuit breaker.
 
 - Burn-in runs daily via `./scripts/auto-burn-in.sh`
 - Parallel signal mode is V3 + V2.5 consensus. The swarm engine is no longer in the automated scan/vote path — it remains as a manual/advisory tool (`./tradebot-local swarm`) only.
@@ -66,6 +73,8 @@ currently `2026-07-11T00:00:00+00:00`, after the 50-share cap was introduced.
 - Run `./tradebot-local paper-report` for the multi-dimensional P&L view (overall, by strategy, by hour, by ticker) — replaces the SQL probes previously needed to answer "where did today's loss come from?"
 - Run `./tradebot-local trade-attribution` for the paired BUY/SELL roster
 - Run `./tradebot-local graduation-check` for the configured cohort's 100-trade decision gate; explicit `--since`/`--until` values override the configured window
+- Run `./tradebot-local drawdown` and `./tradebot-local risk-report` for cohort-bounded drawdown (uses `paper.equity_evaluation_since` when set, otherwise `paper.graduation_since`); fewer than two cohort snapshots → "Insufficient cohort evidence" instead of false halts
+- Run `./tradebot-local doctor --burn-in` to verify heartbeat, dashboard, EOD watchdog, DB, and scan freshness before each cycle
 
 **Decision gate**: When 100 closed trades are reached, review profit factor.
 - PF > 1.3 → graduate to live trading consideration
@@ -132,6 +141,13 @@ risk:
 
 market_data:
   validate_data: true  # V2.5: fail-fast
+
+paper:
+  graduation_since: "2026-07-11T00:00:00+00:00"  # trade-quality cohort
+  equity_evaluation_since: "2026-07-15T22:29:45.354846-04:00"  # equity-risk cohort
+
+app:
+  dashboard_port: 8000  # overridden by DASHBOARD_PORT env var
 ```
 
 **Quirks:**
@@ -170,6 +186,11 @@ trading_bot/
 A trade is recorded in two steps: `record_fill()` on BUY/SELL (writes to
 `orders` table) then `update_trade_exit()` on SELL (updates P&L fields).
 Cross-table reporting reads both `orders` and `trades` tables separately.
+Position cost basis uses the actual slipped BUY fill. New SELL `pnl` values are
+net of BUY and SELL fees, with BUY fees allocated proportionally across partial
+exits; cumulative portfolio P&L does not double-count the BUY fee charged when
+the position opened. The `2026-07-11` paper cohort's persisted SELL rows were
+reconciled to this fill-to-fill net convention; older legacy rows were not.
 
 ---
 
@@ -232,6 +253,53 @@ tail -f logs/burn_in/decision-log.jsonl
 # Tuning experiments persist to state/tuning_experiments/; the shadow baseline
 # canary appends fills/equity lines to <artifacts_dir>/shadow-fills.jsonl and
 # shadow-equity.jsonl (JSONL, one record per line).
+
+## Runtime Canary Contract
+
+Live paper trading during an experiment's `CANARY` phase now mirrors every
+BUY and SELL into paired ledgers via `RuntimeCanaryContext`. The context is
+constructed once per CLI invocation or continuous-loop cycle and threaded
+through `run_paper_trade` (BUYs) and the shared SELL seam in
+`trading_bot.runtime.position_exit`. When no experiment is in CANARY,
+`load_runtime_canary(...)` returns `None` and the trading paths behave
+identically to the legacy no-shadow implementation.
+
+**Allowlist.** The runtime canary supports exactly one parameter today:
+`supermodel.range_bound_trend_caution_multiplier` with `0 < candidate <= 1`
+and `0 < baseline <= 1`. Any other field — including the threshold and
+weight knobs — returns `None` from `load_runtime_canary` so unsupported
+experiments never enter runtime mirroring. Add support for new parameters
+with a fresh spec revision plus fixtures; do not extend the allowlist in
+ad-hoc commits.
+
+**Activation gate.** Before promoting `PROPOSED → CANARY`, the controller
+verifies the live portfolio is flat. A non-flat portfolio produces
+`INCONCLUSIVE` with reason `non_flat_portfolio_on_canary_start` and the
+candidate bytes are never written to live overrides. This rule also fires
+on resume so a position opened after activation cannot slip past the gate.
+
+**Restart safety.** The harness reads `state.canary_starting_equity` on
+every load so a crashed process restarts against the same baseline cash.
+SELLs for positions opened before the canary started are silently dropped;
+SELLs for paired positions drive a proportional baseline exit
+(`baseline_exit ≈ baseline_held × (candidate_exit / candidate_held)`).
+
+**Decision-boundary snapshots.** `ExperimentController.record_canary_snapshot`
+populates `state.candidate_metrics` (runtime candidate) and
+`state.shadow_metrics` (runtime baseline). `state.baseline_metrics` retains
+the offline replay baseline so both evidence sources are auditable
+side-by-side. When the paired trade counts diverge, the canary is
+immediately marked `INCONCLUSIVE` with reason `paired_ledgers_diverged`.
+
+**Pass/fail threshold.** The runtime canary runs alongside the existing
+experiment rules in `_decide`. The runtime metrics feed the same
+`candidate_metrics` vs `shadow_metrics` comparison; candidates that fail
+the existing PF / net-P&L / drawdown gates are auto-rolled back.
+
+Verified by `tests/test_runtime_canary_*.py` (8 new files covering the
+harness, controller guards, context seam, BUY wiring, SELL wiring, CLI
+lifecycle, and end-to-end behavior).
+
 
 # Advisory learner (paper-only; opt-in via advisory.enabled)
 ./tradebot-local advisory-learn
@@ -300,9 +368,10 @@ Fail-fast: stops on first validation error.
 ## Session Gotchas
 
 - When calling `trading_bot.runtime.position_exit` helpers outside CLI entrypoints, pass the active `settings` object explicitly so exit persistence uses the intended DB/log paths.
-- Intraday backtests are causal: signals receive only completed prior-day context, exits are evaluated one bar at a time, same-bar stop/target collisions choose the stop, and configured paper fees/slippage apply. When `app.signal_mode=parallel`, replay and paper mode share the V3 + V2.5 consensus, counter-thesis, supermodel veto, and one-source half-sizing path. Portfolio-wide correlation, sector exposure, cooldown, and adaptive strategy-tracker state remain paper-runtime concerns; only the configured paper cohort counts toward graduation.
+- Intraday backtests are causal: signals receive only completed prior-day context, approved setups fill at the next observed bar open, next opens at or beyond the original stop/target cancel the setup, exits are evaluated one bar at a time, same-bar stop/target collisions choose the stop, and configured paper fees/slippage apply. When `app.signal_mode=parallel`, replay and paper mode share the V3 + V2.5 consensus, counter-thesis, supermodel veto, and one-source half-sizing path. Portfolio-wide correlation, sector exposure, cooldown, and adaptive strategy-tracker state remain paper-runtime concerns; only the configured paper cohort counts toward graduation.
 - New paper fills are persisted as timezone-aware UTC timestamps. Legacy order rows before the `2026-07-11` cohort may contain naive America/New_York wall time and must not be mixed into UTC-window conclusions.
 - `list_equity_history()` retains legacy oldest-first semantics; monitoring and audits must use `list_recent_equity_history()` when requesting a bounded recent window.
+- `trading_bot.data.providers.registry` is the source of truth for market-data capabilities, network-free credential readiness, and intraday fallback priority. Add or change a provider there in the same commit as its adapter; unsupported intervals are skipped before provider construction.
 - `./tradebot-local tune` writes `state/tuning_overrides.yaml`; loader applies only allowlisted supermodel + strategy-tracker fields and still forces `live_trading_enabled=false`
 - Swarm worker votes (when running the manual `./tradebot-local swarm` command) are logged to `logs/worker_votes.jsonl`; use this file for per-worker weight tuning
 - Decision-log and paper-trade rows preserve compact supermodel evidence even on rejects and `NO_SIGNAL`; use `paper-report`, `trade-attribution`, and `db-features` for paper review before adding new logging.
