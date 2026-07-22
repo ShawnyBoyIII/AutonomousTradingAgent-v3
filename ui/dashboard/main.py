@@ -178,6 +178,7 @@ def _portfolio_payload() -> dict:
     return {
         "cash": float(pstate.cash),
         "equity": float(pstate.equity),
+        "starting_equity": _resolve_starting_equity(pstate),
         "positions": positions,
         "position_count": len(positions),
         "unrealized_pnl": total_unrealized_pnl,
@@ -188,6 +189,47 @@ def _portfolio_payload() -> dict:
         "marks_loaded": marks_loaded,
         "timestamp": datetime.now().isoformat(),
     }
+
+
+def _resolve_starting_equity(pstate) -> float:
+    """Compute the cohort starting equity used for P&L baseline.
+
+    Priority:
+    1. ``settings.paper.graduation_since`` paired with the oldest
+       cohort-equity snapshot for that boundary.
+    2. ``settings.paper.equity_evaluation_since`` as a fallback.
+    3. The portfolio's current equity (freshly seeded cohorts).
+    """
+    import logging
+
+    logger = logging.getLogger(__name__)
+    settings = state.settings
+    cohort = getattr(settings.paper, "graduation_since", None) or getattr(
+        settings.paper, "equity_evaluation_since", None
+    )
+    if cohort is not None:
+        try:
+            history = state.ledger.list_recent_equity_history(
+                limit=None, since=cohort
+            )
+            if history:
+                first = history[0]
+                eq = float(first.get("equity", 0.0) or 0.0)
+                if eq > 0:
+                    return eq
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not read cohort equity history: %s", exc)
+    try:
+        cash_seed = float(
+            getattr(settings.app, "starting_cash", None)
+            or getattr(settings.paper, "starting_cash", None)
+            or 0.0
+        )
+        if cash_seed > 0:
+            return cash_seed
+    except (TypeError, ValueError):
+        pass
+    return float(pstate.equity or 0.0)
 
 
 def _health_payload() -> dict:

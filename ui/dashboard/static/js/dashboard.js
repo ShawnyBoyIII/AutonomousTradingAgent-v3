@@ -145,6 +145,12 @@
 
     const equity  = Number(data.equity) || 0;
     const cash    = Number(data.cash) || 0;
+    // Prefer the API-supplied starting_equity over the HTML body attribute.
+    // The body attribute is the static default; the API response reflects
+    // the actual cohort boundary (graduation_since / equity_evaluation_since).
+    if (Number.isFinite(Number(data.starting_equity)) && Number(data.starting_equity) > 0) {
+      STATE.startingEquity = Number(data.starting_equity);
+    }
     const positions = Array.isArray(data.positions) ? data.positions : [];
     const count   = positions.length;
     const totalUnrealized = Number(data.total_unrealized_pnl);
