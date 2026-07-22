@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 import math
 from pathlib import Path
@@ -126,14 +126,16 @@ def doctor(
 
     state_dir_setting = Path(getattr(ctx.obj.app, "state_dir", None) or Path(ctx.obj.app.state_db_path).parent)
     db_path = Path(ctx.obj.app.state_db_path)
-    dashboard_port = int(getattr(ctx.obj.app, "dashboard_port", 8080))
+    dashboard_port = int(getattr(ctx.obj.app, "dashboard_port", 8000))
     eod_watchdog_pid_file = state_dir_setting / "burn_in" / "eod_watchdog.pid"
+    scan_results_path = Path(ctx.obj.app.scan_results_path)
 
     report: HealthReport = run_health_checks(
         state_dir=state_dir_setting,
         db_path=db_path,
         dashboard_port=dashboard_port,
         eod_watchdog_pid_file=eod_watchdog_pid_file,
+        scan_results_path=scan_results_path,
     )
 
     if json_output:
@@ -525,9 +527,9 @@ def serve(
         help="Bind host. Defaults to localhost (127.0.0.1) for security.",
     ),
     port: int = typer.Option(
-        8000,
+        None,
         "--port",
-        help="Port to serve the live dashboard on.",
+        help="Port to serve the live dashboard on. Defaults to app.dashboard_port (8000).",
     ),
 ) -> None:
     """Serve a live, auto-refreshing dashboard from local state files.
@@ -540,9 +542,12 @@ def serve(
     """
     from trading_bot.runtime.dashboard import serve_dashboard
 
-    typer.echo(f"Serving live dashboard at http://{host}:{port} (Ctrl-C to stop)")
+    effective_port = port if port is not None else ctx.obj.app.dashboard_port
+    typer.echo(
+        f"Serving live dashboard at http://{host}:{effective_port} (Ctrl-C to stop)"
+    )
     typer.echo("Routes: / (HTML) | /api/state (JSON) | /healthz")
-    serve_dashboard(ctx.obj, host=host, port=port, block=True)
+    serve_dashboard(ctx.obj, host=host, port=effective_port, block=True)
 
 
 @app.command(name="manage-positions")
@@ -1124,12 +1129,24 @@ def deposit(
 @app.command(name="paper-audit")
 def paper_audit(ctx: typer.Context) -> None:
     """Check local paper-mode state for obvious drift."""
+    from datetime import datetime as dt, timezone
+
     ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
     state = ledger.ensure_portfolio_state()
     orders = ledger.list_order_rows()
     equity_history = ledger.list_recent_equity_history(limit=1)
-    snapshot = _load_json_snapshot(Path(ctx.obj.app.portfolio_summary_path))
-    issues = _collect_paper_audit_issues(state, orders, equity_history, snapshot)
+    snapshot_path = Path(ctx.obj.app.portfolio_summary_path)
+    snapshot = _load_json_snapshot(snapshot_path)
+    snapshot_generated_at = _parse_snapshot_timestamp(snapshot.get("generated_at") if snapshot else None)
+    now = dt.now(timezone.utc)
+    issues = _collect_paper_audit_issues(
+        state,
+        orders,
+        equity_history,
+        snapshot,
+        snapshot_generated_at=snapshot_generated_at,
+        now=now,
+    )
 
     typer.echo(
         " ".join(
@@ -1258,7 +1275,10 @@ def paper_report(
         raise typer.Exit(code=1)
 
     report = summarize_paper_performance(
-        db_path=db_path, since=since_dt, until=until_dt
+        db_path=db_path,
+        since=since_dt,
+        until=until_dt,
+        naive_timezone=ctx.obj.app.timezone,
     )
     typer.echo(format_paper_performance_report(report))
     if json_output:
@@ -1405,6 +1425,7 @@ def graduation_check(
         db_path=db_path,
         since=since_dt,
         until=until_dt,
+        naive_timezone=ctx.obj.app.timezone,
     )
     typer.echo(format_paper_performance_report(report))
     typer.echo("")
@@ -1459,13 +1480,34 @@ def _build_portfolio_view(state: PortfolioState, settings) -> dict[str, object]:
     }
 
 
+def _parse_snapshot_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ledger_exposure(state: PortfolioState) -> float:
+    return sum(
+        position.quantity * position.average_cost for position in state.positions.values()
+    )
+
+
 def _collect_paper_audit_issues(
     state: PortfolioState,
     orders: list[dict[str, object]],
     equity_history: list[dict[str, object]],
     snapshot: dict[str, object],
+    snapshot_generated_at: datetime | None = None,
+    now: datetime | None = None,
 ) -> list[str]:
     issues: list[str] = []
+    if snapshot_generated_at is not None and snapshot_generated_at.tzinfo is None:
+        snapshot_generated_at = snapshot_generated_at.replace(tzinfo=timezone.utc)
+    if now is not None and now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
     if snapshot:
         summary = snapshot.get("summary") if isinstance(snapshot.get("summary"), dict) else {}
         positions = snapshot.get("positions") if isinstance(snapshot.get("positions"), list) else []
@@ -1489,6 +1531,30 @@ def _collect_paper_audit_issues(
                 issues.append(f"portfolio snapshot quantity mismatch for {ticker}")
             if round(float(row.get("average_cost", position.average_cost)), 2) != round(position.average_cost, 2):
                 issues.append(f"portfolio snapshot average_cost mismatch for {ticker}")
+
+        if "realized_pnl" in summary and round(
+            float(summary.get("realized_pnl", state.realized_pnl)), 2
+        ) != round(state.realized_pnl, 2):
+            issues.append("portfolio snapshot realized_pnl does not match ledger state")
+        if "unrealized_pnl" in summary and round(
+            float(summary.get("unrealized_pnl", state.unrealized_pnl)), 2
+        ) != round(state.unrealized_pnl, 2):
+            issues.append("portfolio snapshot unrealized_pnl does not match ledger state")
+        if "exposure" in summary:
+            ledger_exposure = round(_ledger_exposure(state), 2)
+            snapshot_exposure = round(float(summary.get("exposure", ledger_exposure)), 2)
+            if snapshot_exposure != ledger_exposure:
+                issues.append("portfolio snapshot exposure does not match ledger state")
+
+        if (
+            snapshot_generated_at is not None
+            and now is not None
+            and now - snapshot_generated_at > timedelta(hours=24)
+        ):
+            issues.append(
+                f"portfolio snapshot is stale "
+                f"({(now - snapshot_generated_at).total_seconds() / 3600:.1f}h old)"
+            )
     elif orders or state.positions:
         issues.append("portfolio snapshot missing; run `portfolio` to refresh local paper snapshot")
 
@@ -1837,6 +1903,7 @@ def _fill_sell_position(
     log_path,
     bars=None,
     settings=None,
+    runtime_canary=None,
 ) -> tuple:
     """Submit a market SELL order, record the fill, and update portfolio state."""
     exit_rsi = None
@@ -1886,6 +1953,7 @@ def _fill_sell_position(
         exit_strategy=exit_strategy,
         exit_reason=reason,
         settings=settings,
+        runtime_canary=runtime_canary,
     )
 
 
@@ -2035,6 +2103,8 @@ def _format_scan_summary(summary: dict[str, object]) -> str:
 
 
 def _format_doctor(settings) -> str:
+    from trading_bot.data.providers.registry import provider_readiness
+
     snapshots = [
         settings.app.scan_results_path,
         settings.app.portfolio_summary_path,
@@ -2047,16 +2117,8 @@ def _format_doctor(settings) -> str:
     provider = ",".join(providers)
     provider_statuses: list[str] = []
     for provider_name in providers:
-        provider_ok = "ok"
-        if provider_name == "alpaca":
-            import os
-            if not os.environ.get("APCA_API_KEY_ID") or not os.environ.get("APCA_API_SECRET_KEY"):
-                provider_ok = "missing APCA_API_KEY_ID/APCA_API_SECRET_KEY"
-        elif provider_name == "polygon":
-            import os
-            if not os.environ.get("POLYGON_API_KEY"):
-                provider_ok = "missing POLYGON_API_KEY"
-        provider_statuses.append(f"{provider_name}:{provider_ok}")
+        readiness = provider_readiness(provider_name)
+        provider_statuses.append(f"{provider_name}:{readiness.reason}")
     provider_auth = ",".join(provider_statuses)
 
     return " ".join(
@@ -2416,7 +2478,23 @@ def drawdown(ctx: typer.Context) -> None:
     )
 
     ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
-    metrics = compute_drawdown_from_ledger(ledger, limit=500)
+    boundary = ctx.obj.paper.equity_evaluation_since or ctx.obj.paper.graduation_since
+    metrics = compute_drawdown_from_ledger(
+        ledger,
+        limit=None,
+        since=boundary,
+        naive_timezone=ctx.obj.app.timezone,
+    )
+    if boundary is not None:
+        typer.echo(f"Equity evaluation since {boundary.isoformat()}")
+    if not metrics.sufficient_evidence:
+        if metrics.sample_size == 0:
+            typer.echo(format_drawdown_report(metrics))
+            return
+        typer.echo(
+            "Insufficient cohort evidence (<2 snapshots); drawdown reporting skipped."
+        )
+        return
     typer.echo(format_drawdown_report(metrics))
 
     if metrics.max_drawdown_pct > ctx.obj.monitoring.max_drawdown_pct:
@@ -2602,8 +2680,24 @@ def risk_report(ctx: typer.Context) -> None:
 
     # 1. Drawdown
     typer.echo("--- Drawdown ---")
-    dd_metrics = compute_drawdown_from_ledger(ledger, limit=500)
-    typer.echo(format_drawdown_report(dd_metrics))
+    equity_boundary = ctx.obj.paper.equity_evaluation_since or ctx.obj.paper.graduation_since
+    if equity_boundary is not None:
+        typer.echo(f"Cohort equity boundary: {equity_boundary.isoformat()}")
+    dd_metrics = compute_drawdown_from_ledger(
+        ledger,
+        limit=None,
+        since=equity_boundary,
+        naive_timezone=ctx.obj.app.timezone,
+    )
+    if not dd_metrics.sufficient_evidence:
+        if dd_metrics.sample_size == 0:
+            typer.echo(format_drawdown_report(dd_metrics))
+        else:
+            typer.echo(
+                "Insufficient cohort evidence (<2 snapshots); drawdown reporting skipped."
+            )
+    else:
+        typer.echo(format_drawdown_report(dd_metrics))
     typer.echo("")
 
     # 2. VaR

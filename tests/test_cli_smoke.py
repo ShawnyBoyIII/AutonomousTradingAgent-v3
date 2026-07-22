@@ -1797,12 +1797,13 @@ def test_paper_audit_passes_for_matching_local_state(tmp_path: Path) -> None:
         json.dumps(
             {
                 "mode": "portfolio",
+                "generated_at": datetime.now().isoformat(),
                 "summary": {
                     "cash": 12500.0,
-                    "equity": 13050.0,
+                    "equity": 13000.0,
                     "realized_pnl": 150.0,
-                    "unrealized_pnl": 50.0,
-                    "exposure": 0.04,
+                    "unrealized_pnl": 350.0,
+                    "exposure": 500.0,
                     "positions": 1,
                 },
                 "positions": [

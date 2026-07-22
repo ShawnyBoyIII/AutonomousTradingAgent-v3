@@ -512,7 +512,13 @@ def _attach_supermodel_row_fields(row: dict[str, object], details: dict[str, obj
 
 
 
-def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = False) -> list[str]:
+def run_paper_trade(
+    symbols: list[str],
+    settings: Settings,
+    dry_run: bool = False,
+    *,
+    runtime_canary: Any = None,
+) -> list[str]:
     ledger = PortfolioLedger(Path(settings.app.state_db_path))
     state = ledger.ensure_portfolio_state()
     broker = PaperBroker(
@@ -774,6 +780,70 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
             if details.get("is_half_size"):
                 decision.position_size = max(1, int(decision.position_size * 0.5))
 
+            from trading_bot.strategy.supermodel import (
+                compute_entry_policy_multiplier,
+                select_source_metadata,
+            )
+
+            source_metadata = select_source_metadata(
+                [dict(v) for v in details.get("source_votes", []) or []]
+            )
+            source_metadata["strategy"] = getattr(signal, "strategy_tag", "")
+            # When the parallel consensus path doesn't populate source_votes
+            # (e.g., serial V3 mode), fall back to the signal's own tag so the
+            # policy still keys on whether V3 was the *selected* producer.
+            selected_source = source_metadata.get("selected_source")
+            if not selected_source:
+                strategy_tag = getattr(signal, "strategy_tag", "") or ""
+                if strategy_tag.startswith("v3-"):
+                    selected_source = "v3"
+                elif strategy_tag.startswith("v25-") or strategy_tag == "intraday-signal-engine":
+                    selected_source = "v2.5"
+            regime_value = (
+                details.get("regime")
+                or details.get("v3_regime")
+                or details.get("mtf_regime")
+            )
+            policy_decision = compute_entry_policy_multiplier(
+                selected_source=selected_source,
+                selected_strategy=source_metadata.get("selected_strategy")
+                or source_metadata.get("strategy"),
+                regime=regime_value,
+                supermodel_decision=details.get("supermodel_decision"),
+                settings=settings.supermodel,
+            )
+            if policy_decision.applied:
+                if policy_decision.multiplier <= 0:
+                    append_decision_event(
+                        log_path,
+                        {
+                            "command": "paper-trade",
+                            "ticker": symbol,
+                            "status": "REJECTED",
+                            "reason": (
+                                f"entry policy {policy_decision.policy_name or 'block'} "
+                                f"rejects ({policy_decision.reason})"
+                            ),
+                            "policy_multiplier": policy_decision.multiplier,
+                            **_paper_evidence_fields(details),
+                        },
+                    )
+                    results.append(
+                        f"{symbol} REJECTED entry policy {policy_decision.policy_name} "
+                        f"multiplier={policy_decision.multiplier}"
+                    )
+                    continue
+                decision.position_size = max(
+                    1, int(decision.position_size * policy_decision.multiplier)
+                )
+            details["entry_policy"] = {
+                "name": policy_decision.policy_name,
+                "applied": policy_decision.applied,
+                "multiplier": policy_decision.multiplier,
+                "reason": policy_decision.reason,
+                **policy_decision.metadata,
+            }
+
             sector_reason = _sector_concentration_exceeded(
                 symbol,
                 state,
@@ -880,12 +950,34 @@ def run_paper_trade(symbols: list[str], settings: Settings, dry_run: bool = Fals
                 baseline_signal=details,
                 shadow=None,
             )
+            if runtime_canary is not None:
+                baseline_quantity = decision.position_size
+                if policy_decision.applied and policy_decision.multiplier > 0:
+                    candidate_quantity = max(
+                        1,
+                        int(decision.position_size * policy_decision.multiplier),
+                    )
+                else:
+                    candidate_quantity = decision.position_size
+                runtime_canary.record_entry(
+                    ticker=fill.ticker,
+                    baseline_quantity=baseline_quantity,
+                    candidate_quantity=candidate_quantity,
+                    fill_price=fill.fill_price,
+                    fees=fill.fees,
+                    session_date=(
+                        fill.filled_at.date().isoformat()
+                        if getattr(fill.filled_at, "date", None)
+                        else None
+                    ),
+                )
             _persist_trade_to_db(fill, signal, settings, details)
             updated_state = _portfolio_state_from_broker(
                 broker,
                 signal,
                 previous_state=state,
                 fill_fees=fill.fees,
+                fill_price=fill.fill_price,
                 filled_at=fill.filled_at,
             )
             ledger.save_portfolio_state(updated_state)
@@ -1588,6 +1680,7 @@ def _portfolio_state_from_broker(
     signal,
     previous_state: PortfolioState,
     fill_fees: float,
+    fill_price: float,
     filled_at: datetime | None = None,
 ) -> PortfolioState:
     positions: dict[str, Position] = {}
@@ -1601,14 +1694,17 @@ def _portfolio_state_from_broker(
         positions[ticker] = Position(
             ticker=ticker,
             quantity=quantity,
-            average_cost=signal.entry_price,
+            average_cost=fill_price,
             stop_loss=signal.stop_loss,
             profit_target=signal.profit_target,
             entry_at=filled_at,
             strategy_tag=getattr(signal, "strategy_tag", ""),
+            entry_fees=fill_fees,
         )
     equity = broker.cash + sum(
-        position.quantity * position.average_cost for position in positions.values()
+        position.quantity
+        * (signal.entry_price if ticker == signal.ticker else position.average_cost)
+        for ticker, position in positions.items()
     )
     return PortfolioState(
         cash=round(broker.cash, 2),
@@ -2084,4 +2180,8 @@ def _paper_evidence_fields(details: dict | None) -> dict[str, object]:
         if key in details
     }
     compact.update({key: value for key, value in details.items() if str(key).startswith("vote_")})
+    if "entry_policy" in details:
+        compact["entry_policy"] = details["entry_policy"]
+    if "regime" in details and "v3_regime" not in details:
+        compact["regime"] = details["regime"]
     return compact

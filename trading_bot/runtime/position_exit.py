@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from trading_bot.models.order import OrderRequest
 from trading_bot.models.portfolio import PortfolioState
+
+if TYPE_CHECKING:
+    from trading_bot.learning.experiments.runtime_canary import (
+        RuntimeCanaryContext,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +35,7 @@ def fill_sell_position(
     exit_strategy: str | None = None,
     exit_reason: str | None = None,
     settings=None,
+    runtime_canary: "RuntimeCanaryContext | None" = None,
 ) -> tuple[PortfolioState, dict[str, object], str]:
     """Submit a market SELL order, record the fill, and update portfolio state."""
     fill_quantity = quantity if quantity is not None else position.quantity
@@ -42,8 +49,35 @@ def fill_sell_position(
         ),
         market_price=last_price,
     )
-    realized_pnl = (fill.fill_price - position.average_cost) * fill.quantity - fill.fees
+    entry_fee_share = (
+        position.entry_fees * fill.quantity / position.quantity
+        if position.quantity > 0
+        else 0.0
+    )
+    realized_pnl = (
+        (fill.fill_price - position.average_cost) * fill.quantity
+        - fill.fees
+        - entry_fee_share
+    )
     ledger.record_fill(fill, side="SELL", realized_pnl=realized_pnl, strategy_tag=position.strategy_tag)
+
+    if runtime_canary is not None:
+        from trading_bot.learning.experiments.runtime_canary import (
+            RuntimeCanaryContext,
+        )
+
+        if isinstance(runtime_canary, RuntimeCanaryContext):
+            runtime_canary.record_exit(
+                ticker=fill.ticker,
+                candidate_quantity=fill.quantity,
+                fill_price=fill.fill_price,
+                fees=fill.fees,
+                session_date=(
+                    fill.filled_at.date().isoformat()
+                    if getattr(fill.filled_at, "date", None)
+                    else None
+                ),
+            )
 
     try:
         from trading_bot.db.models import Trade
@@ -149,6 +183,7 @@ def fill_partial_take_profit_position(
         log_path,
         fraction: float = 0.5,
         settings=None,
+        runtime_canary: "RuntimeCanaryContext | None" = None,
 ) -> tuple[PortfolioState, dict[str, object], str]:
     """Scale out part of a winning position and protect the remainder."""
     partial_qty = max(1, int(position.quantity * fraction))
@@ -166,6 +201,7 @@ def fill_partial_take_profit_position(
         state=state,
         log_path=log_path,
         quantity=partial_qty,
+        runtime_canary=runtime_canary,
         close_db_position=False,
         mark_exit_timestamp=False,
         settings=settings,
@@ -196,11 +232,20 @@ def portfolio_state_after_sell(
     broker,
 ) -> PortfolioState:
     exited_position = previous_state.positions[ticker]
-    positions = {
-        symbol: previous_state.positions[symbol].model_copy(update={"quantity": quantity})
-        for symbol, quantity in broker.positions.items()
-        if quantity > 0 and symbol in previous_state.positions
-    }
+    positions = {}
+    for symbol, quantity in broker.positions.items():
+        if quantity <= 0 or symbol not in previous_state.positions:
+            continue
+        position = previous_state.positions[symbol]
+        update = {"quantity": quantity}
+        if symbol == ticker and exited_position.quantity > 0:
+            sold_fee_share = (
+                exited_position.entry_fees * sold_quantity / exited_position.quantity
+            )
+            update["entry_fees"] = max(
+                0.0, exited_position.entry_fees - sold_fee_share
+            )
+        positions[symbol] = position.model_copy(update=update)
     realized_delta = (
         (fill_price - exited_position.average_cost) * sold_quantity
     ) - fill_fees

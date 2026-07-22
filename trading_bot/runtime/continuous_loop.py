@@ -156,7 +156,12 @@ def _read_universe_symbols(settings: Settings) -> list[str]:
     return []
 
 
-def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> dict:
+def _run_manage_positions_once(
+    settings: Settings,
+    ledger: PortfolioLedger,
+    *,
+    runtime_canary: Any = None,
+) -> dict:
     """Run one position-management check (EOD, stop, target, trail).
 
     Mirrors _run_manage_positions_once from cli/app.py but as a reusable function.
@@ -287,6 +292,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                     reason="eod_exit",
                     state=state,
                     bars=intraday_frame,
+                    runtime_canary=runtime_canary,
                 )
                 if updated_state is not None:
                     state = updated_state
@@ -307,6 +313,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                     reason="stop_loss",
                     state=state,
                     bars=intraday_frame,
+                    runtime_canary=runtime_canary,
                 )
                 if updated_state is not None:
                     state = updated_state
@@ -330,6 +337,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                         log_path=log_path,
                         fraction=settings.paper.partial_take_profit_fraction,
                         settings=settings,
+                        runtime_canary=runtime_canary,
                     )
                     append_decision_event(log_path, event)
                     line_parts.append(line)
@@ -355,6 +363,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                         reason="profit_target",
                         state=state,
                         bars=intraday_frame,
+                        runtime_canary=runtime_canary,
                     )
                 if updated_state is not None:
                     state = updated_state
@@ -381,6 +390,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                         reason=f"time_exit_{int(held)}m",
                         state=state,
                         bars=intraday_frame,
+                        runtime_canary=runtime_canary,
                     )
                     if updated_state is not None:
                         state = updated_state
@@ -405,6 +415,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                             reason="counter_thesis",
                             state=state,
                             bars=intraday_frame,
+                            runtime_canary=runtime_canary,
                         )
                         if updated_state is not None:
                             state = updated_state
@@ -427,6 +438,7 @@ def _run_manage_positions_once(settings: Settings, ledger: PortfolioLedger) -> d
                     reason="trailing_stop",
                     state=state,
                     bars=intraday_frame,
+                    runtime_canary=runtime_canary,
                 )
                 if updated_state is not None:
                     state = updated_state
@@ -484,6 +496,7 @@ def _close_position(
     reason: str,
     state: PortfolioState | None = None,
     bars=None,
+    runtime_canary=None,
 ) -> PortfolioState | None:
     """Close a position and return the updated portfolio state."""
     exit_rsi = None
@@ -534,6 +547,7 @@ def _close_position(
             exit_strategy=exit_strategy,
             exit_reason=reason,
             settings=settings,
+            runtime_canary=runtime_canary,
         )
     except ValueError:
         line_parts.append(f"SELL_FAILED reason={reason}")
