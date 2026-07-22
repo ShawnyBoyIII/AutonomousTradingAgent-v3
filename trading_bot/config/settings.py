@@ -31,6 +31,7 @@ class AppSettings(BaseModel):
     log_file: str | None = None
     dashboard_summary_path: str = "state/dashboard_summary.json"
     scan_results_path: str = "state/scan_results.json"
+    approved_candidates_path: str = "state/approved_candidates.jsonl"
     portfolio_summary_path: str = "state/portfolio_summary.json"
     backtest_summary_path: str = "state/backtest_summary.json"
     tuning_overrides_path: str = "state/tuning_overrides.yaml"
@@ -74,6 +75,10 @@ class MarketDataSettings(BaseModel):
     # scan hung for 7+ hours at the Polygon call chain with no global
     # deadline, blocking the burn-in's main loop and skipping EOD exits.
     scan_deadline_minutes: int = Field(default=5, ge=1, le=60)
+    # Approved-candidate freshness window: a candidate older than this
+    # is rejected at paper-trade time even if scan ran. Keeps a stale
+    # scan from leaking fills into the next cycle.
+    candidate_max_age_minutes: int = Field(default=15, ge=0, le=240)
     # V2.5: Data validation settings
     validate_data: bool = Field(default=True)
     max_price_jump_pct: float = Field(default=1000.0, ge=100.0, le=5000.0)

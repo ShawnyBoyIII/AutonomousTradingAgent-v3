@@ -171,6 +171,9 @@ def load_settings(config_path: Path | None = None) -> Settings:
     settings.app.scan_results_path = _resolve_relative_value(
         settings.app.scan_results_path, base_dir
     )
+    settings.app.approved_candidates_path = _resolve_relative_value(
+        settings.app.approved_candidates_path, base_dir
+    )
     settings.app.portfolio_summary_path = _resolve_relative_value(
         settings.app.portfolio_summary_path, base_dir
     )

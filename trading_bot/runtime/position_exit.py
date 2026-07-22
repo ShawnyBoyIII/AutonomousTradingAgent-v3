@@ -59,37 +59,23 @@ def fill_sell_position(
         - fill.fees
         - entry_fee_share
     )
-    ledger.record_fill(fill, side="SELL", realized_pnl=realized_pnl, strategy_tag=position.strategy_tag)
+    from trading_bot.runtime.fill_transaction import (
+        FillTransaction,
+        FillTransactionError,
+    )
 
-    if runtime_canary is not None:
-        from trading_bot.learning.experiments.runtime_canary import (
-            RuntimeCanaryContext,
-        )
-
-        if isinstance(runtime_canary, RuntimeCanaryContext):
-            runtime_canary.record_exit(
-                ticker=fill.ticker,
-                candidate_quantity=fill.quantity,
-                fill_price=fill.fill_price,
-                fees=fill.fees,
-                session_date=(
-                    fill.filled_at.date().isoformat()
-                    if getattr(fill.filled_at, "date", None)
-                    else None
-                ),
-            )
-
-    try:
+    def _sell_sql_persist(**ctx):
         from trading_bot.db.models import Trade
         from trading_bot.db.repositories import close_position, update_trade_exit
         from trading_bot.db.session import get_session, init_db, make_session_factory
         from sqlalchemy import select
 
-        if settings is None:
+        nonlocal_settings = settings
+        if nonlocal_settings is None:
             from trading_bot.cli.app import load_settings
 
-            settings = load_settings()
-        engine = init_db(settings)
+            nonlocal_settings = load_settings()
+        engine = init_db(nonlocal_settings)
         session_factory = make_session_factory(engine)
         session = get_session(session_factory)
         try:
@@ -121,8 +107,39 @@ def fill_sell_position(
         finally:
             session.close()
             engine.dispose()
-    except Exception:
-        logger.exception("Failed to persist sell trade to database")
+
+    sell_tx = FillTransaction()
+    sell_tx.register(
+        lambda fill, side, **ctx: ledger.record_fill(
+            fill,
+            side="SELL",
+            realized_pnl=realized_pnl,
+            strategy_tag=position.strategy_tag,
+        )
+    )
+    sell_tx.register(_sell_sql_persist)
+    try:
+        sell_tx.run(fill=fill, side="SELL")
+    except FillTransactionError as exc:
+        logger.exception("SELL fill transaction failed for %s", ticker)
+
+    if runtime_canary is not None:
+        from trading_bot.learning.experiments.runtime_canary import (
+            RuntimeCanaryContext,
+        )
+
+        if isinstance(runtime_canary, RuntimeCanaryContext):
+            runtime_canary.record_exit(
+                ticker=fill.ticker,
+                candidate_quantity=fill.quantity,
+                fill_price=fill.fill_price,
+                fees=fill.fees,
+                session_date=(
+                    fill.filled_at.date().isoformat()
+                    if getattr(fill.filled_at, "date", None)
+                    else None
+                ),
+            )
 
     new_state = portfolio_state_after_sell(
         previous_state=state,

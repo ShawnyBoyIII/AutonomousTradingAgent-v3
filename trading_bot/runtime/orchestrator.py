@@ -23,6 +23,7 @@ from trading_bot.portfolio.ledger import PortfolioLedger
 from trading_bot.portfolio.performance import compute_portfolio_heat, compute_unrealized_pnl
 from trading_bot.risk.correlation import compute_portfolio_correlation
 from trading_bot.runtime.decision_log import append_decision_event
+from trading_bot.runtime.approved_candidate import new_scan_id
 from trading_bot.runtime.snapshots import write_snapshot
 from trading_bot.risk.risk_manager import evaluate_signal
 from trading_bot.strategy.intraday_signal_engine import generate_recent_signal_with_reason
@@ -246,6 +247,7 @@ def run_scan(
 
 
     pending_symbols = [value.strip() for value in symbols if value.strip()]
+    _scan_id = new_scan_id()
     while pending_symbols:
         if time.monotonic() - _scan_t0 > _scan_deadline_seconds:
             _deadline_exceeded = True
@@ -421,6 +423,7 @@ def run_scan(
             if include_details:
                 row["details"] = details
             candidate_rows.append(row)
+            _maybe_emit_approved_candidate(row, scan_id=_scan_id, settings=settings)
             approved_results.append(
                 (
                     row,
@@ -506,6 +509,63 @@ def _attach_supermodel_row_fields(row: dict[str, object], details: dict[str, obj
         row["supermodel_score"] = details.get("supermodel_score")
 
 
+def _maybe_emit_approved_candidate(
+    row: dict[str, object],
+    *,
+    scan_id: str,
+    settings: Settings,
+) -> None:
+    """Append an :class:`ApprovedCandidate` row to the candidates JSONL.
+
+    Only GREEN and YELLOW rows are emitted; NO_SIGNAL/REJECTED/ERROR
+    candidates are intentionally omitted so paper-trade cannot fall
+    through to the legacy path. Failure to write the JSONL never
+    blocks scan (defensive: scan returns even when the file is
+    read-only).
+    """
+    try:
+        from trading_bot.runtime.approved_candidate import (
+            ApprovedCandidate,
+            write_candidates_jsonl,
+        )
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        candidate = ApprovedCandidate(
+            ticker=str(row["ticker"]),
+            quality=str(row.get("quality", "")),
+            timestamp=str(row.get("timestamp", "")),
+            entry=float(row["entry"]),
+            stop=float(row["stop"]),
+            target=float(row["target"]),
+            qty=int(row["qty"]),
+            rr=float(row["rr"]),
+            confidence=float(row["confidence"]),
+            risk=float(row["risk"]),
+            allocation=float(row["allocation"]),
+            strategy=str(row.get("strategy") or row.get("strategy_tag") or ""),
+            supermodel_decision=str(row.get("supermodel_decision") or "no_signal"),
+            scan_id=scan_id,
+            v3_score=(float(row["v3_total_score"]) if row.get("v3_total_score") else None),
+            v3_confidence=(str(row["v3_confidence"]) if row.get("v3_confidence") else None),
+            v3_regime=(str(row["v3_regime"]) if row.get("v3_regime") else None),
+            v3_setup=(str(row.get("v3_setup") or "") or None),
+            source_votes=list(row.get("source_votes") or []),
+        )
+    except (KeyError, TypeError, ValueError):
+        return
+    try:
+        path = Path(settings.app.approved_candidates_path)
+        existing: list[ApprovedCandidate] = []
+        from trading_bot.runtime.approved_candidate import list_candidates
+        if path.exists():
+            existing = list_candidates(path)
+        existing.append(candidate)
+        write_candidates_jsonl(existing, path)
+    except Exception:  # noqa: BLE001
+        return
+
+
 
 
 
@@ -560,6 +620,40 @@ def run_paper_trade(
 
     for symbol in (value.strip() for value in symbols if value.strip()):
         try:
+            from trading_bot.runtime.approved_candidate import read_candidate
+            from datetime import datetime, timezone
+
+            candidate_path = Path(settings.app.approved_candidates_path)
+            candidate = read_candidate(symbol, candidate_path)
+            if candidate is not None:
+                try:
+                    cand_ts = datetime.fromisoformat(candidate.timestamp)
+                    if cand_ts.tzinfo is None:
+                        cand_ts = cand_ts.replace(tzinfo=timezone.utc)
+                    age_minutes = (
+                        datetime.now(timezone.utc) - cand_ts
+                    ).total_seconds() / 60.0
+                except ValueError:
+                    age_minutes = float("inf")
+                max_age = float(
+                    getattr(settings.market_data, "candidate_max_age_minutes", 0) or 0
+                )
+                if max_age > 0 and age_minutes > max_age:
+                    results.append(
+                        f"{symbol} REJECTED candidate_stale age={age_minutes:.1f}m"
+                    )
+                    append_decision_event(
+                        log_path,
+                        {
+                            "command": "paper-trade",
+                            "ticker": symbol,
+                            "status": "REJECTED",
+                            "reason": "candidate stale",
+                            "candidate_age_minutes": age_minutes,
+                        },
+                    )
+                    continue
+
             if _daily_loss_limit_hit(ledger, state, settings):
                 append_decision_event(
                     log_path,
@@ -934,10 +1028,15 @@ def run_paper_trade(
                 continue
 
             strategy_tag = _trade_strategy_tag(signal, details) or ""
-            ledger.record_fill(
-                fill,
-                side="BUY",
+            buy_tx = _build_buy_fill_transaction(
+                ledger=ledger,
+                sql_persist=lambda fill, side, **ctx: _persist_trade_to_db(
+                    fill, signal, settings, details
+                ),
                 strategy_tag=strategy_tag,
+                settings=settings,
+                signal=signal,
+                details=details,
             )
             _maybe_record_shadow_fill(
                 {
@@ -971,7 +1070,21 @@ def run_paper_trade(
                         else None
                     ),
                 )
-            _persist_trade_to_db(fill, signal, settings, details)
+            try:
+                buy_tx.run(fill=fill, side="BUY", filled_at=fill.filled_at)
+            except FillTransactionError as exc:
+                logger.error("BUY fill transaction failed: %s", exc)
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "paper-trade",
+                        "ticker": fill.ticker,
+                        "status": "ERROR",
+                        "reason": f"fill transaction failed: {exc}",
+                    },
+                )
+                results.append(f"{symbol} ERROR fill transaction failed")
+                continue
             updated_state = _portfolio_state_from_broker(
                 broker,
                 signal,
@@ -2122,6 +2235,48 @@ def _persist_trade_to_db(
             engine.dispose()
     except Exception:
         logger.exception("Failed to persist trade to database")
+
+
+def _build_buy_fill_transaction(
+    *,
+    ledger: Any,
+    sql_persist: Any,
+    strategy_tag: str,
+    settings: Settings,
+    signal: Any,
+    details: dict | None,
+) -> "FillTransaction":
+    """Compose the canonical BUY fill transaction.
+
+    Steps: ``ledger.record_fill`` → SQL persist → strategy tracker.
+    Each step runs in order; any exception raises
+    :class:`FillTransactionError` so callers can fail fast instead of
+    silently desyncing the JSON ledger from the SQL trades table.
+    """
+    from trading_bot.runtime.fill_transaction import FillTransaction
+
+    tx = FillTransaction()
+
+    def step_record_order(fill, side, **ctx):  # noqa: ANN001
+        ledger.record_fill(fill, side=side, strategy_tag=strategy_tag)
+
+    def step_strategy_tracker(fill, side, **ctx):  # noqa: ANN001
+        from trading_bot.strategy.strategy_tracker import record_entry
+        from pathlib import Path
+
+        record_entry(
+            Path(settings.app.log_dir),
+            strategy_tag,
+            fill.ticker,
+            fill.fill_price,
+            getattr(fill, "filled_at", None) or ctx.get("filled_at"),
+        )
+
+    tx.register(step_record_order)
+    tx.register(sql_persist)
+    if strategy_tag:
+        tx.register(step_strategy_tracker)
+    return tx
 
 
 def _trade_strategy_tag(signal, details: dict | None = None) -> str | None:
