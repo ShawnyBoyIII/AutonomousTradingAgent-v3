@@ -175,14 +175,26 @@ def test_dashboard_fail_connection_refused(monkeypatch):
 
 # --- check_eod_watchdog -----------------------------------------------------
 
-def test_eod_watchdog_pass_no_fire_window(tmp_path: Path):
+def test_eod_watchdog_pass_outside_burner_hours(tmp_path: Path):
     pid_file = tmp_path / "wd.pid"
-    # No PID file + 12:00 ET Monday → not yet expected to fire → PASS
+    # 22:00 ET Monday → outside burner hours → watchdog not required → PASS
+    result = check_eod_watchdog(
+        pid_file=pid_file,
+        now_utc=datetime(2026, 7, 7, 2, 0, tzinfo=timezone.utc),  # Mon 22:00 ET
+    )
+    assert result.status == "PASS"
+
+
+def test_eod_watchdog_fail_in_burner_hours_without_pid(tmp_path: Path):
+    pid_file = tmp_path / "wd.pid"
+    # 12:00 ET Monday → within burner hours; missing PID file → FAIL
+    # (audit item 7: previously the check returned PASS outside the
+    # 15:50-16:05 fire window even when the watchdog was dead.)
     result = check_eod_watchdog(
         pid_file=pid_file,
         now_utc=datetime(2026, 7, 6, 16, 0, tzinfo=timezone.utc),  # Mon 12:00 ET
     )
-    assert result.status == "PASS"
+    assert result.status == "FAIL"
 
 
 def test_eod_watchdog_fail_in_window_without_pid(tmp_path: Path):

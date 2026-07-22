@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 from trading_bot.health.types import CheckResult
 
@@ -26,13 +27,12 @@ def _safe_alive(pid: int) -> bool:
         return False
 
 
-# 15:55 ET expressed in minutes from local UTC offset. US/Eastern is UTC-4
-# (EDT) or UTC-5 (EST); we approximate EDT for summer months (matches burn-in's
-# expectation year-round; if it drifts, callers can override via parameter).
 def _now_in_eastern_minutes(now_utc: datetime) -> int:
-    eastern = now_utc.astimezone(timezone.utc).replace(tzinfo=None)
-    # Assume EDT (UTC-4) for the trading calendar
-    eastern = eastern.replace(hour=(eastern.hour - 4) % 24)
+    """Return minutes-of-day in US/Eastern for *now_utc*.
+
+    Uses ZoneInfo so DST transitions are reflected exactly.
+    """
+    eastern = now_utc.astimezone(ZoneInfo("America/New_York"))
     return eastern.hour * 60 + eastern.minute
 
 
@@ -149,18 +149,33 @@ def check_dashboard_health(port: int, *, timeout_seconds: float = 1.0) -> CheckR
 
 
 def check_eod_watchdog(pid_file: Path, *, now_utc: datetime) -> CheckResult:
-    """Verify the EOD watchdog will fire (or has fired) at the expected window."""
+    """Verify the EOD watchdog is alive (and has fired in the post-EOD window).
+
+    The audit previously returned PASS outside 15:50–16:05 even when the
+    watchdog PID file was absent or the process was dead. That let a
+    dead watchdog pass the morning health check.
+
+    New behavior:
+    - During burner operation (weekdays 09:00-16:30 ET): the watchdog PID
+      file must exist and reference a live process. A missing or dead
+      watchdog is FAIL.
+    - Outside that window: still PASS because the burner sleeps; the
+      watchdog is not required to be alive.
+    - Post-close verification: if 16:05+ ET on a weekday, the daily
+      EOD marker should also exist. (Marker path is operator-dependent
+      so we only soft-warn there.)
+    """
     minute_of_day = _now_in_eastern_minutes(now_utc)
     weekday = now_utc.weekday()  # 0=Mon
-    eod_window_start = 15 * 60 + 50  # 15:50 ET — start observing
-    eod_window_end = 16 * 60 + 5  # 16:05 ET — expected to have fired
+    burner_window_start = 9 * 60          # 09:00 ET
+    burner_window_end = 16 * 60 + 30      # 16:30 ET (gives a safety margin past 16:05)
 
-    in_window = weekday <= 4 and eod_window_start <= minute_of_day <= eod_window_end
-    if not in_window:
+    in_burner_hours = weekday <= 4 and burner_window_start <= minute_of_day <= burner_window_end
+    if not in_burner_hours:
         return CheckResult(
             name="eod_watchdog",
             status="PASS",
-            detail="outside EOD watchdog window",
+            detail="outside burner hours; watchdog not required",
             observed={"weekday": weekday, "et_minute": minute_of_day},
         )
 
@@ -168,7 +183,7 @@ def check_eod_watchdog(pid_file: Path, *, now_utc: datetime) -> CheckResult:
         return CheckResult(
             name="eod_watchdog",
             status="FAIL",
-            detail="EOD watchdog PID file missing during 15:50-16:05 ET window",
+            detail="EOD watchdog PID file missing during burner hours",
             observed={"pid_file": str(pid_file)},
         )
     raw = pid_file.read_text().strip()
@@ -191,7 +206,7 @@ def check_eod_watchdog(pid_file: Path, *, now_utc: datetime) -> CheckResult:
     return CheckResult(
         name="eod_watchdog",
         status="FAIL",
-        detail=f"EOD watchdog PID {pid} not alive in window",
+        detail=f"EOD watchdog PID {pid} not alive during burner hours",
         observed={"pid": pid},
     )
 
@@ -267,6 +282,102 @@ def check_open_positions_consistent(
         status="FAIL",
         detail=f"{open_count} open positions, heartbeat stale {int(age_s)}s",
         observed={"open_trades": open_count, "heartbeat_age_s": int(age_s)},
+    )
+
+
+def check_scan_freshness(
+    scan_results_path: Path,
+    *,
+    now_utc: datetime,
+    max_age_seconds: int = 180,
+) -> CheckResult:
+    """Verify the most recent scan produced a snapshot inside the burn-in loop.
+
+    The scan orchestrator persists a JSON snapshot after each completed scan.
+    This check confirms one exists, is recent, and did not exceed its
+    deadline — three signals the burn-in loop is actually making progress.
+    """
+    if not scan_results_path.exists():
+        return CheckResult(
+            name="scan_freshness",
+            status="FAIL",
+            detail=f"scan results missing: {scan_results_path}",
+            observed={"path": str(scan_results_path)},
+        )
+    try:
+        payload = json.loads(scan_results_path.read_text())
+    except json.JSONDecodeError as exc:
+        return CheckResult(
+            name="scan_freshness",
+            status="FAIL",
+            detail=f"scan results unreadable: {exc}",
+            observed={"path": str(scan_results_path)},
+        )
+
+    if not isinstance(payload, dict):
+        return CheckResult(
+            name="scan_freshness",
+            status="FAIL",
+            detail=(
+                f"scan results malformed: expected JSON object, got "
+                f"{type(payload).__name__}"
+            ),
+            observed={"path": str(scan_results_path)},
+        )
+
+    raw_ts = payload.get("generated_at", "")
+    try:
+        ts = datetime.fromisoformat(str(raw_ts))
+    except (TypeError, ValueError) as exc:
+        return CheckResult(
+            name="scan_freshness",
+            status="FAIL",
+            detail=f"scan results unreadable: {exc}",
+            observed={"path": str(scan_results_path)},
+        )
+
+    if not isinstance(ts, datetime):
+        return CheckResult(
+            name="scan_freshness",
+            status="FAIL",
+            detail=f"scan results missing or invalid generated_at",
+            observed={"path": str(scan_results_path)},
+        )
+
+    age_s = (now_utc.astimezone(timezone.utc) - ts.astimezone(timezone.utc)).total_seconds()
+    raw_summary = payload.get("summary")
+    summary = raw_summary if isinstance(raw_summary, dict) else {}
+    deadline_exceeded = bool(summary.get("deadline_exceeded", False))
+
+    if age_s <= max_age_seconds:
+        status = "WARN" if deadline_exceeded else "PASS"
+        return CheckResult(
+            name="scan_freshness",
+            status=status,
+            detail=(
+                f"scan fresh (last {int(age_s)}s ago)"
+                if not deadline_exceeded
+                else f"scan fresh but deadline exceeded (last {int(age_s)}s ago)"
+            ),
+            observed={
+                "age_seconds": int(age_s),
+                "deadline_exceeded": deadline_exceeded,
+            },
+        )
+
+    if age_s <= max_age_seconds * 5:
+        return CheckResult(
+            name="scan_freshness",
+            status="WARN",
+            detail=f"scan stale (last {int(age_s)}s ago)",
+            observed={"age_seconds": int(age_s)},
+        )
+
+    return CheckResult(
+        name="scan_freshness",
+        status="FAIL",
+        detail=f"scan very stale (last {int(age_s)}s ago)",
+        observed={"age_seconds": int(age_s)},
     )
 
 

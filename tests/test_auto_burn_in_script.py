@@ -42,6 +42,9 @@ def test_auto_burn_in_integrates_dashboard_sidecar() -> None:
     # Default-on with documented opt-out via env vars.
     assert 'AUTO_DASHBOARD="${AUTO_DASHBOARD:-true}"' in script
     assert 'DASHBOARD_PORT="${DASHBOARD_PORT:-8080}"' in script
+    # DASHBOARD_PORT must be EXPORTED so child processes (doctor --burn-in)
+    # see the same port the burn-in's sidecar started on.
+    assert "export DASHBOARD_PORT" in script
 
     # Uses the launcher script and points it at the same config the burn-in uses.
     assert "./scripts/start-dashboard.sh" in script
@@ -54,28 +57,30 @@ def test_auto_burn_in_integrates_dashboard_sidecar() -> None:
 
 
 def test_auto_burn_in_integrates_eod_data_download() -> None:
-    """auto-burn-in.sh must schedule the EOD massive.com data download."""
+    """auto-burn-in.sh must schedule the EOD massive.com data download.
+
+    Audit item 7: previously the call lived inside the daily-discovery
+    branch (around 09:30 ET). If the first cycle ran before the 11:30 ET
+    time gate, the EOD fetch was skipped for the rest of the day. The
+    fetch is now called once per main loop iteration; the function
+    itself gates on the per-interval marker and time window, so
+    repeated calls are idempotent.
+    """
     script = Path("scripts/auto-burn-in.sh").read_text(encoding="utf-8")
 
     # Function defined + called.
     assert "run_eod_data_download()" in script
     assert script.count("run_eod_data_download") >= 2  # definition + invocation
-    # Wired into the daily-discovery slot BEFORE nightly tuning so the
-    # learning loops consume the freshly fetched data.
-    #
-    # In the source, the main-loop section looks like:
-    #     run_discovery "daily"
-    #     run_eod_data_download
-    #     run_nightly_tuning
-    # We assert the call ORDER at the main-loop site (not the function
-    # definition site) by checking the segment between run_discovery "daily"
-    # and the end of the if-block.
-    daily_block = script.split('run_discovery "daily"', 1)[1]
-    eod_pos = daily_block.index("run_eod_data_download")
-    tune_pos = daily_block.index("run_nightly_tuning")
-    assert eod_pos < tune_pos, (
-        "run_eod_data_download must run before run_nightly_tuning so the "
-        "learning loops consume fresh data"
+    # The call must appear in the main loop (outside any discovery if-block).
+    # Use the line marker "write_heartbeat" right above the call to delimit
+    # the main loop body without confusing it with nested loops.
+    heartbeat_idx = script.rfind("write_heartbeat")
+    sleep_until_idx = script.find("sleep_until_market_open", heartbeat_idx)
+    main_loop_segment = script[heartbeat_idx:sleep_until_idx]
+    eod_count_in_loop = main_loop_segment.count("run_eod_data_download")
+    assert eod_count_in_loop >= 1, (
+        "run_eod_data_download must be called inside the main loop so it "
+        "fires every iteration, not only when discovery runs"
     )
 
     # Default-on with documented opt-out via env var.

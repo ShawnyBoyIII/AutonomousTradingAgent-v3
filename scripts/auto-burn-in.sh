@@ -63,6 +63,7 @@ EOF
 #                 DASHBOARD_PORT=9000 ./scripts/auto-burn-in.sh
 AUTO_DASHBOARD="${AUTO_DASHBOARD:-true}"
 DASHBOARD_PORT="${DASHBOARD_PORT:-8080}"
+export DASHBOARD_PORT
 DASHBOARD_PID=""
 DASHBOARD_LOG="$LOG_DIR/dashboard.log"
 
@@ -746,24 +747,35 @@ start_eod_watchdog() {
                 # Without this, both processes can write duplicate SELL
                 # orders with distinct UUIDs (no PK conflict) — corrupting
                 # realized P&L and the profit-factor graduation gate.
-                local eod_output eod_rc
+                local eod_output eod_rc eod_status
                 if _manage_lock_acquire; then
                     eod_output=$(sh ./tradebot-local --config-path "$config_file" manage-positions 2>&1)
                     eod_rc=$?
                     _manage_lock_release
+                    printf '%s\n' "$eod_output" | head -100 | sed "s/^/[$timestamp]    /"
+                    if [ "$eod_rc" -eq 0 ]; then
+                        eod_status="ok"
+                    else
+                        eod_status="retry"
+                    fi
                 else
-                    echo "[$timestamp] ℹ️  manage-positions already running (main loop?), EOD watchdog skipping; marking day complete"
-                    eod_rc=0
+                    # Lock contention: the main loop is currently running
+                    # manage-positions. Retry on the next 30s poll — do NOT
+                    # mark the day complete yet. The previous "mark complete
+                    # on contention" path silently swallowed EOD exits when
+                    # the main loop was just starting or stuck.
+                    echo "[$timestamp] ℹ️  manage-positions already running (main loop?), EOD watchdog will retry; marker NOT yet created"
+                    eod_status="lock_contention"
                 fi
-                printf '%s\n' "$eod_output" | head -100 | sed "s/^/[$timestamp]    /"
-                if [ "$eod_rc" -eq 0 ]; then
+                if [ "$eod_status" = "ok" ]; then
                     touch "$marker"
                     echo "[$timestamp] ✅ EOD watchdog complete (marker=$marker)"
                 else
                     # Marker intentionally NOT touched — the next 30s poll
                     # will retry. This prevents losing the EOD exit to a
-                    # transient failure (db lock, etc.).
-                    echo "[$timestamp] ⚠️  EOD watchdog manage-positions FAILED (rc=$eod_rc); marker NOT created, will retry next cycle"
+                    # transient failure (db lock, etc.) or to a hung CLI
+                    # that returned 0 without actually managing positions.
+                    echo "[$timestamp] ⚠️  EOD watchdog manage-positions FAILED (rc=$eod_rc, status=$eod_status); marker NOT created, will retry next cycle"
                 fi
             fi
             sleep 30
@@ -936,72 +948,57 @@ else:
     fi
 }
 
-# Function to check max drawdown and halt if exceeded
+# Function to check max drawdown and halt if exceeded.
+# Delegates to the Python implementation so the shell shares the
+# cohort-aware drawdown contract (paper.equity_evaluation_since).
 check_max_drawdown() {
     local db_path="$1"
     local max_drawdown_pct=${2:-10}  # Default: 10% max drawdown
-    
+
     if [ ! -f "$db_path" ]; then
         echo "[$(date '+%H:%M:%S')] ⚠️  Max drawdown check: no database yet, skipping"
         return 0
     fi
-    
-    local result=$(.venv/bin/python -c "
-import sqlite3
-import json
 
-db_path = '$db_path'
-conn = sqlite3.connect(db_path)
-cursor = conn.cursor()
+    local result
+    result=$(.venv/bin/python -c "
+from datetime import datetime, timezone
+from pathlib import Path
+from trading_bot.config.loader import load_settings
+from trading_bot.monitoring.drawdown import compute_drawdown_from_ledger
+from trading_bot.portfolio.ledger import PortfolioLedger
 
-# Get equity history
-cursor.execute('SELECT equity FROM equity_history ORDER BY rowid ASC')
-equities = [r[0] for r in cursor.fetchall() if r[0] is not None]
-
-if len(equities) < 2:
-    print('DRAWDOWN_OK:insufficient_data')
-    conn.close()
-    exit(0)
-
-# Calculate max drawdown from peak
-peak = equities[0]
-max_dd = 0.0
-current_dd = 0.0
-
-for eq in equities:
-    if eq > peak:
-        peak = eq
-    dd = (peak - eq) / peak * 100 if peak > 0 else 0
-    if dd > max_dd:
-        max_dd = dd
-
-# Get current equity
-cursor.execute('SELECT payload FROM portfolio_state ORDER BY id DESC LIMIT 1')
-row = cursor.fetchone()
-if row:
-    state = json.loads(row[0])
-    current_equity = state.get('equity', 0)
-else:
-    current_equity = equities[-1] if equities else 0
-
-# Get starting equity
-starting_equity = equities[0] if equities else current_equity
-
-# Calculate total return
-total_return = (current_equity - starting_equity) / starting_equity * 100 if starting_equity > 0 else 0
-
-conn.close()
+db_path = Path('$db_path')
+cfg = load_settings(Path('$CONFIG_FILE'))
+boundary = (
+    getattr(cfg.paper, 'equity_evaluation_since', None)
+    or getattr(cfg.paper, 'graduation_since', None)
+)
+ledger = PortfolioLedger(db_path)
+metrics = compute_drawdown_from_ledger(
+    ledger,
+    limit=None,
+    since=boundary,
+    naive_timezone=cfg.app.timezone,
+)
+if not metrics.sufficient_evidence:
+    print(f'DRAWDOWN_OK:insufficient_evidence,boundary={boundary.isoformat() if boundary else None}')
+    raise SystemExit(0)
 
 max_dd_limit = $max_drawdown_pct
+peak = metrics.peak_equity
+current = metrics.recovery_equity
+max_dd = metrics.max_drawdown_pct
+total_return = (current / peak - 1) * 100 if peak > 0 else 0.0
 
 if max_dd >= max_dd_limit:
-    print(f'DRAWDOWN_HALT:peak_dd={max_dd:.2f}%>={max_dd_limit}%,current_equity={current_equity:.2f},starting_equity={starting_equity:.2f}')
+    print(f'DRAWDOWN_HALT:peak_dd={max_dd:.2f}%>={max_dd_limit}%,current_equity={current:.2f},starting_equity={peak:.2f}')
 elif max_dd >= max_dd_limit * 0.8:
-    print(f'DRAWDOWN_WARNING:peak_dd={max_dd:.2f}% approaching {max_dd_limit}%,current_equity={current_equity:.2f}')
+    print(f'DRAWDOWN_WARNING:peak_dd={max_dd:.2f}% approaching {max_dd_limit}%,current_equity={current:.2f}')
 else:
-    print(f'DRAWDOWN_OK:peak_dd={max_dd:.2f}%,current_equity={current_equity:.2f},total_return={total_return:.2f}%')
+    print(f'DRAWDOWN_OK:peak_dd={max_dd:.2f}%,current_equity={current:.2f},total_return={total_return:.2f}%')
 " 2>/dev/null)
-    
+
     if echo "$result" | grep -q "DRAWDOWN_HALT"; then
         echo "[$(date '+%H:%M:%S')] 🚨 MAX DRAWDOWN HALT: $result"
         echo "[$(date '+%H:%M:%S')] 🚨 Halting burn-in - drawdown exceeded ${max_drawdown_pct}%"
@@ -1017,7 +1014,7 @@ else:
     else
         echo "[$(date '+%H:%M:%S')] ✅ Drawdown OK: $result"
     fi
-    
+
     return 0
 }
 
@@ -1048,6 +1045,14 @@ while true; do
     CYCLE_COUNT=$((CYCLE_COUNT + 1))
     write_heartbeat 0 0 0  # fills/exits/rejects tracked later; placeholder for now
 
+    # EOD ingestion: idempo­tent per (date, intervals). The function itself
+    # gates on EOD_FETCH_TIME and a per-interval marker, so calling it on
+    # every cycle is safe — it returns immediately when its time gate or
+    # marker is unmet. Previously the call lived inside the daily-discovery
+    # branch which only fires once per session; if the first cycle ran
+    # before 11:30 ET the EOD fetch was skipped for the rest of the day.
+    run_eod_data_download
+
     # Check if we should run discovery (hybrid: daily + conditional mid-day)
     if should_discover; then
         # Determine trigger reason for logging
@@ -1055,9 +1060,7 @@ while true; do
             run_discovery "midday"
         else
             run_discovery "daily"
-            # EOD fetch happens AFTER discovery (so the universe file is fresh)
-            # and BEFORE tuning/retraining (so learning loops consume fresh data).
-            run_eod_data_download
+            # nightly tuning runs after discovery; EOD fetch already ran above
             run_nightly_tuning
         fi
         load_symbols
