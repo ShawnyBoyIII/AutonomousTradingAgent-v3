@@ -9,15 +9,30 @@ if TYPE_CHECKING:
     pass
 
 
-def test_shadow_ledger_matches_broker_with_identical_fills(tmp_path: Path) -> None:
+def test_shadow_ledger_records_no_trade_until_round_trip(tmp_path: Path) -> None:
+    """A BUY alone must not count as a closed trade; trades only counts
+    SELLs that close an open position so PF/drawdown metrics remain valid.
+    """
     ledger = ShadowLedger(artifacts_dir=tmp_path / "shadow", starting_cash=100_000.0)
     fill = ShadowFill(ticker="AAPL", side="BUY", quantity=1, fill_price=10.0, fees=1.0)
 
     ledger.record(fill)
     metrics = ledger.metrics()
 
+    # Open position: not yet a closed trade.
+    assert metrics.trades == 0
+    assert metrics.net_pnl == 0.0
+
+
+def test_shadow_ledger_closes_round_trip(tmp_path: Path) -> None:
+    ledger = ShadowLedger(artifacts_dir=tmp_path / "shadow", starting_cash=100_000.0)
+    ledger.record(ShadowFill(ticker="AAPL", side="BUY", quantity=1, fill_price=10.0, fees=1.0))
+    ledger.record(ShadowFill(ticker="AAPL", side="SELL", quantity=1, fill_price=11.0, fees=1.0))
+
+    metrics = ledger.metrics()
     assert metrics.trades == 1
-    assert metrics.net_pnl == -11.0
+    # Bought at 10 with 1 fee, sold at 11 with 1 fee → realized = (11-10)*1 - 2 = -1
+    assert abs(metrics.net_pnl - (-1.0)) < 0.001
 
 
 def test_shadow_ledger_does_not_touch_burn_in_db(tmp_path: Path) -> None:
@@ -62,6 +77,8 @@ def test_shadow_ledger_appends_all_fills_to_jsonl(tmp_path: Path) -> None:
 
 
 def test_maybe_record_shadow_fill_records_buy_when_shadow_active() -> None:
+    """A standalone BUY records the fill but does NOT count as a closed
+    trade until a matching SELL closes it."""
     from trading_bot.runtime.orchestrator import _maybe_record_shadow_fill
 
     ledger = ShadowLedger(artifacts_dir=Path("/tmp/nonexistent-shadow-test"), starting_cash=50_000.0)
@@ -79,8 +96,8 @@ def test_maybe_record_shadow_fill_records_buy_when_shadow_active() -> None:
     )
 
     metrics = ledger.metrics()
-    assert metrics.trades == 1
-    assert metrics.net_pnl == -501.5  # -(5 * 100 + 1.5)
+    assert metrics.trades == 0
+    assert metrics.net_pnl == 0.0
 
 
 def test_maybe_record_shadow_fill_noop_when_shadow_none() -> None:

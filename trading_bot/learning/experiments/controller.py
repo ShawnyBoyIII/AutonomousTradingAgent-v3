@@ -33,6 +33,34 @@ EARLY_PF_FLOOR = 0.50
 TIMEOUT_SESSIONS = 10
 HEALTH_STALE_SECONDS = 7200
 
+# The runtime canary only supports sizing-only policy changes whose values
+# lie in (0, 1) and whose baseline is exactly 1.0 (the production default).
+# Adding more parameters requires a new spec revision plus fixtures.
+RUNTIME_CANARY_ALLOWED: set[tuple[str, str]] = {
+    ("supermodel", "range_bound_trend_caution_multiplier"),
+}
+
+
+def is_runtime_canary_supported(change: ParameterChange) -> bool:
+    """Return True when ``change`` can be faithfully exercised by the runtime
+    paired-canary shadow harness today. Anything else must be rejected at
+    activation so the harness never silently simulates a parameter it
+    cannot model accurately.
+
+    Accepted ranges:
+        - ``baseline`` in (0, 1] (current production default is 1.0).
+        - ``candidate`` in (0, 1]; values equal to baseline are a no-op
+          canary but still flow through the harness so the test path that
+          asserts the candidate is written remains valid.
+    """
+    if (change.section, change.field) not in RUNTIME_CANARY_ALLOWED:
+        return False
+    if not (0.0 < float(change.candidate) <= 1.0):
+        return False
+    if not (0.0 < float(change.baseline) <= 1.0):
+        return False
+    return True
+
 
 class ExperimentController:
     def __init__(
@@ -112,6 +140,64 @@ class ExperimentController:
         return state
 
     # --- evaluation -----------------------------------------------------
+    def supports_runtime_canary(self, change: ParameterChange) -> bool:
+        """Whether the runtime canary harness can faithfully simulate this change."""
+        return is_runtime_canary_supported(change)
+
+    def record_canary_snapshot(
+        self,
+        state: ExperimentState,
+        harness: Any,
+    ) -> ExperimentState:
+        """Copy harness metrics into ``state`` and detect divergence.
+
+        The harness exposes ``candidate_metrics``, ``baseline_metrics``, and
+        ``closed_trade_counts_match``. Runtime candidate metrics populate
+        ``state.candidate_metrics``; the paired baseline populates
+        ``state.shadow_metrics``. Offline baseline metrics on
+        ``state.baseline_metrics`` remain untouched so the audit trail
+        references both replay and runtime evidence side-by-side.
+
+        When the paired trade counts diverge, the experiment is marked
+        INCONCLUSIVE because the comparison is unsafe.
+        """
+        candidate = harness.candidate_metrics()
+        baseline = harness.baseline_metrics()
+        state.candidate_metrics = candidate
+        state.shadow_metrics = baseline
+        state.canary_closed_trades = int(candidate.trades)
+        if not harness.closed_trade_counts_match():
+            state.status = "INCONCLUSIVE"
+            state.last_error = "paired_ledgers_diverged"
+            self.store.save_current(state)
+            self.store.append_event({
+                "event": "paired_ledgers_diverged",
+                "experiment_id": state.experiment_id,
+                "candidate_trades": candidate.trades,
+                "baseline_trades": baseline.trades,
+            })
+        else:
+            self.store.save_current(state)
+        return state
+
+    def activate_canary(self, state: ExperimentState, ledger: Any) -> None:
+        """Persist the immutable ``canary_starting_equity`` for restart safety."""
+        from trading_bot.portfolio.ledger import PortfolioLedger
+
+        if isinstance(ledger, PortfolioLedger):
+            starting = ledger.ensure_portfolio_state().equity
+        elif hasattr(ledger, "ensure_portfolio_state"):
+            starting = ledger.ensure_portfolio_state().equity
+        else:
+            raise TypeError("ledger must expose ensure_portfolio_state()")
+        state.canary_starting_equity = float(starting)
+        self.store.save_current(state)
+        self.store.append_event({
+            "event": "canary_starting_equity_recorded",
+            "experiment_id": state.experiment_id,
+            "starting_equity": float(starting),
+        })
+
     @staticmethod
     def _filter_fully_covered_symbols(
         symbols: list[str], bar_loader: Any, start: date, end: date
@@ -142,6 +228,25 @@ class ExperimentController:
                 continue
             kept.append(sym)
         return kept
+
+    def _live_portfolio_is_flat(self) -> bool:
+        """Return True when the live ledger has zero open positions.
+
+        The runtime canary must start flat: a position opened before the
+        canary has no paired shadow entry, so its exit cannot be mirrored
+        safely. The check reads the live ledger and never raises on
+        missing files (a never-persisted portfolio is treated as flat).
+        """
+        from trading_bot.portfolio.ledger import PortfolioLedger
+
+        try:
+            ledger = PortfolioLedger(Path(self.settings.app.state_db_path))
+            portfolio = ledger.ensure_portfolio_state()
+        except Exception:  # noqa: BLE001
+            return True
+        return all(
+            position.quantity <= 0 for position in portfolio.positions.values()
+        )
 
     def evaluate(self) -> ExperimentState | None:
         state = self.store.load_current()
@@ -180,6 +285,32 @@ class ExperimentController:
                 return state
             state.baseline_metrics = evaluation.baseline_validation
             state.candidate_metrics = evaluation.candidate_validation
+
+            # Runtime-canary gating: refuse to enter the runtime canary for
+            # any change the harness cannot simulate faithfully, or whenever
+            # the live portfolio is not flat. We bail BEFORE the candidate
+            # bytes are activated so baseline overrides remain intact.
+            if not is_runtime_canary_supported(state.change):
+                state.status = "INCONCLUSIVE"
+                state.last_error = "unsupported_runtime_canary"
+                self.store.save_current(state)
+                self.store.append_event({
+                    "event": "unsupported_runtime_canary",
+                    "experiment_id": state.experiment_id,
+                    "change": state.change.model_dump(),
+                })
+                return state
+            state.runtime_canary_armed = True
+            if not self._live_portfolio_is_flat():
+                state.status = "INCONCLUSIVE"
+                state.last_error = "non_flat_portfolio_on_canary_start"
+                state.runtime_canary_armed = False
+                self.store.save_current(state)
+                self.store.append_event({
+                    "event": "non_flat_portfolio_on_canary_start",
+                    "experiment_id": state.experiment_id,
+                })
+                return state
             state.status = "CANARY"
 
             # Drift guard: if the operator hand-edited the live overrides
@@ -221,6 +352,47 @@ class ExperimentController:
             self.store.append_event({"event": "canary_started", "experiment_id": state.experiment_id})
 
         if state.status != "CANARY":
+            return state
+
+        # Runtime-canary resume guard: only runs when the experiment was
+        # actually armed by the activation path (which sets
+        # canary_starting_equity). Experiments that bypass activation —
+        # typically legacy test fixtures — keep their old semantics.
+        if (
+            state.runtime_canary_armed
+            and state.canary_closed_trades == 0
+            and not is_runtime_canary_supported(state.change)
+        ):
+            state.status = "INCONCLUSIVE"
+            state.last_error = "unsupported_runtime_canary"
+            self.store.save_current(state)
+            self.store.append_event({
+                "event": "unsupported_runtime_canary",
+                "experiment_id": state.experiment_id,
+                "change": state.change.model_dump(),
+                "phase": "canary_resume",
+            })
+            self.store.restore_baseline_exact(
+                state.experiment_id, self.overrides_path
+            )
+            return state
+        if (
+            state.runtime_canary_armed
+            and state.canary_closed_trades == 0
+            and not self._live_portfolio_is_flat()
+            and is_runtime_canary_supported(state.change)
+        ):
+            state.status = "INCONCLUSIVE"
+            state.last_error = "non_flat_portfolio_on_canary_start"
+            self.store.save_current(state)
+            self.store.append_event({
+                "event": "non_flat_portfolio_on_canary_start",
+                "experiment_id": state.experiment_id,
+                "phase": "canary_resume",
+            })
+            self.store.restore_baseline_exact(
+                state.experiment_id, self.overrides_path
+            )
             return state
 
         decision = self._decide(state)

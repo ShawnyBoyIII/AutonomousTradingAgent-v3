@@ -32,13 +32,16 @@ def _loader():
 def _seed_overrides(path: Path) -> None:
     """Pre-write overrides so ``propose()`` finds a change vs. default settings.
 
-    ``controller.propose()`` reads ``overrides_path`` to derive the baseline.
-    Writing a ``counter_veto_weight`` of 0.5 (vs. settings default of 1.0)
-    guarantees ``select_single_change`` returns a 0.25 step toward 1.0.
+    Seeds ``range_bound_trend_caution_multiplier`` (the only parameter the
+    runtime canary harness can faithfully simulate) at 0.5 so
+    ``select_single_change`` returns a discrete step toward 0.0 per
+    the SIZE_2_STEP allowlist.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        yaml.safe_dump({"supermodel": {"counter_veto_weight": 0.5}}),
+        yaml.safe_dump(
+            {"supermodel": {"range_bound_trend_caution_multiplier": 0.5}}
+        ),
         encoding="utf-8",
     )
 
@@ -69,6 +72,179 @@ def test_evaluate_keeps_candidate_when_validation_succeeds(tmp_path: Path) -> No
     assert final is not None
     assert final.status == "KEPT"
     assert overrides.exists()
+
+
+def test_canary_transition_writes_candidate_to_overrides(tmp_path: Path) -> None:
+    """On CANARY transition the candidate snapshot must become the active
+    overrides file so subsequent bot processes actually use the candidate.
+    """
+    overrides = tmp_path / "state" / "tuning_overrides.yaml"
+    _seed_overrides(overrides)
+
+    controller = ExperimentController(
+        settings=_settings(),
+        store=ExperimentStore(root=tmp_path / "experiments"),
+        bar_loader=_loader(),
+        overrides_path=overrides,
+    )
+
+    state = controller.propose()
+    assert state is not None
+    # Manually mark offline evaluation passed and inspect overrides
+    # AFTER the CANARY transition, NOT after a manual _set_state.
+    state.status = "PROPOSED"
+    state.baseline_metrics = MetricSet(trades=30, profit_factor=0.6, net_pnl=-200.0)
+    state.candidate_metrics = MetricSet(trades=30, profit_factor=0.8, net_pnl=100.0)
+    controller._set_state(state)
+
+    # Stub offline to a passing evaluation.
+    from trading_bot.learning.experiments.replay import OfflineEvaluation
+
+    controller._run_offline = lambda s: OfflineEvaluation(
+        accepted=True,
+        reasons=[],
+        baseline_train=MetricSet(trades=30, profit_factor=0.6, net_pnl=-200.0),
+        candidate_train=MetricSet(trades=30, profit_factor=0.8, net_pnl=100.0),
+        baseline_validation=MetricSet(trades=30, profit_factor=0.6, net_pnl=-200.0),
+        candidate_validation=MetricSet(trades=30, profit_factor=0.8, net_pnl=100.0),
+    )
+
+    final = controller.evaluate()
+    assert final is not None
+    assert final.status == "CANARY"
+
+    # Overrides file MUST contain the candidate (not the baseline).
+    on_disk = yaml.safe_load(overrides.read_text(encoding="utf-8"))
+    assert on_disk is not None
+    expected_field = state.change.field
+    expected_value = state.change.candidate
+    assert on_disk[state.change.section][expected_field] == expected_value
+
+
+def test_propose_records_exact_baseline_bytes_for_rollback(tmp_path: Path) -> None:
+    """propose() must capture the original YAML byte-for-byte so an
+    exact-byte rollback can restore operator-authored formatting and
+    comments, not a YAML re-dump of the parsed structure."""
+    overrides = tmp_path / "state" / "tuning_overrides.yaml"
+    exact_bytes = (
+        "# Operator-authored header comment\n"
+        "supermodel:\n"
+        "  counter_veto_weight: 0.5\n"
+    )
+    overrides.parent.mkdir(parents=True, exist_ok=True)
+    overrides.write_text(exact_bytes, encoding="utf-8")
+
+    controller = ExperimentController(
+        settings=_settings(),
+        store=ExperimentStore(root=tmp_path / "experiments"),
+        bar_loader=_loader(),
+        overrides_path=overrides,
+    )
+    state = controller.propose()
+    assert state is not None
+    assert state.baseline_checksum
+    assert not state.baseline_was_absent
+
+    snapshot_path = tmp_path / "experiments" / state.experiment_id / "baseline.yaml"
+    assert snapshot_path.read_bytes().decode("utf-8") == exact_bytes
+
+
+def test_propose_marks_baseline_absent_when_no_file(tmp_path: Path) -> None:
+    """When the overrides file does not exist at propose time, the controller
+    must record ``baseline_was_absent`` so rollback doesn't fabricate a file."""
+    overrides = tmp_path / "state" / "tuning_overrides.yaml"
+    assert not overrides.exists()
+
+    store = ExperimentStore(root=tmp_path / "experiments")
+
+    from datetime import datetime, timezone
+    from trading_bot.learning.experiments.models import (
+        ExperimentState,
+        ParameterChange,
+    )
+
+    change = ParameterChange(
+        section="supermodel",
+        field="counter_veto_weight",
+        baseline=1.0,
+        candidate=0.75,
+    )
+    experiment_id = "absent-test-001"
+    store.snapshot_absent_baseline(experiment_id)
+    store.snapshot_overrides(
+        experiment_id,
+        "candidate",
+        {"supermodel": {"counter_veto_weight": 0.75}},
+    )
+
+    state = ExperimentState(
+        experiment_id=experiment_id,
+        status="PROPOSED",
+        change=change,
+        started_at=datetime.now(timezone.utc),
+        candidate_checksum="x",
+        baseline_checksum="",
+        baseline_was_absent=True,
+    )
+    store.save_current(state)
+
+    loaded = store.load_current()
+    assert loaded is not None
+    assert loaded.baseline_was_absent is True
+    assert (
+        tmp_path / "experiments" / experiment_id / "baseline.absent"
+    ).exists()
+
+
+def test_rollback_with_absent_baseline_leaves_overrides_uncreated(
+    tmp_path: Path,
+) -> None:
+    overrides = tmp_path / "state" / "tuning_overrides.yaml"
+    overrides.parent.mkdir(parents=True, exist_ok=True)
+
+    store = ExperimentStore(tmp_path / "experiments")
+
+    from datetime import datetime, timezone
+    from trading_bot.learning.experiments.models import (
+        ExperimentState,
+        ParameterChange,
+    )
+
+    change = ParameterChange(
+        section="supermodel",
+        field="counter_veto_weight",
+        baseline=1.0,
+        candidate=0.75,
+    )
+    experiment_id = "absent-rollback-001"
+    store.snapshot_absent_baseline(experiment_id)
+    store.snapshot_overrides(
+        experiment_id,
+        "candidate",
+        {"supermodel": {"counter_veto_weight": 0.75}},
+    )
+
+    state = ExperimentState(
+        experiment_id=experiment_id,
+        status="CANARY",
+        change=change,
+        started_at=datetime.now(timezone.utc),
+        baseline_was_absent=True,
+        baseline_checksum="",
+    )
+    store.save_current(state)
+
+    controller = ExperimentController(
+        settings=_settings(),
+        store=store,
+        bar_loader=_loader(),
+        overrides_path=overrides,
+    )
+
+    assert controller.rollback(reason="manual") is not None
+    assert not overrides.exists(), (
+        "rollback must NOT create overrides file when original was absent"
+    )
 
 
 def test_evaluate_rolls_back_when_candidate_pf_below_early_floor(tmp_path: Path) -> None:

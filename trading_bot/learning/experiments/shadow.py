@@ -238,16 +238,24 @@ class ShadowLedger:
 class PairedShadowHarness:
     """Independent paired broker: baseline vs. candidate.
 
-    Each ``record_paired`` records the same logical fill into two ledgers,
-    applying *different* ``applied_multiplier`` values:
-      * Baseline ledger receives ``baseline_multiplier`` (1.0 by design —
-        this represents the pre-experiment behavior).
-      * Candidate ledger receives ``candidate_multiplier`` (whatever the
-        experiment configured; e.g. 0.5 for the half-size policy).
+    The harness supports two related APIs:
 
-    This is what allows the canary gate to compare ``candidate.profit_factor``
-    against ``baseline.profit_factor``: the *only* delta comes from the
-    policy multiplier, not from filled-quantity duplication.
+    1. ``record_entry`` / ``record_exit`` — exact-quantity mirroring used by
+       the runtime canary. Callers pass the *baseline* quantity (pre-policy
+       size) and the *candidate* quantity (actual filled size, post-policy).
+       The harness never applies a multiplier internally, so the runtime
+       executor remains the only place that decides sizing.
+
+    2. ``record_paired`` — legacy compatibility wrapper kept for the
+       existing ``tests/test_paired_shadow_lifecycle.py``. It derives
+       baseline and candidate quantities by multiplying ``raw_quantity``
+       against ``baseline_multiplier`` and ``candidate_multiplier``. New
+       code should prefer ``record_entry``.
+
+    In either mode, exits derive the baseline SELL quantity from the
+    fraction of the candidate position sold; a final exit closes both
+    ledgers fully. The canary gate compares ``candidate_metrics()``
+    against ``baseline_metrics()`` at the decision boundary.
     """
 
     def __init__(
@@ -275,6 +283,115 @@ class PairedShadowHarness:
             ledger_id="candidate",
         )
 
+    def record_entry(
+        self,
+        *,
+        ticker: str,
+        baseline_quantity: int,
+        candidate_quantity: int,
+        fill_price: float,
+        fees: float,
+    ) -> None:
+        """Mirror a BUY at the supplied baseline and candidate quantities.
+
+        No multiplier is applied here: callers are responsible for any
+        pre- vs. post-policy split. ``baseline_quantity`` and
+        ``candidate_quantity`` are both clamped at 0 silently — callers
+        should already have filtered zero-quantity entries.
+        """
+        baseline_quantity = int(baseline_quantity)
+        candidate_quantity = int(candidate_quantity)
+        if baseline_quantity <= 0 and candidate_quantity <= 0:
+            return
+        if baseline_quantity > 0:
+            self.baseline.record(
+                ShadowFill(
+                    ticker=ticker,
+                    side="BUY",
+                    quantity=baseline_quantity,
+                    fill_price=fill_price,
+                    fees=fees,
+                    applied_multiplier=1.0,
+                )
+            )
+        if candidate_quantity > 0:
+            self.candidate.record(
+                ShadowFill(
+                    ticker=ticker,
+                    side="BUY",
+                    quantity=candidate_quantity,
+                    fill_price=fill_price,
+                    fees=fees,
+                    applied_multiplier=1.0,
+                )
+            )
+
+    def record_exit(
+        self,
+        *,
+        ticker: str,
+        candidate_quantity: int,
+        fill_price: float,
+        fees: float,
+    ) -> None:
+        """Mirror a SELL using the candidate-side fraction as the baseline scale.
+
+        The baseline SELL quantity is
+        ``round(baseline_held_before * (candidate_quantity / candidate_held_before))``.
+        When ``candidate_held_before`` is zero the baseline side is
+        skipped — the trade is not part of the paired shadow. A final
+        exit clears both ledgers completely.
+        """
+        candidate_quantity = int(candidate_quantity)
+        if candidate_quantity <= 0:
+            return
+        candidate_held_before = self._held_quantity(self.candidate, ticker)
+        baseline_held_before = self._held_quantity(self.baseline, ticker)
+        if candidate_held_before > 0:
+            fraction = candidate_quantity / candidate_held_before
+            baseline_exit_qty = int(round(baseline_held_before * fraction))
+        else:
+            baseline_exit_qty = 0
+
+        if baseline_exit_qty > 0:
+            self.baseline.record(
+                ShadowFill(
+                    ticker=ticker,
+                    side="SELL",
+                    quantity=baseline_exit_qty,
+                    fill_price=fill_price,
+                    fees=fees,
+                    applied_multiplier=1.0,
+                )
+            )
+        self.candidate.record(
+            ShadowFill(
+                ticker=ticker,
+                side="SELL",
+                quantity=candidate_quantity,
+                fill_price=fill_price,
+                fees=fees,
+                applied_multiplier=1.0,
+            )
+        )
+
+    @staticmethod
+    def _held_quantity(ledger: ShadowLedger, ticker: str) -> int:
+        positions = ledger.snapshot_positions()
+        value = positions.get(ticker)
+        if value is None:
+            return 0
+        return int(round(float(value.get("qty", 0.0))))
+
+    def candidate_metrics(self) -> MetricSet:
+        return self.candidate.metrics()
+
+    def baseline_metrics(self) -> MetricSet:
+        return self.baseline.metrics()
+
+    def closed_trade_counts_match(self) -> bool:
+        return self.candidate.metrics().trades == self.baseline.metrics().trades
+
     def record_paired(
         self,
         ticker: str,
@@ -283,16 +400,35 @@ class PairedShadowHarness:
         fill_price: float,
         fees: float,
     ) -> None:
-        """Record one logical fill into both ledgers at their own size."""
+        """Legacy compatibility wrapper around ``record_entry``/``record_exit``.
+
+        Mirrors ``raw_quantity`` against the configured multipliers so the
+        existing ``tests/test_paired_shadow_lifecycle.py`` suite stays
+        green. New code should call ``record_entry`` directly and supply
+        exact pre/post-policy quantities.
+        """
         if raw_quantity <= 0:
             return
-        baseline_qty = max(1, int(round(raw_quantity * self.baseline_multiplier)))
-        candidate_qty = max(1, int(round(raw_quantity * self.candidate_multiplier)))
+        if side == "BUY":
+            baseline_qty = max(1, int(round(raw_quantity * self.baseline_multiplier)))
+            candidate_qty = max(1, int(round(raw_quantity * self.candidate_multiplier)))
+            self.record_entry(
+                ticker=ticker,
+                baseline_quantity=baseline_qty,
+                candidate_quantity=candidate_qty,
+                fill_price=fill_price,
+                fees=fees,
+            )
+            return
+        # Legacy SELL semantics: both ledgers record the same raw quantity.
+        # We do NOT call record_exit here because that derives the baseline
+        # size from the candidate-side fraction; the existing lifecycle
+        # tests rely on symmetric sizing instead.
         self.baseline.record(
             ShadowFill(
                 ticker=ticker,
-                side=side,
-                quantity=baseline_qty,
+                side="SELL",
+                quantity=raw_quantity,
                 fill_price=fill_price,
                 fees=fees,
                 applied_multiplier=self.baseline_multiplier,
@@ -301,8 +437,8 @@ class PairedShadowHarness:
         self.candidate.record(
             ShadowFill(
                 ticker=ticker,
-                side=side,
-                quantity=candidate_qty,
+                side="SELL",
+                quantity=raw_quantity,
                 fill_price=fill_price,
                 fees=fees,
                 applied_multiplier=self.candidate_multiplier,

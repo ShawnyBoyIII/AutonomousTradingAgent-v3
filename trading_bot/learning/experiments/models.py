@@ -45,3 +45,5 @@ class ExperimentState(BaseModel):
     candidate_checksum: str | None = None
     baseline_checksum: str | None = None
     baseline_was_absent: bool = False
+    canary_starting_equity: float | None = None
+    runtime_canary_armed: bool = False
