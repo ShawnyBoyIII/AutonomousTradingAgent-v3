@@ -11,6 +11,7 @@ import pandas as pd
 from trading_bot.backtest.diagnostics import attach_diagnostics, diagnostics
 from trading_bot.config.settings import Settings
 from trading_bot.data import market_data
+from trading_bot.data.feature_pipeline import add_all_features
 from trading_bot.data.indicators import add_atr, add_bollinger_bands, add_ema, add_rsi, add_sma
 from trading_bot.execution.order_manager import submit_signal_as_order
 from trading_bot.execution.paper_broker import PaperBroker
@@ -152,23 +153,23 @@ def run_backtest(
             for i in range(min(len(intraday_frame), len(daily_frame)))
         ) if not intraday_frame.empty and not daily_frame.empty else False
         
-        daily_frame = add_ema(daily_frame, period=20, column_name="ema_20")
-        daily_frame = add_sma(daily_frame, period=50, column_name="sma_50")
+        daily_frame = add_all_features(
+            daily_frame,
+            atr_period=settings.risk.atr_period,
+        )
 
         use_v3 = (
             getattr(settings, "strategy", None) is not None
             and settings.strategy.use_v3_signals
         )
-        if use_v3:
-            daily_frame = add_atr(daily_frame, period=settings.risk.atr_period)
-            daily_frame = add_bollinger_bands(daily_frame, period=20)
 
         intraday_frame = _filter_frame_by_date(intraday_frame, start=start, end=end)
         intraday_frame = intraday_frame.copy(deep=True)
         intraday_frame["volume_avg_5"] = intraday_frame["volume"].rolling(5).mean()
-        intraday_frame = add_atr(intraday_frame, period=settings.risk.atr_period)
-        if use_v3:
-            intraday_frame = add_rsi(intraday_frame, period=14)
+        intraday_frame = add_all_features(
+            intraday_frame,
+            atr_period=settings.risk.atr_period,
+        )
 
         if daily_mode:
             result = _run_symbol_backtest_daily(symbol, daily_frame, settings)
@@ -316,6 +317,29 @@ def _evaluate_counter_thesis_for_backtest(
     return evaluate_counter_thesis(ctx, signal, settings.counter_thesis)
 
 
+def _signal_at_next_open(signal: Any, bar: Any) -> Any | None:
+    """Reprice a completed-bar signal for execution at the next bar open."""
+    next_open = float(bar.get("open", float("nan")))
+    if not np.isfinite(next_open):
+        return None
+    if next_open <= signal.stop_loss or next_open >= signal.profit_target:
+        return None
+
+    risk_reward_ratio = (signal.profit_target - next_open) / (
+        next_open - signal.stop_loss
+    )
+    timestamp = bar.get("timestamp", signal.timestamp)
+    if timestamp is not None:
+        timestamp = pd.Timestamp(timestamp).to_pydatetime()
+    return signal.model_copy(
+        update={
+            "entry_price": next_open,
+            "risk_reward_ratio": risk_reward_ratio,
+            "timestamp": timestamp,
+        }
+    )
+
+
 def _run_symbol_backtest(
     symbol: str,
     daily_frame: Any,
@@ -342,6 +366,7 @@ def _run_symbol_backtest(
     gross_loss = 0.0
     trade_records: list[dict[str, float | int]] = []
     open_trade: dict[str, Any] | None = None
+    pending_entry: dict[str, Any] | None = None
 
     use_v3 = (
         getattr(settings, "strategy", None) is not None
@@ -400,7 +425,33 @@ def _run_symbol_backtest(
         bar_index = end_index - 1
         current_bar = window.iloc[-1]
 
-        if open_trade is not None and bar_index > int(open_trade["entry_index"]):
+        if pending_entry is not None:
+            queued = pending_entry
+            pending_entry = None
+            signal = _signal_at_next_open(queued["signal"], current_bar)
+            if signal is not None:
+                fill = submit_signal_as_order(
+                    signal=signal,
+                    broker=broker,
+                    account_equity=10_000.0,
+                    open_tickers={
+                        ticker
+                        for ticker, quantity in broker.positions.items()
+                        if quantity > 0
+                    },
+                    risk_settings=settings.risk,
+                    counter_thesis=queued["counter_result"],
+                    position_size_override=queued["position_size_override"],
+                )
+                if fill is not None:
+                    open_trade = {
+                        "signal": signal,
+                        "fill": fill,
+                        "quantity": broker.positions.get(symbol, 0),
+                        "entry_index": bar_index,
+                    }
+
+        if open_trade is not None and bar_index >= int(open_trade["entry_index"]):
             signal = open_trade["signal"]
             exit_result = _bar_exit(signal, current_bar)
             if exit_result is not None:
@@ -567,25 +618,10 @@ def _run_symbol_backtest(
                 **policy_decision.metadata,
             }
 
-        fill = submit_signal_as_order(
-            signal=signal,
-            broker=broker,
-            account_equity=10_000.0,
-            open_tickers={
-                ticker for ticker, quantity in broker.positions.items() if quantity > 0
-            },
-            risk_settings=settings.risk,
-            counter_thesis=counter_result,
-            position_size_override=position_size_override,
-        )
-        if fill is None:
-            continue
-        quantity = broker.positions.get(symbol, 0)
-        open_trade = {
+        pending_entry = {
             "signal": signal,
-            "fill": fill,
-            "quantity": quantity,
-            "entry_index": bar_index,
+            "counter_result": counter_result,
+            "position_size_override": position_size_override,
         }
 
     if open_trade is not None:
@@ -677,7 +713,7 @@ def _run_symbol_backtest_daily(
 
         if use_v3 and selector is not None:
             window = daily_frame.iloc[: index + 1]
-            selection = selector.select_strategy(symbol, daily_frame, window)
+            selection = selector.select_strategy(symbol, window, window)
             if not selection.should_trade or selection.signal_score is None:
                 continue
             signal = selection_to_signal(symbol, selection, window)
