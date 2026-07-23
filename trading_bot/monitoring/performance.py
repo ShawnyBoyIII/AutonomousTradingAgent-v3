@@ -61,12 +61,21 @@ def calculate_performance_metrics(
     if not rows:
         return PerformanceMetrics(period=f"last_{days}_days", start_date=None, end_date=None)
 
-    # Filter to date range
+    # Filter to date range. Legacy rows may be naive America/New_York
+    # wall time; new fills persist aware UTC. Normalize to naive UTC so
+    # the comparison against the naive cutoff stays valid.
+    from trading_bot.analytics.evaluation_windows import (
+        normalize_timestamp,
+    )
+
     cutoff = datetime.now() - timedelta(days=days)
-    recent_rows = [
-        row for row in rows
-        if datetime.fromisoformat(row["filled_at"]) > cutoff
-    ]
+    recent_rows = []
+    for row in rows:
+        parsed = normalize_timestamp(row["filled_at"], naive_timezone=None)
+        if parsed is None:
+            continue
+        if parsed.replace(tzinfo=None) > cutoff:
+            recent_rows.append(row)
 
     if not recent_rows:
         return PerformanceMetrics(period=f"last_{days}_days", start_date=None, end_date=None)

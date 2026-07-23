@@ -100,8 +100,17 @@ def _check_recent_activity(ledger) -> tuple[bool, str]:
         if not rows:
             return True, "no trades yet"
 
-        # Check last trade time
-        last_trade = datetime.fromisoformat(rows[-1]["filled_at"])
+        # Check last trade time. New fills persist aware UTC; legacy rows
+        # may be naive America/New_York wall time. Normalize both sides
+        # to naive UTC before subtracting so the comparison stays valid.
+        from trading_bot.analytics.evaluation_windows import (
+            normalize_timestamp,
+        )
+
+        last_trade = normalize_timestamp(rows[-1]["filled_at"], naive_timezone=None)
+        if last_trade is None:
+            return True, "no parseable trade timestamp"
+        last_trade = last_trade.replace(tzinfo=None)
         hours_since = (datetime.now() - last_trade).total_seconds() / 3600
 
         if hours_since > 48:
