@@ -1,50 +1,49 @@
 #!/bin/bash
-# Daily trading workflow — run this each morning
-# Usage: ./scripts/daily-start.sh
+# Daily trading reference card — printed, not executed.
+#
+# The production automated workflow is ./scripts/auto-burn-in.sh.
+# This file is the human-readable equivalent for ad-hoc operators who
+# want to drive the trading day by hand. The exit code is always 0.
 
 set -e
 
 cd "$(dirname "$0")/.."
 
 echo "=========================================="
-echo "Daily Trading Workflow"
+echo "Daily Trading Workflow (manual reference)"
 echo "Date: $(date '+%Y-%m-%d %H:%M:%S %Z')"
 echo "=========================================="
 echo ""
-
-# Step 1: Build universe (run once, or daily to refresh)
-echo "Step 1: Build universe (scans market for ranked symbols)"
-echo "  Command: ./tradebot-local scan-universe"
+echo "Production automation: ./scripts/auto-burn-in.sh (manages everything"
+echo "below on a 60s cycle after pre-market). Use this card only for ad-hoc"
+echo "spot checks or for live development against the dashboard."
 echo ""
 
-# Step 2: Serve dashboard
-echo "Step 2: Start live dashboard"
-echo "  Command: ./tradebot-local --config-path burn-in-config.yaml serve --port 8000"
-echo "  Then open: http://localhost:8000"
+echo "Step 1: Build universe"
+echo "  Command: ./tradebot-local build-universe --max 50 --export"
 echo ""
 
-# Step 3: Morning scan
-echo "Step 3: Morning scan (9:30 AM ET)"
-echo "  Command: ./tradebot-local scan --why --summary"
+echo "Step 2: Start the canonical dashboard"
+echo "  Command: ./tradebot-local --config-path burn-in-config.yaml serve --port 8080"
+echo "  Then open: http://localhost:8080"
 echo ""
 
-# Step 4: Paper trade
-echo "Step 4: Submit trades (paper only)"
-echo "  Command: ./tradebot-local paper-trade"
-echo "  (reads state/universe.txt + state/watchlist.txt)"
+echo "Step 3: Spot scan a single symbol"
+echo "  Command: ./tradebot-local scan --symbols SPY --why --summary"
 echo ""
 
-# Step 5: Manage positions
-echo "Step 5: Position management (midday + EOD)"
+echo "Step 4: Submit paper trades for a single symbol"
+echo "  Command: ./tradebot-local paper-trade --symbols SPY"
+echo ""
+
+echo "Step 5: Midday position check"
 echo "  Command: ./tradebot-local manage-positions"
 echo ""
 
-# Step 6: Portfolio summary
 echo "Step 6: Portfolio summary"
 echo "  Command: ./tradebot-local portfolio"
 echo ""
 
-# Step 7: Kill switch status
 echo "Step 7: Kill switch status"
 echo "  Command: ./tradebot-local kill-switch --status"
 echo ""
@@ -54,17 +53,19 @@ echo "Quick copy-paste commands:"
 echo "=========================================="
 echo ""
 echo "# Start dashboard (in one terminal)"
-echo "./tradebot-local --config-path burn-in-config.yaml serve --port 8000"
+echo "./tradebot-local --config-path burn-in-config.yaml serve --port 8080"
 echo ""
-echo "# Morning scan (9:30 AM ET)"
-echo "./tradebot-local scan --why --summary"
+echo "# Morning scan (single symbol)"
+echo "./tradebot-local scan --symbols SPY --why --summary"
 echo ""
-echo "# Submit trades"
-echo "./tradebot-local paper-trade"
+echo "# Submit trades (single symbol)"
+echo "./tradebot-local paper-trade --symbols SPY"
 echo ""
 echo "# Midday check"
 echo "./tradebot-local manage-positions"
 echo ""
-echo "# EOD check (forces exits)"
+echo "# EOD check (forces exits via EOD priority)"
 echo "./tradebot-local manage-positions"
 echo ""
+
+exit 0
