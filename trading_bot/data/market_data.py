@@ -10,6 +10,7 @@ from trading_bot.config.settings import (
     MarketDataSettings,
 )
 from trading_bot.data.cache import MarketDataCache
+from trading_bot.data.providers.registry import order_provider_names
 from trading_bot.data.validation import ValidationResult, validate_market_data
 
 logger = logging.getLogger(__name__)
@@ -33,28 +34,22 @@ def normalize_ohlcv_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return result[["timestamp", "open", "high", "low", "close", "volume"]]
 
 
-def _prioritize_provider_names(
-    settings: MarketDataSettings | None = None,
-    interval: str | None = None,
+def _ordered_provider_names(
+    settings: MarketDataSettings | None,
+    interval: str | None,
 ) -> list[str]:
-    names = list(settings.provider_stack if settings is not None else ["yfinance"])
-    if not interval:
-        return names
+    """Return the provider names to consult for ``interval``.
 
-    token = str(interval).strip().lower()
-    # For sub-daily bars, prefer lower-latency providers before yfinance when
-    # the user configured a stack containing both.
-    is_intraday = token.endswith("m") or token.endswith("h")
-    if not is_intraday:
-        return names
-
-    priority = {"polygon": 0, "alpaca": 1, "finnhub": 2, "yfinance": 3}  # Polygon=massive.com first for SIP-quality data
-    return sorted(names, key=lambda name: (priority.get(str(name).strip().lower(), 99), names.index(name)))
+    Delegates to :func:`order_provider_names` so the registry is the
+    single source of truth for capability checks and intraday priority.
+    """
+    stack = list(settings.provider_stack if settings is not None else ["yfinance"])
+    return order_provider_names(stack, interval)
 
 
 def _resolve_provider_stack(settings: MarketDataSettings | None = None, interval: str | None = None) -> list:
     """Return an ordered list of provider instances from the effective provider stack."""
-    names = _prioritize_provider_names(settings, interval)
+    names = _ordered_provider_names(settings, interval)
     providers: list = []
     for name in names:
         providers.append(_resolve_provider_by_name(name))
@@ -62,8 +57,34 @@ def _resolve_provider_stack(settings: MarketDataSettings | None = None, interval
 
 
 def _cache_namespace(settings: MarketDataSettings | None = None, interval: str | None = None) -> str:
-    names = _prioritize_provider_names(settings, interval)
+    names = _ordered_provider_names(settings, interval)
     return "providers=" + ",".join(str(name).strip().lower() for name in names)
+
+
+_cache_instance: MarketDataCache | None = None
+
+
+def _get_cache() -> MarketDataCache:
+    global _cache_instance
+    if _cache_instance is None:
+        _cache_instance = MarketDataCache()
+    return _cache_instance
+
+
+def reset_cache() -> None:
+    global _cache_instance
+    _cache_instance = None
+
+
+def clear_cache(symbol: str | None = None) -> dict:
+    cache = _get_cache()
+    if symbol:
+        count = cache.invalidate(symbol=symbol.upper().strip())
+        logger.info(f"Cleared {count} cache entries for {symbol}")
+    else:
+        cache.clear_expired()
+        count = 0
+    return cache.status()
 
 
 def _resolve_provider_by_name(name: str) -> Any:
@@ -97,7 +118,7 @@ def _fallback_fetch(
     primary_settings: MarketDataSettings | None = None,
 ) -> pd.DataFrame:
     """Try each provider in the configured stack; first success wins."""
-    stack_names = _prioritize_provider_names(primary_settings, interval)
+    stack_names = _ordered_provider_names(primary_settings, interval)
     if not stack_names:
         stack_names = ["yfinance"]
     logger.info(f"_fallback_fetch symbol={symbol} stack={stack_names}")
@@ -141,32 +162,6 @@ def fetch_bars(
     if result is not None and not result.empty:
         cache.put(symbol, period, interval, result, start=start, end=end, namespace=namespace)
     return result
-
-
-_cache_instance: MarketDataCache | None = None
-
-
-def _get_cache() -> MarketDataCache:
-    global _cache_instance
-    if _cache_instance is None:
-        _cache_instance = MarketDataCache()
-    return _cache_instance
-
-
-def reset_cache() -> None:
-    global _cache_instance
-    _cache_instance = None
-
-
-def clear_cache(symbol: str | None = None) -> dict:
-    cache = _get_cache()
-    if symbol:
-        count = cache.invalidate(symbol=symbol.upper().strip())
-        logger.info(f"Cleared {count} cache entries for {symbol}")
-    else:
-        cache.clear_expired()
-        count = 0
-    return cache.status()
 
 
 def fetch_small_cap_candidates(
@@ -229,3 +224,17 @@ def fetch_and_validate_bars(
         return pd.DataFrame(), result
 
     return frame, result
+
+
+def validate_bars(
+    frame: pd.DataFrame,
+    *,
+    symbol: str | None = None,
+    allow_zero_volume: bool = False,
+) -> ValidationResult:
+    """Validate a normalized OHLCV frame against the V2.5 contract."""
+    return validate_market_data(
+        frame,
+        symbol=symbol,
+        allow_zero_volume=allow_zero_volume,
+    )
