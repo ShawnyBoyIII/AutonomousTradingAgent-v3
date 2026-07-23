@@ -1702,12 +1702,6 @@ def _format_backtest_diagnostics(result: dict) -> str:
     )
 
 
-def _format_paper_confidence_gate(result: dict, starting_cash: float = 10_000.0) -> str:
-    """Stub kept for backward import compatibility; the RL-driven paper
-    confidence gate was removed with the RL teardown."""
-    return "PAPER CONFIDENCE: n/a (RL teardown)"
-
-
 def _build_universe_file(settings) -> dict[str, object]:
     from trading_bot.data import market_data
     from trading_bot.advisory import load_scout_override
