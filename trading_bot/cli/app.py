@@ -52,7 +52,7 @@ from trading_bot.portfolio.performance import (
 )
 from trading_bot.reports.exporters import export_csv, export_json
 from trading_bot.reports.summaries import build_daily_summary
-from trading_bot.runtime import alerts as runtime_alerts
+
 from trading_bot.runtime import session as runtime_session
 from trading_bot.runtime.decision_log import append_decision_event
 from trading_bot.runtime.latency import data_age_minutes, frame_last_timestamp, is_stale
@@ -1847,14 +1847,6 @@ def _format_exit_alert(events: list[dict[str, object]]) -> str:
             ).strip()
         )
     return "\n".join(lines)
-
-
-def _send_discord_alert(settings, content: str) -> None:
-    runtime_alerts.send_discord_message(
-        webhook_url=settings.alerts.discord_webhook_url,
-        content=content,
-        username=settings.alerts.discord_username,
-    )
 
 
 def notify(settings, level: str, title: str, message: str, details: dict | None = None) -> list[bool]:
