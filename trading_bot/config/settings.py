@@ -77,8 +77,10 @@ class MarketDataSettings(BaseModel):
     scan_deadline_minutes: int = Field(default=5, ge=1, le=60)
     # Approved-candidate freshness window: a candidate older than this
     # is rejected at paper-trade time even if scan ran. Keeps a stale
-    # scan from leaking fills into the next cycle.
-    candidate_max_age_minutes: int = Field(default=15, ge=0, le=240)
+    # scan from leaking fills into the next cycle. The default is
+    # generous because the burner cycle (discovery + nightly tuning +
+    # scan + paper-trade) easily takes 20+ minutes end-to-end.
+    candidate_max_age_minutes: int = Field(default=60, ge=0, le=240)
     # V2.5: Data validation settings
     validate_data: bool = Field(default=True)
     max_price_jump_pct: float = Field(default=1000.0, ge=100.0, le=5000.0)

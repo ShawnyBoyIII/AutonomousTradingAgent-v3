@@ -185,6 +185,14 @@ def run_scan(
 ) -> dict[str, object]:
     ledger = PortfolioLedger(Path(settings.app.state_db_path))
     state = ledger.ensure_portfolio_state()
+    # Clear any prior approved-candidate file so stale entries from previous
+    # scans cannot be matched at paper-trade time. A scan run produces a
+    # fresh cohort; carrying over yesterday's candidates (whose timestamps
+    # are still valid but whose evidence is gone) creates spurious trades.
+    try:
+        Path(settings.app.approved_candidates_path).unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
     approved_results: list[tuple[dict[str, object], str]] = []
     other_results: list[str] = []
     candidate_rows: list[dict[str, object]] = []

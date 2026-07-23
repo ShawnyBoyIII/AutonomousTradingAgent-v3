@@ -260,12 +260,12 @@ watchlist_is_low() {
 
 # Check if it's mid-day (between 12:00 PM and 1:00 PM ET)
 is_midday() {
-    local current_hour=$(date +%H)
-    local current_min=$(date +%M)
+    local current_hour=$(TZ=America/New_York date +%H)
+    local current_min=$(TZ=America/New_York date +%M)
     local current_time=$((10#$current_hour * 60 + 10#$current_min))
     local midday_start=$((12 * 60))      # 12:00 PM
     local midday_end=$((13 * 60))        # 1:00 PM
-    
+
     if [ "$current_time" -ge "$midday_start" ] && [ "$current_time" -lt "$midday_end" ]; then
         return 0  # Yes, it's midday
     fi
@@ -317,17 +317,35 @@ should_discover() {
 # Each iteration also writes a heartbeat so a future stall is
 # detectable by the doctor command.
 sleep_until_market_open() {
-    local current_dow current_hour current_min current_time market_open target_epoch
+    local current_dow current_hour current_min current_time market_open market_close target_epoch
     local chunk wake_time
 
     while true; do
-        current_dow=$(date +%u)  # 1=Monday, 7=Sunday
-        current_hour=$(date +%H)
-        current_min=$(date +%M)
+        # Always operate in ET — the host may be in any timezone (audit
+        # item 16). The script's market hours are 9:30-16:00 ET on
+        # weekdays; the main-loop gate at the call site enforces the
+        # close-time guard.
+        current_dow=$(TZ=America/New_York date +%u)  # 1=Monday, 7=Sunday
+        current_hour=$(TZ=America/New_York date +%H)
+        current_min=$(TZ=America/New_York date +%M)
         current_time=$((10#$current_hour * 60 + 10#$current_min))
         market_open=$((9 * 60 + 30))
+        market_close=$((16 * 60))
 
         local now_epoch=$(date +%s)
+
+        # Fast path: if it is currently within market hours on a
+        # weekday, return immediately. Previously the function only
+        # checked `current_time >= market_open`, so 9:30 ET itself
+        # fell into the "after market open today" branch and slept
+        # 24 hours, leaving the burner stuck on its first post-wake
+        # cycle. (Found during burner status check 2026-07-23.)
+        if [ "$current_dow" -le 5 ] \
+            && [ "$current_time" -ge "$market_open" ] \
+            && [ "$current_time" -lt "$market_close" ]; then
+            write_heartbeat 0 0 0
+            return 0
+        fi
 
         if [ "$current_dow" -gt 5 ]; then
             # Weekend: sleep until Monday 9:30 AM
@@ -541,12 +559,13 @@ run_eod_data_download() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 
     # Gate on time window — wait for massive.com to publish (≈11:00 ET) plus a buffer.
-    local current_time=$(date '+%H:%M')
+    # Always evaluate against ET; the host may be in another timezone.
+    local current_time=$(TZ=America/New_York date '+%H:%M')
     if [ "$current_time" \< "$EOD_FETCH_TIME" ]; then
         return 0
     fi
 
-    local today_ymd=$(date '+%Y-%m-%d')
+    local today_ymd=$(TZ=America/New_York date '+%Y-%m-%d')
     # Per-interval marker path matches the CLI helper convention:
     # ".last_eod_fetch_<YYYY-MM-DD>_<sorted_intervals>.marker".
     local marker="${EOD_STORE_ROOT}/.last_eod_fetch_${today_ymd}_${EOD_INTERVALS_SLUG}.marker"
@@ -757,10 +776,10 @@ start_eod_watchdog() {
     local eod_minute=$((15 * 60 + 55))  # 15:55 ET
     (
         while true; do
-            local now_h=$(date +%H)
-            local now_m=$(date +%M)
-            local now_dow=$(date +%u)  # 1=Mon..7=Sun
-            local today=$(date +%Y-%m-%d)
+            local now_h=$(TZ=America/New_York date +%H)
+            local now_m=$(TZ=America/New_York date +%M)
+            local now_dow=$(TZ=America/New_York date +%u)  # 1=Mon..7=Sun
+            local today=$(TZ=America/New_York date +%Y-%m-%d)
             local now_min=$((10#$now_h * 60 + 10#$now_m))
             local marker="$state_dir/.last_eod_watchdog_fire_${today}.marker"
 
@@ -1105,14 +1124,16 @@ while true; do
     # Reload symbols in case file changed
     load_symbols
     
-    # Check if market hours (9:30 AM - 4:00 PM ET, weekdays)
-    current_hour=$(date +%H)
-    current_min=$(date +%M)
-    current_dow=$(date +%u)  # 1=Monday, 7=Sunday
+    # Check if market hours (9:30 AM - 4:00 PM ET, weekdays). Use ET
+    # explicitly — the host may be in another timezone, and a CDT
+    # workstation would otherwise evaluate against local time.
+    current_hour=$(TZ=America/New_York date +%H)
+    current_min=$(TZ=America/New_York date +%M)
+    current_dow=$(TZ=America/New_York date +%u)  # 1=Monday, 7=Sunday
     current_time=$((10#$current_hour * 60 + 10#$current_min))
-    market_open=$((9 * 60 + 30))   # 9:30 AM
-    market_close=$((16 * 60))       # 4:00 PM
-    
+    market_open=$((9 * 60 + 30))   # 9:30 AM ET
+    market_close=$((16 * 60))       # 4:00 PM ET
+
     # If not market hours, sleep efficiently until next open
     if [ "$current_dow" -gt 5 ] || [ "$current_time" -lt "$market_open" ] || [ "$current_time" -ge "$market_close" ]; then
         sleep_until_market_open
@@ -1149,9 +1170,9 @@ while true; do
     fi
     # 15:50 ET pre-EOD hard check (5 min before EOD exit)
     # NOTE: not a function — `local` would error out here.
-    pre_eod_h=$(date +%H)
-    pre_eod_m=$(date +%M)
-    pre_eod_dow=$(date +%u)
+    pre_eod_h=$(TZ=America/New_York date +%H)
+    pre_eod_m=$(TZ=America/New_York date +%M)
+    pre_eod_dow=$(TZ=America/New_York date +%u)
     if [ "$pre_eod_dow" -le 5 ] \
         && [ $((10#$pre_eod_h * 60 + 10#$pre_eod_m)) -eq $((15 * 60 + 50)) ]; then
         run_health_check
