@@ -4169,14 +4169,14 @@ def research_autopilot(
         typer.echo(f"  Status: {hypothesis.status.value}")
 
     elif action == "run":
-        pending = store.list_hypotheses(
-            status=HypothesisStatus.PENDING, limit=max_cycles
+        typer.echo(
+            "research-autopilot --action run is not implemented in this build. "
+            "The candidate action called run_backtest() with the wrong argument "
+            "order and mapped output keys that the active backtest does not "
+            "provide, producing silent zero-metric cycles. The create / stats / "
+            "cycles actions remain available."
         )
-        if not pending:
-            typer.echo("No pending hypotheses to run.")
-            return
-
-        typer.echo(f"Running {len(pending)} pending hypothesis(es)...")
+        return
 
         def _backtest_fn(hyp: Any) -> dict[str, Any]:
             params = hyp.parameters
