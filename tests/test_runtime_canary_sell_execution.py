@@ -144,6 +144,39 @@ def test_position_exit_instruments_record_exit(tmp_path: Path) -> None:
     )
     state_obj = ledger.ensure_portfolio_state()
 
+    # Populate the SQL ORM so _sell_sql_persist can find the trade/position
+    from trading_bot.db.session import init_db, make_session_factory, get_session
+    from trading_bot.db.models import Trade, Position as ORMPosition
+    from trading_bot.db.repositories.trades import upsert_trade
+    from trading_bot.db.repositories.positions import upsert_position
+    from datetime import datetime as _dt
+
+    engine = init_db(settings)
+    session_factory = make_session_factory(engine)
+    session = get_session(session_factory)
+    try:
+        upsert_trade(
+            session,
+            ticker="AAPL",
+            side="BUY",
+            order_type="market",
+            quantity=10,
+            entry_price=100.0,
+            strategy_tag="v3-trend_following",
+        )
+        upsert_position(
+            session,
+            ticker="AAPL",
+            quantity=10,
+            average_cost=100.0,
+            stop_loss=95.0,
+            profit_target=110.0,
+            strategy_tag="v3-trend_following",
+        )
+    finally:
+        session.close()
+        engine.dispose()
+
     broker = PaperBroker(
         starting_cash=state_obj.cash,
         fee_per_order=settings.paper.fee_per_order,

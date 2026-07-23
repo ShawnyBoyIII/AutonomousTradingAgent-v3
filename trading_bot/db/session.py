@@ -42,6 +42,9 @@ def init_db(settings: Settings) -> any:
             "ALTER TABLE trades ADD COLUMN exit_regime VARCHAR(40)",
             "ALTER TABLE trades ADD COLUMN exit_strategy VARCHAR(200)",
             "ALTER TABLE trades ADD COLUMN exit_reason VARCHAR(50)",
+            "ALTER TABLE trades ADD COLUMN partial_exit_count INTEGER DEFAULT 0",
+            "ALTER TABLE trades ADD COLUMN partial_pnl_accumulated FLOAT DEFAULT 0.0",
+            "ALTER TABLE positions ADD COLUMN entry_fees FLOAT DEFAULT 0.0",
         ):
             try:
                 conn.execute(text(ddl))

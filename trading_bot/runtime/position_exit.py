@@ -59,10 +59,7 @@ def fill_sell_position(
         - fill.fees
         - entry_fee_share
     )
-    from trading_bot.runtime.fill_transaction import (
-        FillTransaction,
-        FillTransactionError,
-    )
+    from trading_bot.runtime.fill_transaction import FillTransaction
 
     def _sell_sql_persist(**ctx):
         from trading_bot.db.models import Trade
@@ -118,10 +115,7 @@ def fill_sell_position(
         )
     )
     sell_tx.register(_sell_sql_persist)
-    try:
-        sell_tx.run(fill=fill, side="SELL")
-    except FillTransactionError as exc:
-        logger.exception("SELL fill transaction failed for %s", ticker)
+    sell_tx.run(fill=fill, side="SELL")
 
     if runtime_canary is not None:
         from trading_bot.learning.experiments.runtime_canary import (
