@@ -1,18 +1,20 @@
 """
 Broker abstraction layer for V3 Robinhood integration.
 
-Provides abstract base class and concrete implementations for different brokers.
-All broker interactions go through this layer for safety and consistency.
+Provides abstract base class for read-only broker snapshots and
+reconciliation. The active execution path uses trading_bot.execution
+(PaperBroker + OrderRequest/FillResult) directly. The Robinhood
+boundary subclasses BrokerAdapter for read-only position and order
+status queries; no live trading path uses the abstract base for
+order submission.
 """
 
 from trading_bot.brokers.base import BrokerAdapter, OrderPreview, BrokerAccount, BrokerPosition, BrokerOrder
-from trading_bot.brokers.paper import PaperBrokerAdapter
 
 __all__ = [
     "BrokerAdapter",
-    "OrderPreview", 
+    "OrderPreview",
     "BrokerAccount",
     "BrokerPosition",
     "BrokerOrder",
-    "PaperBrokerAdapter",
 ]

@@ -525,14 +525,20 @@ def dashboard(
     output: Path = typer.Option(
         Path("state/dashboard.html"),
         "--output",
-        help="Path for static HTML dashboard.",
+        help="Deprecated. The static HTML generator has been removed.",
     ),
 ) -> None:
-    """Build a static dashboard from local JSON snapshots."""
-    from trading_bot.runtime.dashboard import build_dashboard
+    """Deprecated: the static HTML dashboard has been removed.
 
-    path = build_dashboard(ctx.obj, output)
-    typer.echo(f"dashboard={path}")
+    Use ``serve`` to launch the canonical FastAPI dashboard instead.
+    This command is kept as a no-op alias so existing automation does
+    not break; it intentionally writes no file.
+    """
+    typer.echo(
+        "dashboard command is deprecated; use `./tradebot-local serve` for "
+        "the canonical FastAPI dashboard."
+    )
+    typer.echo(f"(ignored --output={output})")
 
 
 @app.command()
@@ -549,22 +555,31 @@ def serve(
         help="Port to serve the live dashboard on. Defaults to app.dashboard_port (8000).",
     ),
 ) -> None:
-    """Serve a live, auto-refreshing dashboard from local state files.
+    """Serve the canonical FastAPI dashboard (cohort-aware, SSE-updated).
 
-    Binds to localhost only (127.0.0.1) by default per the security
-    hardening policy. The dashboard reads state JSON + the burn-in
-    decision-log JSONL every refresh and never writes to them.
+    The legacy runtime dashboard and the static HTML generator have been
+    removed; this command now delegates to the rich dashboard at
+    ui/dashboard/main.py. Binds to localhost only by default per the
+    security hardening policy.
 
     Press Ctrl-C to stop.
     """
-    from trading_bot.runtime.dashboard import serve_dashboard
+    import uvicorn
 
     effective_port = port if port is not None else ctx.obj.app.dashboard_port
     typer.echo(
-        f"Serving live dashboard at http://{host}:{effective_port} (Ctrl-C to stop)"
+        f"Serving rich dashboard at http://{host}:{effective_port} (Ctrl-C to stop)"
     )
-    typer.echo("Routes: / (HTML) | /api/state (JSON) | /healthz")
-    serve_dashboard(ctx.obj, host=host, port=effective_port, block=True)
+    typer.echo(
+        "Routes: / (HTML) | /api/portfolio | /api/evaluation-windows | "
+        "/api/trades | /api/health | /api/stream (SSE)"
+    )
+    uvicorn.run(
+        "ui.dashboard.main:app",
+        host=host,
+        port=effective_port,
+        log_level="info",
+    )
 
 
 @app.command(name="manage-positions")

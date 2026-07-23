@@ -2380,13 +2380,12 @@ def test_dashboard_command_builds_static_html(tmp_path: Path) -> None:
         ["--config-path", str(config_file), "dashboard", "--output", str(output)],
     )
 
+    # The static HTML dashboard has been removed; this command is now a
+    # deprecation no-op alias that points users at `serve`.
     assert result.exit_code == 0
-    assert result.stdout.strip() == f"dashboard={output}"
-    html_text = output.read_text(encoding="utf-8")
-    assert "Autonomous Trading Agent" in html_text
-    assert "SPY" in html_text
-    assert "GREEN" in html_text
-    assert "$10,000.00" in html_text
+    assert "deprecated" in result.stdout.lower()
+    assert "serve" in result.stdout.lower()
+    assert not output.exists(), "dashboard command must not write a file anymore"
 
 
 def test_manage_positions_reports_empty_portfolio(tmp_path: Path) -> None:

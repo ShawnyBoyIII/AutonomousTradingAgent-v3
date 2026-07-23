@@ -271,32 +271,6 @@ class TestCircuitBreakerInOrchestrator:
         assert "CIRCUIT_BREAKER" in result["lines"][0]
 
 
-class TestDashboardCircuitBreaker:
-    """Dashboard snapshot includes circuit breaker metrics."""
-
-    def test_dashboard_snapshot_includes_cb_metrics(self, tmp_path: Path) -> None:
-        from trading_bot.config.settings import AppSettings, Settings
-        from trading_bot.runtime.dashboard import DashboardServer
-
-        settings = Settings(
-            app=AppSettings(
-                state_db_path=str(tmp_path / "test.db"),
-                log_dir=str(tmp_path / "logs"),
-                portfolio_summary_path=str(tmp_path / "portfolio.json"),
-                scan_results_path=str(tmp_path / "scan.json"),
-                dashboard_summary_path=str(tmp_path / "dashboard.json"),
-                backtest_summary_path=str(tmp_path / "backtest.json"),
-            )
-        )
-        server = DashboardServer(settings)
-        snap = server.snapshot()
-
-        assert "circuit_breaker" in snap
-        assert "consecutive_losses" in snap["circuit_breaker"]
-        assert "drawdown_current_pct" in snap["circuit_breaker"]
-        assert "drawdown_max_pct" in snap["circuit_breaker"]
-
-
 class TestManagePositionsCircuitBreaker:
     """manage-positions CLI also respects the circuit breaker."""
 
