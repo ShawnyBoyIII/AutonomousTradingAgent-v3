@@ -10,6 +10,7 @@ from trading_bot.health.checks import (
     check_market_data_freshness,
     check_open_positions_consistent,
     check_pid_alive,
+    check_scan_freshness,
     check_tuning_experiment,
 )
 from trading_bot.health.types import CheckResult, HealthReport
@@ -21,6 +22,7 @@ def run_health_checks(
     db_path: Path,
     dashboard_port: int,
     eod_watchdog_pid_file: Path,
+    scan_results_path: Path | None = None,
     now_utc: datetime | None = None,
 ) -> HealthReport:
     """Run all burn-in checks; never raises. Failures degrade to FAIL."""
@@ -37,5 +39,7 @@ def run_health_checks(
     results.append(check_open_positions_consistent(db_path=db_path, heartbeat_path=heartbeat))
     results.append(check_market_data_freshness(db_path=db_path, now_utc=now))
     results.append(check_tuning_experiment(state_dir=state_dir, now_utc=now))
+    if scan_results_path is not None:
+        results.append(check_scan_freshness(scan_results_path, now_utc=now))
 
     return HealthReport(checks=results, generated_at=now.isoformat())

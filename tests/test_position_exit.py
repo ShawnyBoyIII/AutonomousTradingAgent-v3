@@ -197,3 +197,72 @@ def test_partial_take_profit_keeps_trade_open_and_records_single_snapshot(tmp_pa
     assert new_state.positions["AAPL"].quantity == 5
     assert new_state.positions["AAPL"].partial_profit_taken is True
     assert ledger.snapshot_timestamps == [datetime(2026, 7, 4, 14, 5, tzinfo=timezone.utc)]
+
+
+def test_fill_sell_position_event_includes_realized_pnl_for_partial_accumulator(tmp_path: Path) -> None:
+    """fill_sell_position must return realized_pnl in the event dict so
+    fill_partial_take_profit_position's accumulate_partial_exit call sees
+    the actual amount, not zero.
+    """
+    settings = _settings(tmp_path)
+    init_db(settings)
+    ledger = _LedgerSpy()
+    broker = _BrokerStub(
+        fill_price=110.0,
+        fill_quantity=5,
+        filled_at=datetime(2026, 7, 4, 14, 5, tzinfo=timezone.utc),
+        cash=549.0,
+        positions={"AAPL": 5},
+    )
+    position = _position(quantity=10).model_copy(update={"entry_fees": 1.0})
+    state = PortfolioState(cash=0.0, equity=1000.0, positions={"AAPL": position})
+
+    _, event, _ = fill_sell_position(
+        ticker="AAPL",
+        position=position,
+        reason="profit_target",
+        submitted_at=datetime(2026, 7, 4, 14, 0, tzinfo=timezone.utc),
+        last_price=110.0,
+        broker=broker,
+        ledger=ledger,
+        state=state,
+        log_path=tmp_path / "logs" / "decision-log.jsonl",
+        settings=settings,
+        quantity=5,
+        close_db_position=False,
+    )
+
+    # (110 - 100) * 5 - 1.0 (sell fee) - 0.5 (entry fee share) = 48.5
+    assert event["realized_pnl"] == 48.5
+    assert ledger.recorded_fills == [("SELL", 48.5)]
+
+
+def test_portfolio_state_after_sell_subtracts_proportional_entry_fees(tmp_path: Path) -> None:
+    """portfolio_state_after_sell must debit the proportional entry fees
+    from realized P&L so PortfolioState.realized_pnl matches the
+    fill_sell_position realized_pnl.
+    """
+    from trading_bot.runtime.position_exit import portfolio_state_after_sell
+
+    position = _position(quantity=10).model_copy(update={"entry_fees": 1.0})
+    state = PortfolioState(cash=1000.0, equity=1000.0, positions={"AAPL": position})
+    broker = _BrokerStub(
+        fill_price=110.0,
+        fill_quantity=10,
+        filled_at=datetime(2026, 7, 4, 14, 5, tzinfo=timezone.utc),
+        cash=1099.0,
+        positions={},
+    )
+
+    new_state = portfolio_state_after_sell(
+        previous_state=state,
+        ticker="AAPL",
+        sold_quantity=10,
+        fill_price=110.0,
+        fill_fees=1.0,
+        broker=broker,
+        entry_fee_share=1.0,
+    )
+
+    # (110 - 100) * 10 - 1.0 (sell fee) - 1.0 (entry fee share, full exit) = 98.0
+    assert new_state.realized_pnl == 98.0

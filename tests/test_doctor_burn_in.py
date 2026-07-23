@@ -96,3 +96,33 @@ def test_doctor_burn_in_fail_exit_code(state_dir: Path, monkeypatch):
     runner = CliRunner()
     result = runner.invoke(app, ["doctor", "--burn-in"])
     assert result.exit_code == 2
+
+
+def test_doctor_burn_in_invokes_scan_freshness(state_dir: Path, monkeypatch):
+    """The CLI must pass scan_results_path through to the runner so the
+    scan_freshness check is included in the burn-in health report.
+    """
+    from trading_bot.health import runner as runner_module
+    from trading_bot.health.types import CheckResult, HealthReport
+
+    captured: dict = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return HealthReport(
+            checks=[
+                CheckResult(name="pid_alive", status="PASS", detail="ok", observed=None),
+                CheckResult(name="scan_freshness", status="PASS", detail="fresh", observed=None),
+            ],
+            generated_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    monkeypatch.setattr(runner_module, "run_health_checks", fake_run)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["doctor", "--burn-in"])
+    assert result.exit_code == 0, result.output
+    assert "scan_results_path" in captured, "CLI did not forward scan_results_path"
+    assert captured["scan_results_path"] is not None
+    # scan_freshness appears in the rendered output
+    assert "scan_freshness" in result.output

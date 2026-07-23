@@ -132,6 +132,7 @@ class Position(Base):
     entry_at = Column(DateTime, nullable=True)
     strategy_tag = Column(String(200), nullable=True)
     closed_at = Column(DateTime, nullable=True)
+    entry_fees = Column(Float, nullable=False, default=0.0)
 
 
 class PortfolioSnapshot(Base):

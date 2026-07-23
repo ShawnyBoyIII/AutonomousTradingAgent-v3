@@ -16,6 +16,7 @@ class Position(BaseModel):
     entry_at: datetime | None = None
     strategy_tag: str = ""
     partial_profit_taken: bool = False
+    entry_fees: float = Field(default=0.0, ge=0.0)
 
 
 class PortfolioState(BaseModel):

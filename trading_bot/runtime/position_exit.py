@@ -147,6 +147,7 @@ def fill_sell_position(
         sold_quantity=fill.quantity,
         fill_price=fill.fill_price,
         fill_fees=fill.fees,
+        entry_fee_share=entry_fee_share,
         broker=broker,
     )
     if mark_exit_timestamp:
@@ -165,6 +166,7 @@ def fill_sell_position(
         "quantity": fill.quantity,
         "fill_price": fill.fill_price,
         "cash": new_state.cash,
+        "realized_pnl": round(realized_pnl, 2),
     }
     line = (
         f"{ticker} FILLED reason={reason} qty={fill.quantity} "
@@ -282,6 +284,7 @@ def portfolio_state_after_sell(
     fill_price: float,
     fill_fees: float,
     broker,
+    entry_fee_share: float = 0.0,
 ) -> PortfolioState:
     exited_position = previous_state.positions[ticker]
     positions = {}
@@ -300,7 +303,7 @@ def portfolio_state_after_sell(
         positions[symbol] = position.model_copy(update=update)
     realized_delta = (
         (fill_price - exited_position.average_cost) * sold_quantity
-    ) - fill_fees
+    ) - fill_fees - entry_fee_share
     equity = broker.cash + sum(
         position.quantity * position.average_cost for position in positions.values()
     )
