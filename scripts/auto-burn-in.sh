@@ -303,38 +303,74 @@ should_discover() {
 }
 
 # Sleep until next market open (9:30 AM ET next weekday)
+#
+# Phase 5 (P5.1): a single `sleep "$sleep_seconds"` for up to 17.5
+# hours is paused by macOS Maintenance Sleep despite
+# `caffeinate -s -i -m`. CLOCK_MONOTONIC does not advance while the
+# process is suspended, so the timer never reaches the target epoch
+# and the burner skips an entire trading day.
+#
+# Fix: replace the single long sleep with a polling loop that
+# sleeps in 60-second chunks. Each chunk is short enough that
+# macOS does deliver the wakeup signal after a single Maintenance
+# Sleep window, so even an overnight suspension resumes the loop.
+# Each iteration also writes a heartbeat so a future stall is
+# detectable by the doctor command.
 sleep_until_market_open() {
-    local now_epoch=$(date +%s)
-    local current_dow=$(date +%u)  # 1=Monday, 7=Sunday
-    local current_hour=$(date +%H)
-    local current_min=$(date +%M)
-    local current_time=$((10#$current_hour * 60 + 10#$current_min))
-    local market_open=$((9 * 60 + 30))
-    
-    local target_epoch
-    if [ "$current_dow" -gt 5 ]; then
-        # Weekend: sleep until Monday 9:30 AM
-        local days_until_monday=$((8 - current_dow))
-        target_epoch=$((now_epoch + days_until_monday * 86400 - current_time * 60 + market_open * 60))
-    elif [ "$current_time" -ge "$market_open" ]; then
-        # After market open today: sleep until tomorrow 9:30 AM (or Monday if Friday)
-        if [ "$current_dow" -eq 5 ]; then
-            # Friday after hours: sleep until Monday 9:30 AM
-            target_epoch=$((now_epoch + 3 * 86400 - current_time * 60 + market_open * 60))
+    local current_dow current_hour current_min current_time market_open target_epoch
+    local chunk wake_time
+
+    while true; do
+        current_dow=$(date +%u)  # 1=Monday, 7=Sunday
+        current_hour=$(date +%H)
+        current_min=$(date +%M)
+        current_time=$((10#$current_hour * 60 + 10#$current_min))
+        market_open=$((9 * 60 + 30))
+
+        local now_epoch=$(date +%s)
+
+        if [ "$current_dow" -gt 5 ]; then
+            # Weekend: sleep until Monday 9:30 AM
+            local days_until_monday=$((8 - current_dow))
+            target_epoch=$((now_epoch + days_until_monday * 86400 - current_time * 60 + market_open * 60))
+        elif [ "$current_time" -ge "$market_open" ]; then
+            # After market open today: sleep until tomorrow 9:30 AM (or Monday if Friday)
+            if [ "$current_dow" -eq 5 ]; then
+                target_epoch=$((now_epoch + 3 * 86400 - current_time * 60 + market_open * 60))
+            else
+                target_epoch=$((now_epoch + 86400 - current_time * 60 + market_open * 60))
+            fi
         else
-            target_epoch=$((now_epoch + 86400 - current_time * 60 + market_open * 60))
+            # Pre-market: sleep until 9:30 AM today
+            target_epoch=$((now_epoch + (market_open - current_time) * 60))
         fi
-    else
-        # Pre-market: sleep until 9:30 AM today
-        target_epoch=$((now_epoch + (market_open - current_time) * 60))
-    fi
-    
-    local sleep_seconds=$((target_epoch - now_epoch))
-    if [ "$sleep_seconds" -gt 0 ]; then
-        local wake_time=$(date -r "$target_epoch" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date -d "@$target_epoch" '+%Y-%m-%d %H:%M:%S %Z')
-        echo "[$timestamp] Sleeping until market open: $wake_time ($sleep_seconds sec)"
-        sleep "$sleep_seconds"
-    fi
+
+        local sleep_seconds=$((target_epoch - now_epoch))
+        if [ "$sleep_seconds" -le 0 ]; then
+            # Market is now open. Emit a final heartbeat and return.
+            write_heartbeat 0 0 0
+            return 0
+        fi
+
+        # First iteration: announce the plan with the wake target.
+        if [ -z "${_PREMARKET_ANNOUNCED:-}" ]; then
+            _PREMARKET_ANNOUNCED=1
+            wake_time=$(date -r "$target_epoch" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date -d "@$target_epoch" '+%Y-%m-%d %H:%M:%S %Z')
+            echo "[$timestamp] Pre-market: polling until market open at $wake_time ($sleep_seconds sec total, 60s ticks)"
+        fi
+
+        # Phase 5 (P5.1): 60-second polling chunks. Each chunk is short
+        # enough that a single macOS Maintenance Sleep window cannot
+        # stall us indefinitely; if the kernel suspends us we resume
+        # at the next kernel wakeup. Write a heartbeat on each tick so
+        # a stalled pre-market is visible in the doctor report.
+        chunk=$sleep_seconds
+        if [ "$chunk" -gt 60 ]; then
+            chunk=60
+        fi
+        sleep "$chunk"
+        write_heartbeat 0 0 0
+    done
 }
 
 # Load symbols function - reads from Python-configured paths (universe + watchlist)
