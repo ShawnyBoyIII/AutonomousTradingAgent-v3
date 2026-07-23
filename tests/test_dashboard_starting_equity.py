@@ -34,7 +34,13 @@ class _DummyLedger:
     def __init__(self, history):
         self._history = history
 
-    def list_recent_equity_history(self, *, limit=None, since=None):
+    def list_recent_equity_history(
+        self,
+        *,
+        limit=None,
+        since=None,
+        naive_timezone=None,
+    ):
         return self._history
 
 

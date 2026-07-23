@@ -23,7 +23,13 @@ from trading_bot.cli.app import app
 
 
 def _fill_orders_table(conn: sqlite3.Connection) -> None:
-    """Build a tiny two-day trade fixture covering two strategies."""
+    """Build a tiny two-day trade fixture covering two strategies.
+
+    ``filled_at`` values are naive UTC instants so the fixture is
+    timezone-agnostic for callers that pin ``naive_timezone=UTC``.
+    Callers that exercise the local-timezone behavior should use
+    dedicated fixtures with explicit offsets.
+    """
     rows = [
         # Day 1: trend strategy wins/loses alternating
         ("o1", "AAA", "BUY", 10, 100.0, "2026-07-10T09:32:00", 0.0, "v3-trend_following"),
@@ -156,6 +162,28 @@ def test_summarize_paper_performance_filters_to_window(tmp_path) -> None:
     assert set(by_hour.keys()) == {14, 15}
 
 
+def test_summarize_paper_performance_interprets_naive_in_configured_timezone(
+    tmp_path,
+) -> None:
+    """Legacy naive ``filled_at`` rows are interpreted in
+    ``naive_timezone`` so cohort boundaries align with the operator's
+    configured trading day, not silent UTC."""
+    db_path = _seed_burn_in_db(tmp_path)
+    # 10:10 NY (UTC-4) = 14:10 UTC; falls AFTER 13:00 UTC filter.
+    report = summarize_paper_performance(
+        db_path=db_path,
+        since=datetime(2026, 7, 10, 13, 0, 0, tzinfo=timezone.utc),
+        naive_timezone="America/New_York",
+    )
+    by_hour = {int(row.label): row for row in report.by_hour}
+    # Hours are bucketed in the configured timezone, so the 10:10/10:11
+    # cluster lands in NY-local hour 10 and the 14:00/15:00 cluster in
+    # NY-local hours 14/15 (not UTC hours).
+    assert by_hour[10].trades == 2
+    assert by_hour[14].trades == 1
+    assert by_hour[15].trades == 1
+
+
 def test_format_paper_performance_report_shows_top_losers_and_strategy_table(tmp_path) -> None:
     db_path = _seed_burn_in_db(tmp_path)
     report = summarize_paper_performance(db_path=db_path)
@@ -179,6 +207,7 @@ def _write_graduation_config(tmp_path, db_path: str, graduation_since: str) -> s
     config.write_text(
         "app:\n"
         f"  state_db_path: {db_path}\n"
+        "  timezone: 'UTC'\n"
         "paper:\n"
         f"  graduation_since: '{graduation_since}'\n",
         encoding="utf-8",

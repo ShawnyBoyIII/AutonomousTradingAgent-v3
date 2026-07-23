@@ -13,7 +13,7 @@
 
   <link rel="stylesheet" href="/static/css/dashboard.css">
 </head>
-<body data-starting-equity="350000">
+<body data-starting-equity="0">
   <a class="skip-link" href="#main">Skip to main content</a>
 
   <!-- =============================================================
@@ -82,15 +82,16 @@
           </div>
         </div>
         <div class="hero__equity-since">
-          <span>Since burn-in start</span>
-          <strong>$350,000</strong>
+          <span>Since <em id="equitySinceLabel">burn-in start</em></span>
+          <strong id="equitySinceValue">$—</strong>
         </div>
       </div>
 
       <div class="hero__col">
-        <span class="hero__eyebrow">Day · P&amp;L</span>
+        <span class="hero__eyebrow">Today · Realized P&amp;L</span>
         <div class="hero__pnl-value" id="pnlValue" data-trend="up">—</div>
         <div class="hero__pnl-pct" id="pnlPct" data-trend="up">—%</div>
+        <div class="hero__pnl-sub" id="pnlSub">—</div>
         <div class="sparkline" id="sparklineWrap" data-trend="flat" aria-hidden="true">
           <svg viewBox="0 0 200 56" preserveAspectRatio="none">
             <polygon id="sparklineFill" points=""></polygon>
@@ -245,6 +246,92 @@
             <div class="tab-pane__body" id="closedTradesList">
               <div class="empty">No closed trades yet</div>
             </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Evaluation Windows — tabbed Today / Trade Cohort / Equity Cohort -->
+      <section class="card card--windows" aria-labelledby="windowsTitle">
+        <header class="card__head">
+          <span class="card__eyebrow"><b>02a</b>Cohort</span>
+          <h2 class="card__title" id="windowsTitle">Evaluation Windows</h2>
+          <span class="card__count" id="windowsBadge" data-state="">—</span>
+        </header>
+
+        <div class="tabs" role="tablist" aria-label="Evaluation windows">
+          <button
+            type="button"
+            class="tab is-active"
+            id="todayTab"
+            role="tab"
+            aria-selected="true"
+            aria-controls="todayPane"
+            tabindex="0"
+          >
+            <span class="tab__label">Today</span>
+          </button>
+          <button
+            type="button"
+            class="tab"
+            id="tradeCohortTab"
+            role="tab"
+            aria-selected="false"
+            aria-controls="tradeCohortPane"
+            tabindex="-1"
+          >
+            <span class="tab__label">Trade Cohort</span>
+          </button>
+          <button
+            type="button"
+            class="tab"
+            id="equityCohortTab"
+            role="tab"
+            aria-selected="false"
+            aria-controls="equityCohortPane"
+            tabindex="-1"
+          >
+            <span class="tab__label">Equity Cohort</span>
+          </button>
+        </div>
+
+        <div class="tab-panes">
+          <div
+            class="tab-pane is-active"
+            id="todayPane"
+            role="tabpanel"
+            aria-labelledby="todayTab"
+          >
+            <div class="tab-pane__body" id="todayMetricsBody">
+              <div class="empty">Awaiting data</div>
+            </div>
+            <span class="windows-status" id="todayStatus" data-state="unconfigured">Loading…</span>
+            <div class="windows-boundary" id="todayBoundary">Boundary: —</div>
+          </div>
+          <div
+            class="tab-pane"
+            id="tradeCohortPane"
+            role="tabpanel"
+            aria-labelledby="tradeCohortTab"
+            hidden
+          >
+            <div class="tab-pane__body" id="tradeCohortMetricsBody">
+              <div class="empty">Awaiting data</div>
+            </div>
+            <span class="windows-status" id="tradeCohortStatus" data-state="unconfigured">Loading…</span>
+            <div class="windows-boundary" id="tradeCohortBoundary">Boundary: —</div>
+          </div>
+          <div
+            class="tab-pane"
+            id="equityCohortPane"
+            role="tabpanel"
+            aria-labelledby="equityCohortTab"
+            hidden
+          >
+            <div class="tab-pane__body" id="equityCohortMetricsBody">
+              <div class="empty">Awaiting data</div>
+            </div>
+            <span class="windows-status" id="equityCohortStatus" data-state="unconfigured">Loading…</span>
+            <div class="windows-boundary" id="equityCohortBoundary">Boundary: —</div>
           </div>
         </div>
       </section>

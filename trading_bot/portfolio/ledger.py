@@ -369,21 +369,67 @@ class PortfolioLedger:
 
     def list_recent_equity_history(
         self,
-        limit: int = 500,
+        limit: int | None = 500,
+        since: datetime | None = None,
+        naive_timezone: str | None = None,
     ) -> list[dict[str, object]]:
-        """Return the newest equity snapshots in chronological order."""
+        """Return the newest equity snapshots in chronological order.
+
+        ``limit`` caps the result set (``None`` ⇒ unbounded).
+        ``since`` filters by UTC timestamp boundary. Legacy naive rows
+        are interpreted in ``naive_timezone`` (defaults to UTC) so the
+        cohort boundary is honored without rewriting history.
+        """
+        from trading_bot.analytics.evaluation_windows import normalize_timestamp
+
+        normalized_since = (
+            normalize_timestamp(since, naive_timezone) if since is not None else None
+        )
+
         self.initialize()
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT timestamp, equity, cash, realized_pnl, unrealized_pnl
-                FROM equity_history
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (max(limit, 1),),
-            ).fetchall()
+            if limit is not None:
+                rows = conn.execute(
+                    """
+                    SELECT timestamp, equity, cash, realized_pnl, unrealized_pnl
+                    FROM equity_history
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (max(limit, 1),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT timestamp, equity, cash, realized_pnl, unrealized_pnl
+                    FROM equity_history
+                    ORDER BY id DESC
+                    """
+                ).fetchall()
 
+        chronological = list(reversed(rows))
+        if normalized_since is None:
+            return [
+                {
+                    "timestamp": row[0],
+                    "equity": row[1],
+                    "cash": row[2],
+                    "realized_pnl": row[3] if row[3] is not None else 0.0,
+                    "unrealized_pnl": row[4] if row[4] is not None else 0.0,
+                }
+                for row in chronological
+            ]
+
+        filtered: list[tuple[datetime, sqlite3.Row | tuple]] = []
+        for row in chronological:
+            ts = row[0]
+            ts_normalized = normalize_timestamp(ts, naive_timezone)
+            if ts_normalized is None:
+                continue
+            if ts_normalized >= normalized_since:
+                filtered.append((ts_normalized, row))
+
+        filtered.sort(key=lambda pair: pair[0])
         return [
             {
                 "timestamp": row[0],
@@ -392,5 +438,5 @@ class PortfolioLedger:
                 "realized_pnl": row[3] if row[3] is not None else 0.0,
                 "unrealized_pnl": row[4] if row[4] is not None else 0.0,
             }
-            for row in reversed(rows)
+            for _, row in filtered
         ]

@@ -9,7 +9,7 @@
   // State
   // -------------------------------------------------------------
   const STATE = {
-    startingEquity: 350000,  // Updated 2026-07-08 after +$250K deposit
+    startingEquity: null,   // resolved from /api/portfolio; cohort-driven
     history: [],            // ring buffer of equity samples (for sparkline)
     historyMax: 80,
     lastUpdate: null,
@@ -169,6 +169,16 @@
     // Hero equity
     setValue($("equityValue"), fmtUSD(equity));
     $("equityValue").dataset.trend = equity >= STATE.startingEquity ? "up" : "down";
+
+    // Equity since: use equity-cohort starting equity when available.
+    // The "Since <label>" caption is updated by renderEvaluationWindows
+    // once the cohort boundary is known.
+    const sinceValueEl = $("equitySinceValue");
+    if (sinceValueEl && Number.isFinite(STATE.startingEquity) && STATE.startingEquity > 0) {
+      setValue(sinceValueEl, fmtUSD(STATE.startingEquity));
+    } else if (sinceValueEl) {
+      setValue(sinceValueEl, "—");
+    }
 
     // KPIs
     setValue($("cashValue"), fmtUSD(cash));
@@ -824,12 +834,13 @@
     let stop = false;
     const run = async () => {
       try {
-        const [portfolio, health, alerts, trades, closed] = await Promise.all([
+        const [portfolio, health, alerts, trades, closed, windows] = await Promise.all([
           fetchJSON("/api/portfolio"),
           fetchJSON("/api/health"),
           fetchJSON("/api/alerts"),
           fetchJSON("/api/trades"),
           fetchJSON("/api/closed-trades"),
+          fetchJSON("/api/evaluation-windows"),
         ]);
         if (stop) return;
         if (portfolio) renderPortfolio(portfolio);
@@ -837,6 +848,7 @@
         if (alerts) renderAlerts(alerts);
         if (trades) renderTrades(trades);
         if (closed) renderClosedTrades(closed);
+        if (windows) renderEvaluationWindows(windows);
         setConnection("connected");
       } catch (e) {
         setConnection("disconnected");
@@ -860,28 +872,32 @@
     if (payload.alerts)    renderAlerts(payload.alerts);
     if (payload.trades)    renderTrades(payload.trades);
     if (payload.closed_trades) renderClosedTrades(payload.closed_trades);
+    if (payload.evaluation_windows) renderEvaluationWindows(payload.evaluation_windows);
   }
 
   async function bootstrap() {
     try {
-      const [portfolio, health, alerts, trades, closed] = await Promise.all([
+      const [portfolio, health, alerts, trades, closed, windows] = await Promise.all([
         fetchJSON("/api/portfolio").catch(() => null),
         fetchJSON("/api/health").catch(() => null),
         fetchJSON("/api/alerts").catch(() => null),
         fetchJSON("/api/trades").catch(() => null),
         fetchJSON("/api/closed-trades").catch(() => null),
+        fetchJSON("/api/evaluation-windows").catch(() => null),
       ]);
       if (portfolio) renderPortfolio(portfolio);
       if (health)    renderHealth(health);
       if (alerts)    renderAlerts(alerts);
       if (trades)    renderTrades(trades);
       if (closed)    renderClosedTrades(closed);
+      if (windows)   renderEvaluationWindows(windows);
     } catch (e) {
       console.warn("bootstrap fetch failed", e);
     }
     startClock();
     connect();
     bindBookTabs();
+    bindWindowTabs();
   }
 
   // -------------------------------------------------------------
@@ -956,6 +972,296 @@
         } else if (ev.key === "End") {
           ev.preventDefault();
           activateBookTab(order[order.length - 1]);
+          $(`${order[order.length - 1]}Tab`).focus();
+        }
+      });
+    });
+  }
+
+  // -------------------------------------------------------------
+  // Evaluation Windows — render the three-window cohort snapshot
+  // driven entirely by the server (no client-side time bucketing).
+  // -------------------------------------------------------------
+  function fmtNumberOrDash(value, decimals = 2) {
+    if (value === null || value === undefined || Number.isNaN(value)) return "—";
+    if (typeof value === "number" && !isFinite(value)) return "—";
+    return Number(value).toLocaleString(undefined, {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals,
+    });
+  }
+  function fmtIntOrDash(value) {
+    if (value === null || value === undefined) return "—";
+    return fmtInt(value);
+  }
+  function trendFor(value) {
+    if (value === null || value === undefined) return "flat";
+    if (value > 0) return "up";
+    if (value < 0) return "down";
+    return "flat";
+  }
+
+  function renderWindowStatus(statusEl, status) {
+    if (!statusEl) return;
+    const state = (status && status.state) || "unconfigured";
+    const detail = (status && status.detail) || "";
+    const stateLabel = {
+      ready: "Ready",
+      empty: "Empty",
+      insufficient: "Insufficient evidence",
+      unconfigured: "Not configured",
+      error: detail ? "Error" : "Unavailable",
+    }[state] || state;
+    statusEl.dataset.state = state;
+    statusEl.textContent = detail ? `${stateLabel} · ${detail}` : stateLabel;
+  }
+
+  function renderWindowBoundary(boundaryEl, status) {
+    if (!boundaryEl) return;
+    const boundary = (status && status.boundary) || "—";
+    const source = (status && status.boundary_source) || "";
+    const sourceLabel = source
+      ? `<span class="windows-boundary__source">${escapeHTML(source)}</span>`
+      : "";
+    boundaryEl.innerHTML = `Boundary: <strong>${escapeHTML(boundary)}</strong>${sourceLabel}`;
+  }
+
+  function tradeMetricsHtml(metrics, empty) {
+    if (empty) {
+      return `<div class="empty">No closed trades in this window yet</div>`;
+    }
+    const closed = fmtIntOrDash(metrics && metrics.closed_exits);
+    const wins = fmtIntOrDash(metrics && metrics.wins);
+    const losses = fmtIntOrDash(metrics && metrics.losses);
+    const avg = fmtNumberOrDash(metrics && metrics.average_exit_pnl, 2);
+    const pnl = fmtNumberOrDash(metrics && metrics.realized_pnl, 2);
+    const trend = trendFor(metrics && metrics.realized_pnl);
+    // realized_pnl === null means no closed exits (server returns null
+    // when closed_exits == 0). Show "—" rather than "∞", which is
+    // reserved for the profit_factor infinite case.
+    const pnlDisplay = (metrics && metrics.realized_pnl === null) || pnl === "—"
+      ? "—"
+      : `${pnl}`;
+    const pfState = (metrics && metrics.profit_factor_state) || "ready";
+    const pfDisplay = pfState === "infinite"
+      ? "∞"
+      : fmtNumberOrDash(metrics && metrics.profit_factor, 2);
+    const targetTrades = metrics && metrics.target_trades;
+    const progress = targetTrades
+      ? `${closed} / ${targetTrades} trades`
+      : `${closed} closed`;
+    return `
+      <div class="windows-metric-grid">
+        <div class="windows-metric">
+          <span class="windows-metric__label">Realized P&amp;L</span>
+          <strong class="windows-metric__value" data-trend="${trend}">${pnlDisplay}</strong>
+          <span class="windows-metric__sub">${progress}</span>
+        </div>
+        <div class="windows-metric">
+          <span class="windows-metric__label">Profit Factor</span>
+          <strong class="windows-metric__value">${pfDisplay}</strong>
+          <span class="windows-metric__sub">wins ${wins} · losses ${losses}</span>
+        </div>
+        <div class="windows-metric">
+          <span class="windows-metric__label">Avg Exit P&amp;L</span>
+          <strong class="windows-metric__value">${avg}</strong>
+          <span class="windows-metric__sub">per closed trade</span>
+        </div>
+      </div>
+    `;
+  }
+
+  function equityMetricsHtml(metrics, status) {
+    const starting = fmtNumberOrDash(metrics && metrics.starting_equity, 2);
+    const current = fmtNumberOrDash(metrics && metrics.current_equity, 2);
+    const peak = fmtNumberOrDash(metrics && metrics.peak_equity, 2);
+    const drawdown = fmtNumberOrDash(metrics && metrics.max_drawdown_pct, 2);
+    const ret = fmtNumberOrDash(metrics && metrics.return_pct, 2);
+    const retAmount = fmtNumberOrDash(metrics && metrics.return_amount, 2);
+    const retTrend = trendFor(metrics && metrics.return_amount);
+    const snapshots = fmtIntOrDash(metrics && metrics.snapshot_count);
+    return `
+      <div class="windows-metric-grid">
+        <div class="windows-metric">
+          <span class="windows-metric__label">Return</span>
+          <strong class="windows-metric__value" data-trend="${retTrend}">${ret}%</strong>
+          <span class="windows-metric__sub">${retAmount} (${snapshots} snapshots)</span>
+        </div>
+        <div class="windows-metric">
+          <span class="windows-metric__label">Max Drawdown</span>
+          <strong class="windows-metric__value">${drawdown}%</strong>
+          <span class="windows-metric__sub">peak ${peak}</span>
+        </div>
+        <div class="windows-metric">
+          <span class="windows-metric__label">Start → Current</span>
+          <strong class="windows-metric__value">${starting}</strong>
+          <span class="windows-metric__sub">→ ${current}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderEvaluationWindows(payload) {
+    if (!payload) return;
+    if (payload.error) {
+      const status = $("todayStatus");
+      if (status) {
+        status.dataset.state = "error";
+        status.textContent = "Unavailable · " + payload.error;
+      }
+      return;
+    }
+    const todayBody = $("todayMetricsBody");
+    const tradeBody = $("tradeCohortMetricsBody");
+    const equityBody = $("equityCohortMetricsBody");
+    const todayStatus = $("todayStatus");
+    const tradeStatus = $("tradeCohortStatus");
+    const equityStatus = $("equityCohortStatus");
+    const todayBoundary = $("todayBoundary");
+    const tradeBoundary = $("tradeCohortBoundary");
+    const equityBoundary = $("equityCohortBoundary");
+    const badge = $("windowsBadge");
+    const tradingDate = payload.today_metrics && payload.today_metrics.trading_date;
+
+    if (todayStatus) renderWindowStatus(todayStatus, payload.today);
+    if (tradeStatus) renderWindowStatus(tradeStatus, payload.trade_cohort);
+    if (equityStatus) renderWindowStatus(equityStatus, payload.equity_cohort);
+    if (todayBoundary) renderWindowBoundary(todayBoundary, payload.today);
+    if (tradeBoundary) renderWindowBoundary(tradeBoundary, payload.trade_cohort);
+    if (equityBoundary) renderWindowBoundary(equityBoundary, payload.equity_cohort);
+
+    if (todayBody) {
+      const empty = (payload.today.state === "empty" || (payload.today_metrics.closed_exits === 0));
+      todayBody.innerHTML = tradeMetricsHtml(payload.today_metrics, empty);
+      const dateLine = `<div class="windows-boundary">Trading date: <strong>${escapeHTML(tradingDate || "—")}</strong></div>`;
+      todayBody.insertAdjacentHTML("beforeend", dateLine);
+    }
+    if (tradeBody) {
+      const empty = (payload.trade_cohort.state === "empty" || payload.trade_cohort_metrics.closed_exits === 0);
+      tradeBody.innerHTML = tradeMetricsHtml(payload.trade_cohort_metrics, empty);
+    }
+    if (equityBody) {
+      const showMetrics = payload.equity_cohort.state === "ready";
+      if (showMetrics) {
+        equityBody.innerHTML = equityMetricsHtml(payload.equity_cohort_metrics, payload.equity_cohort);
+      } else {
+        // Suppress the all-"—" metric card when there is no cohort evidence.
+        equityBody.innerHTML = `<div class="empty">Drawdown not reported — ${escapeHTML(payload.equity_cohort.detail || "awaiting cohort evidence")}</div>`;
+      }
+    }
+
+    // The hero "Since <label>" caption is driven by the equity cohort's
+    // boundary. Source label distinguishes the dedicated boundary from
+    // the graduation fallback so operators can see which is in use.
+    const sinceLabel = $("equitySinceLabel");
+    if (sinceLabel && payload.equity_cohort && payload.equity_cohort.boundary) {
+      const source = payload.equity_cohort.boundary_source;
+      sinceLabel.textContent = source === "equity_evaluation_since"
+        ? "equity-cohort start"
+        : source === "graduation_fallback"
+          ? "graduation-fallback cohort"
+          : "cohort start";
+    }
+    if (badge) {
+      const states = ["today", "trade_cohort", "equity_cohort"]
+        .map((k) => payload[k] && payload[k].state)
+        .filter(Boolean);
+      const allReady = states.every((s) => s === "ready");
+      const anyError = states.includes("error");
+      badge.dataset.state = anyError ? "critical" : (allReady ? "ok" : "");
+      const label = payload.trade_cohort_metrics
+        ? `${payload.trade_cohort_metrics.closed_exits || 0} cohort trades`
+        : "—";
+      badge.textContent = label;
+    }
+
+    // The hero's "Today" P&L is driven by the server's today realized P&L,
+    // not by the equity-vs-starting difference. We only update when the
+    // metric is present, so the equity-based gauge and "since" line are
+    // unaffected. When today has no closed trades (server returns null
+    // realized_pnl) we keep the equity-based hero display intact and just
+    // clear the secondary sub-line.
+    const todayPnl = payload.today_metrics && payload.today_metrics.realized_pnl;
+    if (Number.isFinite(todayPnl)) {
+      const pnlEl = $("pnlValue");
+      const pctEl = $("pnlPct");
+      const subEl = $("pnlSub");
+      const sign = todayPnl < 0 ? "−" : "";
+      setValue(pnlEl, sign + fmtUSD(Math.abs(todayPnl)));
+      setAttr(pnlEl, "data-trend", trendFor(todayPnl));
+      // Use the equity-cohort baseline (resolved via /api/portfolio) so the
+      // percentage tracks the same number shown in the "Since $X" caption.
+      const baseline = Number.isFinite(STATE.startingEquity) && STATE.startingEquity > 0
+        ? STATE.startingEquity
+        : null;
+      const pct = baseline ? todayPnl / baseline : null;
+      setValue(pctEl, pct === null ? "—" : FMT_PCT(pct, 2));
+      setAttr(pctEl, "data-trend", trendFor(todayPnl));
+      if (subEl) {
+        const closed = payload.today_metrics.closed_exits;
+        const pfDisplay = payload.today_metrics.profit_factor_state === "infinite"
+          ? "∞"
+          : fmtNumberOrDash(payload.today_metrics.profit_factor, 2);
+        setValue(subEl, `${closed} exit${closed === 1 ? "" : "s"} · PF ${pfDisplay}`);
+      }
+    } else {
+      const subEl = $("pnlSub");
+      if (subEl) setValue(subEl, "—");
+    }
+  }
+
+  function activateWindowTab(name) {
+    const tabs = ["today", "tradeCohort", "equityCohort"];
+    tabs.forEach((id) => {
+      const tab = $(`${id}Tab`);
+      const pane = $(`${id}Pane`);
+      if (!tab || !pane) return;
+      const isActive = id === name;
+      setAttr(tab, "aria-selected", isActive ? "true" : "false");
+      tab.setAttribute("tabindex", isActive ? "0" : "-1");
+      tab.classList.toggle("is-active", isActive);
+      pane.classList.toggle("is-active", isActive);
+      pane.hidden = !isActive;
+    });
+    try { window.localStorage.setItem("activeWindowTab", name); } catch (_) {}
+  }
+
+  function bindWindowTabs() {
+    const today = $("todayTab");
+    const trade = $("tradeCohortTab");
+    const equity = $("equityCohortTab");
+    if (!today || !trade || !equity) return;
+    let desired = "today";
+    try {
+      const stored = window.localStorage.getItem("activeWindowTab");
+      if (stored && ["today", "tradeCohort", "equityCohort"].includes(stored)) {
+        desired = stored;
+      }
+    } catch (_) {}
+    activateWindowTab(desired);
+    today.addEventListener("click", () => activateWindowTab("today"));
+    trade.addEventListener("click", () => activateWindowTab("tradeCohort"));
+    equity.addEventListener("click", () => activateWindowTab("equityCohort"));
+    const order = ["today", "tradeCohort", "equityCohort"];
+    [today, trade, equity].forEach((btn, i) => {
+      btn.addEventListener("keydown", (ev) => {
+        if (ev.key === "ArrowRight") {
+          ev.preventDefault();
+          const next = (i + 1) % order.length;
+          activateWindowTab(order[next]);
+          $(`${order[next]}Tab`).focus();
+        } else if (ev.key === "ArrowLeft") {
+          ev.preventDefault();
+          const prev = (i - 1 + order.length) % order.length;
+          activateWindowTab(order[prev]);
+          $(`${order[prev]}Tab`).focus();
+        } else if (ev.key === "Home") {
+          ev.preventDefault();
+          activateWindowTab(order[0]);
+          $(`${order[0]}Tab`).focus();
+        } else if (ev.key === "End") {
+          ev.preventDefault();
+          activateWindowTab(order[order.length - 1]);
           $(`${order[order.length - 1]}Tab`).focus();
         }
       });

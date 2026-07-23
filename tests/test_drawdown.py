@@ -166,6 +166,18 @@ class TestFormatDrawdownReport:
         assert "Calmar Ratio" in report
         assert "12,000" in report  # formatted with comma
 
+    def test_with_insufficient_evidence(self) -> None:
+        """Fewer than two cohort snapshots reports the insufficient state."""
+        metrics = DrawdownMetrics(
+            peak_equity=12000.0,
+            recovery_equity=11400.0,
+            sample_size=1,
+            sufficient_evidence=False,
+        )
+        report = format_drawdown_report(metrics)
+        assert "Insufficient cohort evidence" in report
+        assert "1 snapshot" in report
+
 
 class TestEquityHistoryTable:
     """Tests for the equity_history table via PortfolioLedger."""

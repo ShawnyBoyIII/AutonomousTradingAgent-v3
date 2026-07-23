@@ -711,6 +711,7 @@ header, main, footer, .mode-rail, .skip-link { position: relative; z-index: 1; }
 .card--health { grid-column: span 4; }
 .card--telemetry { grid-column: span 4; }
 .card--trades { grid-column: span 12; }
+.card--windows { grid-column: span 12; }
 
 .kill {
   display: flex;
@@ -1105,6 +1106,72 @@ header, main, footer, .mode-rail, .skip-link { position: relative; z-index: 1; }
   color: var(--ink-faint);
   font-family: var(--font-mono);
 }
+
+/* Evaluation Windows — metric grid + status states */
+.windows-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+.windows-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.5rem 0.65rem;
+  background: var(--bg-2, rgba(255, 255, 255, 0.02));
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.06));
+  border-radius: 6px;
+}
+.windows-metric__label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+.windows-metric__value {
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--ink, inherit);
+  letter-spacing: 0.01em;
+}
+.windows-metric__value[data-trend="up"] { color: var(--pos, #4ade80); }
+.windows-metric__value[data-trend="down"] { color: var(--neg, #f87171); }
+.windows-metric__sub {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+.windows-status {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.25rem 0.55rem;
+  border-radius: 999px;
+  display: inline-block;
+  margin-bottom: 0.6rem;
+}
+.windows-status[data-state="ready"] { background: rgba(74, 222, 128, 0.12); color: #4ade80; }
+.windows-status[data-state="empty"] { background: rgba(148, 163, 184, 0.12); color: #94a3b8; }
+.windows-status[data-state="insufficient"] { background: rgba(251, 191, 36, 0.16); color: #fbbf24; }
+.windows-status[data-state="unconfigured"] { background: rgba(148, 163, 184, 0.08); color: #94a3b8; }
+.windows-status[data-state="error"] { background: rgba(248, 113, 113, 0.18); color: #f87171; }
+.windows-boundary {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+  margin-top: 0.5rem;
+  letter-spacing: 0.04em;
+}
+.windows-boundary__source {
+  color: var(--ink-dim);
+  text-transform: uppercase;
+  margin-left: 0.5rem;
+}
+
 .book-count {
   display: inline-flex;
   align-items: baseline;
@@ -1656,6 +1723,7 @@ header, main, footer, .mode-rail, .skip-link { position: relative; z-index: 1; }
   .card--health     { grid-column: span 6;  order: 4; }
   .card--telemetry  { grid-column: span 12; order: 5; }
   .card--trades     { grid-column: span 12; order: 6; }
+  .card--windows    { grid-column: span 12; order: 7; }
   .tabs { gap: 0; }
   .tab { padding: var(--s-3) var(--s-4); font-size: 11.5px; letter-spacing: 0.14em; }
 }
@@ -1678,7 +1746,7 @@ header, main, footer, .mode-rail, .skip-link { position: relative; z-index: 1; }
     padding: 0 1rem 1rem;
   }
   .bento { grid-template-columns: 1fr; gap: var(--s-4); padding: var(--s-5) 1rem var(--s-6); }
-  .card--alerts, .card--health, .card--telemetry { grid-column: 1 / -1; }
+  .card--alerts, .card--health, .card--telemetry, .card--windows { grid-column: 1 / -1; }
   .footer { flex-direction: column; align-items: flex-start; gap: 0.5rem; padding: var(--s-4) 1rem; }
   .kill__panel { grid-template-columns: 1fr; gap: var(--s-4); }
   .kill__meta { text-align: left; align-items: flex-start; }

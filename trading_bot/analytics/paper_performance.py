@@ -97,13 +97,21 @@ class PaperPerformanceReport:
         return self.realized_pnl / self.total_trades
 
 
-def _parse_iso(value: str) -> datetime | None:
+def _parse_iso(value: str, naive_timezone: str | None = None) -> datetime | None:
     try:
         dt = datetime.fromisoformat(value)
     except (TypeError, ValueError):
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        if naive_timezone:
+            try:
+                from zoneinfo import ZoneInfo
+
+                dt = dt.replace(tzinfo=ZoneInfo(naive_timezone))
+            except Exception:
+                dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.replace(tzinfo=timezone.utc)
     return dt
 
 
@@ -164,10 +172,15 @@ def _bucket(rows: Sequence[dict], key_fn) -> list[BucketAggregate]:
     return out
 
 
-def _in_window(filled_at: str, since: datetime | None, until: datetime | None) -> bool:
+def _in_window(
+    filled_at: str,
+    since: datetime | None,
+    until: datetime | None,
+    naive_timezone: str | None = None,
+) -> bool:
     if since is None and until is None:
         return True
-    parsed = _parse_iso(filled_at)
+    parsed = _parse_iso(filled_at, naive_timezone)
     if parsed is None:
         return False
     if since is not None and parsed < since:
@@ -181,6 +194,7 @@ def summarize_paper_performance(
     db_path: str | Path,
     since: datetime | None = None,
     until: datetime | None = None,
+    naive_timezone: str | None = None,
 ) -> PaperPerformanceReport:
     """Read closed SELL orders from the burn-in DB and aggregate P&L.
 
@@ -233,7 +247,7 @@ def summarize_paper_performance(
     sells: list[dict] = []
     for raw in rows:
         record = dict(zip(cols, raw))
-        if not _in_window(record.get("filled_at", ""), since, until):
+        if not _in_window(record.get("filled_at", ""), since, until, naive_timezone):
             continue
         sells.append(record)
 
@@ -259,7 +273,7 @@ def summarize_paper_performance(
         return row.get("strategy_tag") or "untagged"
 
     def _by_hour(row):
-        dt = _parse_iso(row.get("filled_at", ""))
+        dt = _parse_iso(row.get("filled_at", ""), naive_timezone)
         return dt.hour if dt is not None else -1
 
     def _by_ticker(row):
@@ -341,7 +355,7 @@ def format_paper_performance_report(report: PaperPerformanceReport) -> str:
         lines.append("")
 
     if report.by_hour:
-        lines.append("By hour (UTC, worst first):")
+        lines.append("By hour (configured local time, worst first):")
         lines.append(
             f"  {'hour':>5} {'N':>4} {'W':>4} {'L':>4} {'net':>11} {'avg':>9}"
         )

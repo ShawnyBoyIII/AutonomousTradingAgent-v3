@@ -5,6 +5,7 @@ Read-only dashboard for portfolio monitoring with real-time updates.
 
 import asyncio
 import json
+import logging
 import math
 import sys
 from contextlib import asynccontextmanager
@@ -41,6 +42,8 @@ class DashboardState:
 
 
 state = DashboardState()
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -195,22 +198,27 @@ def _resolve_starting_equity(pstate) -> float:
     """Compute the cohort starting equity used for P&L baseline.
 
     Priority:
-    1. ``settings.paper.graduation_since`` paired with the oldest
-       cohort-equity snapshot for that boundary.
-    2. ``settings.paper.equity_evaluation_since`` as a fallback.
-    3. The portfolio's current equity (freshly seeded cohorts).
-    """
-    import logging
+    1. ``settings.paper.equity_evaluation_since`` (the dedicated
+       equity-risk boundary) paired with the oldest cohort-equity
+       snapshot at or after that boundary.
+    2. ``settings.paper.graduation_since`` as a fallback.
+    3. ``settings.app.starting_cash`` / ``settings.paper.starting_cash``.
+    4. The portfolio's current equity (freshly seeded cohorts).
 
-    logger = logging.getLogger(__name__)
+    Legacy naive ``timestamp`` rows in ``equity_history`` are
+    interpreted in ``settings.app.timezone`` so the baseline matches
+    every other consumer in the analytics layer.
+    """
     settings = state.settings
-    cohort = getattr(settings.paper, "graduation_since", None) or getattr(
-        settings.paper, "equity_evaluation_since", None
-    )
-    if cohort is not None:
+    equity_boundary = getattr(settings.paper, "equity_evaluation_since", None)
+    if equity_boundary is None:
+        equity_boundary = getattr(settings.paper, "graduation_since", None)
+    if equity_boundary is not None:
         try:
             history = state.ledger.list_recent_equity_history(
-                limit=None, since=cohort
+                limit=None,
+                since=equity_boundary,
+                naive_timezone=getattr(settings.app, "timezone", None) or "UTC",
             )
             if history:
                 first = history[0]
@@ -230,6 +238,24 @@ def _resolve_starting_equity(pstate) -> float:
     except (TypeError, ValueError):
         pass
     return float(pstate.equity or 0.0)
+
+
+def _evaluation_windows_payload() -> dict:
+    """Compose the three-window cohort snapshot for the dashboard."""
+    from trading_bot.analytics.evaluation_windows import build_evaluation_windows
+
+    try:
+        windows = build_evaluation_windows(
+            state.settings,
+            state.ledger,
+        )
+        return windows.to_dict()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not build evaluation windows: %s", exc)
+        return {
+            "generated_at": datetime.now().isoformat(),
+            "error": str(exc),
+        }
 
 
 def _health_payload() -> dict:
@@ -446,6 +472,19 @@ async def get_closed_trades(limit: int = 50):
     return _closed_trades_payload(limit=limit)
 
 
+@app.get("/api/evaluation-windows")
+async def get_evaluation_windows():
+    """Three-window cohort snapshot: Today, Trade Cohort, Equity Cohort.
+
+    Each window reports a status envelope (``available``,
+    ``state`` ∈ ``ready``/``empty``/``insufficient``/``unconfigured``/
+    ``error``), a boundary, and JSON-safe metrics. The legacy $1.27M
+    pre-cohort peak is excluded from the equity cohort when the
+    dedicated ``equity_evaluation_since`` boundary is configured.
+    """
+    return _evaluation_windows_payload()
+
+
 async def event_generator():
     while True:
         try:
@@ -455,6 +494,7 @@ async def event_generator():
                 "alerts": _alerts_payload(),
                 "trades": _trades_payload(),
                 "closed_trades": _closed_trades_payload(),
+                "evaluation_windows": _evaluation_windows_payload(),
                 "timestamp": datetime.now().isoformat(),
             }
             yield f"data: {json.dumps(data)}\n\n"

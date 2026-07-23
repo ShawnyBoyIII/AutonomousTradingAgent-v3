@@ -70,7 +70,7 @@ peak cannot trip the circuit breaker.
 - Confidence gates are advisory at PF < 0.8 after 50+ trades (logs alert, does not halt)
 - The daily loss guard resets by configured trading date and sums that day's realized SELL P&L; cumulative historical P&L does not block a new session when dated SELL history is available
 - Strategy tags recorded on all buys and sells for attribution
-- Run `./tradebot-local paper-report` for the multi-dimensional P&L view (overall, by strategy, by hour, by ticker) — replaces the SQL probes previously needed to answer "where did today's loss come from?"
+- Run `./tradebot-local paper-report` for the multi-dimensional P&L view (overall, by strategy, by hour, by ticker) — defaults to the trade-quality cohort (`paper.graduation_since`); pass `--since`/`--until` to override.
 - Run `./tradebot-local trade-attribution` for the paired BUY/SELL roster
 - Run `./tradebot-local graduation-check` for the configured cohort's 100-trade decision gate; explicit `--since`/`--until` values override the configured window
 - Run `./tradebot-local drawdown` and `./tradebot-local risk-report` for cohort-bounded drawdown (uses `paper.equity_evaluation_since` when set, otherwise `paper.graduation_since`); fewer than two cohort snapshots → "Insufficient cohort evidence" instead of false halts
@@ -154,6 +154,40 @@ app:
 - Paths resolved relative to config file location
 - Credentials via environment variables or `.env` only (`.env` is gitignored)
 - `state/burn_in.db` for burn-in, `state/trading_bot.db` for manual commands
+
+---
+
+## Cohort-Aware Reporting & Dashboard
+
+Three evaluation windows are computed from a single source
+(`trading_bot/analytics/evaluation_windows.py`) and shared by the CLI
+reports and the dashboard:
+
+- **Today**: realized SELL P&L since the configured `app.timezone`
+  midnight, used as the hero's "Today · Realized P&L" KPI.
+- **Trade Cohort**: realized SELL P&L since `paper.graduation_since`;
+  default for `paper-report`, `trade-attribution`, and
+  `graduation-check`.
+- **Equity Cohort**: starting/current equity, peak, drawdown, and
+  return since `paper.equity_evaluation_since` (or
+  `graduation_since` fallback); gates the dashboard's drawdown and
+  starting-equity baseline.
+
+Each window returns a status envelope (`ready` / `empty` /
+`insufficient` / `unconfigured` / `error`) plus JSON-safe metrics.
+Legacy naive `filled_at` rows are interpreted in `app.timezone`,
+not silent UTC, so cohort boundaries align with the operator's
+configured trading day.
+
+Dashboard endpoints:
+
+- `GET /api/evaluation-windows` — full three-window payload
+- `GET /api/stream` — SSE includes the same payload every 5 seconds
+
+The hero's "Since <boundary>" caption is driven by the equity
+cohort's starting equity; the hardcoded `$350,000` placeholder is
+gone. Empty cohort evidence never reports `0% drawdown`; it reports
+`Insufficient evidence`.
 
 ---
 

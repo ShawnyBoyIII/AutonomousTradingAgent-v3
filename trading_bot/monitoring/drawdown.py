@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -27,6 +28,12 @@ class DrawdownMetrics:
     underwater_bars: int = 0
     max_underwater_bars: int = 0
     calmar_ratio: float = 0.0
+    starting_equity: float | None = None
+    current_equity: float | None = None
+    total_return_amount: float | None = None
+    total_return_pct: float | None = None
+    sample_size: int = 0
+    sufficient_evidence: bool = False
 
 
 def compute_drawdown(equity_series: list[float]) -> DrawdownMetrics:
@@ -94,23 +101,52 @@ def compute_drawdown(equity_series: list[float]) -> DrawdownMetrics:
 
 def compute_drawdown_from_ledger(
     ledger: PortfolioLedger,
-    limit: int = 500,
+    limit: int | None = 500,
+    *,
+    since: datetime | None = None,
+    naive_timezone: str | None = None,
 ) -> DrawdownMetrics:
     """Compute drawdown from the equity_history table in the ledger.
 
     Args:
         ledger: PortfolioLedger with equity snapshot history.
-        limit: Maximum number of recent snapshots to analyze.
+        limit: Maximum number of recent snapshots to analyze (``None``
+            means unbounded; the result still respects ``since``).
+        since: Optional UTC-aware boundary; only snapshots at or after
+            ``since`` contribute. Naive legacy rows are interpreted in
+            ``naive_timezone`` so they sort correctly.
+        naive_timezone: IANA name (e.g. ``America/New_York``) used to
+            localize naive timestamps from the legacy burn-in DB.
 
     Returns:
         DrawdownMetrics for the equity time series.
     """
-    rows = ledger.list_recent_equity_history(limit=limit)
+    rows = ledger.list_recent_equity_history(
+        limit=limit, since=since, naive_timezone=naive_timezone
+    )
+    sample_size = len(rows)
+    sufficient = sample_size >= 2
+
     if not rows:
-        return DrawdownMetrics()
+        return DrawdownMetrics(sample_size=0, sufficient_evidence=False)
 
     equity_series = [float(row["equity"]) for row in rows]
     metrics = compute_drawdown(equity_series)
+    metrics.sample_size = sample_size
+    metrics.sufficient_evidence = sufficient
+    metrics.starting_equity = equity_series[0]
+    metrics.current_equity = equity_series[-1]
+    if metrics.starting_equity and metrics.starting_equity > 0:
+        metrics.total_return_amount = round(
+            metrics.current_equity - metrics.starting_equity, 4
+        )
+        metrics.total_return_pct = round(
+            ((metrics.current_equity - metrics.starting_equity)
+             / metrics.starting_equity) * 100.0, 4
+        )
+    else:
+        metrics.total_return_amount = 0.0
+        metrics.total_return_pct = 0.0
 
     # Compute Calmar ratio (CAGR / max drawdown)
     # Simplified: annualized return / max DD
@@ -167,16 +203,34 @@ def compute_session_drawdown(
 
 def format_drawdown_report(metrics: DrawdownMetrics) -> str:
     """Format drawdown metrics as a readable report."""
-    if metrics.max_drawdown_pct == 0.0 and metrics.peak_equity == 0.0:
+    if metrics.max_drawdown_pct == 0.0 and metrics.peak_equity == 0.0 and metrics.sample_size == 0:
         return "No equity history available for drawdown analysis."
 
+    # The cohort-evidence gate only fires when the caller explicitly set
+    # ``sample_size`` to a value < 2. Legacy callers leave sample_size=0
+    # and get the full report unchanged.
+    if metrics.sample_size > 0 and not metrics.sufficient_evidence:
+        if metrics.sample_size == 1:
+            return "Insufficient cohort evidence (1 snapshot); drawdown reporting skipped."
+        return (
+            f"Insufficient cohort evidence ({metrics.sample_size} snapshot(s)); "
+            "drawdown reporting skipped."
+        )
+
+    starting = metrics.starting_equity or 0.0
+    current = metrics.current_equity or 0.0
+    return_amount = metrics.total_return_amount or 0.0
+    return_pct = metrics.total_return_pct or 0.0
     lines = [
         "Drawdown Analysis:",
         f"  Current Drawdown: {metrics.current_drawdown_pct:.2f}%",
         f"  Max Drawdown: {metrics.max_drawdown_pct:.2f}%",
         f"  Peak Equity: ${metrics.peak_equity:,.2f}",
         f"  Trough Equity: ${metrics.trough_equity:,.2f}",
-        f"  Current Equity: ${metrics.recovery_equity:,.2f}",
+        f"  Current Equity: ${current:,.2f}",
+        f"  Starting Equity: ${starting:,.2f}",
+        f"  Total Return: ${return_amount:+,.2f} ({return_pct:+.2f}%)",
+        f"  Sample Size: {metrics.sample_size} snapshots",
         f"  Underwater Bars: {metrics.underwater_bars}",
         f"  Max Underwater Bars: {metrics.max_underwater_bars}",
     ]
