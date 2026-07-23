@@ -3183,14 +3183,43 @@ def discover_symbols(
     max_symbols: int = typer.Option(20, "--max", help="Maximum symbols to return"),
     export: bool = typer.Option(False, "--export", help="Export to configured universe file"),
 ) -> None:
-    """Dynamically discover trading candidates based on market conditions."""
-    from trading_bot.strategy.dynamic_watchlist import DynamicWatchlist
+    """Dynamically discover trading candidates based on market conditions.
+
+    --mode dispatches to a dedicated screener:
+      - breakout:        screen_for_breakout_setups (near 20-day high)
+      - mean-reversion:  screen_for_mean_reversion (oversold setups)
+      - gap-up:          find_gap_up_symbols via quick_update_gappers
+
+    The default fallback for unknown modes is the generic DynamicWatchlist
+    update path. The burner runs --mode breakout so this command line
+    semantics are observable.
+    """
+    from datetime import datetime, timezone
+    from trading_bot.strategy.dynamic_watchlist import (
+        DynamicWatchlist,
+        WatchlistEntry,
+    )
     from trading_bot.data.market_data import fetch_bars
+
+    valid_modes = {"breakout", "mean-reversion", "gap-up"}
+    if mode not in valid_modes:
+        typer.echo(
+            f"Unknown --mode {mode!r}; expected one of {sorted(valid_modes)}. "
+            f"Falling back to DynamicWatchlist.update()."
+        )
 
     typer.echo(f"Discovering symbols (mode: {mode})...")
     typer.echo("=" * 50)
 
     watchlist = DynamicWatchlist(max_symbols=max_symbols, scout_settings=ctx.obj.scout)
+
+    # Build symbols_data by reading the configured universe candidates.
+    universe_path = Path(ctx.obj.app.universe_path)
+    candidate_symbols: list[str] = []
+    if universe_path.exists():
+        candidate_symbols = [
+            line.strip() for line in universe_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
 
     def data_provider(symbol: str) -> pd.DataFrame | None:
         try:
@@ -3198,17 +3227,68 @@ def discover_symbols(
         except Exception:
             return None
 
-    typer.echo("Scanning universe for setups...")
-    update = watchlist.update(data_provider)
+    symbols_data: dict[str, pd.DataFrame] = {}
+    for sym in candidate_symbols:
+        frame = data_provider(sym)
+        if frame is not None and not frame.empty:
+            symbols_data[sym] = frame
 
-    if update.sectors_favored:
-        typer.echo(f"Favored sectors: {', '.join(update.sectors_favored)}")
+    added_entries: list[WatchlistEntry] = []
+    if mode == "breakout" and symbols_data:
+        from trading_bot.strategy.market_screener import screen_for_breakout_setups
 
-    typer.echo(f"Added: {len(update.added)} | Removed: {len(update.removed)} | Total: {len(update.current)}")
+        typer.echo(f"Screening {len(symbols_data)} symbols for breakout setups...")
+        results = screen_for_breakout_setups(symbols_data)
+        for r in results[:max_symbols]:
+            entry = WatchlistEntry(
+                symbol=r.symbol,
+                added_at=datetime.now(timezone.utc),
+                reason="; ".join(r.reasons) if r.reasons else "breakout",
+                score=float(r.score),
+            )
+            if not watchlist._entries or entry.symbol not in {e.symbol for e in watchlist._entries}:
+                watchlist._entries.append(entry)
+                added_entries.append(entry)
+    elif mode == "mean-reversion" and symbols_data:
+        from trading_bot.strategy.market_screener import screen_for_mean_reversion
+
+        typer.echo(f"Screening {len(symbols_data)} symbols for mean-reversion setups...")
+        results = screen_for_mean_reversion(symbols_data)
+        for r in results[:max_symbols]:
+            entry = WatchlistEntry(
+                symbol=r.symbol,
+                added_at=datetime.now(timezone.utc),
+                reason="; ".join(r.reasons) if r.reasons else "mean-reversion",
+                score=float(r.score),
+            )
+            if not watchlist._entries or entry.symbol not in {e.symbol for e in watchlist._entries}:
+                watchlist._entries.append(entry)
+                added_entries.append(entry)
+    elif mode == "gap-up" and symbols_data:
+        typer.echo(f"Screening {len(symbols_data)} symbols for pre-market gap-up setups...")
+        added_entries = watchlist.quick_update_gappers(symbols_data)
+    else:
+        # Fallback: generic DynamicWatchlist update.
+        typer.echo("Scanning universe for setups (fallback path)...")
+        update = watchlist.update(data_provider)
+        if update.sectors_favored:
+            typer.echo(f"Favored sectors: {', '.join(update.sectors_favored)}")
+        typer.echo(f"Added: {len(update.added)} | Removed: {len(update.removed)} | Total: {len(update.current)}")
+        if export:
+            export_path = watchlist.export_for_burn_in(ctx.obj.app.universe_path)
+            overridden = _apply_advisory_symbol_overrides(
+                _read_universe_symbols(Path(export_path)),
+                ctx.obj,
+                limit=max_symbols,
+            )
+            Path(export_path).write_text("\n".join(overridden), encoding="utf-8")
+            typer.echo(f"\nExported {len(overridden)} symbols to {export_path}")
+        return
+
+    typer.echo(f"Added: {len(added_entries)} | Total: {len(watchlist._entries)}")
     typer.echo("")
-
-    if update.current:
-        for entry in update.current[:max_symbols]:
+    if watchlist._entries:
+        for entry in watchlist._entries[:max_symbols]:
             typer.echo(f"  {entry.symbol}: {entry.reason} (score: {entry.score:.1f})")
     else:
         typer.echo("No symbols passed screening criteria.")
