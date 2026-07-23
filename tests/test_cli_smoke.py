@@ -539,8 +539,10 @@ def test_build_universe_applies_advisory_scout_override(monkeypatch, tmp_path: P
         "app:\n"
         f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
         f"  universe_path: {tmp_path / 'state' / 'universe.txt'}\n"
-        f"  universe_candidates_path: {tmp_path / 'state' / 'universe_candidates.json'}\n"
-        f"  advisory_dir: {advisory_dir}\n",
+        f"  universe_candidates_path: {(tmp_path / 'state' / 'universe_candidates.json')}\n"
+        f"  advisory_dir: {advisory_dir}\n"
+        "advisory:\n"
+        "  enabled: true\n",
         encoding="utf-8",
     )
 
@@ -572,7 +574,9 @@ def test_discover_export_applies_advisory_scout_override(monkeypatch, tmp_path: 
         "app:\n"
         f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
         f"  universe_path: {universe_path}\n"
-        f"  advisory_dir: {advisory_dir}\n",
+        f"  advisory_dir: {advisory_dir}\n"
+        "advisory:\n"
+        "  enabled: true\n",
         encoding="utf-8",
     )
 
