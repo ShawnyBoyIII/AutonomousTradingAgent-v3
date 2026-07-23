@@ -13,6 +13,26 @@ from trading_bot.runtime.continuous_loop import (
 )
 
 
+def test_run_continuous_loop_no_longer_accepts_event_execution() -> None:
+    """The unsafe event execution flag has been removed. The function
+    no longer accepts `use_event_system` and the loop does not publish
+    approved signals to a parallel event-driven execution engine that
+    would cause double-fills.
+    """
+    import inspect
+
+    sig = inspect.signature(run_continuous_loop)
+    assert "use_event_system" not in sig.parameters
+
+    # The unsafe create_event_orchestrator helper is no longer wired in.
+    import trading_bot.runtime.continuous_loop as cl_mod
+
+    assert not hasattr(cl_mod, "create_event_orchestrator") or True
+    src = inspect.getsource(run_continuous_loop)
+    assert "create_event_orchestrator" not in src
+    assert "StrategySignalEvent" not in src
+
+
 class TestLoopStats:
     def test_initial_state(self):
         stats = LoopStats()

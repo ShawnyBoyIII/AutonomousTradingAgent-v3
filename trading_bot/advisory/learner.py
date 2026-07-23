@@ -52,6 +52,8 @@ def load_latest_advisory_report(settings: Settings) -> dict[str, Any]:
 
 
 def load_scout_override(settings: Settings) -> dict[str, Any]:
+    if not settings.advisory.enabled:
+        return {}
     path = advisory_paths(settings).scout_override
     if not path.exists():
         return {}

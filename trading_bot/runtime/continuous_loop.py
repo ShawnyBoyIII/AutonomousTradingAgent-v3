@@ -10,15 +10,7 @@ import pandas as pd
 from trading_bot.config.settings import Settings
 from trading_bot.data import market_data
 from trading_bot.data.indicators import add_atr, add_rsi
-from trading_bot.events.bus import MessageBus
-from trading_bot.events.cache import Cache
-from trading_bot.events.loop import EventLoop
-from trading_bot.events.orchestrator import create_event_orchestrator
-from trading_bot.events.types import (
-    MarketBarEvent,
-    StrategySignalEvent,
-    SystemTickEvent,
-)
+from trading_bot.events.types import MarketBarEvent
 from trading_bot.execution.paper_broker import PaperBroker
 from trading_bot.portfolio.ledger import PortfolioLedger
 from trading_bot.portfolio.performance import compute_portfolio_heat
@@ -573,17 +565,15 @@ def run_continuous_loop(
     build_universe: bool = True,
     dry_run: bool = False,
     max_failures: int = 10,
-    use_event_system: bool = False,
 ) -> LoopStats:
     """Run the continuous paper-trading loop.
 
     Each cycle:
-    1. SYSTEM_TICK event
-    2. Build universe (optional)
-    3. Run scan on watchlist
-    4. Run paper-trade on approved signals
-    5. Run manage-positions for existing positions
-    6. Sleep for interval
+    1. Build universe (optional)
+    2. Run scan on watchlist
+    3. Run paper-trade on approved signals
+    4. Run manage-positions for existing positions
+    5. Sleep for interval
 
     Args:
         settings: Application settings
@@ -592,20 +582,12 @@ def run_continuous_loop(
         build_universe: Whether to refresh universe each cycle
         dry_run: Preview trades without executing
         max_failures: Consecutive failures before circuit breaker
-        use_event_system: Wire events through the event bus
 
     Returns:
         LoopStats with statistics from the run
     """
     stats = LoopStats()
     stats.start_time = time.monotonic()
-
-    loop: EventLoop | None = None
-    bus: MessageBus | None = None
-    cache: Cache | None = None
-
-    if use_event_system:
-        loop, bus, cache = create_event_orchestrator(settings)
 
     ledger = PortfolioLedger(Path(settings.app.state_db_path))
     state = ledger.ensure_portfolio_state()
@@ -622,10 +604,6 @@ def run_continuous_loop(
             break
 
         stats.reset_cycle()
-
-        # Emit SYSTEM_TICK if event system is active
-        if loop is not None:
-            loop.submit(SystemTickEvent(tick=cycle))
 
         try:
             # Phase 1: Build universe
@@ -652,24 +630,6 @@ def run_continuous_loop(
                 row for row in scan_result.get("candidates", [])
                 if row.get("status") == "APPROVED" and row.get("quality") == "GREEN"
             ]
-
-            if loop is not None and bus is not None:
-                for candidate in approved:
-                    bus.publish(
-                        StrategySignalEvent(
-                            ticker=candidate["ticker"],
-                            action="BUY",
-                            entry_price=candidate.get("entry", 0.0),
-                            stop_loss=candidate.get("stop", 0.0),
-                            profit_target=candidate.get("target", 0.0),
-                            confidence=candidate.get("confidence", 0.0),
-                            risk_reward_ratio=candidate.get("rr", 0.0),
-                            reasons=candidate.get("reasons", []),
-                            timestamp=datetime.now(),
-                            timeframe="intraday",
-                            strategy_tag="",
-                        )
-                    )
 
             stats.log_rejections(
                 scan_result.get("summary", {}).get("rejected", 0)
