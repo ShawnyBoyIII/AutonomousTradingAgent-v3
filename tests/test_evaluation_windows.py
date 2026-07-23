@@ -267,21 +267,61 @@ def test_build_evaluation_windows_sufficient_equity_evidence(
     assert payload["equity_cohort_metrics"]["current_equity"] == 98500.0
 
 
-def test_build_evaluation_windows_infinite_pf_serialized() -> None:
-    """Wins with zero losses produces null PF + state='infinite'."""
-    payload = {
-        "realized_pnl": 100.0,
-        "closed_exits": 3,
-        "wins": 3,
-        "losses": 0,
-        "profit_factor": None,
-        "profit_factor_state": "infinite",
-        "average_exit_pnl": 33.333,
-    }
+def test_build_evaluation_windows_infinite_pf_serialized(tmp_path: Path) -> None:
+    """A cohort with wins but zero losses must report profit_factor=None
+    with state='infinite', and the JSON payload must round-trip cleanly
+    so the dashboard can render ∞."""
+    db = tmp_path / "burn_in.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT,
+            side TEXT,
+            quantity INTEGER,
+            fill_price REAL,
+            fees REAL,
+            filled_at TEXT,
+            pnl REAL,
+            strategy_tag TEXT
+        );
+        """
+    )
+    conn.executemany(
+        "INSERT INTO orders (ticker, side, quantity, fill_price, fees, filled_at, pnl, strategy_tag) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("A", "SELL", 1, 10.0, 0.0, "2026-07-12T15:30:00+00:00", 50.0, "test"),
+            ("B", "SELL", 1, 10.0, 0.0, "2026-07-13T15:30:00+00:00", 75.0, "test"),
+            ("C", "SELL", 1, 10.0, 0.0, "2026-07-14T15:30:00+00:00", 25.0, "test"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    settings = Settings(
+        app=AppSettings(state_db_path=str(db), timezone="UTC"),
+        paper=PaperSettings(
+            graduation_since=datetime(2026, 7, 11, tzinfo=timezone.utc),
+            equity_evaluation_since=None,
+        ),
+    )
+    ledger = PortfolioLedger(db)
+    windows = build_evaluation_windows(
+        settings, ledger, now=datetime(2026, 7, 22, 19, 30, tzinfo=timezone.utc)
+    )
+    payload = windows.to_dict()
     text = json.dumps(payload)
-    loaded = json.loads(text)
-    assert loaded["profit_factor"] is None
-    assert loaded["profit_factor_state"] == "infinite"
+    assert "NaN" not in text
+    assert "Infinity" not in text
+    assert payload["trade_cohort_metrics"]["closed_exits"] == 3
+    assert payload["trade_cohort_metrics"]["wins"] == 3
+    assert payload["trade_cohort_metrics"]["losses"] == 0
+    assert payload["trade_cohort_metrics"]["profit_factor"] is None
+    assert payload["trade_cohort_metrics"]["profit_factor_state"] == "infinite"
+    assert payload["trade_cohort_metrics"]["realized_pnl"] == 150.0
+    assert payload["trade_cohort_metrics"]["average_exit_pnl"] == 50.0
 
 
 def test_evaluation_windows_dataclass_is_json_safe() -> None:

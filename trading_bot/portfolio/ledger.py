@@ -408,35 +408,26 @@ class PortfolioLedger:
                 ).fetchall()
 
         chronological = list(reversed(rows))
-        if normalized_since is None:
-            return [
-                {
-                    "timestamp": row[0],
-                    "equity": row[1],
-                    "cash": row[2],
-                    "realized_pnl": row[3] if row[3] is not None else 0.0,
-                    "unrealized_pnl": row[4] if row[4] is not None else 0.0,
-                }
-                for row in chronological
-            ]
 
-        filtered: list[tuple[datetime, sqlite3.Row | tuple]] = []
-        for row in chronological:
-            ts = row[0]
-            ts_normalized = normalize_timestamp(ts, naive_timezone)
-            if ts_normalized is None:
-                continue
-            if ts_normalized >= normalized_since:
-                filtered.append((ts_normalized, row))
-
-        filtered.sort(key=lambda pair: pair[0])
-        return [
-            {
+        def _row_dict(row) -> dict[str, object]:
+            return {
                 "timestamp": row[0],
                 "equity": row[1],
                 "cash": row[2],
                 "realized_pnl": row[3] if row[3] is not None else 0.0,
                 "unrealized_pnl": row[4] if row[4] is not None else 0.0,
             }
-            for _, row in filtered
-        ]
+
+        if normalized_since is None:
+            return [_row_dict(row) for row in chronological]
+
+        filtered: list[tuple[datetime, object]] = []
+        for row in chronological:
+            ts_normalized = normalize_timestamp(row[0], naive_timezone)
+            if ts_normalized is None:
+                continue
+            if ts_normalized >= normalized_since:
+                filtered.append((ts_normalized, row))
+
+        filtered.sort(key=lambda pair: pair[0])
+        return [_row_dict(row) for _, row in filtered]

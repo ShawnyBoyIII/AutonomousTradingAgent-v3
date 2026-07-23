@@ -903,79 +903,75 @@
   // -------------------------------------------------------------
   // Book tabs — switch between Open and Closed views
   // -------------------------------------------------------------
+  // Generic tab controller — wire up a group of tab buttons and
+  // matching panes (id + "Tab" suffix and id + "Pane" suffix).
   // Persists the active tab in localStorage so refreshes feel sticky.
-  const BOOK_TAB_STORAGE = "book-active-tab";
+  // Supports keyboard navigation: ArrowLeft/Right cycle, Home/End jump.
+  // -------------------------------------------------------------
+  function bindTabs(tabIds, storageKey, defaultId) {
+    const buttons = tabIds.map((id) => $(`${id}Tab`));
+    const panes   = tabIds.map((id) => $(`${id}Pane`));
+    if (buttons.some((b) => !b) || panes.some((p) => !p)) return null;
 
-  function getActiveBookTab() {
-    try {
-      const t = window.localStorage.getItem(BOOK_TAB_STORAGE);
-      return t === "closed" ? "closed" : "open";
-    } catch (_) {
-      return "open";
-    }
-  }
-
-  function setActiveBookTab(name) {
-    try { window.localStorage.setItem(BOOK_TAB_STORAGE, name); } catch (_) { /* ignore */ }
-  }
-
-  function activateBookTab(name) {
-    const tabs    = ["open", "closed"];
-    const target = tabs.includes(name) ? name : "open";
-    tabs.forEach((t) => {
-      const tabBtn = $(`${t}Tab`);
-      const pane   = $(`${t}Pane`);
-      if (!tabBtn || !pane) return;
-      const isActive = (t === target);
-      tabBtn.classList.toggle("is-active", isActive);
-      tabBtn.setAttribute("aria-selected", isActive ? "true" : "false");
-      tabBtn.setAttribute("tabindex", isActive ? "0" : "-1");
-      pane.classList.toggle("is-active", isActive);
-      if (isActive) {
-        pane.removeAttribute("hidden");
-      } else {
-        pane.setAttribute("hidden", "");
+    function readStored() {
+      try {
+        const stored = window.localStorage.getItem(storageKey);
+        return tabIds.includes(stored) ? stored : defaultId;
+      } catch (_) {
+        return defaultId;
       }
-    });
-    setActiveBookTab(target);
-  }
+    }
+    function writeStored(name) {
+      try { window.localStorage.setItem(storageKey, name); } catch (_) { /* ignore */ }
+    }
+    function activate(name) {
+      const target = tabIds.includes(name) ? name : defaultId;
+      tabIds.forEach((id, idx) => {
+        const isActive = (id === target);
+        const btn = buttons[idx];
+        const pane = panes[idx];
+        btn.classList.toggle("is-active", isActive);
+        btn.setAttribute("aria-selected", isActive ? "true" : "false");
+        btn.setAttribute("tabindex", isActive ? "0" : "-1");
+        pane.classList.toggle("is-active", isActive);
+        if (isActive) pane.removeAttribute("hidden");
+        else pane.setAttribute("hidden", "");
+      });
+      writeStored(target);
+    }
 
-  function bindBookTabs() {
-    const open   = $("openTab");
-    const closed = $("closedTab");
-    if (!open || !closed) return;
+    activate(readStored());
 
-    // Activate default — "open" unless user previously chose "closed".
-    const desired = getActiveBookTab();
-    activateBookTab(desired);
-
-    const handler = (name) => () => activateBookTab(name);
-    open.addEventListener("click", handler("open"));
-    closed.addEventListener("click", handler("closed"));
-
-    // Keyboard: left/right arrows cycle, Home/End jump
-    const order = ["open", "closed"];
-    [open, closed].forEach((btn, i) => {
+    buttons.forEach((btn, i) => {
+      const id = tabIds[i];
+      btn.addEventListener("click", () => activate(id));
       btn.addEventListener("keydown", (ev) => {
         if (ev.key === "ArrowRight") {
           ev.preventDefault();
-          (i === order.length - 1 ? $(`${order[0]}Tab`) : $(`${order[i+1]}Tab`)).focus();
-          activateBookTab(order[(i + 1) % order.length]);
+          const next = (i + 1) % tabIds.length;
+          activate(tabIds[next]);
+          buttons[next].focus();
         } else if (ev.key === "ArrowLeft") {
           ev.preventDefault();
-          (i === 0 ? $(`${order[order.length - 1]}Tab`) : $(`${order[i-1]}Tab`)).focus();
-          activateBookTab(order[(i - 1 + order.length) % order.length]);
+          const prev = (i - 1 + tabIds.length) % tabIds.length;
+          activate(tabIds[prev]);
+          buttons[prev].focus();
         } else if (ev.key === "Home") {
           ev.preventDefault();
-          activateBookTab(order[0]);
-          $(`${order[0]}Tab`).focus();
+          activate(tabIds[0]);
+          buttons[0].focus();
         } else if (ev.key === "End") {
           ev.preventDefault();
-          activateBookTab(order[order.length - 1]);
-          $(`${order[order.length - 1]}Tab`).focus();
+          activate(tabIds[tabIds.length - 1]);
+          buttons[tabIds.length - 1].focus();
         }
       });
     });
+    return { activate };
+  }
+
+  function bindBookTabs() {
+    bindTabs(["open", "closed"], "book-active-tab", "open");
   }
 
   // -------------------------------------------------------------
@@ -1210,62 +1206,12 @@
     }
   }
 
-  function activateWindowTab(name) {
-    const tabs = ["today", "tradeCohort", "equityCohort"];
-    tabs.forEach((id) => {
-      const tab = $(`${id}Tab`);
-      const pane = $(`${id}Pane`);
-      if (!tab || !pane) return;
-      const isActive = id === name;
-      setAttr(tab, "aria-selected", isActive ? "true" : "false");
-      tab.setAttribute("tabindex", isActive ? "0" : "-1");
-      tab.classList.toggle("is-active", isActive);
-      pane.classList.toggle("is-active", isActive);
-      pane.hidden = !isActive;
-    });
-    try { window.localStorage.setItem("activeWindowTab", name); } catch (_) {}
-  }
-
   function bindWindowTabs() {
-    const today = $("todayTab");
-    const trade = $("tradeCohortTab");
-    const equity = $("equityCohortTab");
-    if (!today || !trade || !equity) return;
-    let desired = "today";
-    try {
-      const stored = window.localStorage.getItem("activeWindowTab");
-      if (stored && ["today", "tradeCohort", "equityCohort"].includes(stored)) {
-        desired = stored;
-      }
-    } catch (_) {}
-    activateWindowTab(desired);
-    today.addEventListener("click", () => activateWindowTab("today"));
-    trade.addEventListener("click", () => activateWindowTab("tradeCohort"));
-    equity.addEventListener("click", () => activateWindowTab("equityCohort"));
-    const order = ["today", "tradeCohort", "equityCohort"];
-    [today, trade, equity].forEach((btn, i) => {
-      btn.addEventListener("keydown", (ev) => {
-        if (ev.key === "ArrowRight") {
-          ev.preventDefault();
-          const next = (i + 1) % order.length;
-          activateWindowTab(order[next]);
-          $(`${order[next]}Tab`).focus();
-        } else if (ev.key === "ArrowLeft") {
-          ev.preventDefault();
-          const prev = (i - 1 + order.length) % order.length;
-          activateWindowTab(order[prev]);
-          $(`${order[prev]}Tab`).focus();
-        } else if (ev.key === "Home") {
-          ev.preventDefault();
-          activateWindowTab(order[0]);
-          $(`${order[0]}Tab`).focus();
-        } else if (ev.key === "End") {
-          ev.preventDefault();
-          activateWindowTab(order[order.length - 1]);
-          $(`${order[order.length - 1]}Tab`).focus();
-        }
-      });
-    });
+    bindTabs(
+      ["today", "tradeCohort", "equityCohort"],
+      "activeWindowTab",
+      "today"
+    );
   }
 
   // -------------------------------------------------------------

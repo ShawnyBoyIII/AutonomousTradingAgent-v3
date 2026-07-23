@@ -94,11 +94,12 @@ def test_tab_switcher_logic():
         capture_output=True, text=True,
     )
 
-    # Robust assertion: just verify the source contains the expected helpers.
-    assert "function activateBookTab" in js, "activateBookTab missing"
-    assert "function bindBookTabs" in js, "bindBookTabs missing"
-    assert "function getActiveBookTab" in js, "getActiveBookTab missing"
-    assert "function setActiveBookTab" in js, "setActiveBookTab missing"
+    # Robust assertion: verify the source contains the expected helpers.
+    # Phase 1 refactor consolidated the book + window tab controllers into
+    # one ``bindTabs`` helper; ``bindBookTabs`` is now a thin wrapper.
+    assert "function bindTabs" in js, "bindTabs helper missing"
+    assert "function bindBookTabs" in js, "bindBookTabs wrapper missing"
+    assert "function bindWindowTabs" in js, "bindWindowTabs wrapper missing"
     assert 'arrow-right' in js.lower() or 'ArrowRight' in js, "ArrowRight handler missing"
     assert 'aria-selected' in js, "aria-selected not toggled"
     assert 'is-active' in js, "is-active class not toggled"

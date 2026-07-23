@@ -9,7 +9,7 @@ reports the same numbers.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
@@ -63,12 +63,21 @@ def _start_of_trading_day_local(now_utc: datetime, tz_name: str) -> datetime:
     return local_midnight.astimezone(timezone.utc)
 
 
-def _json_safe(value: float | None) -> float | None:
+def _json_safe(value: Any) -> Any:
+    """Return a JSON-safe value, scrubbing NaN/Infinity to ``None``."""
     if value is None:
         return None
-    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
-        return None
-    return float(value)
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    if is_dataclass(value):
+        return {f.name: _json_safe(getattr(value, f.name)) for f in fields(value)}
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 @dataclass
@@ -80,9 +89,6 @@ class WindowStatus:
     detail: str = ""
     boundary: str | None = None
     boundary_source: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
 
 
 @dataclass
@@ -98,18 +104,6 @@ class TodayMetrics:
     average_exit_pnl: float | None = None
     trading_date: str | None = None
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "realized_pnl": _json_safe(self.realized_pnl),
-            "closed_exits": self.closed_exits,
-            "wins": self.wins,
-            "losses": self.losses,
-            "profit_factor": _json_safe(self.profit_factor),
-            "profit_factor_state": self.profit_factor_state,
-            "average_exit_pnl": _json_safe(self.average_exit_pnl),
-            "trading_date": self.trading_date,
-        }
-
 
 @dataclass
 class TradeCohortMetrics:
@@ -123,18 +117,6 @@ class TradeCohortMetrics:
     profit_factor: float | None = None
     profit_factor_state: str = "ready"
     average_exit_pnl: float | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "realized_pnl": _json_safe(self.realized_pnl),
-            "closed_exits": self.closed_exits,
-            "target_trades": self.target_trades,
-            "wins": self.wins,
-            "losses": self.losses,
-            "profit_factor": _json_safe(self.profit_factor),
-            "profit_factor_state": self.profit_factor_state,
-            "average_exit_pnl": _json_safe(self.average_exit_pnl),
-        }
 
 
 @dataclass
@@ -150,18 +132,6 @@ class EquityCohortMetrics:
     snapshot_count: int = 0
     boundary_source: str | None = None
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "starting_equity": _json_safe(self.starting_equity),
-            "current_equity": _json_safe(self.current_equity),
-            "peak_equity": _json_safe(self.peak_equity),
-            "return_amount": _json_safe(self.return_amount),
-            "return_pct": _json_safe(self.return_pct),
-            "max_drawdown_pct": _json_safe(self.max_drawdown_pct),
-            "snapshot_count": self.snapshot_count,
-            "boundary_source": self.boundary_source,
-        }
-
 
 @dataclass
 class EvaluationWindows:
@@ -176,52 +146,55 @@ class EvaluationWindows:
     equity_cohort_metrics: EquityCohortMetrics = field(default_factory=EquityCohortMetrics)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "generated_at": self.generated_at,
-            "today": self.today.to_dict(),
-            "trade_cohort": self.trade_cohort.to_dict(),
-            "equity_cohort": self.equity_cohort.to_dict(),
-            "today_metrics": self.today_metrics.to_dict(),
-            "trade_cohort_metrics": self.trade_cohort_metrics.to_dict(),
-            "equity_cohort_metrics": self.equity_cohort_metrics.to_dict(),
-        }
+        """Recursive JSON-safe serialization. Scrubs NaN/Infinity to None."""
+        return _json_safe(asdict(self))
 
 
-def _closed_exit_metrics(report: PaperPerformanceReport) -> dict[str, Any]:
+def _populate_trade_window(
+    target_metrics: TodayMetrics | TradeCohortMetrics,
+    report: PaperPerformanceReport,
+    *,
+    target_trades: int | None,
+) -> None:
+    """Copy trade-window fields from the report onto the target dataclass.
+
+    ``profit_factor`` is recomputed from gross values so an infinite PF
+    (gross_wins > 0 with zero gross_losses) is represented as
+    ``None + profit_factor_state='infinite'`` — JSON cannot encode
+    Python's ``math.inf`` so we serialize the state alongside a null.
+    """
     wins = int(report.winning_trades)
     losses = int(report.losing_trades)
     closed = wins + losses
-    if closed == 0:
-        return {
-            "realized_pnl": None,
-            "closed_exits": 0,
-            "wins": 0,
-            "losses": 0,
-            "profit_factor": None,
-            "profit_factor_state": "ready",
-            "average_exit_pnl": None,
-        }
-
     gross_wins = float(report.gross_wins)
     gross_losses = float(report.gross_losses)
     realized = float(report.realized_pnl) if report.realized_pnl is not None else 0.0
-    pf: float | None
-    pf_state = "ready"
-    if gross_losses <= 0 and gross_wins > 0:
-        pf = None
-        pf_state = "infinite"
-    else:
-        pf = gross_wins / gross_losses if gross_losses > 0 else 0.0
 
-    return {
-        "realized_pnl": realized,
-        "closed_exits": closed,
-        "wins": wins,
-        "losses": losses,
-        "profit_factor": pf,
-        "profit_factor_state": pf_state,
-        "average_exit_pnl": realized / closed if closed > 0 else None,
-    }
+    if closed == 0:
+        target_metrics.realized_pnl = None
+        target_metrics.closed_exits = 0
+        target_metrics.wins = 0
+        target_metrics.losses = 0
+        target_metrics.profit_factor = None
+        target_metrics.profit_factor_state = "ready"
+        target_metrics.average_exit_pnl = None
+    else:
+        if gross_losses <= 0 and gross_wins > 0:
+            pf: float | None = None
+            pf_state = "infinite"
+        else:
+            pf = gross_wins / gross_losses if gross_losses > 0 else 0.0
+            pf_state = "ready"
+        target_metrics.realized_pnl = realized
+        target_metrics.closed_exits = closed
+        target_metrics.wins = wins
+        target_metrics.losses = losses
+        target_metrics.profit_factor = pf
+        target_metrics.profit_factor_state = pf_state
+        target_metrics.average_exit_pnl = realized / closed
+
+    if isinstance(target_metrics, TradeCohortMetrics) and target_trades is not None:
+        target_metrics.target_trades = target_trades
 
 
 def build_evaluation_windows(
@@ -335,21 +308,3 @@ def build_evaluation_windows(
             windows.equity_cohort = WindowStatus(False, "error", detail=str(exc))
 
     return windows
-
-
-def _populate_trade_window(
-    target_metrics: TodayMetrics | TradeCohortMetrics,
-    report: PaperPerformanceReport,
-    *,
-    target_trades: int | None,
-) -> None:
-    payload = _closed_exit_metrics(report)
-    target_metrics.realized_pnl = payload["realized_pnl"]
-    target_metrics.closed_exits = payload["closed_exits"]
-    target_metrics.wins = payload["wins"]
-    target_metrics.losses = payload["losses"]
-    target_metrics.profit_factor = payload["profit_factor"]
-    target_metrics.profit_factor_state = payload["profit_factor_state"]
-    target_metrics.average_exit_pnl = payload["average_exit_pnl"]
-    if isinstance(target_metrics, TradeCohortMetrics) and target_trades is not None:
-        target_metrics.target_trades = target_trades
