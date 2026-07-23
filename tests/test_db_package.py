@@ -25,26 +25,34 @@ from trading_bot.db.models import (
 )
 from trading_bot.db.repositories import (
     close_position,
-    create_snapshot,
-    get_events,
-    get_latest_bar_timestamp,
-    get_market_bars,
     get_open_positions,
     get_open_trades,
-    get_predictions,
     get_scan_features,
     get_scan_results,
-    get_snapshots,
     get_trades,
-    is_market_data_stale,
-    log_event,
     update_trade_exit,
-    upsert_market_bars,
     upsert_position,
-    upsert_prediction,
     upsert_scan_result,
     upsert_scan_feature,
     upsert_trade,
+)
+# Test-only repositories: not re-exported from the package surface.
+# No production code reads or writes these tables. They exist to back
+# schema-level integration tests.
+from trading_bot.db.repositories.events import get_events, log_event
+from trading_bot.db.repositories.market_data import (
+    get_latest_bar_timestamp,
+    get_market_bars,
+    is_market_data_stale,
+    upsert_market_bars,
+)
+from trading_bot.db.repositories.model_predictions import (
+    get_predictions,
+    upsert_prediction,
+)
+from trading_bot.db.repositories.portfolio_snapshots import (
+    create_snapshot,
+    get_snapshots,
 )
 
 
