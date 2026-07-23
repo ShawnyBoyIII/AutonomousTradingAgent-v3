@@ -369,6 +369,12 @@ def paper_trade(
     ),
 ) -> None:
     """Run the paper-trading loop."""
+    from pathlib import Path
+
+    from trading_bot.learning.experiments.runtime_canary import (
+        load_runtime_canary,
+    )
+    from trading_bot.portfolio.ledger import PortfolioLedger
     from trading_bot.runtime.orchestrator import run_paper_trade
 
     parsed_symbols: list[str] = []
@@ -377,8 +383,19 @@ def paper_trade(
             symbol.strip() for symbol in raw_value.split(",") if symbol.strip()
         )
 
-    for result in run_paper_trade(parsed_symbols, ctx.obj, dry_run=dry_run):
+    ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
+    runtime_canary = load_runtime_canary(ctx.obj, ledger)
+
+    for result in run_paper_trade(
+        parsed_symbols,
+        ctx.obj,
+        dry_run=dry_run,
+        runtime_canary=runtime_canary,
+    ):
         typer.echo(result)
+
+    if runtime_canary is not None:
+        runtime_canary.snapshot()
 
 
 @app.command()
@@ -716,10 +733,14 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
     so callers (e.g. ``run-ops``) can alert without re-echoing.
     """
     from trading_bot.data import market_data
+    from trading_bot.learning.experiments.runtime_canary import (
+        load_runtime_canary,
+    )
     from trading_bot.safety.kill_switch import check_kill_switch_before_trade
 
     ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
     state = ledger.ensure_portfolio_state()
+    runtime_canary = load_runtime_canary(ctx.obj, ledger)
 
     # Idempotency guard: skip exits for tickers recently sold by a concurrent
     # process.  Two manage-positions processes can read the same stale state and
@@ -843,6 +864,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
             state, event, line = _fill_sell_position(
                 ticker, position, "eod", manage_now, last_price,
                 broker, ledger, state, log_path, frame, ctx.obj,
+                runtime_canary=runtime_canary,
             )
             append_decision_event(log_path, event)
             exit_events.append(event)
@@ -853,6 +875,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
             state, event, line = _fill_sell_position(
                 ticker, position, "stop", manage_now, last_price,
                 broker, ledger, state, log_path, frame, ctx.obj,
+                runtime_canary=runtime_canary,
             )
             append_decision_event(log_path, event)
             exit_events.append(event)
@@ -876,11 +899,13 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
                     log_path=log_path,
                     fraction=ctx.obj.paper.partial_take_profit_fraction,
                     settings=ctx.obj,
+                    runtime_canary=runtime_canary,
                 )
             else:
                 state, event, line = _fill_sell_position(
                     ticker, position, "target", manage_now, last_price,
                     broker, ledger, state, log_path, frame, ctx.obj,
+                    runtime_canary=runtime_canary,
                 )
             append_decision_event(log_path, event)
             exit_events.append(event)
@@ -897,6 +922,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
                 state, event, line = _fill_sell_position(
                     ticker, position, f"time_exit_{int(held)}m", manage_now, last_price,
                     broker, ledger, state, log_path, frame, ctx.obj,
+                    runtime_canary=runtime_canary,
                 )
                 append_decision_event(log_path, event)
                 exit_events.append(event)
@@ -907,7 +933,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
         # Priority: EOD > stop > target > time_exit > counter-thesis > trailing stop.
         counter_exit = _maybe_counter_thesis_exit(
             ticker, position, frame, last_price, ctx.obj, manage_now,
-            broker, ledger, state, log_path,
+            broker, ledger, state, log_path, runtime_canary=runtime_canary,
         )
         if counter_exit is not None:
             state, event, line = counter_exit
@@ -976,6 +1002,9 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
             "positions": portfolio_view["positions"],
         },
     )
+
+    if runtime_canary is not None:
+        runtime_canary.snapshot()
 
     return {
         "positions": len(state.positions),
@@ -1868,6 +1897,7 @@ def _maybe_counter_thesis_exit(
     ledger,
     state,
     log_path,
+    runtime_canary=None,
 ):
     """Check counter-thesis for an open position; exit if thesis is broken.
 
@@ -1886,6 +1916,7 @@ def _maybe_counter_thesis_exit(
     new_state, event, line = _fill_sell_position(
         ticker, position, "counter-thesis", manage_now, last_price,
         broker, ledger, state, log_path, frame, settings,
+        runtime_canary=runtime_canary,
     )
     event["counter_thesis"] = result.to_dict()
     return new_state, event, line

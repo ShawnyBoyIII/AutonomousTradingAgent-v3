@@ -927,9 +927,18 @@ def run_paper_trade(
                         f"multiplier={policy_decision.multiplier}"
                     )
                     continue
+                # Capture the pre-policy size so the runtime canary records the
+                # BASELINE quantity (what the unmodified ledger would have
+                # used) and the CANDIDATE quantity (what the actual fill uses,
+                # post-multiplier). Without this capture the candidate field
+                # would be applied to an already-halved size, producing
+                # quarter-sizes for a 0.5 multiplier.
+                pre_policy_size = decision.position_size
                 decision.position_size = max(
                     1, int(decision.position_size * policy_decision.multiplier)
                 )
+            else:
+                pre_policy_size = decision.position_size
             details["entry_policy"] = {
                 "name": policy_decision.policy_name,
                 "applied": policy_decision.applied,
@@ -1050,18 +1059,10 @@ def run_paper_trade(
                 shadow=None,
             )
             if runtime_canary is not None:
-                baseline_quantity = decision.position_size
-                if policy_decision.applied and policy_decision.multiplier > 0:
-                    candidate_quantity = max(
-                        1,
-                        int(decision.position_size * policy_decision.multiplier),
-                    )
-                else:
-                    candidate_quantity = decision.position_size
                 runtime_canary.record_entry(
                     ticker=fill.ticker,
-                    baseline_quantity=baseline_quantity,
-                    candidate_quantity=candidate_quantity,
+                    baseline_quantity=pre_policy_size,
+                    candidate_quantity=decision.position_size,
                     fill_price=fill.fill_price,
                     fees=fill.fees,
                     session_date=(
