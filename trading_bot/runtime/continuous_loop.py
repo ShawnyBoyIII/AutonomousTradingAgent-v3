@@ -313,8 +313,15 @@ def _run_manage_positions_once(
             from zoneinfo import ZoneInfo
             from trading_bot.runtime.session import should_eod_exit
 
+            # Re-read live position from state. The trailing-stop closure
+            # above may have written a ratcheted stop_loss / highest_high
+            # to state.positions[ticker]; the closure-captured `position`
+            # is stale. Critical review finding #1: reading from `position`
+            # here silently clobbered the ratchet on the no-exit
+            # highest_high cleanup at the end of the loop body.
+            live_position = state.positions[ticker]
             decision = evaluate_exit_priority(
-                position=position,
+                position=live_position,
                 current_price=current_price,
                 settings=settings,
                 now=now,
@@ -327,7 +334,7 @@ def _run_manage_positions_once(
             if decision.partial:
                 state, event, line = fill_partial_take_profit_position(
                     ticker=ticker,
-                    position=position,
+                    position=live_position,
                     submitted_at=now,
                     last_price=current_price,
                     broker=broker,
@@ -352,7 +359,7 @@ def _run_manage_positions_once(
             if decision.should_exit:
                 updated_state = _close_position(
                     ticker=ticker,
-                    position=position,
+                    position=live_position,
                     broker=broker,
                     ledger=ledger,
                     current_price=current_price,
@@ -369,10 +376,15 @@ def _run_manage_positions_once(
                     state = updated_state
                 continue
 
-            # No exit triggered - update highest_high
-            if position.highest_high is None or current_price > position.highest_high:
-                updated_position = position.model_copy(update={"highest_high": current_price})
-                state.positions[ticker] = updated_position
+            # No exit triggered - read live position (might have been
+            # ratcheted above). The previous implementation read from
+            # the closure-captured `position`, which didn't include the
+            # ratchet, and used it to model_copy a new position with the
+            # OLD stop_loss. That silently undid the trailing-stop
+            # ratchet on every bar where current_price > position.highest_high.
+            live_position = state.positions[ticker]
+            if live_position.highest_high is None or current_price > live_position.highest_high:
+                state.positions[ticker] = live_position.model_copy(update={"highest_high": current_price})
 
             highest_high = state.positions[ticker].highest_high
             high_text = f"{highest_high:.2f}" if highest_high is not None else "N/A"
