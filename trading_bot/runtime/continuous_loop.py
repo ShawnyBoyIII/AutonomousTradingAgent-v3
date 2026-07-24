@@ -313,15 +313,8 @@ def _run_manage_positions_once(
             from zoneinfo import ZoneInfo
             from trading_bot.runtime.session import should_eod_exit
 
-            # Re-read live position from state. The trailing-stop closure
-            # above may have written a ratcheted stop_loss / highest_high
-            # to state.positions[ticker]; the closure-captured `position`
-            # is stale. Critical review finding #1: reading from `position`
-            # here silently clobbered the ratchet on the no-exit
-            # highest_high cleanup at the end of the loop body.
-            live_position = state.positions[ticker]
             decision = evaluate_exit_priority(
-                position=live_position,
+                position=position,
                 current_price=current_price,
                 settings=settings,
                 now=now,
@@ -331,6 +324,15 @@ def _run_manage_positions_once(
                 counter_thesis_check=_counter_thesis_check,
                 trailing_stop_check=_trailing_stop_check,
             )
+            # Re-read live position AFTER evaluate_exit_priority returns.
+            # The trailing-stop closure above may have mutated
+            # state.positions[ticker] (ratchet). Without this re-read, the
+            # close / partial paths receive a stale position object that
+            # no longer matches the live state. Currently the ratchet
+            # only mutates stop_loss and highest_high — neither
+            # consumed by fill_sell_position — so this is a latent
+            # issue rather than a production regression today.
+            live_position = state.positions[ticker]
             if decision.partial:
                 state, event, line = fill_partial_take_profit_position(
                     ticker=ticker,
