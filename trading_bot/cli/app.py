@@ -61,6 +61,7 @@ from trading_bot.runtime.position_exit import (
     fill_sell_position as _shared_fill_sell_position,
 
 )
+from trading_bot.runtime.position_management import evaluate_exit_priority
 from trading_bot.runtime.snapshots import read_recent_decision_rows, write_snapshot
 from trading_bot.scout import build_scout_candidates
 from trading_bot.strategy.trailing_stop import next_trailing_stop
@@ -875,90 +876,54 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
                 state.positions[ticker] = position.model_copy(update={"stop_loss": min_stop})
                 position = state.positions[ticker]
                 state_changed = True
-        if eod_active:
-            state, event, line = _fill_sell_position(
-                ticker, position, "eod", manage_now, last_price,
-                broker, ledger, state, log_path, frame, ctx.obj,
-                runtime_canary=runtime_canary,
-            )
-            append_decision_event(log_path, event)
-            exit_events.append(event)
-            actions += 1
-            lines.append(line)
-            continue
-        if position.stop_loss is not None and last_price <= position.stop_loss:
-            state, event, line = _fill_sell_position(
-                ticker, position, "stop", manage_now, last_price,
-                broker, ledger, state, log_path, frame, ctx.obj,
-                runtime_canary=runtime_canary,
-            )
-            append_decision_event(log_path, event)
-            exit_events.append(event)
-            actions += 1
-            lines.append(line)
-            continue
-        if position.profit_target is not None and last_price >= position.profit_target:
+
+        def _counter_thesis_check():
             if (
-                ctx.obj.paper.partial_take_profit_enabled
-                and not getattr(position, "partial_profit_taken", False)
-                and position.quantity >= ctx.obj.paper.partial_take_profit_min_qty
+                not ctx.obj.counter_thesis.enabled
+                or not ctx.obj.counter_thesis.exit_on_block
             ):
-                state, event, line = _shared_fill_partial_take_profit_position(
-                    ticker=ticker,
-                    position=position,
-                    submitted_at=manage_now,
-                    last_price=last_price,
-                    broker=broker,
-                    ledger=ledger,
-                    state=state,
-                    log_path=log_path,
-                    fraction=ctx.obj.paper.partial_take_profit_fraction,
-                    settings=ctx.obj,
-                    runtime_canary=runtime_canary,
-                )
-            else:
-                state, event, line = _fill_sell_position(
-                    ticker, position, "target", manage_now, last_price,
-                    broker, ledger, state, log_path, frame, ctx.obj,
-                    runtime_canary=runtime_canary,
-                )
-            append_decision_event(log_path, event)
-            exit_events.append(event)
-            actions += 1
-            lines.append(line)
-            continue
-        time_exit_m = ctx.obj.session.time_exit_minutes
-        if time_exit_m > 0 and position.entry_at is not None:
-            entry_at = position.entry_at
-            if entry_at.tzinfo is None:
-                entry_at = entry_at.replace(tzinfo=manage_now.tzinfo)
-            held = (manage_now - entry_at).total_seconds() / 60.0
-            if held >= time_exit_m:
-                state, event, line = _fill_sell_position(
-                    ticker, position, f"time_exit_{int(held)}m", manage_now, last_price,
-                    broker, ledger, state, log_path, frame, ctx.obj,
-                    runtime_canary=runtime_canary,
-                )
-                append_decision_event(log_path, event)
-                exit_events.append(event)
-                actions += 1
-                lines.append(line)
-                continue
-        # V3: Counter-thesis exit — original BUY thesis broken, exit early.
-        # Priority: EOD > stop > target > time_exit > counter-thesis > trailing stop.
-        counter_exit = _maybe_counter_thesis_exit(
-            ticker, position, frame, last_price, ctx.obj, manage_now,
-            broker, ledger, state, log_path, runtime_canary=runtime_canary,
+                return None
+            from trading_bot.runtime.orchestrator import (
+                _evaluate_counter_thesis_for_position,
+            )
+
+            result = _evaluate_counter_thesis_for_position(
+                ticker, position, frame, ctx.obj
+            )
+            return result if result is not None and result.block_trade else None
+
+        decision = evaluate_exit_priority(
+            position=position,
+            current_price=last_price,
+            settings=ctx.obj,
+            now=manage_now,
+            eod_active=eod_active,
+            counter_thesis_check=_counter_thesis_check,
+            trailing_stop_check=lambda: _update_trailing_stop(
+                position, frame, last_price, ctx.obj
+            ),
         )
-        if counter_exit is not None:
-            state, event, line = counter_exit
+        if decision.partial:
+            state, event, line = _shared_fill_partial_take_profit_position(
+                ticker=ticker,
+                position=position,
+                submitted_at=manage_now,
+                last_price=last_price,
+                broker=broker,
+                ledger=ledger,
+                state=state,
+                log_path=log_path,
+                fraction=ctx.obj.paper.partial_take_profit_fraction,
+                settings=ctx.obj,
+                runtime_canary=runtime_canary,
+            )
             append_decision_event(log_path, event)
             exit_events.append(event)
             actions += 1
             lines.append(line)
             continue
-        trail_update = _update_trailing_stop(position, frame, last_price, ctx.obj)
-        if trail_update is not None:
+        if decision.reason == "trailing_stop":
+            trail_update = decision.payload
             new_stop, method, new_highest_high, new_initial_risk = trail_update
             state.positions[ticker] = position.model_copy(
                 update={
@@ -988,6 +953,35 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
                 f"{ticker} TRAIL method={method} stop={new_stop:.2f} "
                 f"last={last_price:.2f} high={new_highest_high:.2f}"
             )
+            continue
+        if decision.should_exit:
+            outward_reason = {
+                "eod_exit": "eod",
+                "stop_loss": "stop",
+                "profit_target": "target",
+                "counter_thesis": "counter-thesis",
+            }.get(decision.reason, decision.reason)
+            state, event, line = _fill_sell_position(
+                ticker,
+                position,
+                outward_reason,
+                manage_now,
+                last_price,
+                broker,
+                ledger,
+                state,
+                log_path,
+                frame,
+                ctx.obj,
+                runtime_canary=runtime_canary,
+                exit_reason=decision.reason,
+            )
+            if decision.reason == "counter_thesis":
+                event["counter_thesis"] = decision.payload.to_dict()
+            append_decision_event(log_path, event)
+            exit_events.append(event)
+            actions += 1
+            lines.append(line)
             continue
         lines.append(
             f"{ticker} qty={position.quantity} "
@@ -1887,42 +1881,6 @@ def notify(settings, level: str, title: str, message: str, details: dict | None 
     )
 
 
-def _maybe_counter_thesis_exit(
-    ticker: str,
-    position,
-    frame,
-    last_price: float,
-    settings,
-    manage_now: datetime,
-    broker,
-    ledger,
-    state,
-    log_path,
-    runtime_canary=None,
-):
-    """Check counter-thesis for an open position; exit if thesis is broken.
-
-    Returns ``(new_state, event, line)`` when the position is exited, or
-    None when the position should be kept (feature disabled, no block, or
-    data unavailable — a data outage never forces an exit).
-    """
-    if not settings.counter_thesis.enabled or not settings.counter_thesis.exit_on_block:
-        return None
-    from trading_bot.runtime.orchestrator import _evaluate_counter_thesis_for_position
-
-    result = _evaluate_counter_thesis_for_position(ticker, position, frame, settings)
-    if result is None or not result.block_trade:
-        return None
-
-    new_state, event, line = _fill_sell_position(
-        ticker, position, "counter-thesis", manage_now, last_price,
-        broker, ledger, state, log_path, frame, settings,
-        runtime_canary=runtime_canary,
-    )
-    event["counter_thesis"] = result.to_dict()
-    return new_state, event, line
-
-
 def _fill_sell_position(
     ticker: str,
     position,
@@ -1936,6 +1894,7 @@ def _fill_sell_position(
     bars=None,
     settings=None,
     runtime_canary=None,
+    exit_reason: str | None = None,
 ) -> tuple:
     """Submit a market SELL order, record the fill, and update portfolio state."""
     exit_rsi = None
@@ -1983,7 +1942,7 @@ def _fill_sell_position(
         exit_atr=exit_atr,
         hold_duration_minutes=hold_duration,
         exit_strategy=exit_strategy,
-        exit_reason=reason,
+        exit_reason=exit_reason or reason,
         settings=settings,
         runtime_canary=runtime_canary,
     )
