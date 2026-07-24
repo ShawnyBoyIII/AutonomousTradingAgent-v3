@@ -281,3 +281,33 @@ def test_pre_eod_block_in_main_loop_uses_plain_assignments() -> None:
             f"{var} must not be 'local' (top-level code, not a function): "
             f"{line!r} — the 2026-07-13 burn-in crash started here."
         )
+
+
+def test_burner_detects_zero_candidate_discovery_failure() -> None:
+    """When the discover CLI returns 0 candidates, the burner shell
+    must log the failure as 'failed' (count=0,status="failed") rather
+    than the misleading '✅ Discovered N' success line. Previously the
+    shell used ``grep -q "Exported"`` which matched the
+    preservation-success line and silently counted the existing
+    universe as a fresh discovery.
+    """
+    script = Path("scripts/auto-burn-in.sh").read_text(encoding="utf-8")
+
+    # The CLI emits "0 candidates passed discovery" when no candidates
+    # pass screening. The burner shell must grep for that string.
+    assert "0 candidates passed discovery" in script, (
+        "run_discovery() must check for the 0-candidate failure marker "
+        "before falling through to the success branch"
+    )
+
+    # Capture the CLI exit code (audit follow-up 2026-07-24):
+    # the discover CLI exits 2 on zero-candidate failure.
+    assert "discover_rc=$?" in script, (
+        "run_discovery() must capture the discover CLI exit code so the "
+        "shell can detect exit 2 as a failure even when 'Exported' appears"
+    )
+
+    # The failure branch must emit a structured discovery.log entry
+    # with status="failed" so operators can grep the audit trail.
+    # The shell escapes the JSON quotes as \", so accept either form.
+    assert ('"status":"failed"' in script) or ('\\"status\\":\\"failed\\"' in script)

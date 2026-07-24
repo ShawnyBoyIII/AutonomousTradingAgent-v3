@@ -3251,8 +3251,13 @@ def discover_symbols(
             typer.echo(f"  {entry.symbol}: {entry.reason} (score: {entry.score:.1f})")
     else:
         typer.echo("No symbols passed screening criteria.")
+        typer.echo(
+            "⚠️  0 candidates passed discovery — preserving existing universe. "
+            "Treat discovery as failed."
+        )
 
     if export:
+        pre_export_count = len(watchlist._entries)
         export_path = watchlist.export_for_burn_in(ctx.obj.app.universe_path)
         overridden = _apply_advisory_symbol_overrides(
             _read_universe_symbols(Path(export_path)),
@@ -3260,7 +3265,19 @@ def discover_symbols(
             limit=max_symbols,
         )
         Path(export_path).write_text("\n".join(overridden), encoding="utf-8")
-        typer.echo(f"\nExported {len(overridden)} symbols to {export_path}")
+        if pre_export_count == 0 and overridden:
+            typer.echo(
+                f"\nExported {len(overridden)} symbols (preserved from prior universe) "
+                f"to {export_path}"
+            )
+        else:
+            typer.echo(f"\nExported {len(overridden)} symbols to {export_path}")
+        # When --export is set and discovery produced 0 candidates, the
+        # burner shell relies on the exit code to detect failure
+        # (``if echo $output | grep -q "Exported"; then ...``). Without
+        # a non-zero exit the shell silently treats the run as success.
+        if pre_export_count == 0:
+            raise typer.Exit(code=2)
 
 
 @app.command(name="sector-analysis")

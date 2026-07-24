@@ -190,10 +190,25 @@ run_discovery() {
         done < "$WATCHLIST_FILE"
     fi
     
-    # Run discover with export
-    local discover_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" discover --mode breakout --max 50 --export 2>&1)
-    
-    if echo "$discover_output" | grep -q "Exported"; then
+    # Run discover with export. Capture both stdout and the exit
+    # code so we can distinguish "no candidates" (CLI exits 2) from
+    # "fresh discoveries" (CLI exits 0 with new symbols).
+    local discover_output discover_rc
+    discover_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" discover --mode breakout --max 50 --export 2>&1)
+    discover_rc=$?
+
+    # The "0 candidates" warning is the new failure marker (audit
+    # follow-up 2026-07-24). When the screener returns 0 results the
+    # CLI prints that warning AND exits 2; the existing universe is
+    # preserved but discovery should be logged as failed.
+    if echo "$discover_output" | grep -q "0 candidates passed discovery"; then
+        echo "[$timestamp] ⚠️  Discovery failed: 0 candidates passed screening. Existing universe preserved."
+        echo "{\"event\":\"discovery\",\"timestamp\":\"$timestamp\",\"trigger\":\"$trigger_reason\",\"count\":0,\"status\":\"failed\"}" >> "$LOG_DIR/discovery.log"
+        date +%Y-%m-%d > "$LAST_DISCOVER_FILE"
+        return 0
+    fi
+
+    if [ "$discover_rc" -eq 0 ] && echo "$discover_output" | grep -q "Exported"; then
         local count=$(echo "$discover_output" | grep "Exported" | sed 's/.*Exported \([0-9]*\).*/\1/')
         echo "[$timestamp] ✅ Discovered $count symbols"
         
