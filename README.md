@@ -2,6 +2,12 @@
 
 A CLI-first paper-trading system with risk controls, scout/universe building, and an MCP-backed Robinhood boundary for snapshot sync plus operator-reviewed intents.
 
+> **Release:** [`v3.0.0`](https://github.com/ShawnyBoyIII/AutonomousTradingAgent-v3/releases/tag/v3.0.0) — audit-batch fixes (runtime canary end-to-end, ApprovedCandidate contract, FillTransaction, mark-to-market equity, shared feature pipeline, EOD watchdog, dashboard starting equity, discovery screener fix, dead code removal) plus Stage 1-4 event engine.
+>
+> **Legacy repos archived (read-only):**
+> - `ShawnyBoyIII/AutonomousTradingAgentV2` (V2, frozen at `88d5656`)
+> - `ShawnyBoyIII/AutonomousTradingAgent` (V1, deleted)
+
 ## Features
 
 - **Paper Trading**: Risk-free simulation with realistic fill prices, slippage, and fees
