@@ -7,7 +7,7 @@ Conventions:
   start empty for each ``EngineDriver.run()`` invocation.
 * Strategies emit :class:`SignalEvent` objects; the
   :class:`~event_engine.portfolio.Portfolio` converts them to
-  :class:`OrderEvent`\ s after capital checks.
+  ``OrderEvent`` instances after capital checks.
 * ``AbstractStrategy.calculate_signals`` is called once per
   :class:`MarketEvent`. A strategy returning an empty list emits no
   opinion on that bar; returning a non-empty list emits one entry
