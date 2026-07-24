@@ -105,8 +105,8 @@ counter_thesis:
   extension_pct: 5.0
 
 # EOD data store: pulls massive.com S3 flat-files nightly, stores them in
-# state/data_store/ as Parquet partitions, consumed by tuning_overrides and
-# daily_supermodel for the nightly learning loop.
+# state/data_store/ as Parquet partitions, and supplies active offline tuning
+# plus tuning-experiment replay.
 # Credentials live in .env (MASSIVE_S3_*); see .env.example.
 eod_data_store:
   enabled: true

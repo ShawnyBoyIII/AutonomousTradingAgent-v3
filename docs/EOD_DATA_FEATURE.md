@@ -15,7 +15,6 @@
 | CLI command | `./tradebot-local eod-fetch [--date YYYY-MM-DD] [--backfill-days N] [--dry-run]` | Idempotent, gated on `eod_data_store.enabled` |
 | Shell integration | `scripts/auto-burn-in.sh::run_eod_data_download` | Mirrors `run_nightly_tuning`; idempotent via marker file |
 | Learning-loop wiring (light) | `tuning_overrides.py::_maybe_nudge_window_from_data_store` | Realised-vol heuristic nudges `strategy_tracker.window` up |
-| RL inventory logging | `scripts/daily_supermodel.py` | Logs data-store coverage for top-10 training symbols before training |
 | Credentials | `.env.example` + 4 `MASSIVE_S3_*` env vars | Loaded by `python-dotenv` at startup; rejected by `_validate_credentials_not_in_config` if leaked into YAML |
 
 ## How to use
@@ -51,7 +50,7 @@ echo "MASSIVE_S3_BUCKET=..." >> .env
 ## Open follow-ups (not blockers)
 
 - **Pattern mining (Option D)**: deferred to `docs/FUTURE_PATTERN_MINING.md`.
-- **RL env integration**: `daily_supermodel.py` currently logs data-store coverage but doesn't bypass `fetch_bars`. The deeper wiring (have the RL env prefer `read_bars()` over network when the store has fresh data) is a Phase 6+ follow-up that needs careful treatment of freshness semantics.
+- **Additional offline consumers**: new consumers should use `read_bars()` and define explicit freshness semantics rather than bypassing the live market-data path.
 
 ---
 
@@ -60,14 +59,11 @@ echo "MASSIVE_S3_BUCKET=..." >> .env
 At the end of each trading day, download OHLCV flat-files from massive.com's S3
 bucket for every symbol in today's scout universe, store them in a **separate
 long-term store** (does NOT touch the live hot cache at `state/market_data_cache.db`),
-then run two existing learning pipelines against the freshly stored data:
+then make the freshly stored data available to the active tuning pipeline:
 
 - **(B) Nightly auto-tune** — feed the data through `trading_bot/learning/tuning_overrides.py`
   (the `tune` CLI) so supermodel thresholds drift to match recent performance.
   Writes `state/tuning_overrides.yaml`, consumed by `config/loader.py` on next start.
-- **(C) Nightly RL retrain** — extend `scripts/daily_supermodel.py` to train a PPO
-  agent on freshly stored data. Writes `state/rl_logs/supermodel/`.
-
 Option (D) — pattern mining — is **deferred**. See `docs/FUTURE_PATTERN_MINING.md`.
 
 The user's mental model: "instead of repulling every time, store the data in the
@@ -114,9 +110,6 @@ backend; the backend then studies itself and models the bot to trade better."
 - `trading_bot/advisory/learner.py::_analytics_metrics_by_symbol` — reads
   `scan_features` + `trades` tables grouped by ticker. Pattern to copy for
   the new study job.
-- `scripts/daily_supermodel.py` — the existing nightly PPO retrain pipeline,
-  the **shape template** for the new EOD job (multi-step, dry-run flag,
-  writes `pipeline_result.json`).
 - `trading_bot/db/models.py::ScanFeature` — the de-facto feature store,
   already populated by `runtime/orchestrator.py::_persist_scan_feature_row`.
   Our EOD study job READS this; the running bot already writes it.
@@ -391,10 +384,9 @@ When dispatching the 3 architect sub-tasks tomorrow, give each this brief:
 >    Gated by `EOD_DATA_STORE_ENABLED` env var (default `true`).
 >    Idempotent via `.last_eod_fetch_date` marker.
 >
-> 5. **Wire the stored data into the existing learning loops**:
+> 5. **Wire the stored data into the active tuning loop**:
 >    - `trading_bot/learning/tuning_overrides.py::propose_tuning_overrides`
 >      reads from the new store (in addition to existing inputs).
->    - `scripts/daily_supermodel.py` reads from the new store for training data.
 >
 > 6. **Config** in `burn-in-config.yaml`:
 >    ```yaml
@@ -414,8 +406,7 @@ When dispatching the 3 architect sub-tasks tomorrow, give each this brief:
 > - Paper-only safety envelope (no live trades triggered by the learning loop).
 
 The three sub-task focuses should be:
-1. **Minimal changes** — smallest diff, maximum reuse of `daily_supermodel.py`
-   and `tuning_overrides.py`.
+1. **Minimal changes** — smallest diff, maximum reuse of `tuning_overrides.py`.
 2. **Clean architecture** — new `trading_bot/data_store/` package, abstraction
    for "long-term store backend" so Parquet can be swapped for SQLite later.
 3. **Pragmatic balance** — single new module, Parquet + SQLite manifest, no
@@ -440,7 +431,6 @@ implementation begins. Suggested file plan (final, may shift per architecture):
 - `config.yaml` + `burn-in-config.yaml` — add `eod_data_store:` block
 - `scripts/auto-burn-in.sh` — add `run_eod_data_download()` function
 - `trading_bot/learning/tuning_overrides.py` — extend to read from new store
-- `scripts/daily_supermodel.py` — extend to read training data from new store
 - `tests/test_eod_fetcher.py` — new (network-free, monkeypatch S3 client)
 - `tests/test_auto_burn_in_script.py` — extend with regression test for
   `run_eod_data_download` integration

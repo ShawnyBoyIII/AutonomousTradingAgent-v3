@@ -2,8 +2,8 @@
 
 This module is the cold archive populated nightly by ``eod_fetcher``. The
 manifest tracks (symbol, interval, last_fetched_date) so the fetcher is
-idempotent. Learning loops (tuning_overrides, daily_supermodel) read from
-here via :func:`read_bars`.
+idempotent. Offline tuning and analytics consumers read from here via
+:func:`read_bars`.
 
 **Separation guarantee**: this module never touches the live hot cache at
 ``state/market_data_cache.db``. The two stores have different access

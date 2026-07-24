@@ -147,9 +147,9 @@ class BrokerAdapter(ABC):
     """
     Abstract base class for all broker adapters.
     
-    Implementations:
-    - PaperBrokerAdapter: Simulated trading (existing)
-    - RobinhoodAdapter: Read-only in V3, live in V4
+    Implementations subclass this boundary for external broker integrations.
+    Paper simulation uses ``trading_bot.execution.paper_broker.PaperBroker``;
+    Robinhood is MCP-only and consumes operator-synced snapshots.
     
     Safety guarantees:
     - submit_order() requires explicit mode parameter

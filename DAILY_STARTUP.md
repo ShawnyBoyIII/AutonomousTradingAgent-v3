@@ -15,7 +15,8 @@ The "open this every morning" reference. For one-time setup, see [GETTING_STARTE
 # Terminal 1 — Start trading (leave running)
 ./scripts/auto-burn-in.sh
 
-# Terminal 2 — Live dashboard (optional)
+# The canonical dashboard sidecar starts automatically on port 8080.
+# Optional separate instance using app.dashboard_port (default 8000):
 ./tradebot-local serve
 # → open http://127.0.0.1:8000
 ```
@@ -70,17 +71,28 @@ If kill switch is active, resume with:
 
 ### Live Dashboard (recommended)
 
+`ui/dashboard/main.py` is the single FastAPI + SSE + Jinja dashboard.
+`auto-burn-in.sh` starts it through `scripts/start-dashboard.sh` on port 8080.
+For a separate instance, the CLI launches the same application:
+
 ```bash
 ./tradebot-local serve
 ```
-Open `http://127.0.0.1:8000` in a browser. Auto-refreshes every 5 seconds.
+Open `http://127.0.0.1:8000` in a browser when using the default config.
+The CLI defaults to `app.dashboard_port`; both launchers bind to localhost by default.
 
-Shows: equity, cash, exposure, P&L, kill-switch banner, open positions, scan candidates, live decision feed, recent trade exits.
+Shows: equity, cash, exposure, cohort P&L, kill-switch state, open positions,
+alerts, health checks, and recent durable fills from `PortfolioLedger.orders`.
 
 **Routes:**
-- `/` — HTML dashboard (auto-refresh)
-- `/api/state` — JSON snapshot
-- `/healthz` — `"ok"`
+- `/` — HTML dashboard
+- `/api/portfolio` — portfolio and risk snapshot
+- `/api/evaluation-windows` — today, trade-cohort, and equity-cohort metrics
+- `/api/trades` — recent durable fill rows from the configured
+  `PortfolioLedger.orders` table, newest first
+- `/api/health` — structured overall and per-check statuses using lowercase
+  `ok` / `critical`
+- `/api/stream` — SSE updates every 5 seconds
 
 Binds to localhost only (127.0.0.1) for security.
 
@@ -200,6 +212,7 @@ If empty, ensure `.env` has `CONFIG_PATH=burn-in-config.yaml` and restart your s
 |---------|---------|
 | `./scripts/auto-burn-in.sh` | Start automated trading |
 | `./tradebot-local serve` | Live dashboard at localhost:8000 |
+| `./scripts/start-dashboard.sh` | Same dashboard app at localhost:8080 |
 | `./tradebot-local doctor` | System health check |
 | `./tradebot-local portfolio` | Positions + P&L |
 | `./tradebot-local performance --daily` | Daily performance metrics |

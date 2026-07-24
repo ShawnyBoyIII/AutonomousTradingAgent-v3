@@ -124,26 +124,24 @@ Expected: `doctor live_trading=false provider=alpaca provider_auth=ok`
 
 ### Live Dashboard
 
-Two dashboards are available — pick one:
-
-**A. Rich UI (recommended for desk monitoring)** — Bloomberg-style interface with
-real-time SSE updates, sparkline, kill-switch lever, and bento layout:
+The canonical dashboard is `ui/dashboard/main.py` (FastAPI + SSE + Jinja).
+These are two launchers for the same application:
 
 ```bash
+# Standalone launcher: defaults to config.yaml and port 8080
 ./scripts/start-dashboard.sh
-# → open http://127.0.0.1:8080
-```
-
-See **[`ui/dashboard/README.md`](ui/dashboard/README.md)** for the full guide.
-
-**B. CLI snapshot dashboard** — simpler, built into the CLI:
-
-```bash
+# Or use the CLI: defaults to app.dashboard_port (8000 in config.yaml)
 ./tradebot-local serve
-# → open http://127.0.0.1:8000
 ```
 
-Both bind to localhost only (127.0.0.1) and never expose authentication.
+Both bind to localhost by default. Select a config with
+`./tradebot-local --config-path burn-in-config.yaml serve` or
+`./scripts/start-dashboard.sh --config burn-in-config.yaml`; override ports with
+`serve --port N` or `start-dashboard.sh --port N`. The main endpoints are `/`,
+`/api/portfolio`, `/api/evaluation-windows`, `/api/stream` (SSE),
+`/api/trades` (recent durable fill rows from the configured
+`PortfolioLedger.orders` table), and `/api/health` (overall and per-check
+statuses using lowercase `ok` / `critical`).
 
 ---
 
@@ -171,14 +169,12 @@ This will:
 ### Monitor Burn-In
 
 ```bash
-# Rich UI dashboard (recommended)
+# The burn-in sidecar starts this same dashboard automatically on port 8080.
+# To launch it separately with the burn-in database:
 ./scripts/start-dashboard.sh --config burn-in-config.yaml
-# → open http://127.0.0.1:8080
-# See ui/dashboard/README.md for full guide
 
-# Simpler CLI dashboard (alternative)
+# Equivalent application through the CLI; defaults to app.dashboard_port
 ./tradebot-local serve
-# → open http://127.0.0.1:8000
 
 # Live decision log
 tail -f logs/burn_in/decision-log.jsonl
@@ -199,16 +195,9 @@ Press `Ctrl+C` to stop safely.
 
 ### Live Dashboard
 ```bash
-# Serve live dashboard (auto-refreshes every 5s)
+# Serve the canonical dashboard (SSE updates every 5s)
 ./tradebot-local serve
 # → open http://127.0.0.1:8000
-```
-
-### Static Dashboard (for snapshots)
-```bash
-# Generate static HTML
-./tradebot-local dashboard --output state/dashboard.html
-open state/dashboard.html  # macOS
 ```
 
 ### Performance Metrics

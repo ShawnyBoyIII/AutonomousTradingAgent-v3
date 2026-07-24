@@ -199,16 +199,17 @@ What it does:
   - `< 40% win rate`: strategy skipped
 - Affects which signals get through in `paper-trade` — skipped strategies are rejected before the position sizer runs.
 
-### 11. Build Local Dashboard
+### 11. Launch The Live Dashboard
 
 ```bash
-sh ./tradebot-local dashboard --output state/dashboard.html
+sh ./tradebot-local serve
 ```
 
 What it does:
 
-- Builds a static HTML dashboard from local JSON snapshots.
-- Useful when you want a quick visual without building a real UI.
+- Launches the canonical `ui/dashboard/main.py` FastAPI + SSE + Jinja app.
+- Defaults to `app.dashboard_port` (8000 in `config.yaml`).
+- `./scripts/start-dashboard.sh` launches the same app on port 8080 by default.
 
 ## Most Useful Workflows
 
@@ -244,7 +245,7 @@ sh ./tradebot-local portfolio
 sh ./tradebot-local report
 sh ./tradebot-local strategy-health
 sh ./tradebot-local backtest --symbols SPY,QQQ --start 2026-05-01 --end 2026-06-17
-sh ./tradebot-local dashboard --output state/dashboard.html
+sh ./tradebot-local serve
 ```
 
 ### Strategy Health Check
@@ -380,7 +381,6 @@ Generated under `state/`:
 - `portfolio_summary.json`
 - `dashboard_summary.json`
 - `backtest_summary.json`
-- `dashboard.html`
 
 Generated under `logs/`:
 
@@ -494,5 +494,5 @@ Common reasons:
 - **Review strategies with `half` or `skip` allocation** — they may need re-tuning or retirement.
 - **Use `backtest --walk-forward` to validate strategy robustness** before deploying new signals.
 - Use `report` for totals, not memory.
-- Rebuild `dashboard.html` when you want a visual snapshot.
+- Use `serve` or `scripts/start-dashboard.sh` for the live dashboard; both launch the same app.
 - Review `docs/adr/001-exit-priority-order.md` to understand exit precedence.

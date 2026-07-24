@@ -25,6 +25,8 @@ echo ""
 
 echo "Step 2: Start the canonical dashboard"
 echo "  Command: ./tradebot-local --config-path burn-in-config.yaml serve --port 8080"
+echo "  Alternative: ./scripts/start-dashboard.sh --config burn-in-config.yaml"
+echo "  Both launch ui/dashboard/main.py; the standalone script defaults to 8080."
 echo "  Then open: http://localhost:8080"
 echo ""
 

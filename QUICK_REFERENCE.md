@@ -25,6 +25,7 @@ cp .env.example .env  # then edit with Alpaca keys
 ### Monitoring (separate terminals)
 ```bash
 ./tradebot-local serve                 # Live dashboard → http://127.0.0.1:8000
+./scripts/start-dashboard.sh           # Same app, standalone launcher → :8080
 tail -f logs/burn_in/decision-log.jsonl # Live decision feed
 ./tradebot-local portfolio             # Positions + P&L
 ./tradebot-local performance --daily   # Daily metrics
@@ -53,6 +54,7 @@ tail -f logs/burn_in/decision-log.jsonl # Live decision feed
 |---------|-------------|
 | `./scripts/auto-burn-in.sh` | Automated trading loop |
 | `./tradebot-local serve` | Live dashboard (localhost:8000) |
+| `./scripts/start-dashboard.sh` | Same dashboard app (localhost:8080) |
 | `doctor` | System health check |
 | `scan --symbols SPY,AAPL --why` | Scan for signals |
 | `paper-trade --symbols AAPL` | Execute paper trades |

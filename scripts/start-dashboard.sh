@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch the V3 Shadow Mode monitoring dashboard.
+# Launch the canonical FastAPI + SSE + Jinja monitoring dashboard.
 # Defaults: config.yaml, port 8080, bind 127.0.0.1.
 # Usage:   ./scripts/start-dashboard.sh [--config FILE] [--port N] [--host H]
 set -euo pipefail

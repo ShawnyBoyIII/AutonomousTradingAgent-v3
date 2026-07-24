@@ -179,9 +179,23 @@ Legacy naive `filled_at` rows are interpreted in `app.timezone`,
 not silent UTC, so cohort boundaries align with the operator's
 configured trading day.
 
+The canonical live dashboard is `ui/dashboard/main.py` (FastAPI +
+SSE + Jinja). The CLI `serve` command launches it via uvicorn on
+`app.dashboard_port` (8000 in the default config), overridable via
+`--port`. The burn-in sidecar launches the same application through
+`scripts/start-dashboard.sh` on port 8080 unless overridden. The
+older `runtime/dashboard.py` legacy dashboard and the static HTML
+generator have been removed. The CLI `dashboard` command remains as
+a deprecation no-op alias that points operators at `serve`.
+
 Dashboard endpoints:
 
+- `GET /api/portfolio` — ledger + risk snapshot
 - `GET /api/evaluation-windows` — full three-window payload
+- `GET /api/trades` — recent durable fill rows from the configured
+  `PortfolioLedger.orders` table, newest first
+- `GET /api/health` — overall and per-check statuses use lowercase
+  `ok` / `critical`, with structured detail
 - `GET /api/stream` — SSE includes the same payload every 5 seconds
 
 The hero's "Since <boundary>" caption is driven by the equity
@@ -378,6 +392,26 @@ counter_thesis:
 4. **Time-based exit** (stale positions, configurable via `time_exit_minutes`)
 5. **Counter-thesis exit** (V3: thesis broken)
 6. **Trailing stop** (lowest)
+
+**Canonical evaluator and closed-trade exit reasons:**
+
+- `eod_exit` — EOD window exit
+- `stop_loss` — stop-loss hit
+- `profit_target` — full target hit (or partial-take-profit branch)
+- `time_exit_{minutes}m` — held past `time_exit_minutes`
+- `counter_thesis` — V3 counter-thesis block
+- `trailing_stop` — trailing stop hit
+- `no_exit` — evaluator returned without firing (only used internally)
+
+The shared `evaluate_exit_priority()` helper in
+`trading_bot/runtime/position_management.py` produces these canonical
+reasons for both the CLI `manage-positions` command and the continuous
+loop. The CLI preserves its outward decision-log, event, strategy-tracker,
+and human-readable reason contract (`eod`, `stop`, `target`, and
+`counter-thesis`) while passing the canonical reason separately to the SQL
+closed-trade `exit_reason` field. Partial exits retain `target_partial` and
+do not close the SQL trade. The continuous loop uses canonical outward
+reasons.
 
 ---
 

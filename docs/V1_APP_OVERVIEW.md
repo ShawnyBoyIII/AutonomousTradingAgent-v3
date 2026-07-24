@@ -13,8 +13,8 @@ V1 can:
 - Track local paper portfolio state.
 - Produce local reports.
 - Replay historical data with a simple backtest.
-- Write JSON snapshots for future UI work.
-- Build a static local dashboard from JSON snapshots.
+- Write local JSON snapshots for runtime integrations.
+- Serve the canonical FastAPI + SSE + Jinja dashboard at `ui/dashboard/main.py`.
 - Check local readiness without fetching market data.
 
 V1 is paper-only by default. It does not place live broker orders.
@@ -28,7 +28,7 @@ sh ./tradebot-local paper-trade --symbols SPY
 sh ./tradebot-local backtest --symbols AAPL,MSFT,SPY,NVDA,QQQ --start 2026-05-01 --end 2026-06-17
 sh ./tradebot-local portfolio
 sh ./tradebot-local report
-sh ./tradebot-local dashboard --output state/dashboard.html
+sh ./tradebot-local serve
 sh ./tradebot-local doctor
 sh ./tradebot-local manage-positions
 ```
@@ -133,7 +133,7 @@ Limits:
 - Strategy is simple.
 - Backtest is useful but not institution-grade.
 - No live trading.
-- No frontend yet.
+- The current application includes the live monitoring dashboard at `ui/dashboard/main.py`.
 - No macro or breadth model yet.
 
 ## Safety Position
@@ -159,7 +159,7 @@ Completed from follow-up priority:
 
 - Daily loss limit and daily order limit.
 - Paper-trade dry-run preview.
-- Simple static dashboard from snapshot JSON files.
+- Live FastAPI dashboard with SSE updates.
 - Scan summary table.
 
 Future work priority:
@@ -170,9 +170,11 @@ Reason:
 
 - Daily loss/order limits prevent rogue local loops from creating too many simulated orders.
 - Dry-run preview gives final sanity check before writing fills to SQLite.
-- Dashboard makes paper portfolio debugging easier than terminal-only inspection.
+- The live dashboard makes paper portfolio debugging easier than terminal-only inspection.
 
-Open `state/dashboard.html` in a browser after running `dashboard`.
+Launch it with `./tradebot-local serve` (default config port 8000) or
+`./scripts/start-dashboard.sh` (port 8080 by default). Both launchers run
+the same `ui/dashboard/main.py` application.
 
 Later:
 
