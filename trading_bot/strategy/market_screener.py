@@ -263,7 +263,7 @@ def screen_for_breakout_setups(
     symbols_data: dict[str, "pd.DataFrame"],
     lookback_days: int = 20,
 ) -> list[ScreenResult]:
-    """Screen for breakout setups (near 20-day high).
+    """Screen for breakout setups (near N-day high).
 
     Args:
         symbols_data: Dict of symbol -> daily DataFrame
@@ -274,8 +274,17 @@ def screen_for_breakout_setups(
     """
     breakouts = []
 
+    # ``lookback_days + 1`` ensures we have enough rows to compute a
+    # 20-day window excluding today (which itself counts as part of
+    # the window but is excluded from the prior-high comparison).
+    # The previous ``lookback_days + 5`` was unreachable for ``period=1mo``
+    # fetches (~22 trading days), causing every symbol to be silently
+    # dropped and ``discover`` to return zero candidates every day.
+    # (Audit follow-up 2026-07-24.)
+    min_rows = lookback_days + 1
+
     for symbol, frame in symbols_data.items():
-        if len(frame) < lookback_days + 5:
+        if len(frame) < min_rows:
             continue
 
         try:
@@ -319,7 +328,13 @@ def screen_for_mean_reversion(
     - Price near lower Bollinger Band
     - RSI oversold but turning up
     - High volume (capitulation)
+
+    The frame passed in by the discover CLI is raw OHLCV; the screener
+    computes Bollinger Bands (period 20, std 2.0) and RSI (period 14)
+    on the fly so it works without the runner precomputing them.
     """
+    from trading_bot.data.indicators import add_bollinger_bands, add_rsi
+
     oversold = []
 
     for symbol, frame in symbols_data.items():
@@ -327,8 +342,20 @@ def screen_for_mean_reversion(
             continue
 
         try:
-            latest = frame.iloc[-1]
-            prev = frame.iloc[-2]
+            enriched = frame
+            if "bb_lower" not in enriched.columns:
+                try:
+                    enriched = add_bollinger_bands(enriched, period=20, std_dev=2.0)
+                except Exception:
+                    continue
+            if "rsi_14" not in enriched.columns:
+                try:
+                    enriched = add_rsi(enriched, period=14)
+                except Exception:
+                    continue
+
+            latest = enriched.iloc[-1]
+            prev = enriched.iloc[-2]
 
             close = float(latest["close"])
             bb_lower = float(latest.get("bb_lower", 0))
@@ -343,7 +370,7 @@ def screen_for_mean_reversion(
             near_lower_band = close <= bb_lower * 1.02
             rsi_oversold = rsi < 35
             rsi_turning = rsi > prev_rsi  # RSI increasing
-            volume_high = float(latest["volume"]) > frame["volume"].tail(20).mean() * 1.2
+            volume_high = float(latest["volume"]) > enriched["volume"].tail(20).mean() * 1.2
 
             if near_lower_band and rsi_oversold and rsi_turning:
                 score = 50
