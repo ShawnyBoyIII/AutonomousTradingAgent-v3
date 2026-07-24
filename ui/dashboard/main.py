@@ -328,29 +328,30 @@ def _alerts_payload() -> dict:
 
 
 def _trades_payload(limit: int = 20) -> dict:
-    log_path = Path(state.settings.app.log_dir) / "decision-log.jsonl"
-    trades: list[dict] = []
-    if log_path.exists():
-        try:
-            lines = log_path.read_text().strip().split("\n")
-        except OSError:
-            lines = []
-        for line in reversed(lines[-limit * 4 :]):  # parse a few extra in case of non-fill events
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("event_type") in ("ORDER_SUBMITTED", "ORDER_FILLED", "FILL", "TRADE"):
-                trades.append({
-                    "timestamp": event.get("timestamp"),
-                    "type": event.get("event_type"),
-                    "symbol": event.get("symbol") or event.get("ticker"),
-                    "side": event.get("side"),
-                    "quantity": event.get("quantity"),
-                    "price": event.get("fill_price") or event.get("price"),
-                })
-                if len(trades) >= limit:
-                    break
+    try:
+        rows = state.ledger.list_recent_order_rows(
+            limit=limit,
+            naive_timezone=state.settings.app.timezone,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read recent fills: %s", exc)
+        rows = []
+
+    trades = [
+        {
+            "timestamp": row["filled_at"],
+            "type": "FILL",
+            "symbol": row["ticker"],
+            "side": row["side"],
+            "quantity": row["quantity"],
+            "price": row["fill_price"],
+            "fees": row["fees"],
+            "pnl": row["pnl"],
+            "strategy_tag": row["strategy_tag"],
+            "order_id": row["id"],
+        }
+        for row in rows
+    ]
 
     return {
         "trades": trades,

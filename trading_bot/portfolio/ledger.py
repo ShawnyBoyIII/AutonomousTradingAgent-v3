@@ -238,6 +238,62 @@ class PortfolioLedger:
             results.append(d)
         return results
 
+    def list_recent_order_rows(
+        self,
+        limit: int = 20,
+        naive_timezone: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Return a bounded set of fill rows, newest first."""
+        from trading_bot.analytics.evaluation_windows import normalize_timestamp
+
+        def _normalized_epoch(value: object) -> float | None:
+            try:
+                normalized = normalize_timestamp(value, naive_timezone)
+                return normalized.timestamp() if normalized is not None else None
+            except (OverflowError, OSError, ValueError):
+                return None
+
+        bounded_limit = min(max(int(limit), 1), 500)
+        self.initialize()
+        with self._connect() as conn:
+            conn.create_function(
+                "normalized_timestamp_epoch",
+                1,
+                _normalized_epoch,
+                deterministic=True,
+            )
+            rows = conn.execute(
+                """
+                SELECT id, ticker, side, quantity, fill_price, fees,
+                       filled_at, pnl, strategy_tag
+                FROM (
+                    SELECT id, ticker, side, quantity, fill_price, fees,
+                           filled_at, pnl, strategy_tag,
+                           normalized_timestamp_epoch(filled_at) AS normalized_epoch
+                    FROM orders
+                )
+                WHERE normalized_epoch IS NOT NULL
+                ORDER BY normalized_epoch DESC, id DESC
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            ).fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "ticker": row[1],
+                "side": row[2],
+                "quantity": row[3],
+                "fill_price": row[4],
+                "fees": row[5],
+                "filled_at": row[6],
+                "pnl": row[7] if row[7] is not None else 0.0,
+                "strategy_tag": row[8] or "",
+            }
+            for row in rows
+        ]
+
     def get_consecutive_losses(self) -> int:
         """Count consecutive SELL losses from most recent order backward.
 

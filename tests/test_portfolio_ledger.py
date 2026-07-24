@@ -167,6 +167,86 @@ def test_list_order_rows_empty_returns_empty_list(ledger: PortfolioLedger) -> No
     assert ledger.list_order_rows() == []
 
 
+def test_list_recent_order_rows_returns_newest_first_with_deterministic_ties(
+    ledger: PortfolioLedger,
+) -> None:
+    same_time = datetime(2025, 1, 1, 9, 31)
+    ledger.record_fill(_fill(order_id="older", filled_at=datetime(2025, 1, 1, 9, 30)), side="BUY")
+    ledger.record_fill(_fill(order_id="tie-a", filled_at=same_time), side="BUY")
+    ledger.record_fill(_fill(order_id="tie-b", filled_at=same_time), side="SELL")
+
+    rows = ledger.list_recent_order_rows(limit=2)
+
+    assert [row["id"] for row in rows] == ["tie-b", "tie-a"]
+
+
+def test_list_recent_order_rows_clamps_limits(ledger: PortfolioLedger) -> None:
+    ledger.initialize()
+    with sqlite3.connect(ledger.db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO orders
+                (id, ticker, side, quantity, fill_price, fees, filled_at, pnl, strategy_tag)
+            VALUES (?, 'AAPL', 'BUY', 1, 100.0, 0.0, ?, 0.0, '')
+            """,
+            [(f"order-{index:03d}", f"2025-01-01T09:{index // 60:02d}:{index % 60:02d}") for index in range(501)],
+        )
+
+    assert len(ledger.list_recent_order_rows(limit=0)) == 1
+    assert len(ledger.list_recent_order_rows(limit=1_000)) == 500
+
+
+def test_list_recent_order_rows_normalizes_timestamps_before_sql_limit(
+    ledger: PortfolioLedger,
+) -> None:
+    ledger.initialize()
+    rows = [
+        ("legacy-newest", "2026-07-22T10:30:00"),
+        ("aware-second", "2026-07-22T14:00:00+00:00"),
+        ("aware-older", "2026-07-22T13:00:00+00:00"),
+        ("malformed", "zzzz-not-a-timestamp"),
+        ("missing", None),
+    ]
+    with sqlite3.connect(ledger.db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO orders
+                (id, ticker, side, quantity, fill_price, fees, filled_at, pnl, strategy_tag)
+            VALUES (?, 'AAPL', 'BUY', 1, 100.0, 0.0, ?, 0.0, '')
+            """,
+            rows,
+        )
+
+    recent = ledger.list_recent_order_rows(
+        limit=2,
+        naive_timezone="America/New_York",
+    )
+
+    assert [row["id"] for row in recent] == ["legacy-newest", "aware-second"]
+
+
+def test_list_recent_order_rows_filters_timestamp_conversion_overflow(
+    ledger: PortfolioLedger,
+) -> None:
+    ledger.initialize()
+    with sqlite3.connect(ledger.db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO orders
+                (id, ticker, side, quantity, fill_price, fees, filled_at, pnl, strategy_tag)
+            VALUES (?, 'AAPL', 'BUY', 1, 100.0, 0.0, ?, 0.0, '')
+            """,
+            [
+                ("valid", "2026-07-22T14:00:00+00:00"),
+                ("underflow", "0001-01-01T00:00:00+14:00"),
+            ],
+        )
+
+    recent = ledger.list_recent_order_rows(limit=1, naive_timezone="UTC")
+
+    assert [row["id"] for row in recent] == ["valid"]
+
+
 # ---------------------------------------------------------------------------
 # get_consecutive_losses
 # ---------------------------------------------------------------------------
