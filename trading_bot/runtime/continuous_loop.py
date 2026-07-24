@@ -20,6 +20,8 @@ from trading_bot.runtime.orchestrator import (
     run_paper_trade,
 )
 from trading_bot.runtime.position_exit import fill_partial_take_profit_position, fill_sell_position
+from trading_bot.learning.experiments.runtime_canary import load_runtime_canary
+from trading_bot.runtime.position_management import evaluate_exit_priority
 from trading_bot.scout import build_scout_candidates
 
 logger = logging.getLogger(__name__)
@@ -268,155 +270,86 @@ def _run_manage_positions_once(
                     position = pos
                     line_parts.append(f"stop_widened {old_stop:.4f}->{min_stop:.4f}")
 
-            # Exit priority 1: EOD exit
-            from trading_bot.runtime.session import now_in_zone, should_eod_exit
-            if should_eod_exit(now_in_zone(settings.app.timezone), settings.session):
-                updated_state = _close_position(
-                    ticker=ticker,
-                    position=position,
-                    broker=broker,
-                    ledger=ledger,
-                    current_price=current_price,
-                    settings=settings,
-                    line_parts=line_parts,
-                    exit_events=exit_events,
-                    log_path=log_path,
-                    reason="eod_exit",
-                    state=state,
-                    bars=intraday_frame,
-                    runtime_canary=runtime_canary,
-                )
-                if updated_state is not None:
-                    state = updated_state
-                continue
-
-            # Exit priority 2: Stop loss
-            if position.stop_loss is not None and current_price <= position.stop_loss:
-                updated_state = _close_position(
-                    ticker=ticker,
-                    position=position,
-                    broker=broker,
-                    ledger=ledger,
-                    current_price=current_price,
-                    settings=settings,
-                    line_parts=line_parts,
-                    exit_events=exit_events,
-                    log_path=log_path,
-                    reason="stop_loss",
-                    state=state,
-                    bars=intraday_frame,
-                    runtime_canary=runtime_canary,
-                )
-                if updated_state is not None:
-                    state = updated_state
-                continue
-
-            # Exit priority 3: Profit target
-            if position.profit_target is not None and current_price >= position.profit_target:
+            def _counter_thesis_check():
                 if (
-                    settings.paper.partial_take_profit_enabled
-                    and not getattr(position, "partial_profit_taken", False)
-                    and position.quantity >= settings.paper.partial_take_profit_min_qty
+                    getattr(settings, "counter_thesis", None) is None
+                    or not settings.counter_thesis.enabled
                 ):
-                    updated_state, event, line = fill_partial_take_profit_position(
-                        ticker=ticker,
-                        position=position,
-                        submitted_at=now,
-                        last_price=current_price,
-                        broker=broker,
-                        ledger=ledger,
-                        state=state,
-                        log_path=log_path,
-                        fraction=settings.paper.partial_take_profit_fraction,
-                        settings=settings,
-                        runtime_canary=runtime_canary,
-                    )
-                    append_decision_event(log_path, event)
-                    line_parts.append(line)
-                    exit_events.append(
-                        {
-                            "ticker": ticker,
-                            "reason": event["reason"],
-                            "quantity": event["quantity"],
-                            "fill_price": event["fill_price"],
-                        }
-                    )
-                else:
-                    updated_state = _close_position(
-                        ticker=ticker,
-                        position=position,
-                        broker=broker,
-                        ledger=ledger,
-                        current_price=current_price,
-                        settings=settings,
-                        line_parts=line_parts,
-                        exit_events=exit_events,
-                        log_path=log_path,
-                        reason="profit_target",
-                        state=state,
-                        bars=intraday_frame,
-                        runtime_canary=runtime_canary,
-                    )
-                if updated_state is not None:
-                    state = updated_state
-                continue
-
-            # Exit priority 4: Time-based exit (stale positions)
-            time_exit_m = settings.session.time_exit_minutes
-            if time_exit_m > 0 and position.entry_at is not None:
-                entry_at = position.entry_at
-                if entry_at.tzinfo is None:
-                    entry_at = entry_at.replace(tzinfo=timezone.utc)
-                held = (now - entry_at).total_seconds() / 60.0
-                if held >= time_exit_m:
-                    updated_state = _close_position(
-                        ticker=ticker,
-                        position=position,
-                        broker=broker,
-                        ledger=ledger,
-                        current_price=current_price,
-                        settings=settings,
-                        line_parts=line_parts,
-                        exit_events=exit_events,
-                        log_path=log_path,
-                        reason=f"time_exit_{int(held)}m",
-                        state=state,
-                        bars=intraday_frame,
-                        runtime_canary=runtime_canary,
-                    )
-                    if updated_state is not None:
-                        state = updated_state
-                    continue
-
-            # Exit priority 5: Counter-thesis exit (V3)
-            if getattr(settings, "counter_thesis", None) is not None and settings.counter_thesis.enabled:
+                    return None
                 signal, _, details = _build_signal_result(ticker, settings)
                 if signal is not None:
                     counter_result = _evaluate_counter_thesis_for_signal(ticker, signal, settings)
                     if counter_result is not None and counter_result.exit_triggered:
-                        updated_state = _close_position(
-                            ticker=ticker,
-                            position=position,
-                            broker=broker,
-                            ledger=ledger,
-                            current_price=current_price,
-                            settings=settings,
-                            line_parts=line_parts,
-                            exit_events=exit_events,
-                            log_path=log_path,
-                            reason="counter_thesis",
-                            state=state,
-                            bars=intraday_frame,
-                            runtime_canary=runtime_canary,
-                        )
-                        if updated_state is not None:
-                            state = updated_state
-                        continue
+                        return counter_result
+                return None
 
-            # Exit priority 6: Trailing stop
-            atr = _fetch_atr(ticker, settings) if settings.risk.use_atr_sizing else None
-            trailing_stop, _ = next_trailing_stop(position, current_price, atr)
-            if trailing_stop is not None and current_price <= trailing_stop:
+            def _trailing_stop_check():
+                atr = _fetch_atr(ticker, settings) if settings.risk.use_atr_sizing else None
+                live_position = state.positions[ticker]
+                trailing_stop, method = next_trailing_stop(live_position, current_price, atr)
+                # Ratchet first: write any tighter stop to state BEFORE the
+                # exit decision is made. Previously this callable only
+                # returned a value when price had dropped below the new
+                # stop, so position.stop_loss was never ratcheted in the
+                # continuous loop while the CLI did ratchet at the same
+                # bar. (Round 1 review fix.)
+                if trailing_stop is not None:
+                    new_high = live_position.highest_high
+                    if new_high is None or current_price > new_high:
+                        new_high = current_price
+                    if (
+                        trailing_stop > (live_position.stop_loss or trailing_stop - 1)
+                        or new_high != live_position.highest_high
+                    ):
+                        state.positions[ticker] = live_position.model_copy(update={
+                            "stop_loss": trailing_stop,
+                            "highest_high": new_high,
+                        })
+                    if current_price <= trailing_stop:
+                        # Signal exit only after ratchet has been written
+                        return trailing_stop, method
+                return None
+
+            from zoneinfo import ZoneInfo
+            from trading_bot.runtime.session import should_eod_exit
+
+            decision = evaluate_exit_priority(
+                position=position,
+                current_price=current_price,
+                settings=settings,
+                now=now,
+                eod_active=should_eod_exit(
+                    now.astimezone(ZoneInfo(settings.app.timezone)), settings.session
+                ),
+                counter_thesis_check=_counter_thesis_check,
+                trailing_stop_check=_trailing_stop_check,
+            )
+            if decision.partial:
+                state, event, line = fill_partial_take_profit_position(
+                    ticker=ticker,
+                    position=position,
+                    submitted_at=now,
+                    last_price=current_price,
+                    broker=broker,
+                    ledger=ledger,
+                    state=state,
+                    log_path=log_path,
+                    fraction=settings.paper.partial_take_profit_fraction,
+                    settings=settings,
+                    runtime_canary=runtime_canary,
+                )
+                append_decision_event(log_path, event)
+                line_parts.append(line)
+                exit_events.append(
+                    {
+                        "ticker": ticker,
+                        "reason": event["reason"],
+                        "quantity": event["quantity"],
+                        "fill_price": event["fill_price"],
+                    }
+                )
+                continue
+            if decision.should_exit:
                 updated_state = _close_position(
                     ticker=ticker,
                     position=position,
@@ -427,7 +360,7 @@ def _run_manage_positions_once(
                     line_parts=line_parts,
                     exit_events=exit_events,
                     log_path=log_path,
-                    reason="trailing_stop",
+                    reason=decision.reason,
                     state=state,
                     bars=intraday_frame,
                     runtime_canary=runtime_canary,
@@ -605,6 +538,11 @@ def run_continuous_loop(
 
         stats.reset_cycle()
 
+        # Load runtime canary once per cycle (Round 1 fix). When no
+        # experiment is in CANARY, this returns None and the trading
+        # paths behave identically to the no-canary contract.
+        runtime_canary = load_runtime_canary(settings, ledger)
+
         try:
             # Phase 1: Build universe
             symbols: list[str] = []
@@ -638,7 +576,9 @@ def run_continuous_loop(
             # Phase 3: Paper trade
             approved_symbols = [c["ticker"] for c in approved]
             if approved_symbols:
-                trade_results = run_paper_trade(approved_symbols, settings, dry_run=dry_run)
+                trade_results = run_paper_trade(
+                    approved_symbols, settings, dry_run=dry_run, runtime_canary=runtime_canary
+                )
                 trade_count = sum(1 for r in trade_results if "FILLED" in r or "DRY_RUN" in r)
                 stats.log_trades(trade_count)
                 logger.info(f"paper_trades executed trades={trade_count} results={len(trade_results)}")
@@ -646,7 +586,9 @@ def run_continuous_loop(
                 logger.info("no_approved_signals skipping_paper_trade")
 
             # Phase 4: Manage positions
-            manage_result = _run_manage_positions_once(settings, ledger)
+            manage_result = _run_manage_positions_once(
+                settings, ledger, runtime_canary=runtime_canary
+            )
             stats.log_exits(manage_result.get("actions", 0))
             logger.info(
                 f"manage_positions positions={manage_result.get('positions', 0)} "
