@@ -1,6 +1,6 @@
 # System Architecture Overview
 
-> Current as of 2026-07-23. When `AGENTS.md` changes in a way that
+> Current as of 2026-07-24. When `AGENTS.md` changes in a way that
 > affects the architecture, update this file in the same commit.
 
 ## Data Flow
@@ -76,6 +76,16 @@ trading_bot/
 └── events/                 # Event primitives (kept for future use;
                             #   not wired into production)
 
+event_engine/               # Standalone installed research/backtest engine
+├── events.py               # Frozen nanosecond event types
+├── handlers.py             # Historical CSV/Parquet/in-memory data
+├── portfolio.py            # Long/short account and margin accounting
+├── execution.py            # Simulated exchange + market impact
+├── strategy.py             # Strategy ABC + Bollinger reversion sample
+├── prefilter.py            # Vectorized NumPy/pandas parameter sweep
+├── engine.py               # Deterministic event-loop driver
+└── analytics.py            # SQN, PSR/DSR, CPCV/PBO, reports, Plotly
+
 ui/
 └── dashboard/              # FastAPI + SSE + Jinja. Canonical rich
                             #   dashboard. The legacy runtime/HTML
@@ -119,9 +129,19 @@ scripts/
 
 See AGENTS.md **Tuning Experiment Controller** section.
 
+### Quantitative Research Validation
+
+- The root `event_engine` package is isolated from live paper execution.
+- Performance analytics include R-multiples, SQN, annualized risk/return,
+  drawdown depth/duration, PSR, and multiple-testing-adjusted DSR.
+- CPCV uses horizon-aware purging/embargo, complete OOS paths, PBO ranks,
+  and a dependence-preserving strategy-label randomization significance test.
+- Markdown summaries and self-contained Plotly equity/drawdown HTML are
+  available through `event_engine.analytics`.
+
 ## Testing
 
-- 1,915 tests collected (network-free, monkeypatch `fetch_bars`; one pre-existing assertion mismatch in `test_run_symbol_backtest_replays_multiple_trade_cycles` predates this session)
+- 2,099 tests pass (network-free, monkeypatch `fetch_bars`); one pre-existing assertion mismatch in `test_run_symbol_backtest_replays_multiple_trade_cycles` remains.
 - Run: `.venv/bin/python -m pytest -q`
 
 ## Configuration

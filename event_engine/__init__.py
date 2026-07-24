@@ -1,6 +1,6 @@
-r"""Event-driven backtesting engine — Stages 1–4 (events + queue,
+r"""Event-driven backtesting engine — Stages 1–5 (events + queue,
 data handler + portfolio + execution handler, plus the strategy
-interface, vectorized pre-filter, and engine driver).
+interface, vectorized pre-filter, engine driver, and quantitative analytics).
 
 This package is a *stand-alone* alternative to the live paper-trading
 event system under ``trading_bot.events``. It uses pure stdlib (plus
@@ -28,6 +28,8 @@ Layout:
   parameter sweeps in pure pandas / NumPy.
 * :mod:`.engine`     — :class:`EngineDriver` orchestrator with
   heartbeat, signal handler, and context-manager ergonomics.
+* :mod:`.analytics`  — performance metrics, PSR/DSR, CPCV/PBO,
+  Markdown reporting, and Plotly equity visualization.
 * :mod:`.exceptions` — typed error hierarchy.
 """
 from event_engine.events import (
@@ -92,6 +94,21 @@ from event_engine.engine import (
     DriverRunResult,
     EngineDriver,
 )
+from event_engine.analytics import (
+    CPCVResult,
+    CombinatorialPurgedCV,
+    DSRDiagnostics,
+    DeflatedSharpeResult,
+    PerformanceAnalytics,
+    PerformanceMetrics,
+    PurgedSplit,
+    SQNResult,
+    SharpeProbabilityResult,
+    apply_embargo,
+    export_equity_curve_html,
+    generate_markdown_summary,
+    purge_overlapping_events,
+)
 
 __all__ = [
     # Stage 1: events + types
@@ -133,6 +150,20 @@ __all__ = [
     "EngineDriver",
     "DriverHeartbeat",
     "DriverRunResult",
+    # Stage 5: quantitative analytics
+    "PerformanceAnalytics",
+    "PerformanceMetrics",
+    "SQNResult",
+    "DSRDiagnostics",
+    "SharpeProbabilityResult",
+    "DeflatedSharpeResult",
+    "CombinatorialPurgedCV",
+    "PurgedSplit",
+    "CPCVResult",
+    "purge_overlapping_events",
+    "apply_embargo",
+    "generate_markdown_summary",
+    "export_equity_curve_html",
     # Errors
     "DataHandlerError",
     "DuplicateOrderIdError",
@@ -148,4 +179,4 @@ __all__ = [
     "UnknownSymbolError",
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

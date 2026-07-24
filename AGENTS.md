@@ -115,13 +115,32 @@ prints a notice and exits non-zero while an experiment is active.
 ```bash
 .venv/bin/python -m pytest -q          # full suite
 .venv/bin/python -m pytest tests/test_kill_switch.py -v
-.venv/bin/python -m pytest tests/test_kill_switch.py -v
+.venv/bin/python -m pytest tests/eventengine_tests -q
 ```
 
 **Requirements:**
 - Tests are deterministic: monkeypatch market data, use `tmp_path` fixtures
 - No real network calls
 - Config: `pytest -ra --strict-markers` (pyproject.toml)
+
+---
+
+## Event-Driven Research Engine
+
+The installed root package `event_engine/` is independent of the live
+`trading_bot.events` surface. It provides immutable nanosecond events,
+historical handlers, portfolio/execution simulation, vectorized parameter
+screening, the event driver, and Stage 5 quantitative validation.
+
+- `event_engine.analytics.PerformanceAnalytics` owns R-multiples, SQN,
+  CAGR, volatility, Sortino, Calmar, and drawdown metrics.
+- `DSRDiagnostics` reports PSR/DSR on per-observation Sharpe values; trial
+  Sharpe inputs must use the same scale as the return sample.
+- `CombinatorialPurgedCV` purges overlapping event horizons, embargoes after
+  label end-times, builds complete CPCV OOS paths, and reports PBO with a
+  strategy-label randomization p-value.
+- Run the synthetic example with `.venv/bin/python -m
+  examples.event_engine_analytics --output-dir artifacts/analytics`.
 
 ---
 
