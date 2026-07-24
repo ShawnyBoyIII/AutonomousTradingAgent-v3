@@ -27,7 +27,6 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 from trading_bot.learning.experiments.models import MetricSet, ParameterChange
 
@@ -238,24 +237,17 @@ class ShadowLedger:
 class PairedShadowHarness:
     """Independent paired broker: baseline vs. candidate.
 
-    The harness supports two related APIs:
+    The harness supports ``record_entry`` / ``record_exit`` — exact-quantity
+    mirroring used by the runtime canary. Callers pass the *baseline*
+    quantity (pre-policy size) and the *candidate* quantity (actual
+    filled size, post-policy). The harness never applies a multiplier
+    internally, so the runtime executor remains the only place that
+    decides sizing.
 
-    1. ``record_entry`` / ``record_exit`` — exact-quantity mirroring used by
-       the runtime canary. Callers pass the *baseline* quantity (pre-policy
-       size) and the *candidate* quantity (actual filled size, post-policy).
-       The harness never applies a multiplier internally, so the runtime
-       executor remains the only place that decides sizing.
-
-    2. ``record_paired`` — legacy compatibility wrapper kept for the
-       existing ``tests/test_paired_shadow_lifecycle.py``. It derives
-       baseline and candidate quantities by multiplying ``raw_quantity``
-       against ``baseline_multiplier`` and ``candidate_multiplier``. New
-       code should prefer ``record_entry``.
-
-    In either mode, exits derive the baseline SELL quantity from the
-    fraction of the candidate position sold; a final exit closes both
-    ledgers fully. The canary gate compares ``candidate_metrics()``
-    against ``baseline_metrics()`` at the decision boundary.
+    Exits derive the baseline SELL quantity from the fraction of the
+    candidate position sold; a final exit closes both ledgers fully.
+    The canary gate compares ``candidate_metrics()`` against
+    ``baseline_metrics()`` at the decision boundary.
     """
 
     def __init__(
@@ -391,56 +383,3 @@ class PairedShadowHarness:
 
     def closed_trade_counts_match(self) -> bool:
         return self.candidate.metrics().trades == self.baseline.metrics().trades
-
-    def record_paired(
-        self,
-        ticker: str,
-        side: Literal["BUY", "SELL"],
-        raw_quantity: int,
-        fill_price: float,
-        fees: float,
-    ) -> None:
-        """Legacy compatibility wrapper around ``record_entry``/``record_exit``.
-
-        Mirrors ``raw_quantity`` against the configured multipliers so the
-        existing ``tests/test_paired_shadow_lifecycle.py`` suite stays
-        green. New code should call ``record_entry`` directly and supply
-        exact pre/post-policy quantities.
-        """
-        if raw_quantity <= 0:
-            return
-        if side == "BUY":
-            baseline_qty = max(1, int(round(raw_quantity * self.baseline_multiplier)))
-            candidate_qty = max(1, int(round(raw_quantity * self.candidate_multiplier)))
-            self.record_entry(
-                ticker=ticker,
-                baseline_quantity=baseline_qty,
-                candidate_quantity=candidate_qty,
-                fill_price=fill_price,
-                fees=fees,
-            )
-            return
-        # Legacy SELL semantics: both ledgers record the same raw quantity.
-        # We do NOT call record_exit here because that derives the baseline
-        # size from the candidate-side fraction; the existing lifecycle
-        # tests rely on symmetric sizing instead.
-        self.baseline.record(
-            ShadowFill(
-                ticker=ticker,
-                side="SELL",
-                quantity=raw_quantity,
-                fill_price=fill_price,
-                fees=fees,
-                applied_multiplier=self.baseline_multiplier,
-            )
-        )
-        self.candidate.record(
-            ShadowFill(
-                ticker=ticker,
-                side="SELL",
-                quantity=raw_quantity,
-                fill_price=fill_price,
-                fees=fees,
-                applied_multiplier=self.candidate_multiplier,
-            )
-        )

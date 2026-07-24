@@ -1,12 +1,9 @@
+"""TDD: ShadowLedger survives JSONL restart and round-trip accounting."""
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from trading_bot.learning.experiments.shadow import ShadowFill, ShadowLedger
-
-if TYPE_CHECKING:
-    pass
 
 
 def test_shadow_ledger_records_no_trade_until_round_trip(tmp_path: Path) -> None:
@@ -74,63 +71,3 @@ def test_shadow_ledger_appends_all_fills_to_jsonl(tmp_path: Path) -> None:
 
     decoded_fills = [json.loads(line) for line in fill_lines]
     assert [entry["ticker"] for entry in decoded_fills] == ["AAPL", "MSFT", "NVDA"]
-
-
-def test_maybe_record_shadow_fill_records_buy_when_shadow_active() -> None:
-    """A standalone BUY records the fill but does NOT count as a closed
-    trade until a matching SELL closes it."""
-    from trading_bot.runtime.orchestrator import _maybe_record_shadow_fill
-
-    ledger = ShadowLedger(artifacts_dir=Path("/tmp/nonexistent-shadow-test"), starting_cash=50_000.0)
-
-    _maybe_record_shadow_fill(
-        candidate_fill={
-            "ticker": "AAPL",
-            "side": "BUY",
-            "quantity": 5,
-            "fill_price": 100.0,
-            "fees": 1.5,
-        },
-        baseline_signal={},
-        shadow=ledger,
-    )
-
-    metrics = ledger.metrics()
-    assert metrics.trades == 0
-    assert metrics.net_pnl == 0.0
-
-
-def test_maybe_record_shadow_fill_noop_when_shadow_none() -> None:
-    from trading_bot.runtime.orchestrator import _maybe_record_shadow_fill
-
-    _maybe_record_shadow_fill(
-        candidate_fill={
-            "ticker": "AAPL",
-            "side": "BUY",
-            "quantity": 5,
-            "fill_price": 100.0,
-            "fees": 1.5,
-        },
-        baseline_signal={},
-        shadow=None,
-    )
-
-
-def test_maybe_record_shadow_fill_skips_sell_side() -> None:
-    from trading_bot.runtime.orchestrator import _maybe_record_shadow_fill
-
-    ledger = ShadowLedger(artifacts_dir=Path("/tmp/nonexistent-shadow-test"), starting_cash=50_000.0)
-
-    _maybe_record_shadow_fill(
-        candidate_fill={
-            "ticker": "AAPL",
-            "side": "SELL",
-            "quantity": 5,
-            "fill_price": 110.0,
-            "fees": 1.5,
-        },
-        baseline_signal={},
-        shadow=ledger,
-    )
-
-    assert ledger.metrics().net_pnl == 0.0

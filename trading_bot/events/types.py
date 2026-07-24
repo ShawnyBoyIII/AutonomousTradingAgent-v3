@@ -25,9 +25,7 @@ class EventType(str, Enum):
     PORTFOLIO_STATE = "PORTFOLIO_STATE"
     PORTFOLIO_EQUITY = "PORTFOLIO_EQUITY"
     PORTFOLIO_PNL = "PORTFOLIO_PNL"
-    MONITORING_HEALTH = "MONITORING_HEALTH"
     MONITORING_LATENCY = "MONITORING_LATENCY"
-    MONITORING_ALERT = "MONITORING_ALERT"
     COUNTER_THESIS = "COUNTER_THESIS"
     SYSTEM_TICK = "SYSTEM_TICK"
     SYSTEM_HEARTBEAT = "SYSTEM_HEARTBEAT"
@@ -210,26 +208,12 @@ class PortfolioPnLEvent(Event):
     total_return_pct: float = 0.0
 
 
-class MonitoringHealthEvent(Event):
-    event_type: str = EventType.MONITORING_HEALTH
-    status: str = "ok"
-    checks: dict[str, bool] = Field(default_factory=dict)
-    uptime_seconds: float = 0.0
-
-
 class MonitoringLatencyEvent(Event):
     event_type: str = EventType.MONITORING_LATENCY
     component: str = ""
     latency_ms: float = 0.0
     threshold_ms: float = 0.0
     exceeded: bool = False
-
-
-class MonitoringAlertEvent(Event):
-    event_type: str = EventType.MONITORING_ALERT
-    severity: str = "info"
-    message: str = ""
-    component: str = ""
 
 
 class CounterThesisEvent(Event):

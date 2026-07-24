@@ -109,7 +109,7 @@ class AbstractDataHandler(ABC):
 
     @abstractmethod
     def stream(self, queue: EventQueue) -> Iterator[MarketEvent]:
-        """Generator that emits MarketEvent instances in merged chronological order.
+        """Generator that emits MarketEvent instances in merged
         chronological order. Each yielded event is also ``put`` on
         ``queue`` before ``stream`` advances the simulator clock.
 
@@ -117,6 +117,13 @@ class AbstractDataHandler(ABC):
         on each iteration; callers can pause/resume mid-stream by
         iterating ``stream`` synchronously and resuming the iterator.
         """
+
+    @abstractmethod
+    def reset(self) -> None:
+        """Reset per-run state — ``cursor_ns``, per-symbol
+        ``latest_emitted`` caches, and any in-flight iteration.
+        Called by ``EngineDriver.reset()`` between runs so the same
+        data can be replayed cleanly."""
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +294,19 @@ class HistoricCSVDataHandler(AbstractDataHandler):
     without writing to disk. Multiple registrations for the same
     symbol raise :class:`DataHandlerError`.
     """
+
+    def reset(self) -> None:
+        """Reset the simulator cursor so ``stream`` can be replayed.
+
+        Clears :attr:`_cursor_ns` and :attr:`_latest_emitted`, and
+        walks every registered series to put its per-symbol cursor
+        back to zero. After this call, the next ``stream`` invocation
+        pushes every bar from the start.
+        """
+        self._cursor_ns = None
+        self._latest_emitted.clear()
+        for series in self._series.values():
+            series._cursor = 0
 
     def __init__(self) -> None:
         self._series: dict[str, _AssetSeries] = {}

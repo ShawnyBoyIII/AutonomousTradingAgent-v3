@@ -1,12 +1,13 @@
-r"""Event-driven backtesting engine — Stage 1 (events + queue),
-Stage 2 (data handler + portfolio accounting), and Stage 3
-(execution handler with microstructure frictions).
+r"""Event-driven backtesting engine — Stages 1–4 (events + queue,
+data handler + portfolio + execution handler, plus the strategy
+interface, vectorized pre-filter, and engine driver).
 
 This package is a *stand-alone* alternative to the live paper-trading
 event system under ``trading_bot.events``. It uses pure stdlib (plus
-``numpy`` for the data handler) and dataclass-with-slots events
-instead of Pydantic, so backtests can be expressed without taking
-on the live trading pipeline's runtime dependencies.
+``numpy`` and ``pandas`` for the data handler and pre-filter) and
+dataclass-with-slots events instead of Pydantic, so backtests can
+be expressed without taking on the live trading pipeline's runtime
+dependencies.
 
 Layout:
 
@@ -21,6 +22,12 @@ Layout:
 * :mod:`.execution`  — :class:`ExchangeHandler` ABC and the
   concrete :class:`SimulatedExecutionHandler` with Almgren-Chriss
   market impact, limit/stop order simulation, and partial fills.
+* :mod:`.strategy`   — :class:`AbstractStrategy` interface and the
+  :class:`BollingerZScoreReversionStrategy` sample.
+* :mod:`.prefilter`  — :class:`VectorizedPreFilter` for fast
+  parameter sweeps in pure pandas / NumPy.
+* :mod:`.engine`     — :class:`EngineDriver` orchestrator with
+  heartbeat, signal handler, and context-manager ergonomics.
 * :mod:`.exceptions` — typed error hierarchy.
 """
 from event_engine.events import (
@@ -71,6 +78,20 @@ from event_engine.execution import (
     temporary_impact_per_unit,
 )
 from event_engine.queue import EventQueue
+from event_engine.strategy import (
+    AbstractStrategy,
+    BollingerZScoreReversionStrategy,
+)
+from event_engine.prefilter import (
+    PreFilterParameterScore,
+    PreFilterResult,
+    VectorizedPreFilter,
+)
+from event_engine.engine import (
+    DriverHeartbeat,
+    DriverRunResult,
+    EngineDriver,
+)
 
 __all__ = [
     # Stage 1: events + types
@@ -103,12 +124,21 @@ __all__ = [
     "temporary_impact_per_unit",
     "square_root_impact_per_unit",
     "decompose_impact",
+    # Stage 4: strategy / prefilter / engine
+    "AbstractStrategy",
+    "BollingerZScoreReversionStrategy",
+    "VectorizedPreFilter",
+    "PreFilterParameterScore",
+    "PreFilterResult",
+    "EngineDriver",
+    "DriverHeartbeat",
+    "DriverRunResult",
     # Errors
     "DataHandlerError",
     "DuplicateOrderIdError",
     "EventEngineError",
     "EventValidationError",
-    "ExecutionError" if False else "InsufficientCapitalError",  # placeholder
+    "ExecutionError",
     "InsufficientLiquidityError",
     "PointInTimeLeakError",
     "QueueError",
@@ -118,4 +148,4 @@ __all__ = [
     "UnknownSymbolError",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"
