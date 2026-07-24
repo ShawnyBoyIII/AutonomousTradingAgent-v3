@@ -1,7 +1,14 @@
 # 2026-07-08 Open Day — Trading Diagnostics Post-Mortem
 
-> **Status:** Market open since 09:30. **0 fills** as of 10:16 ET.
-> **Burn-in alive** (fire-mode). **1d backfill alive** (24,268 daily partitions, oldest 2024-07-16).
+> **Historical.** This postmortem is retained as a record of the
+> 2026-07-08 trading session. The cleanup checklist at the bottom of
+> the original version has been actioned and superseded by later
+> recovery-branch work. The open items are tracked in
+> `AGENTS.md` and the SDD progress ledger, not here.
+>
+> **Day-of status snapshot:** Market open since 09:30. **0 fills**
+> as of 10:16 ET. Burn-in alive (fire-mode). **1d backfill alive**
+> (24,268 daily partitions, oldest 2024-07-16).
 
 ## TL;DR
 
@@ -82,17 +89,18 @@ providers: [polygon, alpaca, yfinance]
 
 ---
 
-## Post-market cleanup checklist
+## What happened to the cleanup checklist
 
-After 16:00 ET close, in order:
+The original postmortem listed 7 items under
+"Post-market cleanup checklist". Most were reverted by the next
+session, then re-loosened the next day for further burn-in
+experiments. The remaining structural items (per-interval EOD
+marker, NO_SIGNAL reason label) were addressed by later work in
+the recovery branch (commit `0d4d62e` and follow-ups).
 
-- [ ] **Revert `min_entry_confluence_score`** in `burn-in-config.yaml:8` → `1.0`
-- [ ] **Revert `validate_data`** in `burn-in-config.yaml:20` → `true`
-- [ ] **Revert `validate_data`** in `config.yaml:17` → `true`
-- [ ] **Revert `max_consecutive_losses`** in `burn-in-config.yaml:34` → `5`
-- [ ] **Optional**: investigate whether the 5-loss streak today was "real" or noise; consider tuning before tomorrow's open
-- [ ] **Address the marker bug** in `trading_bot/cli/app.py:2019` and `auto-burn-in.sh` — marker should be per-interval, not per-date. Currently `1d` backfill's marker blocks `1m` backfill for the same date.
-- [ ] **Fix bash label** in `auto-burn-in.sh` — line that emits `"No signal: X (stale data)"` should reflect actual reason (parse `NO_SIGNAL reason=...` from paper-trade output).
+The current operational reality lives in `AGENTS.md` (see
+**Tuning Experiment Controller**, **Dual Evaluation Windows**, and
+**Conditional Entry Policy** sections).
 
 ---
 

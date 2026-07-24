@@ -1,5 +1,14 @@
 # Remediation Plan — Trading Bot Loose Ends
 
+> **Historical.** Most items below were addressed during the
+> July 2026 cleanup passes (recovery branch hardening and
+> application reachability review). This file is retained as a
+> change-log reference.
+>
+> Current operational reality lives in **`AGENTS.md`**. New defects
+> and follow-ups belong in the SDD progress ledger or as
+> follow-up commits — not here.
+
 Status legend: [DONE] completed · [READY] actionable now · [DESIGN] needs design decision first · [WATCH] monitor, low priority
 
 ---
@@ -12,7 +21,7 @@ Status legend: [DONE] completed · [READY] actionable now · [DESIGN] needs desi
 **Fix applied:** `trading_bot/db/session.py:13` now returns `Path(settings.app.state_db_path).resolve()`, matching `PortfolioLedger`. Verified: 1997 passing (1 pre-existing RL failure unrelated).
 **Effort:** done — 1 line.
 
-### 2. [READY] Dual-write to `orders` + `trades` without a transaction
+### 2. [DONE] Dual-write to `orders` + `trades` without a transaction
 **Problem:** Every BUY/SELL persists via two independent writes: `ledger.record_fill` (raw sqlite3, `orders` table) and `upsert_trade`/`update_trade_exit` (SQLAlchemy, `trades` table). A crash between them leaves the tables divergent.
 **Impact:** `get_consecutive_losses` reads `orders`; PF reports read `trades`. Same closed trade can show different P&L in each view; circuit breaker's loss count drifts from attribution.
 **Fix approach:** Route both writes through a single transactional boundary. Either (a) make `upsert_trade` a no-op if `record_fill` failed (gate on a shared return code), or (b) collapse to one persistence layer. Lowest-risk: have `_persist_trade_to_db` and `position_exit.py:48-91` check `record_fill`'s success first and skip the SQLA write on failure (rather than silently swallowing). Stop swallowing exceptions at `orchestrator.py:2591` — log them.
@@ -26,14 +35,14 @@ Status legend: [DONE] completed · [READY] actionable now · [DESIGN] needs desi
 **Files:** `trading_bot/safety/circuit_breaker.py:21`, `trading_bot/monitoring/realtime_pnl.py:315`, `trading_bot/portfolio/ledger.py` (add a `compute_profit_factor` method).
 **Effort:** S-M (PF computation already exists in `monitoring/realtime_pnl.py`; just wire it through the breaker).
 
-### 4. [READY] Two divergent `manage-positions` implementations
+### 4. [DONE] Two divergent `manage-positions` implementations
 **Problem:** `cli/app.py:603` `_run_manage_positions_once` and `runtime/continuous_loop.py:159` `_run_manage_positions_once` (docstring admits "Mirrors…") diverge: (a) CLI ratchets trailing stop then `continue`s (exits next cycle); continuous-loop exits immediately; (b) CLI evaluates counter-thesis against the held position; continuous-loop gates on `if signal is not None` (today's fresh scan) and skips exit if today produced no signal.
 **Impact:** Trailing-stop exits are delayed in CLI mode. Counter-thesis broken-thesis exits are skipped in continuous-loop mode whenever today's scan is empty. Same command name, different risk exposure.
 **Fix approach:** Delete one and have both CLI and continuous-loop call the same function. Keep `cli/app.py`'s version as canonical (it handles counter-thesis correctly against the held position, which is the ADR-001 intent). Have `continuous_loop.py` import and call it. Make the trailing-stop exit immediate in the unified function.
 **Files:** `trading_bot/cli/app.py:603`, `trading_bot/runtime/continuous_loop.py:159`.
 **Effort:** M (de-duplicate carefully — the two share helpers but differ in session/loop plumbing).
 
-### 5. [READY] Counter-thesis fetches unvalidated bars, and runs twice per cycle
+### 5. [DONE] Counter-thesis fetches unvalidated bars, and runs twice per cycle
 **Problem:** `fetch_counter_thesis_context` (`counter_thesis.py:141-150`) uses `market_data.fetch_bars` instead of `fetch_and_validate_bars`, bypassing V2.5 fail-fast validation. Also `_evaluate_counter_thesis_for_signal` (`orchestrator.py:2292`) and `_evaluate_counter_thesis_for_position` (`orchestrator.py:2309`) each fetch daily+intraday bars independently per symbol.
 **Impact:** Bad data silently flows into counter-thesis checks; mitigated only by the "None context = no block" fallback. Double-fetch doubles network calls during scan + manage-positions.
 **Fix approach:** Switch `fetch_counter_thesis_context` to `fetch_and_validate_bars`. Cache the counter-thesis context per symbol per `run_scan`/`run_paper_trade`/`_run_manage_positions_once` invocation and pass it to both the signal and position evaluators.
@@ -44,7 +53,7 @@ Status legend: [DONE] completed · [READY] actionable now · [DESIGN] needs desi
 
 ## P1 — Latent bugs / silent drift
 
-### 6. [READY] Portfolio heat frozen per `run_paper_trade` invocation
+### 6. [DONE] Portfolio heat frozen per `run_paper_trade` invocation
 **Problem:** `portfolio_heat` computed once at `orchestrator.py:766` before the symbol loop; never refreshed as fills mutate `state.equity`/`cash` inside the loop.
 **Impact:** The 6th fill's heat check uses stale heat from before fills 1-5.
 **Fix approach:** Move `portfolio_heat = _calculate_portfolio_heat(state, settings)` inside the per-symbol loop (or recompute when `state` is replaced at `orchestrator.py:1139`).
@@ -58,7 +67,7 @@ Status legend: [DONE] completed · [READY] actionable now · [DESIGN] needs desi
 **Files:** `trading_bot/risk/position_sizer.py:6`, `trading_bot/risk/risk_manager.py:99-120`.
 **Effort:** S-M (decision + tests).
 
-### 8. [READY] `min_stop_distance_pct` defaults to 0.0
+### 8. [DONE] `min_stop_distance_pct` defaults to 0.0
 **Problem:** `settings.py:114` defaults to `0.0`; AGENTS.md mandates "5% minimum stop distance on 5-minute bars." Rule only activates if `burn-in-config.yaml` sets it. Any path run without that config silently disables the noise protection.
 **Fix approach:** Either change the default to `3.0`/`5.0` (matching the AGENTS.md mandate), or assert at loader time that burn-in configs override it. Default change is safer; add a test that enforces it.
 **Files:** `trading_bot/config/settings.py:114`, `trading_bot/strategy/strategy_selector.py:377`.
@@ -71,7 +80,7 @@ Status legend: [DONE] completed · [READY] actionable now · [DESIGN] needs desi
 **Files:** `trading_bot/runtime/orchestrator.py:1311`.
 **Effort:** M.
 
-### 10. [READY] `realized_pnl=-fees` only on BUYs; `unrealized_pnl=0.0` hardcoded
+### 10. [DONE] `realized_pnl=-fees` only on BUYs; `unrealized_pnl=0.0` hardcoded
 **Problem:** `_portfolio_state_from_broker` (`orchestrator.py:2170-2171`) sets `realized_pnl = previous.realized_pnl - fill_fees` and `unrealized_pnl = 0.0`. Equity snapshots post-BUY never reflect open-position mark-to-market until the next `manage-positions` tick.
 **Impact:** `equity_history` rows chronicle cash-realized P&L, not mark-to-market. Reporting between trades is misleading.
 **Fix approach:** Compute `unrealized_pnl` from `positions × (last_price - average_cost)` in `_portfolio_state_from_broker` using the fill's entry price (conservative — no extra fetch).
@@ -96,16 +105,16 @@ Status legend: [DONE] completed · [READY] actionable now · [DESIGN] needs desi
 
 ## P2 — Dead code / stale docs / cosmetic
 
-### 13. [READY] Dead advisory outputs
+### 13. [DONE] Dead advisory outputs
 **Problem:** `state/advisory_learner/recommendations.{main_midcap,cheap_stocks}.json` are written (`learner.py:116-117`) but never read by production code (only tests).
 **Fix:** Delete the writes or wire them in. Delete is safer.
 **Files:** `trading_bot/advisory/learner.py:43-44, 116-117`.
 
-### 14. [READY] Dead functions
+### 14. [DONE] Dead functions
 **Problem:** `_portfolio_state_after_sell` (`cli/app.py:1749`), `update_burn_in_symbols` / `create_watchlist_from_breakouts` (`dynamic_watchlist.py:381, 414`), `_short_swarm_decision` (`orchestrator.py:2625`).
 **Fix:** Delete.
 
-### 15. [READY] Stale comments / docstrings
+### 15. [DONE] Stale comments / docstrings
 **Problem:** (a) `auto-burn-in.sh:371` says "V3 + RL + Swarm" but RL is disabled; (b) `cli/app.py:791` exit-priority comment omits `time_exit`; (c) `continuous_loop.py:397, 421` duplicate "priority 5"; (d) `SwarmSettings` docstring claims size-modifier only in `parallel` mode but code applies whenever `swarm.enabled`.
 **Fix:** Update all four.
 
@@ -113,7 +122,7 @@ Status legend: [DONE] completed · [READY] actionable now · [DESIGN] needs desi
 **Problem:** `supermodel.py:165` — a single-source BUY with lean supporting evidence is blocked rather than treated as neutral.
 **Fix:** Change default to `"no_signal"` (or expose as a config switch). Needs a quick design check — was the conservatism intentional?
 
-### 17. [READY] `init_db` ALTER TABLE migrations swallow all exceptions
+### 17. [DONE] `init_db` ALTER TABLE migrations swallow all exceptions
 **Problem:** `db/session.py:51-52` `except Exception: pass` masks migration failures beyond "column exists."
 **Fix:** Catch `OperationalError` only (SQLite's "duplicate column") and re-raise other errors.
 

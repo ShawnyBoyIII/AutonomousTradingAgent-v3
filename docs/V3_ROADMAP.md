@@ -1,5 +1,12 @@
 # V3 Roadmap: Robinhood Shadow Integration
 
+> **Historical.** All V3.1 tasks (Tasks 1-3) and most V3.2 tasks
+> (Tasks 4-6) have shipped as the Robinhood MCP boundary plus the
+> local intent-log layer. Live order placement was deferred — V3
+> remains read-only by design. New Robinhood work should add to the
+> MCP boundary, not the legacy direct-auth path that this roadmap
+> originally described.
+
 ## Goal
 Read-only integration with Robinhood for account sync, market data parity, and shadow trading. **No live order placement.** This is the bridge between paper trading (V2) and live trading (V4).
 

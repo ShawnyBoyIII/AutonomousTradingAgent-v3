@@ -1,8 +1,13 @@
 # V3 Implementation Progress
 
-> Historical doc. Many sections below describe superseded direct-auth Robinhood work.
-> Current supported Robinhood path: MCP/operator-managed snapshots plus local intent logs.
-> Current CLI surface: `robinhood-status`, `sync-account`, `sync-positions`, `reconcile-positions`.
+> **Historical.** Many sections below describe superseded direct-auth
+> Robinhood work and intermediate dashboard iterations. The current
+> supported Robinhood path is the MCP / operator-managed snapshot
+> boundary plus local intent logs. The current CLI surface is
+> `robinhood-status`, `sync-account`, `sync-positions`, and
+> `reconcile-positions`. The canonical dashboard is `ui/dashboard/`
+> (FastAPI + SSE + Jinja), served by `./tradebot-local serve` or the
+> `auto-burn-in.sh` sidecar on port 8080.
 
 ## ✅ Completed (Ready for Testing)
 
