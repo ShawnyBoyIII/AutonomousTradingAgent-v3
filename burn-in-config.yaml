@@ -8,6 +8,7 @@ app:
   min_entry_confluence_score: 0.0  # TEMP FIRE MODE 2026-07-09 (user said "loosen the guardrails"); permits any signal the V3 selector produces; see AGENTS.md.
   signal_mode: "parallel"
   min_timeframe_alignment: 1
+  dashboard_port: 8080
 
 market_data:
   provider: polygon
