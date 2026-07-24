@@ -10,6 +10,7 @@
 /trained_models/
 /ui/
 /.opencode/
+/.worktrees/
 /Volumes/
 /gpu_run_*/
 /state/rl_logs/gpu_run_*/
