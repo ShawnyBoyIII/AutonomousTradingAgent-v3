@@ -33,3 +33,4 @@ include = ["trading_bot*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
+pythonpath = ["."]  # so stand-alone packages (e.g. event_engine) are importable.

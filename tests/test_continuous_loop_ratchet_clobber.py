@@ -80,12 +80,13 @@ def manage_positions_env(monkeypatch, tmp_path):
     )
 
     # Synthetic 1-bar frame at price=115 (above highest_high=110).
-    # next_trailing_stop should compute:
-    #   candidate = 115 - 5 = 110; 110 >= 100 (entry) and 110 > 95 (current)
-    #   so the ratchet proposes stop_loss=110.
+    # The bar must be fresh (< 5 minutes old) or the staleness check
+    # in ``_run_manage_positions_once`` skips the ticker before any
+    # trailing-stop logic fires. Using ``now`` plus a tiny offset.
+    bar_ts = pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=10)
     frame = pd.DataFrame(
         {"close": [115.0], "high": [115.0], "low": [114.0], "volume": [1000]},
-        index=pd.DatetimeIndex([pd.Timestamp("2026-07-24 13:30:00", tz="UTC")]),
+        index=pd.DatetimeIndex([bar_ts]),
     )
     monkeypatch.setattr(
         continuous_loop.market_data,

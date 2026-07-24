@@ -82,10 +82,12 @@ def exit_env(monkeypatch, tmp_path):
     # Bar 1: price=115 (above highest_high). Forces the ratchet to fire.
     # next_trailing_stop computes candidate = 115 - 5 = 110 -> ratchet to 110.
     # The trailing_check returns None (since 115 > 110), so the position
-    # survives and the ratchet lands on disk.
+    # survives and the ratchet lands on disk. Bar must be fresh
+    # (< 5 minutes old) for the staleness check in
+    # ``_run_manage_positions_once`` to let it through.
     bar1 = pd.DataFrame(
         {"close": [115.0], "high": [115.0], "low": [114.0], "volume": [1000]},
-        index=pd.DatetimeIndex([pd.Timestamp("2026-07-24 13:30:00", tz="UTC")]),
+        index=pd.DatetimeIndex([pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=10)]),
     )
 
     def _drive_bar(frame):
@@ -130,11 +132,11 @@ def test_trailing_stop_close_uses_post_ratchet_position(exit_env):
         "fixture precondition: bar 1 must ratchet stop to 110"
     )
 
-    # Bar 2: price=100, below ratcheted stop. trailing_stop_check should
-    # fire. The close path needs to operate on the ratcheted state.
+    # Bar 2: price=100, below ratcheted stop. The bar must be fresh
+    # (< 5 minutes old) or the staleness check skips this ticker.
     bar2 = pd.DataFrame(
         {"close": [100.0], "high": [100.0], "low": [99.0], "volume": [1000]},
-        index=pd.DatetimeIndex([pd.Timestamp("2026-07-24 13:35:00", tz="UTC")]),
+        index=pd.DatetimeIndex([pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=5)]),
     )
     exit_env["drive_bar"](bar2)
 
@@ -169,7 +171,7 @@ def test_trailing_stop_close_passes_posthoc_ratchet_fields(exit_env):
 
     bar2 = pd.DataFrame(
         {"close": [100.0], "high": [100.0], "low": [99.0], "volume": [1000]},
-        index=pd.DatetimeIndex([pd.Timestamp("2026-07-24 13:35:00", tz="UTC")]),
+        index=pd.DatetimeIndex([pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=5)]),
     )
     exit_env["drive_bar"](bar2)
     cl._run_manage_positions_once(settings, ledger, runtime_canary=None)

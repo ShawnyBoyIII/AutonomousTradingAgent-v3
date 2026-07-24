@@ -313,8 +313,16 @@ def _run_manage_positions_once(
             from zoneinfo import ZoneInfo
             from trading_bot.runtime.session import should_eod_exit
 
+            # Re-read live position from state BEFORE evaluate_exit_priority.
+            # If the trailing-stop closure writes a ratcheted stop_loss
+            # during this call, ``live_position`` will reflect it on the
+            # next iteration; but the *current* iteration still needs to
+            # see the tightened stop if the ratchet fires mid-call (e.g.
+            # price dropped below a ratcheted stop). Pass live_position
+            # so the evaluator's stop_loss check uses the freshest value.
+            live_position = state.positions[ticker]
             decision = evaluate_exit_priority(
-                position=position,
+                position=live_position,
                 current_price=current_price,
                 settings=settings,
                 now=now,
@@ -324,15 +332,6 @@ def _run_manage_positions_once(
                 counter_thesis_check=_counter_thesis_check,
                 trailing_stop_check=_trailing_stop_check,
             )
-            # Re-read live position AFTER evaluate_exit_priority returns.
-            # The trailing-stop closure above may have mutated
-            # state.positions[ticker] (ratchet). Without this re-read, the
-            # close / partial paths receive a stale position object that
-            # no longer matches the live state. Currently the ratchet
-            # only mutates stop_loss and highest_high — neither
-            # consumed by fill_sell_position — so this is a latent
-            # issue rather than a production regression today.
-            live_position = state.positions[ticker]
             if decision.partial:
                 state, event, line = fill_partial_take_profit_position(
                     ticker=ticker,
