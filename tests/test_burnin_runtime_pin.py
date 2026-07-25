@@ -173,9 +173,19 @@ def test_wrapper_uses_pin_dir_when_set(tmp_path: Path, monkeypatch: pytest.Monke
     snapshot = capture_snapshot(REPO_ROOT, pin_dir)
     pinned_wrapper = snapshot.wrapper_path
 
-    # Replace the snapshot's venv python with a stub that records
-    # PYTHONPATH and the resolved trading_bot.__file__. The wrapper
-    # will pick up this stub via ``$ROOT_DIR/.venv/bin/python``.
+    # ``snapshot.python_executable`` is a symlink into the live
+    # ``.venv`` by default so production runs work without copying
+    # GB of packages. Tests cannot write through that symlink or
+    # they will corrupt the live interpreter. Replace the symlink
+    # with a regular directory and a stub script so we can drive
+    # the wrapper without touching the live venv.
+    snapshot_bin = snapshot.python_executable.parent
+    snapshot_bin.mkdir(parents=True, exist_ok=True)
+    if snapshot.python_executable.is_symlink() or snapshot.python_executable.exists():
+        if snapshot.python_executable.is_symlink():
+            snapshot.python_executable.unlink()
+        elif snapshot.python_executable.is_file():
+            snapshot.python_executable.unlink()
     stub_py = snapshot.python_executable
     stub_py.write_text(
         "#!/usr/bin/env python3\n"
