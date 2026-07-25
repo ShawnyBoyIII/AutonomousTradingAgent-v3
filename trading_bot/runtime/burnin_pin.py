@@ -161,19 +161,29 @@ def capture_snapshot(
         archive_path.unlink(missing_ok=True)
 
     # Always create the .venv directory layout so the wrapper can
-    # resolve ``$ROOT_DIR/.venv/bin/python``. We only create the
-    # ``bin`` directory; the test suite (and most callers) will
-    # overwrite ``bin/python`` with a stub. Copying the full venv
-    # is unnecessary — the wrapper only needs the directory tree to
-    # exist before invoking ``$PYTHON_BIN``. If ``BURNIN_PIN_COPY_VENV``
-    # is set, we copy the full venv (useful for production).
+    # resolve ``$ROOT_DIR/.venv/bin/python``. By default we symlink
+    # the live .venv into the snapshot — the snapshot's source files
+    # are the security boundary, not the interpreter. Tests opt out
+    # of the symlink by clearing ``BURNIN_PIN_USE_LIVE_VENV``.
     src_venv = repo_root / ".venv"
     dst_venv = snapshot_root / ".venv"
-    (dst_venv / "bin").mkdir(parents=True, exist_ok=True)
-    if src_venv.exists() and os.environ.get("BURNIN_PIN_COPY_VENV"):
-        if dst_venv.exists():
-            shutil.rmtree(dst_venv)
-        shutil.copytree(src_venv, dst_venv, symlinks=True)
+    if src_venv.exists() and os.environ.get("BURNIN_PIN_USE_LIVE_VENV", "1") == "1":
+        # Symlink the live venv into the snapshot. We use absolute
+        # symlinks so the snapshot is portable across worktrees.
+        if dst_venv.exists() or dst_venv.is_symlink():
+            if dst_venv.is_symlink():
+                dst_venv.unlink()
+            else:
+                shutil.rmtree(dst_venv)
+        dst_venv.symlink_to(src_venv.resolve())
+    else:
+        # Stub directory so the wrapper's path check passes during
+        # test extraction; the test stubs ``bin/python`` itself.
+        (dst_venv / "bin").mkdir(parents=True, exist_ok=True)
+        if src_venv.exists() and os.environ.get("BURNIN_PIN_COPY_VENV"):
+            if dst_venv.exists():
+                shutil.rmtree(dst_venv)
+            shutil.copytree(src_venv, dst_venv, symlinks=True)
 
     # Recompute the fingerprint with the operator-provided globs so the
     # caller can extend it. The base implementation hashes a small set
