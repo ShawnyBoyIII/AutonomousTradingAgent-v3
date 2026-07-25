@@ -33,3 +33,8 @@ __pycache__/
 # Workspace-local state (CortexKit magic-context + test fixture sandbox)
 .cortexkit/
 ignored-by-fixture/
+
+# Burn-in runtime pin (2026-07-24): immutable snapshot the launcher
+# captures at burner startup under .burnin_pin/<head_sha>/. Per-launch
+# runtime state — never source-controlled.
+.burnin_pin/
