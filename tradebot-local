@@ -1,7 +1,30 @@
 #!/bin/sh
+# Repo-local wrapper around the burn-in venv.
+#
+# When PIN_DIR is set (typically by scripts/burnin-launcher.sh), we
+# prepend PIN_DIR to PYTHONPATH so every trading_bot.main invocation
+# resolves against the immutable snapshot, not the live mutable
+# worktree. This is the boundary that prevents a mid-session
+# ``git switch`` from poisoning the running burner with a foreign
+# revision (the 2026-07-24 false drawdown halt).
+#
+# When PIN_DIR is unset, manual operators keep using the live
+# worktree -- same behavior as before the pin was introduced.
 set -eu
 
-ROOT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+# Resolve our own directory. macOS lacks ``readlink -f``, so we fall
+# back to ``python3 -c 'os.path.realpath'`` which is portable.
+SELF="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")"
+ROOT_DIR="$(CDPATH= cd -- "$(dirname "$SELF")" && pwd)"
+
+if [ -n "${PIN_DIR:-}" ]; then
+  case ":${PYTHONPATH:-}:" in
+    *:"$ROOT_DIR":*) ;;
+    *) PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" ;;
+  esac
+  export PYTHONPATH
+fi
+
 PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
 
 if [ ! -x "$PYTHON_BIN" ]; then
