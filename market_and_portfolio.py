@@ -50,7 +50,7 @@ class HistoricCSVDataHandler(AbstractDataHandler):
         """
         self.queue = queue
         self.symbol_data: Dict[str, pd.DataFrame] = {}
-        self.latest_symbol_data: Dict[str, MarketEvent] = {}
+        self.latest_symbol_data: Dict[str, List[MarketEvent]] = {}
         self.current_time_ns: int = 0
 
         self._load_and_merge_data(file_paths)
@@ -58,7 +58,7 @@ class HistoricCSVDataHandler(AbstractDataHandler):
     def _load_and_merge_data(self, file_paths: Dict[str, str]):
         dfs = []
         for symbol, path in file_paths.items():
-
+            self.latest_symbol_data[symbol] = []
 
             if path.endswith('.csv'):
                 df = pd.read_csv(path)
@@ -95,7 +95,7 @@ class HistoricCSVDataHandler(AbstractDataHandler):
             )
 
             self.current_time_ns = event.timestamp
-            self.latest_symbol_data[row.symbol] = event
+            self.latest_symbol_data[row.symbol].append(event)
             self.queue.put(event)
             return True
 
@@ -104,7 +104,9 @@ class HistoricCSVDataHandler(AbstractDataHandler):
 
     def get_latest_bar(self, symbol: str) -> Optional[MarketEvent]:
         # Point-in-time lookup: only returns data that has been "pushed" to the engine.
-        return self.latest_symbol_data.get(symbol)
+        if symbol in self.latest_symbol_data and self.latest_symbol_data[symbol]:
+            return self.latest_symbol_data[symbol][-1]
+        return None
 
     def get_latest_price(self, symbol: str) -> float:
         bar = self.get_latest_bar(symbol)
