@@ -1017,6 +1017,13 @@ def run_paper_trade(
                 continue
 
             strategy_tag = _trade_strategy_tag(signal, details) or ""
+            from trading_bot.runtime.fill_transaction import FillTransactionError
+
+            canary_experiment_id = (
+                runtime_canary.state.experiment_id
+                if runtime_canary is not None
+                else None
+            )
             buy_tx = _build_buy_fill_transaction(
                 ledger=ledger,
                 sql_persist=lambda fill, side, **ctx: _persist_trade_to_db(
@@ -1026,20 +1033,13 @@ def run_paper_trade(
                 settings=settings,
                 signal=signal,
                 details=details,
+                canary_experiment_id=canary_experiment_id,
+                canary_baseline_quantity=(
+                    pre_policy_size if runtime_canary is not None else None
+                ),
+                runtime_canary=runtime_canary,
+                pre_policy_size=pre_policy_size,
             )
-            if runtime_canary is not None:
-                runtime_canary.record_entry(
-                    ticker=fill.ticker,
-                    baseline_quantity=pre_policy_size,
-                    candidate_quantity=decision.position_size,
-                    fill_price=fill.fill_price,
-                    fees=fill.fees,
-                    session_date=(
-                        fill.filled_at.date().isoformat()
-                        if getattr(fill.filled_at, "date", None)
-                        else None
-                    ),
-                )
             try:
                 buy_tx.run(fill=fill, side="BUY", filled_at=fill.filled_at)
             except FillTransactionError as exc:
@@ -2220,6 +2220,10 @@ def _build_buy_fill_transaction(
     settings: Settings,
     signal: Any,
     details: dict | None,
+    canary_experiment_id: str | None = None,
+    canary_baseline_quantity: int | None = None,
+    runtime_canary: Any = None,
+    pre_policy_size: int | None = None,
 ) -> "FillTransaction":
     """Compose the canonical BUY fill transaction.
 
@@ -2228,30 +2232,18 @@ def _build_buy_fill_transaction(
     :class:`FillTransactionError` so callers can fail fast instead of
     silently desyncing the JSON ledger from the SQL trades table.
     """
-    from trading_bot.runtime.fill_transaction import FillTransaction
+    from trading_bot.runtime.fill_transaction import build_buy_transaction
 
-    tx = FillTransaction()
-
-    def step_record_order(fill, side, **ctx):  # noqa: ANN001
-        ledger.record_fill(fill, side=side, strategy_tag=strategy_tag)
-
-    def step_strategy_tracker(fill, side, **ctx):  # noqa: ANN001
-        from trading_bot.strategy.strategy_tracker import record_entry
-        from pathlib import Path
-
-        record_entry(
-            Path(settings.app.log_dir),
-            strategy_tag,
-            fill.ticker,
-            fill.fill_price,
-            getattr(fill, "filled_at", None) or ctx.get("filled_at"),
-        )
-
-    tx.register(step_record_order)
-    tx.register(sql_persist)
-    if strategy_tag:
-        tx.register(step_strategy_tracker)
-    return tx
+    return build_buy_transaction(
+        ledger=ledger,
+        sql_persist=sql_persist,
+        strategy_tag=strategy_tag,
+        log_dir_path=Path(settings.app.log_dir),
+        canary_experiment_id=canary_experiment_id,
+        canary_baseline_quantity=canary_baseline_quantity,
+        runtime_canary=runtime_canary,
+        pre_policy_size=pre_policy_size,
+    )
 
 
 def _trade_strategy_tag(signal, details: dict | None = None) -> str | None:
