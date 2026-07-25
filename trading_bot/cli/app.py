@@ -373,7 +373,8 @@ def paper_trade(
     from pathlib import Path
 
     from trading_bot.learning.experiments.runtime_canary import (
-        load_runtime_canary,
+        begin_runtime_canary,
+        finish_runtime_canary,
     )
     from trading_bot.portfolio.ledger import PortfolioLedger
     from trading_bot.runtime.orchestrator import run_paper_trade
@@ -385,7 +386,7 @@ def paper_trade(
         )
 
     ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
-    runtime_canary = load_runtime_canary(ctx.obj, ledger)
+    runtime_canary = begin_runtime_canary(ctx.obj, ledger)
 
     for result in run_paper_trade(
         parsed_symbols,
@@ -395,8 +396,7 @@ def paper_trade(
     ):
         typer.echo(result)
 
-    if runtime_canary is not None:
-        runtime_canary.snapshot()
+    finish_runtime_canary(runtime_canary)
 
 
 @app.command()
@@ -750,13 +750,14 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
     """
     from trading_bot.data import market_data
     from trading_bot.learning.experiments.runtime_canary import (
-        load_runtime_canary,
+        begin_runtime_canary,
+        finish_runtime_canary,
     )
     from trading_bot.safety.kill_switch import check_kill_switch_before_trade
 
     ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
     state = ledger.ensure_portfolio_state()
-    runtime_canary = load_runtime_canary(ctx.obj, ledger)
+    runtime_canary = begin_runtime_canary(ctx.obj, ledger)
 
     # Idempotency guard: skip exits for tickers recently sold by a concurrent
     # process.  Two manage-positions processes can read the same stale state and
@@ -1013,7 +1014,7 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
     )
 
     if runtime_canary is not None:
-        runtime_canary.snapshot()
+        finish_runtime_canary(runtime_canary)
 
     return {
         "positions": len(state.positions),

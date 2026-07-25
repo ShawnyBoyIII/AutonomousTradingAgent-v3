@@ -20,7 +20,11 @@ from trading_bot.runtime.orchestrator import (
     run_paper_trade,
 )
 from trading_bot.runtime.position_exit import fill_partial_take_profit_position, fill_sell_position
-from trading_bot.learning.experiments.runtime_canary import load_runtime_canary
+from trading_bot.learning.experiments.runtime_canary import (
+    begin_runtime_canary,
+    finish_runtime_canary,
+    RuntimeCanaryLifecycleError,
+)
 from trading_bot.runtime.position_management import evaluate_exit_priority
 from trading_bot.scout import build_scout_candidates
 
@@ -551,10 +555,20 @@ def run_continuous_loop(
 
         stats.reset_cycle()
 
-        # Load runtime canary once per cycle (Round 1 fix). When no
+        # Begin runtime canary once per cycle (Round 1 fix). When no
         # experiment is in CANARY, this returns None and the trading
-        # paths behave identically to the no-canary contract.
-        runtime_canary = load_runtime_canary(settings, ledger)
+        # paths behave identically to the no-canary contract. A
+        # lifecycle error (malformed/inaccessible state) is logged
+        # and the cycle continues without shadow tracking.
+        try:
+            runtime_canary = begin_runtime_canary(settings, ledger)
+        except RuntimeCanaryLifecycleError as exc:
+            logger.error(
+                "canary_lifecycle_error cycle=%d error=%s",
+                cycle,
+                exc,
+            )
+            runtime_canary = None
 
         try:
             # Phase 1: Build universe
@@ -630,6 +644,12 @@ def run_continuous_loop(
             logger.warning(f"backing_off cycle={cycle} failures={stats.consecutive_failures} seconds={backoff}")
             time.sleep(backoff)
             continue
+
+        finally:
+            # Finish the runtime canary context once per cycle so paired
+            # metrics and completed-position counts are persisted
+            # regardless of how the cycle ended.
+            finish_runtime_canary(runtime_canary)
 
         stats.last_cycle_time = time.monotonic() - stats.start_time
 
