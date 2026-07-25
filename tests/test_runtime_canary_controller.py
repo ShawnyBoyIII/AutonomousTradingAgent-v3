@@ -213,6 +213,14 @@ def test_evaluate_marks_unsupported_change_inconclusive(
         ),
         started_at=datetime.now(timezone.utc),
     )
+    # Seed baseline snapshot so finalize_terminal can restore on INCONCLUSIVE.
+    store.snapshot_overrides_bytes(
+        state.experiment_id, "baseline", overrides.read_bytes()
+    )
+    state.baseline_checksum = store.checksum(
+        store.root / state.experiment_id / "baseline.yaml"
+    )
+    state.baseline_was_absent = False
     store.save_current(state)
 
     # Skip the offline stage by jumping directly to CANARY.
@@ -283,6 +291,14 @@ def test_evaluate_marks_non_flat_portfolio_inconclusive(
             "max_drawdown_pct": 2.0,
         },
     )
+    # Seed baseline snapshot so finalize_terminal can restore on INCONCLUSIVE.
+    store.snapshot_overrides_bytes(
+        state.experiment_id, "baseline", overrides.read_bytes()
+    )
+    state.baseline_checksum = store.checksum(
+        store.root / state.experiment_id / "baseline.yaml"
+    )
+    state.baseline_was_absent = False
     store.save_current(state)
 
     # Inject a non-flat portfolio directly via PortfolioState construction.
