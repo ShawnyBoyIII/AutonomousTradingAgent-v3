@@ -61,12 +61,14 @@ class RuntimeCanaryContext:
         candidate_quantity: int,
         fill_price: float,
         fees: float,
+        operation_id: str = "",
         session_date: str | None = None,
     ) -> None:
         if self._invalidated_reasons:
             return
         try:
             self.harness.record_entry(
+                operation_id=operation_id,
                 ticker=ticker,
                 baseline_quantity=baseline_quantity,
                 candidate_quantity=candidate_quantity,
@@ -84,12 +86,14 @@ class RuntimeCanaryContext:
         candidate_quantity: int,
         fill_price: float,
         fees: float,
+        operation_id: str = "",
         session_date: str | None = None,
     ) -> None:
         if self._invalidated_reasons:
             return
         try:
             self.harness.record_exit(
+                operation_id=operation_id,
                 ticker=ticker,
                 candidate_quantity=candidate_quantity,
                 fill_price=fill_price,

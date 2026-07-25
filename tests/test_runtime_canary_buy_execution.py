@@ -251,6 +251,7 @@ def test_harness_receives_exact_pre_policy_and_fill_quantities(tmp_path: Path) -
 
     # Simulate a BUY with pre-policy=10, candidate (post-policy) = 5.
     ctx.record_entry(
+        operation_id="buy-1",
         ticker="AAPL",
         baseline_quantity=10,
         candidate_quantity=5,

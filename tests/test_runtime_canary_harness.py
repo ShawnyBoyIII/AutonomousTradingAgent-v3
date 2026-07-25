@@ -43,6 +43,7 @@ def test_record_entry_records_exact_quantities(tmp_path: Path) -> None:
     )
 
     harness.record_entry(
+        operation_id="buy-1",
         ticker="SPY",
         baseline_quantity=50,
         candidate_quantity=25,
@@ -68,6 +69,7 @@ def test_record_entry_nonmatching_records_equal_quantities(tmp_path: Path) -> No
     )
 
     harness.record_entry(
+        operation_id="buy-1",
         ticker="AAPL",
         baseline_quantity=10,
         candidate_quantity=10,
@@ -92,6 +94,7 @@ def test_record_exit_derives_baseline_qty_from_candidate_fraction(
     )
     # Baseline 50, candidate 25.
     harness.record_entry(
+        operation_id="buy-1",
         ticker="SPY",
         baseline_quantity=50,
         candidate_quantity=25,
@@ -100,6 +103,7 @@ def test_record_exit_derives_baseline_qty_from_candidate_fraction(
     )
     # Sell 10/25 = 40% of candidate; baseline should sell 40%*50 = 20.
     harness.record_exit(
+        operation_id="sell-1",
         ticker="SPY",
         candidate_quantity=10,
         fill_price=110.0,
@@ -120,6 +124,7 @@ def test_record_exit_full_closes_both_ledgers(tmp_path: Path) -> None:
         change=_make_change(),
     )
     harness.record_entry(
+        operation_id="buy-1",
         ticker="SPY",
         baseline_quantity=50,
         candidate_quantity=25,
@@ -127,6 +132,7 @@ def test_record_exit_full_closes_both_ledgers(tmp_path: Path) -> None:
         fees=1.0,
     )
     harness.record_exit(
+        operation_id="sell-1",
         ticker="SPY",
         candidate_quantity=25,
         fill_price=120.0,
@@ -152,6 +158,7 @@ def test_metrics_track_partial_profit_taking(tmp_path: Path) -> None:
 
     # Trade 1: candidate 10, full exit at +5
     harness.record_entry(
+        operation_id="buy-1",
         ticker="AAPL",
         baseline_quantity=10,
         candidate_quantity=10,
@@ -159,6 +166,7 @@ def test_metrics_track_partial_profit_taking(tmp_path: Path) -> None:
         fees=1.0,
     )
     harness.record_exit(
+        operation_id="sell-1",
         ticker="AAPL",
         candidate_quantity=10,
         fill_price=105.0,
@@ -167,6 +175,7 @@ def test_metrics_track_partial_profit_taking(tmp_path: Path) -> None:
 
     # Trade 2: candidate 5, full exit at -2
     harness.record_entry(
+        operation_id="buy-2",
         ticker="MSFT",
         baseline_quantity=5,
         candidate_quantity=5,
@@ -174,6 +183,7 @@ def test_metrics_track_partial_profit_taking(tmp_path: Path) -> None:
         fees=1.0,
     )
     harness.record_exit(
+        operation_id="sell-2",
         ticker="MSFT",
         candidate_quantity=5,
         fill_price=198.0,
@@ -198,6 +208,7 @@ def test_closed_trade_counts_match_true(tmp_path: Path) -> None:
         change=_make_change(),
     )
     harness.record_entry(
+        operation_id="buy-1",
         ticker="SPY",
         baseline_quantity=25,
         candidate_quantity=10,
@@ -205,6 +216,7 @@ def test_closed_trade_counts_match_true(tmp_path: Path) -> None:
         fees=1.0,
     )
     harness.record_exit(
+        operation_id="sell-1",
         ticker="SPY",
         candidate_quantity=10,
         fill_price=110.0,
@@ -229,6 +241,7 @@ def test_restart_rebuilds_metrics(tmp_path: Path) -> None:
         change=change,
     )
     harness.record_entry(
+        operation_id="buy-1",
         ticker="SPY",
         baseline_quantity=10,
         candidate_quantity=10,
@@ -236,6 +249,7 @@ def test_restart_rebuilds_metrics(tmp_path: Path) -> None:
         fees=1.0,
     )
     harness.record_exit(
+        operation_id="sell-1",
         ticker="SPY",
         candidate_quantity=10,
         fill_price=110.0,
@@ -264,6 +278,7 @@ def test_metric_set_round_trip_smoke(tmp_path: Path) -> None:
         change=_make_change(),
     )
     harness.record_entry(
+        operation_id="buy-1",
         ticker="SPY",
         baseline_quantity=1,
         candidate_quantity=1,
@@ -271,6 +286,7 @@ def test_metric_set_round_trip_smoke(tmp_path: Path) -> None:
         fees=1.0,
     )
     harness.record_exit(
+        operation_id="sell-1",
         ticker="SPY",
         candidate_quantity=1,
         fill_price=110.0,

@@ -173,6 +173,7 @@ def test_record_entry_mirrors_into_paired_harness(tmp_path: Path) -> None:
     assert ctx is not None
 
     ctx.record_entry(
+        operation_id="buy-1",
         ticker="AAPL",
         baseline_quantity=10,
         candidate_quantity=5,
@@ -205,6 +206,7 @@ def test_record_exit_drives_proportional_baseline_exit(tmp_path: Path) -> None:
     assert ctx is not None
 
     ctx.record_entry(
+        operation_id="buy-1",
         ticker="AAPL",
         baseline_quantity=10,
         candidate_quantity=5,
@@ -212,6 +214,7 @@ def test_record_exit_drives_proportional_baseline_exit(tmp_path: Path) -> None:
         fees=1.0,
     )
     ctx.record_exit(
+        operation_id="sell-1",
         ticker="AAPL",
         candidate_quantity=2,
         fill_price=110.0,
@@ -242,6 +245,7 @@ def test_snapshot_persists_runtime_metrics(tmp_path: Path) -> None:
     assert ctx is not None
 
     ctx.record_entry(
+        operation_id="buy-1",
         ticker="AAPL",
         baseline_quantity=1,
         candidate_quantity=1,
@@ -249,6 +253,7 @@ def test_snapshot_persists_runtime_metrics(tmp_path: Path) -> None:
         fees=1.0,
     )
     ctx.record_exit(
+        operation_id="sell-1",
         ticker="AAPL",
         candidate_quantity=1,
         fill_price=110.0,
@@ -310,6 +315,7 @@ def test_record_entry_records_market_session(tmp_path: Path) -> None:
     assert ctx is not None
 
     ctx.record_entry(
+        operation_id="buy-1",
         ticker="AAPL",
         baseline_quantity=10,
         candidate_quantity=5,

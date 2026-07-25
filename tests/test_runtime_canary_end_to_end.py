@@ -222,6 +222,7 @@ def test_canary_lifecycle_proposes_drive_and_decides(tmp_path: Path) -> None:
     # Mirror 20 winning candidate trades into the harness.
     for i in range(20):
         ctx.record_entry(
+            operation_id=f"buy-{i:02d}",
             ticker=f"T{i:02d}",
             baseline_quantity=10,
             candidate_quantity=5,
@@ -229,6 +230,7 @@ def test_canary_lifecycle_proposes_drive_and_decides(tmp_path: Path) -> None:
             fees=1.0,
         )
         ctx.record_exit(
+            operation_id=f"sell-{i:02d}",
             ticker=f"T{i:02d}",
             candidate_quantity=5,
             fill_price=110.0,
@@ -335,6 +337,7 @@ def test_invalidate_marks_experiment_inconclusive_and_keeps_trading(
     # Drive a real entry then simulate the harness failing on exit so
     # the context invalidates itself.
     ctx.record_entry(
+        operation_id="buy-1",
         ticker="AAPL",
         baseline_quantity=10,
         candidate_quantity=5,
@@ -351,6 +354,7 @@ def test_invalidate_marks_experiment_inconclusive_and_keeps_trading(
     # A subsequent record call after invalidation is a no-op.
     prev_exits = len(ctx.harness.candidate.snapshot_positions())
     ctx.record_entry(
+        operation_id="buy-2",
         ticker="MSFT",
         baseline_quantity=10,
         candidate_quantity=5,
