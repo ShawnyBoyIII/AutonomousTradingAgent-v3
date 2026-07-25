@@ -846,7 +846,7 @@ start_eod_watchdog() {
                 local eod_output eod_rc eod_status
                 if _manage_lock_acquire; then
                     # canonical: sh ./tradebot-local --config-path "$config_file" manage-positions
-                    eod_output=$(sh "$PINNED_TRADEBOT" --config-path "$config_file" manage-positions 2>&1)
+                    eod_output=$(sh ./tradebot-local --config-path "$config_file" manage-positions 2>&1)
                     eod_rc=$?
                     _manage_lock_release
                     printf '%s\n' "$eod_output" | head -100 | sed "s/^/[$timestamp]    /"
@@ -962,7 +962,7 @@ scan_and_trade() {
     local manage_output=""
     if _manage_lock_acquire; then
         # canonical: sh ./tradebot-local --config-path "$CONFIG_FILE" manage-positions
-        manage_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" manage-positions 2>&1)
+        manage_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" manage-positions 2>&1)
         _manage_lock_release
     else
         echo "[$timestamp] ℹ️  manage-positions already running (EOD watchdog?), main loop skipping"
