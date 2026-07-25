@@ -30,6 +30,24 @@ echo ""
 
 cd /Users/shawndlima/Documents/AutonomousTradingAgentcopy
 
+# --------------------------------------------------------------------- #
+# Runtime pin (2026-07-24): when launched through burnin-launcher.sh
+# the burner must always exec the wrapper and Python from the
+# immutable snapshot, not the live mutable worktree. PIN_DIR is set
+# by the launcher and points at the parent dir of the snapshot
+# (<pin>/<head_sha>/). When unset, fall back to the live paths so
+# manual operators are unaffected.
+# --------------------------------------------------------------------- #
+if [ -n "${PIN_DIR:-}" ] && [ -x "$PIN_DIR/tradebot-local" ]; then
+    PINNED_TRADEBOT="$PIN_DIR/tradebot-local"
+    PINNED_PYTHON="$PIN_DIR/.venv/bin/python"
+    export PIN_DIR
+    cd "$PIN_DIR"
+else
+    PINNED_TRADEBOT="./tradebot-local"
+    PINNED_PYTHON="./.venv/bin/python"
+fi
+
 # Configuration
 CONFIG_FILE="burn-in-config.yaml"
 UNIVERSE_FILE="state/universe.txt"
@@ -78,7 +96,7 @@ EOD_FETCH_LOG="$LOG_DIR/eod_data_store.log"
 # Per-interval-set marker (C1 2026-07-08): the marker encodes the interval set
 # so a 1d backfill does not block a 1m backfill on the same date. The interval
 # default mirrors the CLI helper in trading_bot.cli.app._eod_marker_filename.
-EOD_INTERVALS="${EOD_INTERVALS:-$(.venv/bin/python -c "from pathlib import Path; from trading_bot.config.loader import load_settings; cfg=load_settings(Path('$CONFIG_FILE')); print(','.join(cfg.eod_data_store.intervals))" 2>/dev/null || echo "1d,1m")}"
+EOD_INTERVALS="${EOD_INTERVALS:-$($PINNED_PYTHON -c "from pathlib import Path; from trading_bot.config.loader import load_settings; cfg=load_settings(Path('$CONFIG_FILE')); print(','.join(cfg.eod_data_store.intervals))" 2>/dev/null || echo "1d,1m")}"
 EOD_INTERVALS_SLUG=$(echo "$EOD_INTERVALS" | tr ',' '\n' | sort | tr '\n' '_' | sed 's/_$//')
 EOD_STORE_ROOT="state/data_store"
 
@@ -194,7 +212,7 @@ run_discovery() {
     # code so we can distinguish "no candidates" (CLI exits 2) from
     # "fresh discoveries" (CLI exits 0 with new symbols).
     local discover_output discover_rc
-    discover_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" discover --mode breakout --max 50 --export 2>&1)
+    discover_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" discover --mode breakout --max 50 --export 2>&1)
     discover_rc=$?
 
     # The "0 candidates" warning is the new failure marker (audit
@@ -463,23 +481,23 @@ echo "------------------"
 # Check local readiness. ponytail: burn-in should not refuse to start just
 # because the existing paper ledger had a bad week; runtime commands already
 # enforce kill switch and the next check below verifies market data access.
-if ! sh ./tradebot-local --config-path "$CONFIG_FILE" doctor > /dev/null 2>&1; then
+if ! sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" doctor > /dev/null 2>&1; then
     echo "❌ Doctor check failed"
     exit 1
 fi
 echo "✅ Local app ready"
 
 # Check kill switch
-if ! sh ./tradebot-local --config-path "$CONFIG_FILE" kill-switch > /dev/null 2>&1; then
+if ! sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" kill-switch > /dev/null 2>&1; then
     echo "⚠️  Kill switch is ACTIVE - cannot start"
-    echo "Resume with: sh ./tradebot-local kill-switch --resume"
+    echo "Resume with: sh $PINNED_TRADEBOT kill-switch --resume"
     exit 1
 fi
 echo "✅ Kill switch: Trading active"
 
 # Test scan (use any known valid symbol)
 echo "Testing market connection..."
-if ! sh ./tradebot-local --config-path "$CONFIG_FILE" scan --symbols SPY --summary > /dev/null 2>&1; then
+if ! sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" scan --symbols SPY --summary > /dev/null 2>&1; then
     echo "❌ Market connection failed"
     exit 1
 fi
@@ -521,7 +539,7 @@ run_tune_experiment_step() {
     local eval_log="$LOG_DIR/tune_experiment.log"
 
     set +e
-    eval_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" tune-experiment evaluate 2>&1)
+    eval_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" tune-experiment evaluate 2>&1)
     local eval_rc=$?
     set -e
 
@@ -534,7 +552,7 @@ run_tune_experiment_step() {
     fi
 
     set +e
-    propose_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" tune-experiment propose 2>&1)
+    propose_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" tune-experiment propose 2>&1)
     local propose_rc=$?
     set -e
 
@@ -555,7 +573,7 @@ run_health_check() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     local rc=0
     local output
-    output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" doctor --burn-in --json 2>&1) || rc=$?
+    output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" doctor --burn-in --json 2>&1) || rc=$?
     echo "$output" >> "$HEALTH_LOG" 2>/dev/null || true
     if [ "$rc" -ne 0 ]; then
         echo "[$timestamp] ⚠️  Health check exit=$rc (see $HEALTH_LOG)"
@@ -597,7 +615,7 @@ run_eod_data_download() {
     # Default to yesterday's date — the CLI uses the previous trading day
     # because massive.com publishes day-T's bars at 11:00 AM ET on day T+1.
     # Operator can override with --date if they want a different target.
-    fetch_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" eod-fetch \
+    fetch_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" eod-fetch \
         --date "$(date -v -1d '+%Y-%m-%d' 2>/dev/null || date -d 'yesterday' '+%Y-%m-%d')" \
         --backfill-days "$EOD_FETCH_BACKFILL_DAYS" 2>&1)
     local status=$?
@@ -819,7 +837,7 @@ start_eod_watchdog() {
                 # realized P&L and the profit-factor graduation gate.
                 local eod_output eod_rc eod_status
                 if _manage_lock_acquire; then
-                    eod_output=$(sh ./tradebot-local --config-path "$config_file" manage-positions 2>&1)
+                    eod_output=$(sh "$PINNED_TRADEBOT" --config-path "$config_file" manage-positions 2>&1)
                     eod_rc=$?
                     _manage_lock_release
                     printf '%s\n' "$eod_output" | head -100 | sed "s/^/[$timestamp]    /"
@@ -880,7 +898,7 @@ scan_and_trade() {
     echo "[$timestamp] Scanning $symbol_count symbols..."
     
     # Run scan and capture output
-    local scan_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" scan --symbols "$SYMBOLS" --why 2>&1)
+    local scan_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" scan --symbols "$SYMBOLS" --why 2>&1)
     
     # Check if kill switch is active
     if echo "$scan_output" | grep -q "KILL_SWITCH"; then
@@ -900,7 +918,7 @@ scan_and_trade() {
         IFS=',' read -ra SYMBOL_ARRAY <<< "$green_symbols"
         for symbol in "${SYMBOL_ARRAY[@]}"; do
             # Check daily limits first
-            local trade_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" paper-trade --symbols "$symbol" 2>&1)
+            local trade_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" paper-trade --symbols "$symbol" 2>&1)
             
             if echo "$trade_output" | grep -q "FILLED"; then
                 echo "[$timestamp] ✅ Filled: $symbol"
@@ -932,7 +950,7 @@ scan_and_trade() {
     echo "[$timestamp] Managing positions..."
     local manage_output=""
     if _manage_lock_acquire; then
-        manage_output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" manage-positions 2>&1)
+        manage_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" manage-positions 2>&1)
         _manage_lock_release
     else
         echo "[$timestamp] ℹ️  manage-positions already running (EOD watchdog?), main loop skipping"
@@ -968,7 +986,7 @@ check_confidence_gates() {
         return 0
     fi
     
-    local result=$(.venv/bin/python -c "
+    local result=$($PINNED_PYTHON -c "
 import sqlite3
 import json
 import sys
@@ -1031,7 +1049,7 @@ check_max_drawdown() {
     fi
 
     local result
-    result=$(.venv/bin/python -c "
+    result=$($PINNED_PYTHON -c "
 from datetime import datetime, timezone
 from pathlib import Path
 from trading_bot.config.loader import load_settings
@@ -1102,13 +1120,13 @@ MIN_TRADES=50
 MIN_NET_PNL=0
 # Honor the burn-in config's disabled drawdown circuit breaker by default.
 # Operators can still override via env var for one-off sessions.
-ENABLE_DRAWDOWN_CIRCUIT_BREAKER=$(.venv/bin/python -c "from pathlib import Path; from trading_bot.config.loader import load_settings; s=load_settings(Path('$CONFIG_FILE')); print('true' if s.risk.enable_drawdown_circuit_breaker else 'false')" 2>/dev/null || printf "true")
+ENABLE_DRAWDOWN_CIRCUIT_BREAKER=$($PINNED_PYTHON -c "from pathlib import Path; from trading_bot.config.loader import load_settings; s=load_settings(Path('$CONFIG_FILE')); print('true' if s.risk.enable_drawdown_circuit_breaker else 'false')" 2>/dev/null || printf "true")
 if [ "$ENABLE_DRAWDOWN_CIRCUIT_BREAKER" = "false" ]; then
     MAX_DRAWDOWN_PCT=${MAX_DRAWDOWN_PCT:-999}
 else
     MAX_DRAWDOWN_PCT=${MAX_DRAWDOWN_PCT:-10}
 fi
-ADVISORY_ENABLED=$(.venv/bin/python -c "from pathlib import Path; from trading_bot.config.loader import load_settings; s=load_settings(Path('$CONFIG_FILE')); print('true' if s.advisory.enabled else 'false')" 2>/dev/null || printf "false")
+ADVISORY_ENABLED=$($PINNED_PYTHON -c "from pathlib import Path; from trading_bot.config.loader import load_settings; s=load_settings(Path('$CONFIG_FILE')); print('true' if s.advisory.enabled else 'false')" 2>/dev/null || printf "false")
 
 while true; do
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
