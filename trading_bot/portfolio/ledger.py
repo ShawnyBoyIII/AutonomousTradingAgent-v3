@@ -69,7 +69,9 @@ class PortfolioLedger:
                     fees REAL,
                     filled_at TEXT,
                     pnl REAL DEFAULT 0,
-                    strategy_tag TEXT DEFAULT ''
+                    strategy_tag TEXT DEFAULT '',
+                    canary_experiment_id TEXT,
+                    canary_baseline_quantity INTEGER
                 )
                 """
             )
@@ -81,6 +83,14 @@ class PortfolioLedger:
             # Migration: add strategy_tag column for trade attribution.
             try:
                 conn.execute("ALTER TABLE orders ADD COLUMN strategy_tag TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE orders ADD COLUMN canary_experiment_id TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE orders ADD COLUMN canary_baseline_quantity INTEGER")
             except sqlite3.OperationalError:
                 pass
             conn.execute(
@@ -188,12 +198,17 @@ class PortfolioLedger:
         side: str,
         realized_pnl: float = 0.0,
         strategy_tag: str = "",
+        canary_experiment_id: str | None = None,
+        canary_baseline_quantity: int | None = None,
     ) -> None:
         self.initialize()
         self._execute_write(
             """
-            INSERT INTO orders (id, ticker, side, quantity, fill_price, fees, filled_at, pnl, strategy_tag)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO orders (
+                id, ticker, side, quantity, fill_price, fees, filled_at, pnl,
+                strategy_tag, canary_experiment_id, canary_baseline_quantity
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 fill.order_id,
@@ -205,8 +220,41 @@ class PortfolioLedger:
                 fill.filled_at.isoformat(),
                 float(realized_pnl),
                 strategy_tag,
+                canary_experiment_id,
+                canary_baseline_quantity,
             ),
         )
+
+    def list_canary_order_rows(
+        self,
+        experiment_id: str,
+    ) -> list[dict[str, object]]:
+        self.initialize()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, ticker, side, quantity, fill_price, fees, filled_at,
+                       canary_baseline_quantity
+                FROM orders
+                WHERE canary_experiment_id = ?
+                ORDER BY filled_at ASC, id ASC
+                """,
+                (experiment_id,),
+            ).fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "ticker": row[1],
+                "side": row[2],
+                "quantity": row[3],
+                "fill_price": row[4],
+                "fees": row[5],
+                "filled_at": row[6],
+                "canary_baseline_quantity": row[7],
+            }
+            for row in rows
+        ]
 
     def list_order_rows(self) -> list[dict[str, object]]:
         self.initialize()
