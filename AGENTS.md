@@ -297,6 +297,7 @@ reconciled to this fill-to-fill net convention; older legacy rows were not.
 ./tradebot-local sync-positions
 
 # Burn-in automation
+./scripts/burnin-launcher.sh          # PINNED launcher — use this for unattended runs
 ./scripts/auto-burn-in.sh              # auto-starts dashboard sidecar on :8080
                                        # AUTO_DASHBOARD=false to opt out
                                        # DASHBOARD_PORT=N to change port
@@ -374,6 +375,43 @@ lifecycle, and end-to-end behavior).
 ./tradebot-local advisory-report --markdown
 ./tradebot-local advisory-report --json
 ```
+
+---
+
+## Burn-In Runtime Pin (2026-07-24)
+
+The auto-burn-in script is a long-running resident process. While it
+holds the burner PID, the worktree's `git switch` may change the source
+code that subsequent `sh ./tradebot-local ...` subprocess invocations
+re-import — silently poisoning the running burner with a foreign
+revision. The 2026-07-24 false-drawdown halt was caused by exactly this:
+while the burner was running, the worktree was switched to a legacy V2
+marker branch; the next paper-trade subprocess re-imported the V2
+`circuit_breaker`, read the legacy equity cohort, and halted at the
+exact 44.9296% drawdown — while a fresh CLI on the same ledger reported
+1.78%.
+
+**The boundary:** `scripts/burnin-launcher.sh` captures an immutable
+snapshot of `HEAD` via `git archive HEAD | tar -x -C
+.burnin_pin/<head_sha>/` and `exec`s `scripts/auto-burn-in.sh` from the
+snapshot root with `PIN_DIR` exported. Every Python subprocess then
+resolves through the snapshot's wrapper, not the live mutable worktree.
+
+- **Always use `./scripts/burnin-launcher.sh` for unattended runs.**
+  `./scripts/auto-burn-in.sh` is still callable for ad-hoc / debugging
+  scenarios where the worktree is stable, but the launcher is the
+  pinned contract.
+- The snapshot lives under `.burnin_pin/<head_sha>/`. SHA is recorded
+  in `state/burn_in_health/burn_in.pin` so the doctor can confirm the
+  burner is operating from the expected snapshot.
+- Doctor `--burn-in` reports the pin SHA and the fingerprint of pinned
+  paths. A fingerprint mismatch means the live worktree edited
+  `tradebot-local`, `scripts/auto-burn-in.sh`, `trading_bot/runtime/burnin_pin.py`,
+  or `scripts/burnin-launcher.sh` mid-session — restart the burner to
+  re-snapshot.
+- Manual `./tradebot-local ...` invocations keep working against the
+  live worktree when `PIN_DIR` is unset, so the operator's CLI workflow
+  is unaffected.
 
 ---
 
