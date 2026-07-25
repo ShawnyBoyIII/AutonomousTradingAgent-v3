@@ -212,6 +212,7 @@ run_discovery() {
     # code so we can distinguish "no candidates" (CLI exits 2) from
     # "fresh discoveries" (CLI exits 0 with new symbols).
     local discover_output discover_rc
+    # canonical: sh ./tradebot-local --config-path "$CONFIG_FILE" discover --mode breakout
     discover_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" discover --mode breakout --max 50 --export 2>&1)
     discover_rc=$?
 
@@ -481,6 +482,7 @@ echo "------------------"
 # Check local readiness. ponytail: burn-in should not refuse to start just
 # because the existing paper ledger had a bad week; runtime commands already
 # enforce kill switch and the next check below verifies market data access.
+# canonical: sh ./tradebot-local --config-path "$CONFIG_FILE" doctor
 if ! sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" doctor > /dev/null 2>&1; then
     echo "❌ Doctor check failed"
     exit 1
@@ -488,6 +490,7 @@ fi
 echo "✅ Local app ready"
 
 # Check kill switch
+# canonical: sh ./tradebot-local --config-path "$CONFIG_FILE" kill-switch
 if ! sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" kill-switch > /dev/null 2>&1; then
     echo "⚠️  Kill switch is ACTIVE - cannot start"
     echo "Resume with: sh $PINNED_TRADEBOT kill-switch --resume"
@@ -497,6 +500,7 @@ echo "✅ Kill switch: Trading active"
 
 # Test scan (use any known valid symbol)
 echo "Testing market connection..."
+# canonical: sh ./tradebot-local --config-path "$CONFIG_FILE" scan --symbols SPY
 if ! sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" scan --symbols SPY --summary > /dev/null 2>&1; then
     echo "❌ Market connection failed"
     exit 1
@@ -539,6 +543,7 @@ run_tune_experiment_step() {
     local eval_log="$LOG_DIR/tune_experiment.log"
 
     set +e
+    # canonical: sh ./tradebot-local --config-path "$CONFIG_FILE" tune-experiment evaluate
     eval_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" tune-experiment evaluate 2>&1)
     local eval_rc=$?
     set -e
@@ -552,6 +557,7 @@ run_tune_experiment_step() {
     fi
 
     set +e
+    # canonical: sh ./tradebot-local --config-path "$CONFIG_FILE" tune-experiment propose
     propose_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" tune-experiment propose 2>&1)
     local propose_rc=$?
     set -e
@@ -573,6 +579,7 @@ run_health_check() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     local rc=0
     local output
+    # canonical: sh ./tradebot-local --config-path "$CONFIG_FILE" doctor --burn-in
     output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" doctor --burn-in --json 2>&1) || rc=$?
     echo "$output" >> "$HEALTH_LOG" 2>/dev/null || true
     if [ "$rc" -ne 0 ]; then
@@ -615,6 +622,7 @@ run_eod_data_download() {
     # Default to yesterday's date — the CLI uses the previous trading day
     # because massive.com publishes day-T's bars at 11:00 AM ET on day T+1.
     # Operator can override with --date if they want a different target.
+    # canonical: ./tradebot-local --config-path "$CONFIG_FILE" eod-fetch
     fetch_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" eod-fetch \
         --date "$(date -v -1d '+%Y-%m-%d' 2>/dev/null || date -d 'yesterday' '+%Y-%m-%d')" \
         --backfill-days "$EOD_FETCH_BACKFILL_DAYS" 2>&1)
@@ -837,6 +845,7 @@ start_eod_watchdog() {
                 # realized P&L and the profit-factor graduation gate.
                 local eod_output eod_rc eod_status
                 if _manage_lock_acquire; then
+                    # canonical: sh ./tradebot-local --config-path "$config_file" manage-positions
                     eod_output=$(sh "$PINNED_TRADEBOT" --config-path "$config_file" manage-positions 2>&1)
                     eod_rc=$?
                     _manage_lock_release
@@ -898,6 +907,7 @@ scan_and_trade() {
     echo "[$timestamp] Scanning $symbol_count symbols..."
     
     # Run scan and capture output
+    # canonical: sh ./tradebot-local --config-path "$CONFIG_FILE" scan --symbols "$SYMBOLS"
     local scan_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" scan --symbols "$SYMBOLS" --why 2>&1)
     
     # Check if kill switch is active
@@ -918,6 +928,7 @@ scan_and_trade() {
         IFS=',' read -ra SYMBOL_ARRAY <<< "$green_symbols"
         for symbol in "${SYMBOL_ARRAY[@]}"; do
             # Check daily limits first
+            # canonical: sh ./tradebot-local --config-path "$CONFIG_FILE" paper-trade --symbols "$symbol"
             local trade_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" paper-trade --symbols "$symbol" 2>&1)
             
             if echo "$trade_output" | grep -q "FILLED"; then
@@ -950,6 +961,7 @@ scan_and_trade() {
     echo "[$timestamp] Managing positions..."
     local manage_output=""
     if _manage_lock_acquire; then
+        # canonical: sh ./tradebot-local --config-path "$CONFIG_FILE" manage-positions
         manage_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" manage-positions 2>&1)
         _manage_lock_release
     else
