@@ -61,7 +61,7 @@ def _settings():
 
 
 def test_run_continuous_loop_loads_canary_and_threads_to_callees(tmp_path, monkeypatch):
-    """run_continuous_loop must call load_runtime_canary once per cycle
+    """run_continuous_loop must call begin_runtime_canary once per cycle
     and pass the result to run_paper_trade and _run_manage_positions_once.
     """
     from trading_bot.runtime import continuous_loop
@@ -81,10 +81,10 @@ def test_run_continuous_loop_loads_canary_and_threads_to_callees(tmp_path, monke
                     "summary": {"rejected": 0}}
 
     # Patch the local binding inside continuous_loop (the production
-    # code uses `from … import load_runtime_canary`, so it has its own
+    # code uses `from … import begin_runtime_canary`, so it has its own
     # module-level reference that monkeypatching the source module
     # does NOT affect).
-    monkeypatch.setattr(continuous_loop, "load_runtime_canary", fake_load)
+    monkeypatch.setattr(continuous_loop, "begin_runtime_canary", fake_load)
     monkeypatch.setattr(continuous_loop, "run_paper_trade", spy_paper)
     monkeypatch.setattr(continuous_loop, "_run_manage_positions_once", spy_manage)
     monkeypatch.setattr(continuous_loop, "_read_universe_symbols", lambda s: ["AAPL"])
@@ -116,7 +116,7 @@ def test_run_continuous_loop_loads_canary_and_threads_to_callees(tmp_path, monke
 
 
 def test_run_continuous_loop_handles_none_canary_gracefully(tmp_path, monkeypatch):
-    """When load_runtime_canary returns None (no active experiment),
+    """When begin_runtime_canary returns None (no active experiment),
     the loop must still pass None through to both callees when they
     are invoked — identical to the no-canary contract that existed
     before the fix.
@@ -133,7 +133,7 @@ def test_run_continuous_loop_handles_none_canary_gracefully(tmp_path, monkeypatc
         "summary": {"rejected": 0},
     }
 
-    monkeypatch.setattr(continuous_loop, "load_runtime_canary", lambda s, l: None)
+    monkeypatch.setattr(continuous_loop, "begin_runtime_canary", lambda s, l: None)
     monkeypatch.setattr(continuous_loop, "run_paper_trade", MagicMock(return_value=[]))
     monkeypatch.setattr(continuous_loop, "_run_manage_positions_once", spy_manage)
     monkeypatch.setattr(continuous_loop, "_read_universe_symbols", lambda s: ["AAPL"])

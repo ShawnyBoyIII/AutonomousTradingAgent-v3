@@ -5,11 +5,20 @@ A ``RuntimeCanaryContext`` owns the live view of an experiment in
 for marking metrics and decisions, and the paired ``PairedShadowHarness``
 that mirrors every BUY and SELL into two parallel ledgers.
 
-The seam is constructed once per CLI invocation (or once per
-continuous-loop cycle). When no experiment is in CANARY, or when the
-runtime support guard rejects the change, ``load_runtime_canary`` returns
+The production lifecycle boundary is ``begin_runtime_canary(settings, ledger)``
+and ``finish_runtime_canary(context)``. The canonical experiment root is
+derived from ``<state-db-parent>/tuning_experiments`` so the production
+path cannot silently return ``None`` when dependencies are missing. The
+internal ``_build_canary_context_with_deps`` helper is the explicit
+test-only construction seam — it accepts an optional ``controller`` and
+``store`` so tests can inject a custom store, but the production API
+never passes those parameters.
+
+When no experiment is in CANARY, ``begin_runtime_canary`` returns
 ``None`` so the trading paths transparently fall back to the legacy
-no-shadow behavior.
+no-shadow behavior. Malformed or inaccessible active state raises
+``RuntimeCanaryLifecycleError`` so corruption is observable rather than
+silently equated with "no canary".
 
 Failures during shadow persistence (disk errors, malformed JSONL, ledger
 divergence) trigger :meth:`RuntimeCanaryContext.invalidate`, which marks
@@ -39,6 +48,15 @@ from trading_bot.learning.experiments.store import ExperimentStore
 from trading_bot.portfolio.ledger import PortfolioLedger
 
 logger = logging.getLogger(__name__)
+
+
+class RuntimeCanaryLifecycleError(Exception):
+    """Raised when the runtime canary lifecycle cannot proceed.
+
+    Differentiates malformed/inaccessible active state from the
+    benign "no active canary" path so callers can fail loudly rather
+    than silently treating corruption as inactivity.
+    """
 
 
 @dataclass
@@ -160,70 +178,6 @@ def _resolve_artifacts_dir(store: ExperimentStore) -> Path:
     return store.root / state.experiment_id
 
 
-def load_runtime_canary(
-    settings: Settings,
-    ledger: PortfolioLedger | object | None,
-    *,
-    controller: ExperimentController | None = None,
-    store: ExperimentStore | None = None,
-    now: datetime | None = None,
-) -> RuntimeCanaryContext | None:
-    """Return a context for the active CANARY experiment, or ``None``.
-
-    Returns ``None`` when:
-        - No experiment is in CANARY.
-        - The candidate change is unsupported by the harness (anything
-          other than the allowlisted sizing-only parameter).
-        - The persistence seams are unreachable.
-
-    The caller treats a ``None`` return as "no shadow tracking this
-    cycle" and proceeds with the legacy no-shadow path.
-    """
-    if controller is not None:
-        ctl = controller
-        store = controller.store
-    elif store is not None:
-        ctl = ExperimentController(
-            settings=settings,
-            store=store,
-            bar_loader=None,
-            overrides_path=Path(settings.app.tuning_overrides_path),
-        )
-    else:
-        return None
-
-    try:
-        state = store.load_current()
-    except Exception:  # noqa: BLE001
-        return None
-
-    if state is None or state.status != "CANARY":
-        return None
-
-    if not is_runtime_canary_supported(state.change):
-        return None
-
-    artifacts_dir = _resolve_artifacts_dir(store)
-    try:
-        starting_cash = _resolve_starting_cash(state, ledger)
-    except Exception:  # noqa: BLE001
-        return None
-
-    harness = PairedShadowHarness(
-        artifacts_dir=artifacts_dir,
-        starting_cash=starting_cash,
-        change=state.change,
-    )
-    return RuntimeCanaryContext(
-        state=state,
-        controller=ctl,
-        store=store,
-        harness=harness,
-        artifacts_dir=artifacts_dir,
-        starting_cash=starting_cash,
-    )
-
-
 def _resolve_starting_cash(state: ExperimentState, ledger: object | None) -> float:
     """Return the immutable starting cash for the harness.
 
@@ -239,3 +193,209 @@ def _resolve_starting_cash(state: ExperimentState, ledger: object | None) -> flo
         portfolio = ledger.ensure_portfolio_state()  # type: ignore[attr-defined]
         return float(getattr(portfolio, "cash", 0.0))
     return 0.0
+
+
+def _reconcile_durable_orders(
+    harness: PairedShadowHarness,
+    state: ExperimentState,
+    ledger: PortfolioLedger | object | None,
+) -> None:
+    """Replay durable orders missing from the shadow JSONL.
+
+    The shadow append happens after the SQLite commit. If the process
+    crashes between the two, the durable row exists but the shadow
+    JSONL does not. This method backfills the missing rows so the
+    harness state matches the durable ledger.
+
+    Idempotency: the individual shadow ledgers drop duplicate
+    operation_ids, so re-recording an already-applied row is a no-op.
+    """
+    if ledger is None:
+        return
+    list_rows = getattr(ledger, "list_canary_order_rows", None)
+    if list_rows is None:
+        return
+    try:
+        rows = list_rows(state.experiment_id)
+    except Exception as exc:
+        logger.exception(
+            "Failed to read canary orders for %s during reconciliation",
+            state.experiment_id,
+        )
+        raise RuntimeCanaryLifecycleError(
+            "canary_orders_inaccessible"
+        ) from exc
+
+    for row in rows:
+        order_id = str(row["id"])
+        side = str(row["side"])
+        ticker = str(row["ticker"])
+        fill_price = float(row["fill_price"])
+        fees = float(row["fees"])
+        if side == "BUY":
+            baseline_quantity = int(row.get("canary_baseline_quantity") or 0)
+            candidate_quantity = int(row["quantity"])
+            harness.record_entry(
+                operation_id=order_id,
+                ticker=ticker,
+                baseline_quantity=baseline_quantity,
+                candidate_quantity=candidate_quantity,
+                fill_price=fill_price,
+                fees=fees,
+            )
+        elif side == "SELL":
+            candidate_quantity = int(row["quantity"])
+            if candidate_quantity <= 0:
+                continue
+            harness.record_exit(
+                operation_id=order_id,
+                ticker=ticker,
+                candidate_quantity=candidate_quantity,
+                fill_price=fill_price,
+                fees=fees,
+            )
+
+
+def _build_canary_context_with_deps(
+    settings: Settings,
+    ledger: PortfolioLedger | object | None,
+    *,
+    controller: ExperimentController | None = None,
+    store: ExperimentStore | None = None,
+) -> RuntimeCanaryContext | None:
+    """Internal loader used by both the production API and the test seam.
+
+    The production API only ever calls this without explicit
+    ``controller`` or ``store``; the test seam allows injection so
+    tests can use a tmp_path store without touching the canonical root.
+    """
+    canonical_root = (
+        Path(settings.app.state_db_path).parent / "tuning_experiments"
+    )
+    if controller is not None:
+        store = controller.store
+    elif store is None:
+        store = ExperimentStore(root=canonical_root)
+
+    try:
+        state = store.load_current()
+    except Exception as exc:
+        logger.exception(
+            "Failed to load runtime canary state from %s", canonical_root
+        )
+        raise RuntimeCanaryLifecycleError(
+            "canary_state_inaccessible"
+        ) from exc
+
+    if state is None:
+        return None
+    if state.status != "CANARY":
+        return None
+    if not is_runtime_canary_supported(state.change):
+        logger.warning(
+            "Runtime canary %s has unsupported change %s.%s; "
+            "falling back to no-shadow path",
+            state.experiment_id,
+            state.change.section,
+            state.change.field,
+        )
+        return None
+
+    if controller is None:
+        controller = ExperimentController(
+            settings=settings,
+            store=store,
+            bar_loader=None,
+            overrides_path=Path(settings.app.tuning_overrides_path),
+        )
+
+    artifacts_dir = _resolve_artifacts_dir(store)
+    try:
+        starting_cash = _resolve_starting_cash(state, ledger)
+    except Exception as exc:
+        logger.exception(
+            "Failed to resolve starting cash for canary %s",
+            state.experiment_id,
+        )
+        raise RuntimeCanaryLifecycleError(
+            "canary_starting_cash_unavailable"
+        ) from exc
+
+    harness = PairedShadowHarness(
+        artifacts_dir=artifacts_dir,
+        starting_cash=starting_cash,
+        change=state.change,
+    )
+
+    _reconcile_durable_orders(harness, state, ledger)
+
+    return RuntimeCanaryContext(
+        state=state,
+        controller=controller,
+        store=store,
+        harness=harness,
+        artifacts_dir=artifacts_dir,
+        starting_cash=starting_cash,
+    )
+
+
+def begin_runtime_canary(
+    settings: Settings,
+    ledger: PortfolioLedger,
+) -> RuntimeCanaryContext | None:
+    """Begin a runtime canary context for the current cycle.
+
+    Derives the canonical experiment root from
+    ``<state_db_parent>/tuning_experiments``, builds the
+    ``ExperimentController`` and ``PairedShadowHarness``, validates the
+    canary state, and reconstructs paired ledgers from durable
+    artifacts.
+
+    Returns ``None`` when no experiment is in CANARY (the legacy
+    no-shadow fallback).
+
+    Raises ``RuntimeCanaryLifecycleError`` when active state is
+    malformed or inaccessible — observability requires that corruption
+    is not silently equated with inactivity.
+    """
+    return _build_canary_context_with_deps(settings, ledger)
+
+
+def finish_runtime_canary(context: RuntimeCanaryContext | None) -> None:
+    """Finalize the canary context: snapshot metrics and persist state.
+
+    Captures candidate_metrics, shadow_metrics, and the completed-position
+    count via the controller's snapshot. No-op when ``context`` is None
+    so callers can finish without a branch on the canary state.
+    """
+    if context is None:
+        return
+    context.snapshot()
+
+
+def load_runtime_canary(
+    settings: Settings,
+    ledger: PortfolioLedger | object | None,
+    *,
+    controller: ExperimentController | None = None,
+    store: ExperimentStore | None = None,
+    now: datetime | None = None,
+) -> RuntimeCanaryContext | None:
+    """Backward-compatible loader preserving the existing None-on-error contract.
+
+    Returns ``None`` when no canary is in CANARY, when the change is
+    unsupported, or when the canonical state is malformed/inaccessible.
+    Production callers should use :func:`begin_runtime_canary` instead —
+    this shim catches ``RuntimeCanaryLifecycleError`` so the legacy
+    test suite continues to work without per-call error handling.
+    """
+    del now  # unused; legacy parameter
+    try:
+        return _build_canary_context_with_deps(
+            settings,
+            ledger,
+            controller=controller,
+            store=store,
+        )
+    except RuntimeCanaryLifecycleError:
+        return None
