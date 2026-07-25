@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import shutil
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -33,12 +34,36 @@ EARLY_PF_FLOOR = 0.50
 TIMEOUT_SESSIONS = 10
 HEALTH_STALE_SECONDS = 7200
 
+logger = logging.getLogger(__name__)
+
+# Terminal outcomes: every status that resolves an experiment. KEPT
+# retains the candidate bytes; the rest must restore baseline so the
+# next proposal can run.
+TERMINAL_STATUSES = frozenset({
+    "KEPT",
+    "ROLLED_BACK",
+    "INCONCLUSIVE",
+    "ERROR",
+    "OFFLINE_REJECTED",
+})
+
 # The runtime canary only supports sizing-only policy changes whose values
 # lie in (0, 1) and whose baseline is exactly 1.0 (the production default).
 # Adding more parameters requires a new spec revision plus fixtures.
 RUNTIME_CANARY_ALLOWED: set[tuple[str, str]] = {
     ("supermodel", "range_bound_trend_caution_multiplier"),
 }
+
+
+class RuntimeCanaryLifecycleError(Exception):
+    """Raised when the runtime canary lifecycle cannot proceed.
+
+    Differentiates malformed/inaccessible active state from the
+    benign "no active canary" path so callers can fail loudly rather
+    than silently treating corruption as inactivity. Also raised when
+    baseline restoration fails during terminal finalization so the
+    operator can intervene before the next proposal.
+    """
 
 
 def is_runtime_canary_supported(change: ParameterChange) -> bool:
@@ -234,16 +259,25 @@ class ExperimentController:
 
         The runtime canary must start flat: a position opened before the
         canary has no paired shadow entry, so its exit cannot be mirrored
-        safely. The check reads the live ledger and never raises on
-        missing files (a never-persisted portfolio is treated as flat).
+        safely.
+
+        Fail-closed semantics:
+        - A never-initialized ledger (no SQLite file at the configured
+          path) is allowed and treated as flat.
+        - Any read, parse, or schema error against an existing file
+          returns False so a corrupted ledger cannot silently enable
+          canary activation.
         """
         from trading_bot.portfolio.ledger import PortfolioLedger
 
+        db_path = Path(self.settings.app.state_db_path)
+        if not db_path.exists():
+            return True
         try:
-            ledger = PortfolioLedger(Path(self.settings.app.state_db_path))
+            ledger = PortfolioLedger(db_path)
             portfolio = ledger.ensure_portfolio_state()
         except Exception:  # noqa: BLE001
-            return True
+            return False
         return all(
             position.quantity <= 0 for position in portfolio.positions.values()
         )
@@ -260,14 +294,11 @@ class ExperimentController:
             if self.store.detect_candidate_drift(
                 state.experiment_id, state.candidate_checksum
             ):
-                state.status = "ERROR"
-                state.last_error = "candidate snapshot drifted from proposal"
-                self.store.save_current(state)
-                self.store.append_event({
-                    "event": "candidate_drift",
-                    "experiment_id": state.experiment_id,
-                })
-                return state
+                return self.finalize_terminal(
+                    state,
+                    "ERROR",
+                    reason="candidate snapshot drifted from proposal",
+                )
 
             evaluation = self._run_offline(state)
             self.store.append_event({
@@ -277,40 +308,42 @@ class ExperimentController:
                 "reasons": evaluation.reasons,
             })
             if not evaluation.accepted:
-                state.status = "OFFLINE_REJECTED"
                 state.candidate_metrics = evaluation.candidate_validation
                 state.baseline_metrics = evaluation.baseline_validation
-                self.store.save_current(state)
-                self._archive_to_terminal(state, "OFFLINE_REJECTED")
-                return state
+                return self.finalize_terminal(
+                    state, "OFFLINE_REJECTED", reason="offline_evaluation_rejected"
+                )
             state.baseline_metrics = evaluation.baseline_validation
             state.candidate_metrics = evaluation.candidate_validation
 
             # Runtime-canary gating: refuse to enter the runtime canary for
             # any change the harness cannot simulate faithfully, or whenever
             # the live portfolio is not flat. We bail BEFORE the candidate
-            # bytes are activated so baseline overrides remain intact.
+            # bytes are activated so baseline overrides remain intact;
+            # finalize_terminal archives the state so the next proposal can run.
             if not is_runtime_canary_supported(state.change):
-                state.status = "INCONCLUSIVE"
-                state.last_error = "unsupported_runtime_canary"
-                self.store.save_current(state)
-                self.store.append_event({
-                    "event": "unsupported_runtime_canary",
-                    "experiment_id": state.experiment_id,
-                    "change": state.change.model_dump(),
-                })
-                return state
+                return self.finalize_terminal(
+                    state,
+                    "INCONCLUSIVE",
+                    reason="unsupported_runtime_canary",
+                )
             state.runtime_canary_armed = True
             if not self._live_portfolio_is_flat():
-                state.status = "INCONCLUSIVE"
-                state.last_error = "non_flat_portfolio_on_canary_start"
                 state.runtime_canary_armed = False
-                self.store.save_current(state)
-                self.store.append_event({
-                    "event": "non_flat_portfolio_on_canary_start",
-                    "experiment_id": state.experiment_id,
-                })
-                return state
+                return self.finalize_terminal(
+                    state,
+                    "INCONCLUSIVE",
+                    reason="non_flat_portfolio_on_canary_start",
+                )
+
+            # Persist the immutable canary_starting_equity BEFORE the
+            # candidate bytes hit disk so a crashed restart can rebuild
+            # the harness against the same baseline cash.
+            from trading_bot.portfolio.ledger import PortfolioLedger
+            self.activate_canary(state, PortfolioLedger(
+                Path(self.settings.app.state_db_path)
+            ))
+
             state.status = "CANARY"
 
             # Drift guard: if the operator hand-edited the live overrides
@@ -336,18 +369,12 @@ class ExperimentController:
                 state.experiment_id, self.overrides_path
             )
             if not activated:
-                state.status = "ERROR"
-                state.last_error = "candidate snapshot missing at activation"
-                self.store.save_current(state)
-                self.store.append_event({
-                    "event": "candidate_missing",
-                    "experiment_id": state.experiment_id,
-                })
                 # Restore baseline so we don't leave a partial state.
-                self.store.restore_baseline_exact(
-                    state.experiment_id, self.overrides_path
+                return self.finalize_terminal(
+                    state,
+                    "ERROR",
+                    reason="candidate snapshot missing at activation",
                 )
-                return state
             self.store.save_current(state)
             self.store.append_event({"event": "canary_started", "experiment_id": state.experiment_id})
 
@@ -363,52 +390,38 @@ class ExperimentController:
             and state.canary_closed_trades == 0
             and not is_runtime_canary_supported(state.change)
         ):
-            state.status = "INCONCLUSIVE"
-            state.last_error = "unsupported_runtime_canary"
-            self.store.save_current(state)
             self.store.append_event({
                 "event": "unsupported_runtime_canary",
                 "experiment_id": state.experiment_id,
                 "change": state.change.model_dump(),
                 "phase": "canary_resume",
             })
-            self.store.restore_baseline_exact(
-                state.experiment_id, self.overrides_path
+            return self.finalize_terminal(
+                state,
+                "INCONCLUSIVE",
+                reason="unsupported_runtime_canary",
             )
-            return state
         if (
             state.runtime_canary_armed
             and state.canary_closed_trades == 0
             and not self._live_portfolio_is_flat()
             and is_runtime_canary_supported(state.change)
         ):
-            state.status = "INCONCLUSIVE"
-            state.last_error = "non_flat_portfolio_on_canary_start"
-            self.store.save_current(state)
             self.store.append_event({
                 "event": "non_flat_portfolio_on_canary_start",
                 "experiment_id": state.experiment_id,
                 "phase": "canary_resume",
             })
-            self.store.restore_baseline_exact(
-                state.experiment_id, self.overrides_path
+            return self.finalize_terminal(
+                state,
+                "INCONCLUSIVE",
+                reason="non_flat_portfolio_on_canary_start",
             )
-            return state
 
         decision = self._decide(state)
-        state.status = decision
-        if decision == "KEPT":
-            self.store.save_current(state)
-            self._archive_to_terminal(state, "KEPT")
-        elif decision in {"ROLLED_BACK", "INCONCLUSIVE", "ERROR"}:
-            self.store.restore_baseline_exact(
-                state.experiment_id, self.overrides_path
-            )
-            state.rolled_back_at = datetime.now(timezone.utc)
-            self.store.save_current(state)
-            self._archive_to_terminal(state, decision)
-        self.store.append_event({"event": decision.lower(), "experiment_id": state.experiment_id})
-        return state
+        if decision not in TERMINAL_STATUSES:
+            return state
+        return self.finalize_terminal(state, decision, reason=state.last_error)
 
     def rollback(self, reason: str | None = None) -> ExperimentState | None:
         state = self.store.load_current()
@@ -428,21 +441,14 @@ class ExperimentController:
                 "phase": "rollback",
                 "reason": reason,
             })
-        ok = self.store.restore_baseline_exact(
-            state.experiment_id, self.overrides_path
-        )
-        state.status = "ROLLED_BACK"
-        state.rolled_back_at = datetime.now(timezone.utc)
-        state.last_error = reason
-        if ok:
-            self._archive_to_terminal(state, "ROLLED_BACK")
+        finalized = self.finalize_terminal(state, "ROLLED_BACK", reason=reason)
         self.store.append_event({
             "event": "rolled_back",
             "experiment_id": state.experiment_id,
             "manual": True,
             "reason": reason,
         })
-        return state
+        return finalized
 
     def _archive_to_terminal(
         self, state: ExperimentState, status: str
@@ -464,6 +470,55 @@ class ExperimentController:
             if target_files.exists():
                 shutil.rmtree(target_files)
             shutil.move(str(src), str(target_files))
+
+    def finalize_terminal(
+        self,
+        state: ExperimentState,
+        status: str,
+        reason: str | None = None,
+    ) -> ExperimentState:
+        """One terminal path for every experiment outcome.
+
+        Owns status assignment, restoration, archival, and event logging.
+        All non-KEPT terminal statuses (ROLLED_BACK, INCONCLUSIVE, ERROR,
+        OFFLINE_REJECTED) MUST restore the baseline so the next proposal
+        can run. KEPT retains the candidate bytes because the experiment
+        was accepted.
+
+        Restoration failure is treated as a hard failure: the state is
+        left in the active store (NOT archived) and a
+        :class:`RuntimeCanaryLifecycleError` is raised so the operator
+        can investigate before the next proposal is attempted.
+        """
+        state.status = status  # type: ignore[assignment]
+        if reason is not None:
+            state.last_error = reason
+        if status in TERMINAL_STATUSES:
+            state.rolled_back_at = datetime.now(timezone.utc)
+
+        # Restoration must succeed before save_current so a failed
+        # restoration does not advance the state on disk.
+        if status != "KEPT":
+            restored = self.store.restore_baseline_exact(
+                state.experiment_id, self.overrides_path
+            )
+            if not restored:
+                logger.exception(
+                    "Baseline restoration failed for %s",
+                    state.experiment_id,
+                )
+                raise RuntimeCanaryLifecycleError(
+                    f"baseline restoration failed for {state.experiment_id}"
+                )
+
+        self.store.save_current(state)
+        self.store.append_event({
+            "event": status.lower(),
+            "experiment_id": state.experiment_id,
+            "reason": reason,
+        })
+        self._archive_to_terminal(state, status)
+        return state
 
     def status(self) -> dict[str, Any]:
         state = self.store.load_current()

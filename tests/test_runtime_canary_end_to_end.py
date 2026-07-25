@@ -346,8 +346,13 @@ def test_invalidate_marks_experiment_inconclusive_and_keeps_trading(
     )
     ctx.invalidate("simulated_persistence_failure")
 
-    reloaded = store.load_current()
-    assert reloaded is not None
+    # State is archived after invalidate (finalize_terminal archives
+    # terminal outcomes). Read the archived state instead.
+    archived_path = (
+        store.root / "archived" / "e2e-canary-invalid" / "current.json"
+    )
+    assert archived_path.exists()
+    reloaded = ExperimentState.model_validate_json(archived_path.read_text())
     assert reloaded.status == "INCONCLUSIVE"
     assert reloaded.last_error == "simulated_persistence_failure"
 

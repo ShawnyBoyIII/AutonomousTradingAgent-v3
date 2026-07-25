@@ -275,12 +275,26 @@ def test_invalidate_marks_canary_inconclusive(tmp_path: Path) -> None:
     store = ExperimentStore(root=tmp_path / "experiments")
 
     state = _seed_canary_state(store)
+    # Seed baseline snapshot so finalize_terminal can restore on INCONCLUSIVE.
+    overrides = tmp_path / "overrides.yaml"
+    overrides.write_text(
+        "supermodel:\n  range_bound_trend_caution_multiplier: 1.0\n",
+        encoding="utf-8",
+    )
+    store.snapshot_overrides_bytes(
+        state.experiment_id, "baseline", overrides.read_bytes()
+    )
+    state.baseline_checksum = store.checksum(
+        store.root / state.experiment_id / "baseline.yaml"
+    )
+    state.baseline_was_absent = False
+    store.save_current(state)
 
     controller = ExperimentController(
         settings=settings,
         store=store,
         bar_loader=None,
-        overrides_path=tmp_path / "overrides.yaml",
+        overrides_path=overrides,
     )
     ledger = _FakeLedger()
 
@@ -289,8 +303,11 @@ def test_invalidate_marks_canary_inconclusive(tmp_path: Path) -> None:
 
     ctx.invalidate("mock_persistence_failure")
 
-    loaded = store.load_current()
-    assert loaded is not None
+    # State is archived after invalidate (finalize_terminal archives
+    # terminal outcomes). Read the archived state instead.
+    archived_path = store.root / "archived" / state.experiment_id / "current.json"
+    assert archived_path.exists()
+    loaded = ExperimentState.model_validate_json(archived_path.read_text())
     assert loaded.status == "INCONCLUSIVE"
     assert loaded.last_error == "mock_persistence_failure"
     assert state.experiment_id == loaded.experiment_id

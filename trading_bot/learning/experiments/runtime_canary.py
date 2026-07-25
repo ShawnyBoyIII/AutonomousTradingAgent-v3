@@ -37,6 +37,7 @@ from typing import Iterable
 from trading_bot.config.settings import Settings
 from trading_bot.learning.experiments.controller import (
     ExperimentController,
+    RuntimeCanaryLifecycleError,
     is_runtime_canary_supported,
 )
 from trading_bot.learning.experiments.models import (
@@ -50,13 +51,17 @@ from trading_bot.portfolio.ledger import PortfolioLedger
 logger = logging.getLogger(__name__)
 
 
-class RuntimeCanaryLifecycleError(Exception):
-    """Raised when the runtime canary lifecycle cannot proceed.
-
-    Differentiates malformed/inaccessible active state from the
-    benign "no active canary" path so callers can fail loudly rather
-    than silently treating corruption as inactivity.
-    """
+# Re-exported so callers can ``from runtime_canary import
+# RuntimeCanaryLifecycleError``. The canonical definition lives in
+# :mod:`trading_bot.learning.experiments.controller` so the controller
+# can raise it without creating an import cycle.
+__all__ = [
+    "RuntimeCanaryContext",
+    "RuntimeCanaryLifecycleError",
+    "begin_runtime_canary",
+    "finish_runtime_canary",
+    "load_runtime_canary",
+]
 
 
 @dataclass
@@ -94,8 +99,10 @@ class RuntimeCanaryContext:
                 fees=fees,
             )
             self._maybe_add_session(session_date)
+        except RuntimeCanaryLifecycleError:
+            raise
         except Exception as exc:  # noqa: BLE001
-            self.invalidate(f"record_entry_failure: {exc!s}")
+            self._safe_invalidate(f"record_entry_failure: {exc!s}")
 
     def record_exit(
         self,
@@ -118,44 +125,63 @@ class RuntimeCanaryContext:
                 fees=fees,
             )
             self._maybe_add_session(session_date)
+        except RuntimeCanaryLifecycleError:
+            raise
         except Exception as exc:  # noqa: BLE001
-            self.invalidate(f"record_exit_failure: {exc!s}")
+            self._safe_invalidate(f"record_exit_failure: {exc!s}")
 
     def snapshot(self) -> None:
         if self._invalidated_reasons:
             return
         try:
             self.controller.record_canary_snapshot(self.state, self.harness)
+        except RuntimeCanaryLifecycleError:
+            raise
         except Exception as exc:  # noqa: BLE001
-            self.invalidate(f"snapshot_failure: {exc!s}")
+            self._safe_invalidate(f"snapshot_failure: {exc!s}")
 
     def invalidate(self, reason: str) -> None:
-        """Mark the canary INCONCLUSIVE and record the reason.
+        """Mark the canary INCONCLUSIVE, restore baseline, and archive.
 
-        Live paper trading continues; the controller restores baseline
-        overrides and archives the experiment on the next ``evaluate()``
-        call.
+        Delegates to :meth:`ExperimentController.finalize_terminal` so the
+        runtime invalidation path converges with the evaluate-time
+        lifecycles. The result is the same: state transitions to
+        INCONCLUSIVE, baseline overrides are restored, and the experiment
+        is archived so a subsequent proposal can run.
+
+        Raises :class:`RuntimeCanaryLifecycleError` if finalization fails
+        so the caller can decide. The trading path catches and logs the
+        error rather than letting it propagate.
         """
         if reason in self._invalidated_reasons:
             return
         self._invalidated_reasons.append(reason)
-        self.state.status = "INCONCLUSIVE"
-        self.state.last_error = reason
-        self.state.rolled_back_at = datetime.now(timezone.utc)
-        try:
-            self.store.save_current(self.state)
-            self.store.append_event({
-                "event": "runtime_canary_invalidated",
-                "experiment_id": self.state.experiment_id,
-                "reason": reason,
-            })
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to persist canary invalidation")
+        self.controller.finalize_terminal(
+            self.state, "INCONCLUSIVE", reason=reason
+        )
         logger.warning(
             "Runtime canary %s invalidated: %s",
             self.state.experiment_id,
             reason,
         )
+
+    def _safe_invalidate(self, reason: str) -> None:
+        """invalidate() helper that swallows finalization failures.
+
+        ``record_entry`` / ``record_exit`` / ``snapshot`` use this so a
+        hard failure in :meth:`finalize_terminal` (typically a missing
+        baseline snapshot) does not crash the live paper trade path;
+        the error is logged and the next ``evaluate()`` will revisit the
+        state.
+        """
+        try:
+            self.invalidate(reason)
+        except RuntimeCanaryLifecycleError:
+            logger.critical(
+                "Failed to finalize canary invalidation for %s",
+                self.state.experiment_id,
+                exc_info=True,
+            )
 
     def _maybe_add_session(self, session_date: str | None) -> None:
         if not session_date:
@@ -166,8 +192,10 @@ class RuntimeCanaryContext:
         try:
             self.state.market_sessions = new_sessions
             self.store.save_current(self.state)
+        except RuntimeCanaryLifecycleError:
+            raise
         except Exception as exc:  # noqa: BLE001
-            self.invalidate(f"session_persist_failure: {exc!s}")
+            self._safe_invalidate(f"session_persist_failure: {exc!s}")
 
 
 def _resolve_artifacts_dir(store: ExperimentStore) -> Path:

@@ -167,6 +167,10 @@ def test_rollback_logs_drift_event(tmp_path):
         baseline_checksum=store.checksum(overrides),
         baseline_was_absent=False,
     )
+    # Seed baseline snapshot so finalize_terminal can restore on rollback.
+    store.snapshot_overrides_bytes(
+        state.experiment_id, "baseline", overrides.read_bytes()
+    )
     store.save_current(state)
 
     # Operator edits after propose
@@ -196,6 +200,10 @@ def test_rollback_no_drift_event_when_unchanged(tmp_path):
         started_at=datetime.now(timezone.utc),
         baseline_checksum=store.checksum(overrides),
         baseline_was_absent=False,
+    )
+    # Seed baseline snapshot so finalize_terminal can restore on rollback.
+    store.snapshot_overrides_bytes(
+        state.experiment_id, "baseline", overrides.read_bytes()
     )
     store.save_current(state)
 
