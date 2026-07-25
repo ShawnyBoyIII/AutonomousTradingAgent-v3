@@ -25,8 +25,9 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from trading_bot.learning.experiments.models import MetricSet, ParameterChange
 
@@ -39,6 +40,14 @@ class ShadowFill:
     fill_price: float
     fees: float
     applied_multiplier: float = 1.0
+    operation_id: str = field(default="")
+
+    def __post_init__(self) -> None:
+        # ``field(default=...)`` cannot precede required dataclass fields, so
+        # we coerce ``None`` (the JSON ``null`` after a legacy replay) back
+        # to ``""`` to keep the duplicate-detection logic uniform.
+        if self.operation_id is None:  # type: ignore[unreachable]
+            object.__setattr__(self, "operation_id", "")
 
 
 class ShadowLedger:
@@ -63,6 +72,8 @@ class ShadowLedger:
         self._positions: dict[str, dict[str, float]] = {}
         self._closed_pnls: list[float] = []
         self._equity_curve: list[float] = [float(starting_cash)]
+        self._completed_positions: int = 0
+        self._applied_operation_ids: set[str] = set()
         prefix = "" if ledger_id == "baseline" else f"{ledger_id}-"
         self._fills_path = self.artifacts_dir / f"{prefix}shadow-fills.jsonl"
         self._equity_path = self.artifacts_dir / f"{prefix}shadow-equity.jsonl"
@@ -74,10 +85,23 @@ class ShadowLedger:
         The shadow's sizing is determined upstream (``applied_multiplier``
         on the fill), so the ledger does not know whether the fill came
         from the candidate or the baseline; it just records the fill.
+
+        Idempotency: a non-empty ``fill.operation_id`` is recorded the
+        first time and silently dropped on every subsequent call. The
+        empty ``""`` sentinel is the legacy replay value and is **not**
+        deduped — pre-schema callers lacked unique IDs and we must not
+        silently drop their repeated retries. Completed-position
+        accounting increments only when a SELL drives a previously
+        positive ticker quantity to zero.
         """
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         if fill.quantity <= 0:
             return
+        operation_id = fill.operation_id or ""
+        if operation_id and operation_id in self._applied_operation_ids:
+            return
+        if operation_id:
+            self._applied_operation_ids.add(operation_id)
         cost = fill.fill_price * fill.quantity + fill.fees
         if fill.side == "BUY":
             self._cash -= cost
@@ -88,24 +112,36 @@ class ShadowLedger:
             pos["cost_basis"] += cost
         else:  # SELL
             pos = self._positions.get(fill.ticker, {"qty": 0.0, "cost_basis": 0.0})
-            sold_qty = min(float(fill.quantity), float(pos.get("qty", 0.0)))
+            held_before = float(pos.get("qty", 0.0))
+            sold_qty = min(float(fill.quantity), held_before)
             avg_cost = (
-                float(pos["cost_basis"]) / float(pos["qty"])
-                if float(pos.get("qty", 0.0)) > 0
-                else 0.0
+                float(pos["cost_basis"]) / held_before if held_before > 0 else 0.0
             )
             realized = (fill.fill_price - avg_cost) * sold_qty - fill.fees
             self._cash += fill.fill_price * sold_qty - fill.fees
-            pos["qty"] = float(pos.get("qty", 0.0)) - sold_qty
+            held_after = held_before - sold_qty
+            pos["qty"] = held_after
             pos["cost_basis"] = max(0.0, float(pos.get("cost_basis", 0.0)) - avg_cost * sold_qty)
-            if pos["qty"] <= 1e-9:
+            if held_after <= 1e-9:
                 self._positions.pop(fill.ticker, None)
             if sold_qty > 0:
                 self._closed_pnls.append(realized)
+            if held_before > 0 and held_after <= 1e-9:
+                self._completed_positions += 1
         self._append_line(self._fills_path, fill.__dict__)
         equity = self._marked_to_market()
         self._equity_curve.append(equity)
         self._append_line(self._equity_path, {"equity": equity})
+
+    @property
+    def completed_positions(self) -> int:
+        """Number of SELL fills that closed a ticker position to zero.
+
+        Distinct from ``metrics().trades`` (realized SELL count) so the
+        controller's gate can react to *finished positions* rather than
+        to partial exits that record realized P&L.
+        """
+        return self._completed_positions
 
     def metrics(self) -> MetricSet:
         closed = len(self._closed_pnls)
@@ -167,9 +203,10 @@ class ShadowLedger:
         """Reload ledger state from JSONL artifacts on construction.
 
         Rebuilt state covers cash (derived from recorded SELL fills minus
-        BUY costs), positions, closed-trade P&L history, and the equity
-        curve. If artifacts are absent or malformed, the ledger starts
-        fresh from ``starting_cash``.
+        BUY costs), positions, closed-trade P&L history, the equity
+        curve, the completed-position counter, and the applied-id set.
+        If artifacts are absent or malformed, the ledger starts fresh
+        from ``starting_cash``.
 
         Malformed tail handling: parse line-by-line so a torn final record
         does not discard every previously valid entry. The valid prefix is
@@ -195,6 +232,7 @@ class ShadowLedger:
                     fill_price=float(entry["fill_price"]),
                     fees=float(entry["fees"]),
                     applied_multiplier=float(entry.get("applied_multiplier", 1.0)),
+                    operation_id=str(entry.get("operation_id") or ""),
                 )
             except (KeyError, TypeError, ValueError):
                 continue
@@ -202,9 +240,21 @@ class ShadowLedger:
 
 
     def _record_in_memory(self, fill: ShadowFill) -> None:
-        """Replay a fill into the in-memory state without re-writing artifacts."""
+        """Replay a fill into the in-memory state without re-writing artifacts.
+
+        Replay must honor the same idempotency contract as ``record``:
+        duplicate non-empty operation_ids are dropped so a torn-write
+        recovery cannot double-count. The completed-position counter and
+        the applied-id set are updated in lockstep with the live
+        ``record`` path.
+        """
         if fill.quantity <= 0:
             return
+        operation_id = fill.operation_id or ""
+        if operation_id and operation_id in self._applied_operation_ids:
+            return
+        if operation_id:
+            self._applied_operation_ids.add(operation_id)
         cost = fill.fill_price * fill.quantity + fill.fees
         if fill.side == "BUY":
             self._cash -= cost
@@ -215,22 +265,24 @@ class ShadowLedger:
             pos["cost_basis"] += cost
         else:
             pos = self._positions.get(fill.ticker, {"qty": 0.0, "cost_basis": 0.0})
-            sold_qty = min(float(fill.quantity), float(pos.get("qty", 0.0)))
+            held_before = float(pos.get("qty", 0.0))
+            sold_qty = min(float(fill.quantity), held_before)
             avg_cost = (
-                float(pos["cost_basis"]) / float(pos["qty"])
-                if float(pos.get("qty", 0.0)) > 0
-                else 0.0
+                float(pos["cost_basis"]) / held_before if held_before > 0 else 0.0
             )
             realized = (fill.fill_price - avg_cost) * sold_qty - fill.fees
             self._cash += fill.fill_price * sold_qty - fill.fees
-            pos["qty"] = float(pos.get("qty", 0.0)) - sold_qty
+            held_after = held_before - sold_qty
+            pos["qty"] = held_after
             pos["cost_basis"] = max(
                 0.0, float(pos.get("cost_basis", 0.0)) - avg_cost * sold_qty
             )
-            if pos["qty"] <= 1e-9:
+            if held_after <= 1e-9:
                 self._positions.pop(fill.ticker, None)
             if sold_qty > 0:
                 self._closed_pnls.append(realized)
+            if held_before > 0 and held_after <= 1e-9:
+                self._completed_positions += 1
         self._equity_curve.append(self._marked_to_market())
 
 
@@ -244,10 +296,17 @@ class PairedShadowHarness:
     internally, so the runtime executor remains the only place that
     decides sizing.
 
+    Every ``record_entry`` and ``record_exit`` call requires a stable
+    ``operation_id`` (the durable paper-order row id). The same id is
+    applied atomically to both ledgers; a duplicate id is a no-op so a
+    retried fill cannot double-realize P&L or double-count a completion.
+
     Exits derive the baseline SELL quantity from the fraction of the
     candidate position sold; a final exit closes both ledgers fully.
     The canary gate compares ``candidate_metrics()`` against
-    ``baseline_metrics()`` at the decision boundary.
+    ``baseline_metrics()`` at the decision boundary, and uses
+    ``candidate_completed_trades()`` / ``baseline_completed_trades()``
+    (not the realized-SELL counts) to gate the 20-trade minimum.
     """
 
     def __init__(
@@ -274,9 +333,12 @@ class PairedShadowHarness:
             starting_cash=starting_cash,
             ledger_id="candidate",
         )
+        self._applied_entry_ids: set[str] = set()
+        self._applied_exit_ids: set[str] = set()
 
     def record_entry(
         self,
+        operation_id: str,
         *,
         ticker: str,
         baseline_quantity: int,
@@ -286,15 +348,28 @@ class PairedShadowHarness:
     ) -> None:
         """Mirror a BUY at the supplied baseline and candidate quantities.
 
-        No multiplier is applied here: callers are responsible for any
-        pre- vs. post-policy split. ``baseline_quantity`` and
+        ``operation_id`` is the durable paper-order row id and must be
+        supplied so retries do not double-record. A duplicate id is
+        rejected atomically: neither ledger is touched on the second
+        call. No multiplier is applied here: callers are responsible for
+        any pre- vs. post-policy split. ``baseline_quantity`` and
         ``candidate_quantity`` are both clamped at 0 silently — callers
         should already have filtered zero-quantity entries.
         """
+        if not operation_id:
+            raise ValueError("operation_id is required for record_entry")
+        if operation_id in self._applied_entry_ids:
+            return
         baseline_quantity = int(baseline_quantity)
         candidate_quantity = int(candidate_quantity)
         if baseline_quantity <= 0 and candidate_quantity <= 0:
+            # Still mark the id as applied so a re-recorded zero-quantity
+            # entry cannot escape idempotency.
+            self._applied_entry_ids.add(operation_id)
             return
+        # Mark BEFORE recording so an exception inside ``record`` cannot
+        # leave one ledger updated and the other unupdated.
+        self._applied_entry_ids.add(operation_id)
         if baseline_quantity > 0:
             self.baseline.record(
                 ShadowFill(
@@ -304,6 +379,7 @@ class PairedShadowHarness:
                     fill_price=fill_price,
                     fees=fees,
                     applied_multiplier=1.0,
+                    operation_id=operation_id,
                 )
             )
         if candidate_quantity > 0:
@@ -315,11 +391,13 @@ class PairedShadowHarness:
                     fill_price=fill_price,
                     fees=fees,
                     applied_multiplier=1.0,
+                    operation_id=operation_id,
                 )
             )
 
     def record_exit(
         self,
+        operation_id: str,
         *,
         ticker: str,
         candidate_quantity: int,
@@ -328,14 +406,22 @@ class PairedShadowHarness:
     ) -> None:
         """Mirror a SELL using the candidate-side fraction as the baseline scale.
 
-        The baseline SELL quantity is
+        ``operation_id`` must be supplied so retries do not double-record
+        P&L or completed positions. A duplicate id is rejected
+        atomically: neither ledger is touched on the second call. The
+        baseline SELL quantity is
         ``round(baseline_held_before * (candidate_quantity / candidate_held_before))``.
         When ``candidate_held_before`` is zero the baseline side is
         skipped — the trade is not part of the paired shadow. A final
         exit clears both ledgers completely.
         """
+        if not operation_id:
+            raise ValueError("operation_id is required for record_exit")
+        if operation_id in self._applied_exit_ids:
+            return
         candidate_quantity = int(candidate_quantity)
         if candidate_quantity <= 0:
+            self._applied_exit_ids.add(operation_id)
             return
         candidate_held_before = self._held_quantity(self.candidate, ticker)
         baseline_held_before = self._held_quantity(self.baseline, ticker)
@@ -345,6 +431,9 @@ class PairedShadowHarness:
         else:
             baseline_exit_qty = 0
 
+        # Mark BEFORE recording so an exception cannot leave one ledger
+        # updated and the other unupdated.
+        self._applied_exit_ids.add(operation_id)
         if baseline_exit_qty > 0:
             self.baseline.record(
                 ShadowFill(
@@ -354,6 +443,7 @@ class PairedShadowHarness:
                     fill_price=fill_price,
                     fees=fees,
                     applied_multiplier=1.0,
+                    operation_id=operation_id,
                 )
             )
         self.candidate.record(
@@ -364,6 +454,7 @@ class PairedShadowHarness:
                 fill_price=fill_price,
                 fees=fees,
                 applied_multiplier=1.0,
+                operation_id=operation_id,
             )
         )
 
@@ -381,5 +472,28 @@ class PairedShadowHarness:
     def baseline_metrics(self) -> MetricSet:
         return self.baseline.metrics()
 
+    def candidate_completed_trades(self) -> int:
+        """Count of candidate-ledger positions closed to zero.
+
+        Distinct from ``candidate_metrics().trades`` (realized-SELL
+        count). The controller's 20-trade gate keys on this counter
+        so partial exits do not advance the gate.
+        """
+        return self.candidate.completed_positions
+
+    def baseline_completed_trades(self) -> int:
+        """Count of baseline-ledger positions closed to zero."""
+        return self.baseline.completed_positions
+
     def closed_trade_counts_match(self) -> bool:
         return self.candidate.metrics().trades == self.baseline.metrics().trades
+
+    def completed_trade_counts_match(self) -> bool:
+        """Return True iff both ledgers have completed the same number of positions.
+
+        This is the divergence-invalidation signal: if a partial exit
+        drives the candidate ledger to zero while the baseline still
+        holds residual shares (or vice versa) the ledgers have
+        diverged and the canary must be marked ``INCONCLUSIVE``.
+        """
+        return self.candidate.completed_positions == self.baseline.completed_positions

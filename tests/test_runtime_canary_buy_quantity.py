@@ -116,6 +116,7 @@ def test_record_entry_carries_baseline_and_candidate_quantities(tmp_path: Path) 
     )
     assert harness.entries == [
         {
+            "operation_id": "",
             "ticker": "AAPL",
             "baseline_quantity": 20,
             "candidate_quantity": 10,

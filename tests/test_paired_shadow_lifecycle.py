@@ -37,6 +37,7 @@ def test_paired_shadow_routes_each_fill_at_independent_size(tmp_path: Path) -> N
     harness = _harness(artifacts)
 
     harness.record_entry(
+        operation_id="buy-1",
         ticker="SPY",
         baseline_quantity=10,
         candidate_quantity=5,
@@ -44,6 +45,7 @@ def test_paired_shadow_routes_each_fill_at_independent_size(tmp_path: Path) -> N
         fees=1.0,
     )
     harness.record_exit(
+        operation_id="sell-1",
         ticker="SPY",
         candidate_quantity=5,
         fill_price=110.0,
@@ -72,6 +74,7 @@ def test_paired_shadow_baseline_records_equity_curves(tmp_path: Path) -> None:
     harness = _harness(artifacts)
 
     harness.record_entry(
+        operation_id="buy-1",
         ticker="SPY",
         baseline_quantity=10,
         candidate_quantity=5,
@@ -79,6 +82,7 @@ def test_paired_shadow_baseline_records_equity_curves(tmp_path: Path) -> None:
         fees=1.0,
     )
     harness.record_exit(
+        operation_id="sell-1",
         ticker="SPY",
         candidate_quantity=5,
         fill_price=110.0,
@@ -119,13 +123,13 @@ def test_paired_shadow_ignores_zero_and_negative_quantities(tmp_path: Path) -> N
         ),
     )
 
-    harness.record_entry(ticker="SPY", baseline_quantity=0, candidate_quantity=0,
+    harness.record_entry(operation_id="noop-1", ticker="SPY", baseline_quantity=0, candidate_quantity=0,
                          fill_price=100.0, fees=0.0)
-    harness.record_entry(ticker="SPY", baseline_quantity=-1, candidate_quantity=-1,
+    harness.record_entry(operation_id="noop-2", ticker="SPY", baseline_quantity=-1, candidate_quantity=-1,
                          fill_price=100.0, fees=0.0)
-    harness.record_exit(ticker="SPY", candidate_quantity=0,
+    harness.record_exit(operation_id="noop-3", ticker="SPY", candidate_quantity=0,
                         fill_price=110.0, fees=1.0)
-    harness.record_exit(ticker="SPY", candidate_quantity=-5,
+    harness.record_exit(operation_id="noop-4", ticker="SPY", candidate_quantity=-5,
                         fill_price=110.0, fees=1.0)
 
     assert harness.baseline.metrics().trades == 0

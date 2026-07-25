@@ -233,6 +233,7 @@ def test_context_persists_metrics_on_snapshot(tmp_path: Path) -> None:
     assert ctx is not None
 
     ctx.record_entry(
+        operation_id="buy-1",
         ticker="AAPL",
         baseline_quantity=1,
         candidate_quantity=1,
@@ -240,6 +241,7 @@ def test_context_persists_metrics_on_snapshot(tmp_path: Path) -> None:
         fees=1.0,
     )
     ctx.record_exit(
+        operation_id="sell-1",
         ticker="AAPL",
         candidate_quantity=1,
         fill_price=110.0,
