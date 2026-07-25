@@ -59,7 +59,7 @@ def fill_sell_position(
         - fill.fees
         - entry_fee_share
     )
-    from trading_bot.runtime.fill_transaction import FillTransaction
+    from trading_bot.runtime.fill_transaction import build_sell_transaction
 
     def _sell_sql_persist(**ctx):
         from trading_bot.db.models import Trade
@@ -105,35 +105,19 @@ def fill_sell_position(
             session.close()
             engine.dispose()
 
-    sell_tx = FillTransaction()
-    sell_tx.register(
-        lambda fill, side, **ctx: ledger.record_fill(
-            fill,
-            side="SELL",
-            realized_pnl=realized_pnl,
-            strategy_tag=position.strategy_tag,
-        )
+    canary_experiment_id = (
+        runtime_canary.state.experiment_id
+        if runtime_canary is not None
+        else None
     )
-    sell_tx.register(_sell_sql_persist)
-    sell_tx.run(fill=fill, side="SELL")
-
-    if runtime_canary is not None:
-        from trading_bot.learning.experiments.runtime_canary import (
-            RuntimeCanaryContext,
-        )
-
-        if isinstance(runtime_canary, RuntimeCanaryContext):
-            runtime_canary.record_exit(
-                ticker=fill.ticker,
-                candidate_quantity=fill.quantity,
-                fill_price=fill.fill_price,
-                fees=fill.fees,
-                session_date=(
-                    fill.filled_at.date().isoformat()
-                    if getattr(fill.filled_at, "date", None)
-                    else None
-                ),
-            )
+    sell_tx = build_sell_transaction(
+        ledger=ledger,
+        sql_persist=_sell_sql_persist,
+        strategy_tag=position.strategy_tag,
+        canary_experiment_id=canary_experiment_id,
+        runtime_canary=runtime_canary,
+    )
+    sell_tx.run(fill=fill, side="SELL", realized_pnl=realized_pnl)
 
     new_state = portfolio_state_after_sell(
         previous_state=state,

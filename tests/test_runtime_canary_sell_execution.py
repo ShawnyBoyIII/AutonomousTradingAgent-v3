@@ -7,9 +7,12 @@ profit-taking.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from trading_bot.config.settings import (
     PaperSettings,
@@ -58,6 +61,49 @@ def _settings(state_db_path: Path) -> Settings:
     )
     settings.app.state_db_path = str(state_db_path)
     return settings
+
+
+def _build_runtime_canary(
+    settings: Settings,
+    tmp_path: Path,
+    harness: _Harness,
+):
+    from trading_bot.learning.experiments.runtime_canary import RuntimeCanaryContext
+
+    store = ExperimentStore(root=tmp_path / "experiments")
+    state = ExperimentState(
+        experiment_id="sell-wiring",
+        status="CANARY",
+        change=ParameterChange(
+            section="supermodel",
+            field="range_bound_trend_caution_multiplier",
+            baseline=1.0,
+            candidate=0.5,
+        ),
+        started_at=datetime.now(timezone.utc),
+        runtime_canary_armed=True,
+        baseline_metrics=MetricSet(
+            trades=24,
+            profit_factor=1.20,
+            net_pnl=320.0,
+            max_drawdown_pct=2.0,
+        ),
+    )
+    store.save_current(state)
+    controller = ExperimentController(
+        settings=settings,
+        store=store,
+        bar_loader=None,
+        overrides_path=tmp_path / "overrides.yaml",
+    )
+    return RuntimeCanaryContext(
+        state=state,
+        controller=controller,
+        store=store,
+        harness=harness,
+        artifacts_dir=tmp_path / "experiments" / "sell-wiring",
+        starting_cash=99_000.0,
+    )
 
 
 def test_fill_sell_position_accepts_runtime_canary(tmp_path: Path) -> None:
@@ -223,3 +269,136 @@ def test_position_exit_instruments_record_exit(tmp_path: Path) -> None:
     assert last["ticker"] == "AAPL"
     assert last["candidate_quantity"] == 10
     assert last["fill_price"] == 110.0
+
+
+def test_failed_sell_transaction_does_not_record_shadow(tmp_path: Path) -> None:
+    from trading_bot.execution.paper_broker import PaperBroker
+    from trading_bot.models.portfolio import PortfolioState, Position
+    from trading_bot.runtime.fill_transaction import FillTransactionError
+    from trading_bot.runtime.position_exit import fill_sell_position
+
+    class FailingLedger:
+        def __init__(self) -> None:
+            self.canary_experiment_id: str | None = None
+
+        def record_fill(
+            self,
+            fill,
+            side,
+            realized_pnl=0.0,
+            strategy_tag="",
+            canary_experiment_id=None,
+            canary_baseline_quantity=None,
+        ) -> None:
+            self.canary_experiment_id = canary_experiment_id
+            raise RuntimeError("db failed")
+
+    state_db = tmp_path / "state.db"
+    settings = _settings(state_db)
+    position = Position(
+        ticker="AAPL",
+        quantity=10,
+        average_cost=100.0,
+        entry_fees=1.0,
+    )
+    state = PortfolioState(
+        cash=99_000.0,
+        equity=100_000.0,
+        positions={"AAPL": position},
+    )
+    broker = PaperBroker(
+        starting_cash=state.cash,
+        fee_per_order=settings.paper.fee_per_order,
+        slippage_bps=0,
+        dynamic_slippage_enabled=False,
+        dynamic_slippage_notional_bps_per_10k=0.0,
+        dynamic_slippage_low_price_boost_bps=0.0,
+        dynamic_slippage_max_extra_bps=0.0,
+    )
+    broker.positions = {"AAPL": 10}
+    broker.position_costs = {"AAPL": 100.0}
+    ledger = FailingLedger()
+    harness = _Harness()
+    ctx = _build_runtime_canary(settings, tmp_path, harness)
+
+    with pytest.raises(FillTransactionError):
+        fill_sell_position(
+            ticker="AAPL",
+            position=position,
+            reason="stop_loss",
+            submitted_at=datetime.now(timezone.utc),
+            last_price=110.0,
+            broker=broker,
+            ledger=ledger,
+            state=state,
+            log_path=tmp_path / "decision-log.jsonl",
+            settings=settings,
+            runtime_canary=ctx,
+        )
+
+    assert harness.exits == []
+    assert ledger.canary_experiment_id == "sell-wiring"
+
+
+def test_successful_sell_records_canary_experiment_id(tmp_path: Path) -> None:
+    from trading_bot.execution.paper_broker import PaperBroker
+    from trading_bot.models.portfolio import PortfolioState, Position
+    from trading_bot.portfolio.ledger import PortfolioLedger
+    from trading_bot.runtime.position_exit import fill_sell_position
+
+    state_db = tmp_path / "state.db"
+    settings = _settings(state_db)
+    ledger = PortfolioLedger(state_db)
+    position = Position(
+        ticker="AAPL",
+        quantity=10,
+        average_cost=100.0,
+        entry_fees=1.0,
+    )
+    ledger.save_portfolio_state(
+        PortfolioState(
+            cash=99_000.0,
+            equity=100_000.0,
+            positions={"AAPL": position},
+        )
+    )
+    state = ledger.ensure_portfolio_state()
+    broker = PaperBroker(
+        starting_cash=state.cash,
+        fee_per_order=settings.paper.fee_per_order,
+        slippage_bps=0,
+        dynamic_slippage_enabled=False,
+        dynamic_slippage_notional_bps_per_10k=0.0,
+        dynamic_slippage_low_price_boost_bps=0.0,
+        dynamic_slippage_max_extra_bps=0.0,
+    )
+    broker.positions = {"AAPL": 10}
+    broker.position_costs = {"AAPL": 100.0}
+    harness = _Harness()
+    ctx = _build_runtime_canary(settings, tmp_path, harness)
+
+    fill_sell_position(
+        ticker="AAPL",
+        position=position,
+        reason="stop_loss",
+        submitted_at=datetime.now(timezone.utc),
+        last_price=110.0,
+        broker=broker,
+        ledger=ledger,
+        state=state,
+        log_path=tmp_path / "decision-log.jsonl",
+        settings=settings,
+        runtime_canary=ctx,
+    )
+
+    with sqlite3.connect(state_db) as connection:
+        row = connection.execute(
+            """
+            SELECT id, canary_experiment_id, canary_baseline_quantity
+            FROM orders
+            WHERE side = 'SELL'
+            """
+        ).fetchone()
+    assert row is not None
+    assert row[1:] == ("sell-wiring", None)
+    assert harness.exits[-1]["operation_id"] == row[0]
