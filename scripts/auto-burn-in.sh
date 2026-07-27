@@ -211,9 +211,16 @@ run_discovery() {
     # Run discover with export. Capture both stdout and the exit
     # code so we can distinguish "no candidates" (CLI exits 2) from
     # "fresh discoveries" (CLI exits 0 with new symbols).
+    # The `|| true` is required: this script runs under `set -e` and
+    # the discover CLI exits 2 when 0 candidates pass the screener;
+    # without `|| true` the assignment's non-zero subshell return
+    # would kill the burner on every empty-discovery day (which the
+    # audit's "discovery failure visibility" change made the default
+    # case when EOD data hasn't been published yet). Confirmed via
+    # `bash -x` trace on 2026-07-27.
     local discover_output discover_rc
     # canonical: sh ./tradebot-local --config-path "$CONFIG_FILE" discover --mode breakout
-    discover_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" discover --mode breakout --max 50 --export 2>&1)
+    discover_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" discover --mode breakout --max 50 --export 2>&1) || true
     discover_rc=$?
 
     # The "0 candidates" warning is the new failure marker (audit
