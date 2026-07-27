@@ -324,49 +324,83 @@ tail -f logs/burn_in/decision-log.jsonl
 
 ## Runtime Canary Contract
 
-Live paper trading during an experiment's `CANARY` phase now mirrors every
-BUY and SELL into paired ledgers via `RuntimeCanaryContext`. The context is
-constructed once per CLI invocation or continuous-loop cycle and threaded
-through `run_paper_trade` (BUYs) and the shared SELL seam in
-`trading_bot.runtime.position_exit`. When no experiment is in CANARY,
-`load_runtime_canary(...)` returns `None` and the trading paths behave
-identically to the legacy no-shadow implementation.
+Live paper trading during an experiment's `CANARY` phase mirrors every
+BUY and SELL into paired shadow ledgers via `RuntimeCanaryContext`. The
+production lifecycle is two calls: `begin_runtime_canary(settings, ledger)`
+returns a context (or `None` when no canary is active) and
+`finish_runtime_canary(context)` snapshots metrics once per command or
+continuous-loop cycle. Both calls are wrapped in `try/finally` in every
+entry point (`paper-trade`, `manage-positions`, `run_continuous_loop`)
+so paired metrics persist regardless of how the cycle ends.
+
+**Canonical store.** The lifecycle derives the experiment root from
+`<settings.app.state_db_path parent>/tuning_experiments`. Production
+callers cannot accidentally supply an injected store or controller; tests
+use a private `_build_canary_context_with_deps` helper for dependency
+injection. Malformed or inaccessible active state raises
+`RuntimeCanaryLifecycleError` so corruption is observable rather than
+silently equated with "no canary".
 
 **Allowlist.** The runtime canary supports exactly one parameter today:
 `supermodel.range_bound_trend_caution_multiplier` with `0 < candidate <= 1`
-and `0 < baseline <= 1`. Any other field — including the threshold and
-weight knobs — returns `None` from `load_runtime_canary` so unsupported
-experiments never enter runtime mirroring. Add support for new parameters
-with a fresh spec revision plus fixtures; do not extend the allowlist in
-ad-hoc commits.
+and `0 < baseline <= 1`. Any other field returns `None` from
+`begin_runtime_canary` so unsupported experiments never enter runtime
+mirroring. Add support for new parameters with a fresh spec revision
+plus fixtures; do not extend the allowlist in ad-hoc commits.
 
-**Activation gate.** Before promoting `PROPOSED → CANARY`, the controller
-verifies the live portfolio is flat. A non-flat portfolio produces
-`INCONCLUSIVE` with reason `non_flat_portfolio_on_canary_start` and the
-candidate bytes are never written to live overrides. This rule also fires
-on resume so a position opened after activation cannot slip past the gate.
+**Durable canary metadata.** Each durable `orders` row gains two
+additive nullable columns: `canary_experiment_id` (set on every fill
+during an active canary) and `canary_baseline_quantity` (set on BUY
+rows with the pre-policy baseline size). SELL rows record the
+experiment id; their baseline quantity is derived from the paired
+position fraction during reconciliation.
+
+**Idempotent shadow recording.** Every shadow fill carries the durable
+`FillResult.order_id`. Both the in-memory ledger and the JSONL replay
+drop duplicate non-empty IDs. Re-recording a durable fill that crashed
+between the SQLite commit and the JSONL append is a no-op, so lifecycle
+reconciliation can backfill missing rows safely.
+
+**Completed-position gate.** The 20-trade decision boundary counts
+completed positions (a SELL that drives a ticker to zero), not partial
+SELL fills. Profit factor and net P&L still include each realized
+partial-exit component; only the completion count gates the decision.
+A paired-ledger divergence (`candidate_completed_trades` ≠
+`baseline_completed_trades`) immediately invalidates the canary.
+
+**Activation gate.** Before promoting `PROPOSED → CANARY`, the
+controller verifies the live portfolio is flat and the ledger is
+readable. A non-flat or unreadable ledger produces `INCONCLUSIVE`
+with the matching reason, and the candidate bytes are never written.
+Starting equity is persisted (`canary_starting_equity_recorded`) BEFORE
+candidate bytes are activated so restarts rebuild the harness against
+the same baseline.
 
 **Restart safety.** The harness reads `state.canary_starting_equity` on
 every load so a crashed process restarts against the same baseline cash.
-SELLs for positions opened before the canary started are silently dropped;
-SELLs for paired positions drive a proportional baseline exit
-(`baseline_exit ≈ baseline_held × (candidate_exit / candidate_held)`).
+On lifecycle start, durable order rows for the active experiment are
+reconciled into the paired shadow ledgers via
+`PortfolioLedger.list_canary_order_rows`, so any JSONL gaps from a
+mid-fill crash are backfilled exactly once.
 
-**Decision-boundary snapshots.** `ExperimentController.record_canary_snapshot`
-populates `state.candidate_metrics` (runtime candidate) and
-`state.shadow_metrics` (runtime baseline). `state.baseline_metrics` retains
-the offline replay baseline so both evidence sources are auditable
-side-by-side. When the paired trade counts diverge, the canary is
-immediately marked `INCONCLUSIVE` with reason `paired_ledgers_diverged`.
+**Terminal finalization.** Every CANARY outcome (KEPT, ROLLED_BACK,
+INCONCLUSIVE, ERROR, OFFLINE_REJECTED) routes through one
+`ExperimentController.finalize_terminal(state, status, reason)`. It
+restores baseline overrides (except for KEPT), persists the state,
+logs the event, and archives the experiment. Restoration failure
+raises `RuntimeCanaryLifecycleError` and leaves the state in the
+active store so an operator can investigate.
 
 **Pass/fail threshold.** The runtime canary runs alongside the existing
 experiment rules in `_decide`. The runtime metrics feed the same
 `candidate_metrics` vs `shadow_metrics` comparison; candidates that fail
 the existing PF / net-P&L / drawdown gates are auto-rolled back.
+After 10 market sessions without 20 completed positions the experiment
+becomes `INCONCLUSIVE` and is archived.
 
-Verified by `tests/test_runtime_canary_*.py` (8 new files covering the
-harness, controller guards, context seam, BUY wiring, SELL wiring, CLI
-lifecycle, and end-to-end behavior).
+Verified by `tests/test_runtime_canary_*.py` covering the harness,
+controller guards, context seam, BUY wiring, SELL wiring, CLI
+lifecycle, end-to-end behavior, and idempotency/reconciliation.
 
 
 # Advisory learner (paper-only; opt-in via advisory.enabled)

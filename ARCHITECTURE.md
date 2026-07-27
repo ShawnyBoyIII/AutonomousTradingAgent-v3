@@ -129,6 +129,53 @@ scripts/
 
 See AGENTS.md **Tuning Experiment Controller** section.
 
+### Runtime Canary
+
+The runtime canary is a one-parameter paired-shadow experiment that
+compares a live candidate policy against a frozen baseline without
+submitting baseline orders to the paper broker. The canonical entry
+points are:
+
+- `trading_bot/learning/experiments/runtime_canary.py` — exports
+  `begin_runtime_canary(settings, ledger)` and
+  `finish_runtime_canary(context)`. The lifecycle derives the canonical
+  experiment root from `<state_db_parent>/tuning_experiments`,
+  constructs the controller, and reconciles durable order rows into
+  the paired shadow ledgers via `PortfolioLedger.list_canary_order_rows`.
+- `trading_bot/learning/experiments/controller.py` —
+  `ExperimentController.finalize_terminal(state, status, reason)`
+  is the single owner of state restoration, persistence, event
+  logging, and archival for every terminal outcome
+  (KEPT, ROLLED_BACK, INCONCLUSIVE, ERROR, OFFLINE_REJECTED).
+  `activate_canary` persists `canary_starting_equity` BEFORE the
+  candidate override bytes are activated.
+- `trading_bot/learning/experiments/shadow.py` —
+  `PairedShadowHarness` records BUY and SELL fills under a stable
+  `operation_id` (the durable `FillResult.order_id`); duplicate IDs
+  are silently dropped. `candidate_completed_trades()` /
+  `baseline_completed_trades()` count full SELLs that close a
+  ticker to zero; partial exits realize P&L without advancing the
+  decision boundary.
+- `trading_bot/runtime/fill_transaction.py` —
+  `build_buy_transaction` and `build_sell_transaction` accept
+  optional canary kwargs. The durable order row carries the
+  `canary_experiment_id` (BUY also records `canary_baseline_quantity`)
+  atomically with the fill. The runtime canary context is notified
+  only AFTER the transaction succeeds, so a failed durable commit
+  does not pollute the shadow ledgers.
+
+Every production paper-trading entry point wraps begin/finish in
+`try/finally`:
+
+- `trading_bot/cli/app.py::paper_trade`
+- `trading_bot/cli/app.py::_run_manage_positions_once`
+- `trading_bot/runtime/continuous_loop.py::run_continuous_loop`
+
+The controller's `_live_portfolio_is_flat` is fail-closed: a
+never-initialized ledger is treated as flat, but any read/parse error
+against an existing ledger returns False so a corrupted store cannot
+silently enable canary activation.
+
 ### Quantitative Research Validation
 
 - The root `event_engine` package is isolated from live paper execution.
@@ -141,7 +188,7 @@ See AGENTS.md **Tuning Experiment Controller** section.
 
 ## Testing
 
-- 2,099 tests pass (network-free, monkeypatch `fetch_bars`); one pre-existing assertion mismatch in `test_run_symbol_backtest_replays_multiple_trade_cycles` remains.
+- 2,133 tests pass (network-free, monkeypatch `fetch_bars`); one pre-existing assertion mismatch in `test_run_symbol_backtest_replays_multiple_trade_cycles` remains.
 - Run: `.venv/bin/python -m pytest -q`
 
 ## Configuration

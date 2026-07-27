@@ -388,15 +388,16 @@ def paper_trade(
     ledger = PortfolioLedger(Path(ctx.obj.app.state_db_path))
     runtime_canary = begin_runtime_canary(ctx.obj, ledger)
 
-    for result in run_paper_trade(
-        parsed_symbols,
-        ctx.obj,
-        dry_run=dry_run,
-        runtime_canary=runtime_canary,
-    ):
-        typer.echo(result)
-
-    finish_runtime_canary(runtime_canary)
+    try:
+        for result in run_paper_trade(
+            parsed_symbols,
+            ctx.obj,
+            dry_run=dry_run,
+            runtime_canary=runtime_canary,
+        ):
+            typer.echo(result)
+    finally:
+        finish_runtime_canary(runtime_canary)
 
 
 @app.command()
@@ -759,261 +760,261 @@ def _run_manage_positions_once(ctx: typer.Context) -> dict[str, object]:
     state = ledger.ensure_portfolio_state()
     runtime_canary = begin_runtime_canary(ctx.obj, ledger)
 
-    # Idempotency guard: skip exits for tickers recently sold by a concurrent
-    # process.  Two manage-positions processes can read the same stale state and
-    # both try to sell the same ticker — this prevents duplicate fills.
-    _EXIT_COOLDOWN_SECONDS = 120  # 2-minute window after a sell
+    try:
+        # Idempotency guard: skip exits for tickers recently sold by a concurrent
+        # process.  Two manage-positions processes can read the same stale state and
+        # both try to sell the same ticker — this prevents duplicate fills.
+        _EXIT_COOLDOWN_SECONDS = 120  # 2-minute window after a sell
 
-    def _recently_existed(ticker: str) -> bool:
-        ts = state.last_exited_at.get(ticker)
-        if not ts:
-            return False
-        try:
-            exited_at = datetime.fromisoformat(ts)
-        except (ValueError, TypeError):
-            return False
-        if exited_at.tzinfo is None:
-            exited_at = exited_at.replace(tzinfo=manage_now.tzinfo)
-        return (manage_now - exited_at).total_seconds() < _EXIT_COOLDOWN_SECONDS
+        def _recently_existed(ticker: str) -> bool:
+            ts = state.last_exited_at.get(ticker)
+            if not ts:
+                return False
+            try:
+                exited_at = datetime.fromisoformat(ts)
+            except (ValueError, TypeError):
+                return False
+            if exited_at.tzinfo is None:
+                exited_at = exited_at.replace(tzinfo=manage_now.tzinfo)
+            return (manage_now - exited_at).total_seconds() < _EXIT_COOLDOWN_SECONDS
 
-    # V2.5: Check kill switch
-    allowed, reason = check_kill_switch_before_trade(ledger)
-    if not allowed:
-        typer.echo(f"KILL_SWITCH: {reason}")
-        return {"positions": 0, "actions": 0, "lines": [], "exit_events": []}
+        # V2.5: Check kill switch
+        allowed, reason = check_kill_switch_before_trade(ledger)
+        if not allowed:
+            typer.echo(f"KILL_SWITCH: {reason}")
+            return {"positions": 0, "actions": 0, "lines": [], "exit_events": []}
 
-    # V3.1: Circuit breaker — auto-halt on consecutive losses / max drawdown
-    from trading_bot.safety.circuit_breaker import check_circuit_breakers
+        # V3.1: Circuit breaker — auto-halt on consecutive losses / max drawdown
+        from trading_bot.safety.circuit_breaker import check_circuit_breakers
 
-    cb_allowed, cb_reason = check_circuit_breakers(ledger, ctx.obj)
-    if not cb_allowed:
-        typer.echo(f"CIRCUIT_BREAKER: {cb_reason}")
-        return {"positions": 0, "actions": 0, "lines": [], "exit_events": []}
+        cb_allowed, cb_reason = check_circuit_breakers(ledger, ctx.obj)
+        if not cb_allowed:
+            typer.echo(f"CIRCUIT_BREAKER: {cb_reason}")
+            return {"positions": 0, "actions": 0, "lines": [], "exit_events": []}
 
-    broker = _paper_broker_from_state(state, ctx.obj)
-    log_path = Path(ctx.obj.app.log_dir) / "decision-log.jsonl"
-    manage_now = now_in_zone(ctx.obj.app.timezone)
-    eod_active = should_eod_exit(manage_now, ctx.obj.session)
-    lines: list[str] = []
-    actions = 0
-    skipped_stale = 0
-    state_changed = False
-    exit_events: list[dict[str, object]] = []
-    for ticker, position in sorted(state.positions.items()):
-        # Use intraday bars for responsive trailing stop management
-        try:
-            frame = market_data.fetch_bars(
-                ticker,
-                ctx.obj.market_data.intraday_period,
-                ctx.obj.market_data.intraday_interval,
-                settings=ctx.obj.market_data,
-            )
-        except Exception as exc:
-            skipped_stale += 1
-            append_decision_event(
-                log_path,
-                {
-                    "command": "manage-positions",
-                    "ticker": ticker,
-                    "status": "SKIP",
-                    "reason": "market data fetch failed",
-                    "error": str(exc),
-                    "managed_at": manage_now.isoformat(),
-                },
-            )
-            lines.append(f"{ticker} SKIP reason=market-data-fetch-failed")
-            continue
-        last_timestamp = frame_last_timestamp(frame)
-        last_price: float | None = None
-        if not frame.empty and "close" in frame.columns:
-            last_price = float(frame.iloc[-1]["close"])
-        if _market_data_is_stale_for_manage(
-            last_timestamp, manage_now, ctx.obj.market_data.max_data_age_minutes
-        ):
-            skipped_stale += 1
-            append_decision_event(
-                log_path,
-                {
-                    "command": "manage-positions",
-                    "ticker": ticker,
-                    "status": "SKIP",
-                    "reason": "stale market data",
-                    "last_timestamp": last_timestamp.isoformat() if last_timestamp else None,
-                    "managed_at": manage_now.isoformat(),
-                    "max_age_minutes": ctx.obj.market_data.max_data_age_minutes,
-                },
-            )
-            lines.append(
-                f"{ticker} SKIP reason=stale-data last={'unknown' if last_price is None else f'{last_price:.2f}'}"
-            )
-            continue
-        if last_price is None:
-            skipped_stale += 1
-            append_decision_event(
-                log_path,
-                {
-                    "command": "manage-positions",
-                    "ticker": ticker,
-                    "status": "SKIP",
-                    "reason": "missing market data",
-                    "managed_at": manage_now.isoformat(),
-                },
-            )
-            lines.append(f"{ticker} SKIP reason=stale-data last=unknown")
-            continue
-        # Idempotency: skip if another process already sold this ticker
-        if _recently_existed(ticker):
-            lines.append(f"{ticker} SKIP recently-exited-cooldown")
-            continue
-        min_stop_pct = ctx.obj.risk.min_stop_distance_pct
-        if min_stop_pct > 0 and position.stop_loss is not None:
-            min_stop = round(position.average_cost * (1.0 - min_stop_pct / 100.0), 4)
-            # Only widen stops that are still protective (below entry); a
-            # stop already ratcheted up by trailing should not be undone.
-            if (
-                position.stop_loss > min_stop
-                and position.stop_loss < position.average_cost
+        broker = _paper_broker_from_state(state, ctx.obj)
+        log_path = Path(ctx.obj.app.log_dir) / "decision-log.jsonl"
+        manage_now = now_in_zone(ctx.obj.app.timezone)
+        eod_active = should_eod_exit(manage_now, ctx.obj.session)
+        lines: list[str] = []
+        actions = 0
+        skipped_stale = 0
+        state_changed = False
+        exit_events: list[dict[str, object]] = []
+        for ticker, position in sorted(state.positions.items()):
+            # Use intraday bars for responsive trailing stop management
+            try:
+                frame = market_data.fetch_bars(
+                    ticker,
+                    ctx.obj.market_data.intraday_period,
+                    ctx.obj.market_data.intraday_interval,
+                    settings=ctx.obj.market_data,
+                )
+            except Exception as exc:
+                skipped_stale += 1
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "manage-positions",
+                        "ticker": ticker,
+                        "status": "SKIP",
+                        "reason": "market data fetch failed",
+                        "error": str(exc),
+                        "managed_at": manage_now.isoformat(),
+                    },
+                )
+                lines.append(f"{ticker} SKIP reason=market-data-fetch-failed")
+                continue
+            last_timestamp = frame_last_timestamp(frame)
+            last_price: float | None = None
+            if not frame.empty and "close" in frame.columns:
+                last_price = float(frame.iloc[-1]["close"])
+            if _market_data_is_stale_for_manage(
+                last_timestamp, manage_now, ctx.obj.market_data.max_data_age_minutes
             ):
-                state.positions[ticker] = position.model_copy(update={"stop_loss": min_stop})
-                position = state.positions[ticker]
-                state_changed = True
+                skipped_stale += 1
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "manage-positions",
+                        "ticker": ticker,
+                        "status": "SKIP",
+                        "reason": "stale market data",
+                        "last_timestamp": last_timestamp.isoformat() if last_timestamp else None,
+                        "managed_at": manage_now.isoformat(),
+                        "max_age_minutes": ctx.obj.market_data.max_data_age_minutes,
+                    },
+                )
+                lines.append(
+                    f"{ticker} SKIP reason=stale-data last={'unknown' if last_price is None else f'{last_price:.2f}'}"
+                )
+                continue
+            if last_price is None:
+                skipped_stale += 1
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "manage-positions",
+                        "ticker": ticker,
+                        "status": "SKIP",
+                        "reason": "missing market data",
+                        "managed_at": manage_now.isoformat(),
+                    },
+                )
+                lines.append(f"{ticker} SKIP reason=stale-data last=unknown")
+                continue
+            # Idempotency: skip if another process already sold this ticker
+            if _recently_existed(ticker):
+                lines.append(f"{ticker} SKIP recently-exited-cooldown")
+                continue
+            min_stop_pct = ctx.obj.risk.min_stop_distance_pct
+            if min_stop_pct > 0 and position.stop_loss is not None:
+                min_stop = round(position.average_cost * (1.0 - min_stop_pct / 100.0), 4)
+                # Only widen stops that are still protective (below entry); a
+                # stop already ratcheted up by trailing should not be undone.
+                if (
+                    position.stop_loss > min_stop
+                    and position.stop_loss < position.average_cost
+                ):
+                    state.positions[ticker] = position.model_copy(update={"stop_loss": min_stop})
+                    position = state.positions[ticker]
+                    state_changed = True
 
-        def _counter_thesis_check():
-            if (
-                not ctx.obj.counter_thesis.enabled
-                or not ctx.obj.counter_thesis.exit_on_block
-            ):
-                return None
-            from trading_bot.runtime.orchestrator import (
-                _evaluate_counter_thesis_for_position,
-            )
+            def _counter_thesis_check():
+                if (
+                    not ctx.obj.counter_thesis.enabled
+                    or not ctx.obj.counter_thesis.exit_on_block
+                ):
+                    return None
+                from trading_bot.runtime.orchestrator import (
+                    _evaluate_counter_thesis_for_position,
+                )
 
-            result = _evaluate_counter_thesis_for_position(
-                ticker, position, frame, ctx.obj
-            )
-            return result if result is not None and result.block_trade else None
+                result = _evaluate_counter_thesis_for_position(
+                    ticker, position, frame, ctx.obj
+                )
+                return result if result is not None and result.block_trade else None
 
-        decision = evaluate_exit_priority(
-            position=position,
-            current_price=last_price,
-            settings=ctx.obj,
-            now=manage_now,
-            eod_active=eod_active,
-            counter_thesis_check=_counter_thesis_check,
-            trailing_stop_check=lambda: _update_trailing_stop(
-                position, frame, last_price, ctx.obj
-            ),
-        )
-        if decision.partial:
-            state, event, line = _shared_fill_partial_take_profit_position(
-                ticker=ticker,
+            decision = evaluate_exit_priority(
                 position=position,
-                submitted_at=manage_now,
-                last_price=last_price,
-                broker=broker,
-                ledger=ledger,
-                state=state,
-                log_path=log_path,
-                fraction=ctx.obj.paper.partial_take_profit_fraction,
+                current_price=last_price,
                 settings=ctx.obj,
-                runtime_canary=runtime_canary,
+                now=manage_now,
+                eod_active=eod_active,
+                counter_thesis_check=_counter_thesis_check,
+                trailing_stop_check=lambda: _update_trailing_stop(
+                    position, frame, last_price, ctx.obj
+                ),
             )
-            append_decision_event(log_path, event)
-            exit_events.append(event)
-            actions += 1
-            lines.append(line)
-            continue
-        if decision.reason == "trailing_stop":
-            trail_update = decision.payload
-            new_stop, method, new_highest_high, new_initial_risk = trail_update
-            state.positions[ticker] = position.model_copy(
-                update={
-                    "stop_loss": new_stop,
-                    "highest_high": new_highest_high,
-                    "initial_risk": new_initial_risk,
-                }
+            if decision.partial:
+                state, event, line = _shared_fill_partial_take_profit_position(
+                    ticker=ticker,
+                    position=position,
+                    submitted_at=manage_now,
+                    last_price=last_price,
+                    broker=broker,
+                    ledger=ledger,
+                    state=state,
+                    log_path=log_path,
+                    fraction=ctx.obj.paper.partial_take_profit_fraction,
+                    settings=ctx.obj,
+                    runtime_canary=runtime_canary,
+                )
+                append_decision_event(log_path, event)
+                exit_events.append(event)
+                actions += 1
+                lines.append(line)
+                continue
+            if decision.reason == "trailing_stop":
+                trail_update = decision.payload
+                new_stop, method, new_highest_high, new_initial_risk = trail_update
+                state.positions[ticker] = position.model_copy(
+                    update={
+                        "stop_loss": new_stop,
+                        "highest_high": new_highest_high,
+                        "initial_risk": new_initial_risk,
+                    }
+                )
+                ledger.save_portfolio_state(state)
+                ledger.record_equity_snapshot(state, timestamp=manage_now)
+                append_decision_event(
+                    log_path,
+                    {
+                        "command": "manage-positions",
+                        "ticker": ticker,
+                        "status": "TRAIL",
+                        "method": method,
+                        "old_stop": position.stop_loss,
+                        "new_stop": new_stop,
+                        "last_price": last_price,
+                        "highest_high": new_highest_high,
+                        "initial_risk": new_initial_risk,
+                    },
+                )
+                actions += 1
+                lines.append(
+                    f"{ticker} TRAIL method={method} stop={new_stop:.2f} "
+                    f"last={last_price:.2f} high={new_highest_high:.2f}"
+                )
+                continue
+            if decision.should_exit:
+                outward_reason = {
+                    "eod_exit": "eod",
+                    "stop_loss": "stop",
+                    "profit_target": "target",
+                    "counter_thesis": "counter-thesis",
+                }.get(decision.reason, decision.reason)
+                state, event, line = _fill_sell_position(
+                    ticker,
+                    position,
+                    outward_reason,
+                    manage_now,
+                    last_price,
+                    broker,
+                    ledger,
+                    state,
+                    log_path,
+                    frame,
+                    ctx.obj,
+                    runtime_canary=runtime_canary,
+                    exit_reason=decision.reason,
+                )
+                if decision.reason == "counter_thesis":
+                    event["counter_thesis"] = decision.payload.to_dict()
+                append_decision_event(log_path, event)
+                exit_events.append(event)
+                actions += 1
+                lines.append(line)
+                continue
+            lines.append(
+                f"{ticker} qty={position.quantity} "
+                f"avg={position.average_cost:.2f} last={last_price:.2f}"
             )
+        if state_changed:
             ledger.save_portfolio_state(state)
             ledger.record_equity_snapshot(state, timestamp=manage_now)
-            append_decision_event(
-                log_path,
-                {
-                    "command": "manage-positions",
-                    "ticker": ticker,
-                    "status": "TRAIL",
-                    "method": method,
-                    "old_stop": position.stop_loss,
-                    "new_stop": new_stop,
-                    "last_price": last_price,
-                    "highest_high": new_highest_high,
-                    "initial_risk": new_initial_risk,
-                },
-            )
-            actions += 1
-            lines.append(
-                f"{ticker} TRAIL method={method} stop={new_stop:.2f} "
-                f"last={last_price:.2f} high={new_highest_high:.2f}"
-            )
-            continue
-        if decision.should_exit:
-            outward_reason = {
-                "eod_exit": "eod",
-                "stop_loss": "stop",
-                "profit_target": "target",
-                "counter_thesis": "counter-thesis",
-            }.get(decision.reason, decision.reason)
-            state, event, line = _fill_sell_position(
-                ticker,
-                position,
-                outward_reason,
-                manage_now,
-                last_price,
-                broker,
-                ledger,
-                state,
-                log_path,
-                frame,
-                ctx.obj,
-                runtime_canary=runtime_canary,
-                exit_reason=decision.reason,
-            )
-            if decision.reason == "counter_thesis":
-                event["counter_thesis"] = decision.payload.to_dict()
-            append_decision_event(log_path, event)
-            exit_events.append(event)
-            actions += 1
-            lines.append(line)
-            continue
-        lines.append(
-            f"{ticker} qty={position.quantity} "
-            f"avg={position.average_cost:.2f} last={last_price:.2f}"
+        typer.echo(
+            f"positions={len(state.positions)} actions={actions} skipped={skipped_stale}"
         )
-    if state_changed:
-        ledger.save_portfolio_state(state)
-        ledger.record_equity_snapshot(state, timestamp=manage_now)
-    typer.echo(
-        f"positions={len(state.positions)} actions={actions} skipped={skipped_stale}"
-    )
-    for line in lines:
-        typer.echo(line)
-    portfolio_view = _build_portfolio_view(state, ctx.obj)
-    write_snapshot(
-        ctx.obj.app.portfolio_summary_path,
-        {
-            "mode": "portfolio",
-            "summary": {
-                "cash": round(state.cash, 2),
-                "equity": portfolio_view["equity"],
-                "realized_pnl": round(state.realized_pnl, 2),
-                "unrealized_pnl": portfolio_view["unrealized_pnl"],
-                "exposure": portfolio_view["exposure"],
-                "positions": len(state.positions),
+        for line in lines:
+            typer.echo(line)
+        portfolio_view = _build_portfolio_view(state, ctx.obj)
+        write_snapshot(
+            ctx.obj.app.portfolio_summary_path,
+            {
+                "mode": "portfolio",
+                "summary": {
+                    "cash": round(state.cash, 2),
+                    "equity": portfolio_view["equity"],
+                    "realized_pnl": round(state.realized_pnl, 2),
+                    "unrealized_pnl": portfolio_view["unrealized_pnl"],
+                    "exposure": portfolio_view["exposure"],
+                    "positions": len(state.positions),
+                },
+                "positions": portfolio_view["positions"],
             },
-            "positions": portfolio_view["positions"],
-        },
-    )
-
-    if runtime_canary is not None:
+        )
+    finally:
         finish_runtime_canary(runtime_canary)
 
     return {
