@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 from trading_bot.config.settings import (
@@ -362,3 +363,98 @@ def test_cli_paper_trade_dry_run_path_doesnt_touch_harness(
     run_paper_trade([], settings, dry_run=True, runtime_canary=ctx)
     assert harness.entries == []
     assert harness.exits == []
+
+
+def test_paper_trade_uses_try_finally_for_finish(tmp_path: Path, monkeypatch) -> None:
+    """paper_trade must call finish_runtime_canary exactly once even when
+    the trade loop raises. The CLI wraps the loop in try/finally so the
+    runtime canary snapshot is persisted regardless of how the cycle ends.
+    """
+    import importlib
+
+    cli_app_module = importlib.import_module("trading_bot.cli.app")
+    from trading_bot.learning.experiments import runtime_canary as rc_module
+    from trading_bot.learning.experiments.runtime_canary import (
+        finish_runtime_canary as real_finish,
+    )
+
+    finish_calls: list[Any] = []
+
+    def fake_finish(context: Any) -> None:
+        finish_calls.append(context)
+        return real_finish(context)
+
+    monkeypatch.setattr(rc_module, "finish_runtime_canary", fake_finish)
+
+    state_db = tmp_path / "state.db"
+    settings = _settings(state_db)
+    settings.app.tuning_overrides_path = str(tmp_path / "overrides.yaml")
+
+    # Patch the runtime orchestrator path so the trade loop raises.
+    monkeypatch.setattr(
+        cli_app_module,
+        "run_paper_trade",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "trading_bot.runtime.orchestrator.run_paper_trade",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated")),
+    )
+
+    ctx_obj = _make_cli_context(settings)
+    with pytest.raises(RuntimeError, match="simulated"):
+        cli_app_module.paper_trade(ctx=ctx_obj, symbols=["AAPL"])
+
+    assert finish_calls == [None]
+
+
+def test_manage_positions_uses_try_finally_for_finish(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """_run_manage_positions_once must call finish_runtime_canary via try/finally
+    so the runtime canary snapshot is persisted even when the exit loop raises.
+    """
+    import importlib
+
+    cli_app_module = importlib.import_module("trading_bot.cli.app")
+    from trading_bot.learning.experiments import runtime_canary as rc_module
+    from trading_bot.learning.experiments.runtime_canary import (
+        finish_runtime_canary as real_finish,
+    )
+
+    finish_calls: list[Any] = []
+
+    def fake_finish(context: Any) -> None:
+        finish_calls.append(context)
+        return real_finish(context)
+
+    monkeypatch.setattr(rc_module, "finish_runtime_canary", fake_finish)
+
+    state_db = tmp_path / "state.db"
+    settings = _settings(state_db)
+    settings.app.tuning_overrides_path = str(tmp_path / "overrides.yaml")
+
+    # Force an exception inside the manage body via should_eod_exit so
+    # the finally path is exercised even with no positions seeded.
+    monkeypatch.setattr(
+        cli_app_module,
+        "should_eod_exit",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("simulated")),
+    )
+
+    ctx_obj = _make_cli_context(settings)
+    with pytest.raises(RuntimeError, match="simulated"):
+        cli_app_module._run_manage_positions_once(ctx_obj)
+
+    assert finish_calls == [None]
+
+
+def _make_cli_context(settings: Settings) -> Any:
+    """Build a Typer context with the same shape CLI commands expect."""
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.obj = settings
+    return ctx
