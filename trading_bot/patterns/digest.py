@@ -57,7 +57,16 @@ def generate_digest(
     for p in patterns:
         # Only record notable patterns (e.g., > 55% win rate and decent hit count)
         if p["win_rate"] > 0.55 and p["hits"] >= 10:
+            # Use a deterministic id keyed on the pattern name so daily
+            # digest runs UPDATE the same hypothesis row in place via
+            # ResearchStore.save_hypothesis (INSERT OR REPLACE on id).
+            # Without this, every run generated a fresh timestamp-based
+            # id and the hypotheses table accumulated duplicates that
+            # the advisory pipeline could never advance past PENDING.
+            # The id prefix `hyp_mined_` keeps these discoverable
+            # alongside hand-authored hypotheses in the research DB.
             hyp = Hypothesis(
+                id=f"hyp_mined_{p['name']}",
                 title=f"Mined Pattern: {p['name']}",
                 description=p["description"],
                 category=HypothesisCategory.CUSTOM,

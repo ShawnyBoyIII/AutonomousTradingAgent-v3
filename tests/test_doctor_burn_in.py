@@ -87,6 +87,61 @@ def test_doctor_burn_in_uses_burn_in_config_by_default(monkeypatch, tmp_path):
     )
 
 
+def test_doctor_burn_in_respects_explicit_config_path(monkeypatch, tmp_path):
+    """`doctor --burn-in` must respect an explicit `--config-path` instead
+    of overriding it with burn-in-config.yaml.
+
+    Regression for the bug introduced in 5319ddb where the doctor
+    unconditionally reloaded burn-in-config.yaml whenever --burn-in was
+    set, silently discarding the operator's --config-path choice.
+    """
+    from trading_bot.config import loader as loader_module
+    from trading_bot.health.types import CheckResult, HealthReport
+
+    captured = []
+
+    sdir = tmp_path / "state"
+    sdir.mkdir()
+
+    def fake_load_settings(path):
+        captured.append(str(path))
+        class _A:
+            state_db_path = str(sdir / "burn_in.db")
+            state_dir = str(sdir)
+            scan_results_path = str(sdir / "burn_in/scan.json")
+            dashboard_port = 9999
+        class _S:
+            app = _A()
+            market_data = type("M", (), {"cache_db_path": str(sdir / "market_cache.db")})()
+        return _S()
+
+    monkeypatch.setattr(loader_module, "load_settings", fake_load_settings)
+    monkeypatch.setattr(cli_module, "load_settings", fake_load_settings)
+
+    fake = HealthReport(
+        checks=[
+            CheckResult(name="pid_alive", status="PASS", detail="ok", observed=None),
+        ],
+        generated_at="2026-07-28T13:00:00+00:00",
+    )
+    from trading_bot.health import runner as runner_module
+    monkeypatch.setattr(runner_module, "run_health_checks", lambda **kw: fake)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["--config-path", "/my/custom-burn.yaml", "doctor", "--burn-in"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    # The explicit --config-path must be honored exactly once — the
+    # doctor must NOT silently fall back to burn-in-config.yaml.
+    assert captured == ["/my/custom-burn.yaml"], (
+        f"explicit --config-path should be honored without fallback; "
+        f"got load_settings calls {captured!r}"
+    )
+
+
 def test_doctor_default_unchanged(state_dir: Path):
     runner = CliRunner()
     result = runner.invoke(app, ["doctor"])

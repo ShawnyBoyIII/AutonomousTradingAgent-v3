@@ -95,11 +95,24 @@ def main(
 ) -> None:
     import os
 
+    # Remember whether the caller passed --config-path explicitly so the
+    # doctor command (and any other future subcommand) can decide
+    # whether to auto-route to burn-in-config.yaml or honor the
+    # operator's choice. Without this, `doctor --burn-in` would
+    # silently override --config-path even though the operator picked
+    # a different config. Regression for the 5319ddb bug.
+    #
+    # Typer creates a child context per subcommand, so we stash this
+    # on ``ctx.obj`` (the loaded settings) which is shared between
+    # callback and subcommand.
+    explicit_config_path = config_path is not None
+
     if config_path is None:
         env_path = os.environ.get("CONFIG_PATH")
         if env_path:
             config_path = Path(env_path)
     ctx.obj = load_settings(config_path)
+    ctx.obj._explicit_config_path = explicit_config_path
     configure_from_settings(ctx.obj)
 
 
@@ -204,7 +217,13 @@ def doctor(
     # `./tradebot-local doctor --burn-in` (no --config-path) reads
     # config.yaml's legacy `state/scan_results.json` and reports false-
     # positive FAILs. (Regression: 2026-07-28.)
-    if burn_in:
+    #
+    # Only auto-route when the caller did NOT pass --config-path
+    # explicitly. The callback stores the original input on
+    # ``ctx._explicit_config_path`` so an operator-selected custom
+    # config is honored even with --burn-in. Regression for the 5319ddb
+    # silent-override bug.
+    if burn_in and getattr(ctx.obj, "_explicit_config_path", True) is False:
         from trading_bot.config.loader import load_settings as _reload
         ctx.obj = _reload(Path("burn-in-config.yaml"))
 

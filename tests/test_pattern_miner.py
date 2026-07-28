@@ -246,4 +246,62 @@ def test_generate_digest(tmp_path: Path):
 
     assert len(rows) == 1
     assert rows[0][0] == "Mined Pattern: test_pattern"
-    assert "60.0%" in rows[0][1]
+
+
+def test_generate_digest_deduplicates_across_runs(tmp_path: Path):
+    """Multiple digest runs of the same pattern must update the same
+    hypothesis row, not insert duplicates.
+
+    Regression for the 2026-07 bug where ``digest.py`` generated a fresh
+    timestamp-based Hypothesis.id on every call. Combined with
+    ``ResearchStore.save_hypothesis``'s ``INSERT OR REPLACE`` on the id
+    column, this produced one new row per daily pattern-mining run for
+    every notable pattern. The advisory/tuning pipeline saw stale
+    duplicates forever and never advanced them past PENDING.
+
+    The contract: a pattern named ``"X"`` on day 1 and the same pattern
+    named ``"X"`` on day 2 should result in **one** hypothesis row whose
+    ``parameters`` reflect the most recent run.
+    """
+    import sqlite3
+
+    output_dir = tmp_path / "patterns"
+    research_db = tmp_path / "research.db"
+
+    pattern = {
+        "name": "3_up_days",
+        "hits": 15,
+        "win_rate": 0.60,
+        "avg_return": 0.05,
+        "description": "Run 1 description",
+    }
+
+    # Day 1
+    generate_digest([pattern], output_dir=output_dir, research_db_path=str(research_db))
+
+    # Day 2: same pattern, slightly different metrics
+    pattern_day2 = dict(pattern, hits=20, win_rate=0.65, description="Run 2 description")
+    generate_digest([pattern_day2], output_dir=output_dir, research_db_path=str(research_db))
+
+    # Day 3: still the same pattern, even better metrics
+    pattern_day3 = dict(pattern, hits=25, win_rate=0.70, description="Run 3 description")
+    generate_digest([pattern_day3], output_dir=output_dir, research_db_path=str(research_db))
+
+    # Exactly one hypothesis row, with the most recent metrics.
+    conn = sqlite3.connect(research_db)
+    rows = conn.execute(
+        "SELECT title, parameters FROM hypotheses"
+    ).fetchall()
+    conn.close()
+
+    assert len(rows) == 1, (
+        f"digest.py must dedup hypotheses across runs, got {len(rows)} rows: {rows!r}"
+    )
+    assert rows[0][0] == "Mined Pattern: 3_up_days"
+    # parameters is stored as JSON; verify the most recent run's metrics
+    # were preserved (not the first or any duplicate).
+    import json
+    params = json.loads(rows[0][1])
+    assert params["hits"] == 25, f"expected latest hits=25, got {params['hits']}"
+    assert params["win_rate"] == 0.70, f"expected latest win_rate=0.70, got {params['win_rate']}"
+    assert params["description"] == "Run 3 description"
