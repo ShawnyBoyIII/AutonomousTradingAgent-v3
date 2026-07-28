@@ -215,19 +215,25 @@ class VectorizedPreFilter:
         in_long = False
         in_short = False
         # We'll compute realised-position returns via a walk over the
-        # boolean masks in numpy (faster than ``iterrows``).
+        # boolean masks in numpy (faster than ``iterrows`` or ``iloc``).
         rets = np.zeros(len(z), dtype=np.float64)
         in_pos = np.zeros(len(z), dtype=bool)
+
+        # Performance optimization: extract numpy arrays for O(1) lookups
+        z_np = z.to_numpy(dtype=np.float64)
+        long_entry_np = long_entry.to_numpy(dtype=bool)
+        short_entry_np = short_entry.to_numpy(dtype=bool)
+
         for i in range(len(z)):
             prev_pos_long = in_long
             prev_pos_short = in_short
-            if not prev_pos_long and long_entry.iloc[i]:
+            if not prev_pos_long and long_entry_np[i]:
                 in_long = True
-            elif prev_pos_long and abs(z.iloc[i]) <= self.exit_z:
+            elif prev_pos_long and abs(z_np[i]) <= self.exit_z:
                 in_long = False
-            if not prev_pos_short and short_entry.iloc[i]:
+            if not prev_pos_short and short_entry_np[i]:
                 in_short = True
-            elif prev_pos_short and abs(z.iloc[i]) <= self.exit_z:
+            elif prev_pos_short and abs(z_np[i]) <= self.exit_z:
                 in_short = False
             in_pos[i] = prev_pos_long or prev_pos_short
 
