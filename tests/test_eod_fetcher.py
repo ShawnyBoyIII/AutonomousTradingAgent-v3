@@ -285,6 +285,37 @@ class TestS3ClientGet:
             client.get_object_text("k")
         assert mock_get.call_args.kwargs["verify"] is False
 
+    def test_burn_in_config_does_not_disable_tls(self) -> None:
+        """burn-in-config.yaml must keep TLS verification enabled.
+
+        Regression for the 2026-07 eod_data_store.log WARNING
+        "TLS certificate verification DISABLED for S3 endpoint
+        https://files.massive.com". As of 2026-07-28 the endpoint serves
+        a valid Let's Encrypt cert that validates against the system CA
+        bundle, so disabling verification is unnecessary. If a future
+        rotation breaks that, this test forces the operator to record
+        why and pin a CA bundle explicitly instead of falling back to
+        insecure mode.
+        """
+        from pathlib import Path
+        import yaml
+
+        cfg_path = Path("burn-in-config.yaml")
+        assert cfg_path.exists(), "burn-in-config.yaml must exist at repo root"
+
+        with cfg_path.open() as f:
+            raw = yaml.safe_load(f)
+        eod = raw.get("eod_data_store") if isinstance(raw, dict) else None
+        assert eod is not None, "burn-in-config.yaml must define eod_data_store"
+
+        # If verify_tls is explicitly set, it must be True.
+        if "verify_tls" in eod:
+            assert eod["verify_tls"] is True, (
+                "burn-in-config.yaml disables TLS verification. "
+                "Pin the CA bundle via tls_ca_bundle instead so the "
+                "system CA validates the cert."
+            )
+
     def test_tls_ca_bundle_overrides_verification(self) -> None:
         """A custom CA bundle path takes precedence over verify_tls."""
         from unittest.mock import MagicMock, patch

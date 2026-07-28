@@ -76,40 +76,49 @@ def mine_patterns(
         # Future 1-day return (what happens next day)
         df["fwd_return_1d"] = df["return"].shift(-1)
 
-        for i in range(3, len(df) - 1): # -1 to have a fwd_return
-            row = df.iloc[i]
-            prev1 = df.iloc[i-1]
-            prev2 = df.iloc[i-2]
-            fwd_ret = row["fwd_return_1d"]
+        # Performance optimization: extract numpy arrays once so the
+        # per-row loop below indexes in O(1) instead of calling pandas
+        # .iloc (which constructs a Series for every lookup). Same
+        # anti-pattern was fixed in event_engine.prefilter by commit
+        # ec20af9; at 20 symbols x 90 days this isn't yet a hot path,
+        # but the universe is set to expand with the advisory learner.
+        is_up = df["is_up"].to_numpy()
+        is_down = df["is_down"].to_numpy()
+        gap = df["gap"].to_numpy()
+        fwd_return = df["fwd_return_1d"].to_numpy()
 
+        n = len(df)
+        for i in range(3, n - 1):  # -1 to have a fwd_return
+            fwd_ret = fwd_return[i]
             if pd.isna(fwd_ret):
                 continue
 
             is_win = fwd_ret > 0
 
             # Pattern 1: 3 down days
-            if row["is_down"] and prev1["is_down"] and prev2["is_down"]:
+            if is_down[i] and is_down[i - 1] and is_down[i - 2]:
                 pattern_stats["3_down_days"]["hits"] += 1
                 pattern_stats["3_down_days"]["total_return"] += fwd_ret
                 if is_win:
                     pattern_stats["3_down_days"]["wins"] += 1
 
             # Pattern 2: 3 up days
-            if row["is_up"] and prev1["is_up"] and prev2["is_up"]:
+            if is_up[i] and is_up[i - 1] and is_up[i - 2]:
                 pattern_stats["3_up_days"]["hits"] += 1
                 pattern_stats["3_up_days"]["total_return"] += fwd_ret
                 if is_win:
                     pattern_stats["3_up_days"]["wins"] += 1
 
+            g = gap[i]
             # Pattern 3: Gap down > 2%
-            if row["gap"] < -0.02:
+            if not pd.isna(g) and g < -0.02:
                 pattern_stats["gap_down_2pct"]["hits"] += 1
                 pattern_stats["gap_down_2pct"]["total_return"] += fwd_ret
                 if is_win:
                     pattern_stats["gap_down_2pct"]["wins"] += 1
 
             # Pattern 4: Gap up > 2%
-            if row["gap"] > 0.02:
+            if not pd.isna(g) and g > 0.02:
                 pattern_stats["gap_up_2pct"]["hits"] += 1
                 pattern_stats["gap_up_2pct"]["total_return"] += fwd_ret
                 if is_win:

@@ -100,18 +100,17 @@ eod_data_store:
   store_root: state/data_store
   manifest_db: state/data_store.db
   s3_region: us-east-1
-  # Massive.com's flat-files endpoint currently serves a self-signed
-  # certificate. Strict verification rejects it (CERTIFICATE_VERIFY_FAILED).
-  # Two options, both safe in different ways:
-  #   1. Pin the CA bundle (preferred) — download the cert once and verify
-  #      against it explicitly. Fetches still authenticate the server.
-  #         tls_ca_bundle: /path/to/massive-ca.pem
-  #   2. Disable verification entirely — use only if you trust the network
-  #      path to the endpoint. Logs a loud WARNING at startup.
-  #         verify_tls: false
-  # Default is verify_tls: true, tls_ca_bundle: null (safe on the open
-  # internet but fails against massive.com's current endpoint).
-  verify_tls: false
+  # As of 2026-07-28 the massive.com flat-files endpoint
+  # (https://files.massive.com) serves a valid Let's Encrypt cert
+  # that validates against the system CA bundle, so default
+  # verification is on. If a future rotation breaks that, pin the
+  # CA explicitly via ``tls_ca_bundle`` instead of disabling
+  # verification -- ``verify_tls: false`` logs a loud WARNING and
+  # leaves data-in-transit unauthenticated.
+  # Reference:
+  #   echo | openssl s_client -servername files.massive.com \
+  #     -connect files.massive.com:443 -showcerts
+  verify_tls: true
   tls_ca_bundle: null
   # Massive.com's actually-hosted S3 key layout (verified via probe with
   # test API key, 2026-07). Path is {prefix}/{dataset}/{year}/{month}/{date}.csv.gz.
