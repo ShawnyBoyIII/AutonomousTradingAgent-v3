@@ -77,6 +77,37 @@ class TestComputePortfolioHeat:
         heat = compute_portfolio_heat(positions, prices, 0.0)
         assert heat == 0.0
 
+    def test_mixed_gains_and_losses(self) -> None:
+        positions = {
+            "AAPL": Position(ticker="AAPL", quantity=10, average_cost=150.0),
+            "TSLA": Position(ticker="TSLA", quantity=10, average_cost=200.0),
+            "MSFT": Position(ticker="MSFT", quantity=10, average_cost=300.0)
+        }
+        prices = {
+            "AAPL": 160.0,  # +$100 gain
+            "TSLA": 180.0,  # -$200 loss
+            "MSFT": 290.0   # -$100 loss
+        }
+        # Only losses are counted: 200 + 100 = 300 total loss
+        heat = compute_portfolio_heat(positions, prices, 100_000.0)
+        assert heat == 300.0 / 100_000.0
+
+    def test_skips_zero_quantity(self) -> None:
+        positions = {
+            "AAPL": Position(ticker="AAPL", quantity=0, average_cost=150.0)
+        }
+        prices = {
+            "AAPL": 100.0,  # would be -$500 loss if counted (if quantity was 10)
+        }
+        heat = compute_portfolio_heat(positions, prices, 100_000.0)
+        assert heat == 0.0
+
+    def test_negative_equity_returns_zero(self) -> None:
+        positions = {"AAPL": Position(ticker="AAPL", quantity=10, average_cost=150.0)}
+        prices = {"AAPL": 140.0}
+        heat = compute_portfolio_heat(positions, prices, -10_000.0)
+        assert heat == 0.0
+
     def test_missing_price_falls_back_to_avg_cost(self) -> None:
         """When price is missing, falls back to average_cost (0 heat)."""
         positions = {"AAPL": Position(ticker="AAPL", quantity=10, average_cost=150.0)}
