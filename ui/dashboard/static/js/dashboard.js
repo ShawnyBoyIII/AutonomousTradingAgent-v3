@@ -653,6 +653,7 @@
     );
 
     if (lever) {
+      lever.removeAttribute("aria-busy");
       lever.disabled = halted;
       setValue(leverLbl, halted ? "Halted" : "Pull to halt");
     }
@@ -1219,6 +1220,7 @@
   // -------------------------------------------------------------
   function bindKillSwitch() {
     const lever = $("emergencyBtn");
+    const leverLbl = $("emergencyLabel");
     if (!lever) return;
     lever.addEventListener("click", async () => {
       if (lever.disabled) return;
@@ -1228,6 +1230,8 @@
       if (!ok) return;
       try {
         lever.disabled = true;
+        lever.setAttribute("aria-busy", "true");
+        if (leverLbl) setValue(leverLbl, "Halting...");
         const r = await fetch("/api/kill-switch/halt", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1240,6 +1244,8 @@
       } catch (e) {
         console.error("halt failed", e);
         lever.disabled = false;
+        lever.removeAttribute("aria-busy");
+        if (leverLbl) setValue(leverLbl, "Pull to halt");
         window.alert("Failed to halt. Check the console for details.");
       }
     });
