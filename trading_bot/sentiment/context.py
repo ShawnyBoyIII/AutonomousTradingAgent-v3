@@ -12,7 +12,10 @@ import logging
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
-from xml.etree import ElementTree
+
+# Sentinel: using defusedxml to prevent XXE and Billion Laughs attacks
+# when parsing external, untrusted RSS feeds.
+from defusedxml.ElementTree import fromstring, ParseError
 
 from trading_bot.config.settings import Settings
 
@@ -82,8 +85,8 @@ def _fetch_rss_items(feeds: list[str], max_items_per_feed: int) -> list[dict[str
 
 def _parse_rss_payload(payload: bytes, feed_url: str, max_items: int) -> list[dict[str, Any]]:
     try:
-        root = ElementTree.fromstring(payload)
-    except ElementTree.ParseError as exc:
+        root = fromstring(payload)
+    except ParseError as exc:
         logger.warning("rss sentiment parse failed url=%s error=%s", feed_url, exc)
         return []
 
