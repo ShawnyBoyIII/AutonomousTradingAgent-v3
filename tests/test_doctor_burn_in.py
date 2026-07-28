@@ -98,6 +98,123 @@ def test_doctor_burn_in_fail_exit_code(state_dir: Path, monkeypatch):
     assert result.exit_code == 2
 
 
+def test_resolve_dashboard_port_precedence(monkeypatch):
+    """resolve_dashboard_port must honor DASHBOARD_PORT env var with
+    precedence over the configured settings value, falling back to the
+    settings value (then 8000) when the env var is unset or unparseable.
+    """
+    from trading_bot.cli.app import resolve_dashboard_port
+
+    class FakeApp:
+        def __init__(self, port: int, state_dir: str | None = None) -> None:
+            self.dashboard_port = port
+            self.state_dir = state_dir
+            self.state_db_path = "/dev/null"
+
+        def __getattr__(self, name):
+            return None
+
+    class FakeSettings:
+        def __init__(self, port: int, state_dir: str | None = None) -> None:
+            self.app = FakeApp(port, state_dir)
+
+    monkeypatch.delenv("DASHBOARD_PORT", raising=False)
+    assert resolve_dashboard_port(FakeSettings(8000)) == 8000
+    assert resolve_dashboard_port(FakeSettings(9000)) == 9000
+
+    monkeypatch.setenv("DASHBOARD_PORT", "8080")
+    assert resolve_dashboard_port(FakeSettings(8000)) == 8080
+    assert resolve_dashboard_port(FakeSettings(9000)) == 8080
+
+    monkeypatch.setenv("DASHBOARD_PORT", "  ")
+    assert resolve_dashboard_port(FakeSettings(8000)) == 8000
+
+    monkeypatch.setenv("DASHBOARD_PORT", "not-a-port")
+    assert resolve_dashboard_port(FakeSettings(8000)) == 8000
+
+
+def test_resolve_dashboard_port_reads_burn_in_port_file(tmp_path: Path, monkeypatch):
+    """When DASHBOARD_PORT env var is unset and settings has the default
+    8000, the doctor must discover the burner's actual sidecar port via
+    state/burn_in/dashboard.port (written by auto-burn-in.sh when the
+    sidecar starts). This lets operators run ``doctor --burn-in`` from
+    outside the burner without exporting env vars.
+    """
+    from trading_bot.cli.app import resolve_dashboard_port
+
+    class FakeApp:
+        def __init__(self, state_dir: str) -> None:
+            self.dashboard_port = 8000
+            self.state_dir = state_dir
+            self.state_db_path = str(Path(state_dir) / "burn_in.db")
+
+    class FakeSettings:
+        def __init__(self, state_dir: str) -> None:
+            self.app = FakeApp(state_dir)
+
+    state_dir = tmp_path / "state"
+    burn_in = state_dir / "burn_in"
+    burn_in.mkdir(parents=True)
+    (burn_in / "dashboard.port").write_text("8080\n")
+
+    monkeypatch.delenv("DASHBOARD_PORT", raising=False)
+    assert resolve_dashboard_port(FakeSettings(str(state_dir))) == 8080
+
+
+def test_resolve_dashboard_port_file_overrides_settings(tmp_path: Path, monkeypatch):
+    """A dashboard.port file written by the burner takes precedence over
+    settings.app.dashboard_port when DASHBOARD_PORT env var is unset.
+    This lets the doctor follow the burner's actual sidecar port even
+    when the operator's CLI process doesn't inherit the burner's env.
+    """
+    from trading_bot.cli.app import resolve_dashboard_port
+
+    class FakeApp:
+        def __init__(self, state_dir: str) -> None:
+            self.dashboard_port = 9000
+            self.state_dir = state_dir
+            self.state_db_path = str(Path(state_dir) / "burn_in.db")
+
+    class FakeSettings:
+        def __init__(self, state_dir: str) -> None:
+            self.app = FakeApp(state_dir)
+
+    state_dir = tmp_path / "state"
+    burn_in = state_dir / "burn_in"
+    burn_in.mkdir(parents=True)
+    (burn_in / "dashboard.port").write_text("5555\n")
+
+    monkeypatch.delenv("DASHBOARD_PORT", raising=False)
+    # file wins over settings when env var is unset
+    assert resolve_dashboard_port(FakeSettings(str(state_dir))) == 5555
+
+
+def test_resolve_dashboard_port_env_var_beats_file(tmp_path: Path, monkeypatch):
+    """DASHBOARD_PORT env var still wins over the burner's port file when
+    explicitly set — operators can force a different port without
+    touching the file.
+    """
+    from trading_bot.cli.app import resolve_dashboard_port
+
+    class FakeApp:
+        def __init__(self, state_dir: str) -> None:
+            self.dashboard_port = 9000
+            self.state_dir = state_dir
+            self.state_db_path = str(Path(state_dir) / "burn_in.db")
+
+    class FakeSettings:
+        def __init__(self, state_dir: str) -> None:
+            self.app = FakeApp(state_dir)
+
+    state_dir = tmp_path / "state"
+    burn_in = state_dir / "burn_in"
+    burn_in.mkdir(parents=True)
+    (burn_in / "dashboard.port").write_text("5555\n")
+
+    monkeypatch.setenv("DASHBOARD_PORT", "7777")
+    assert resolve_dashboard_port(FakeSettings(str(state_dir))) == 7777
+
+
 def test_doctor_burn_in_invokes_scan_freshness(state_dir: Path, monkeypatch):
     """The CLI must pass scan_results_path through to the runner so the
     scan_freshness check is included in the burn-in health report.

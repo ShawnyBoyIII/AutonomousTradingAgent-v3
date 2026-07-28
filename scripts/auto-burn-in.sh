@@ -717,6 +717,10 @@ ensure_dashboard() {
         else
             echo "[$timestamp] ⚠️  Port $DASHBOARD_PORT already serves a healthy dashboard; skipping sidecar"
             DASHBOARD_PID=""
+            # Persist the sidecar port so manual operators running
+            # ``doctor --burn-in`` from outside the burner can discover
+            # the actual dashboard port without exporting env vars.
+            printf '%s\n' "$DASHBOARD_PORT" > "$HEALTH_STATE_DIR/dashboard.port"
             return 0
         fi
     fi
@@ -743,9 +747,13 @@ ensure_dashboard() {
 
     if kill -0 "$DASHBOARD_PID" 2>/dev/null; then
         echo "[$(date '+%H:%M:%S')] ✅ Dashboard live: http://127.0.0.1:$DASHBOARD_PORT  (pid=$DASHBOARD_PID, log=$DASHBOARD_LOG)"
+        # Persist the sidecar port so manual operators running
+        # ``doctor --burn-in`` from outside the burner can discover it.
+        printf '%s\n' "$DASHBOARD_PORT" > "$HEALTH_STATE_DIR/dashboard.port"
     else
         echo "[$(date '+%H:%M:%S')] ⚠️  Dashboard did not become ready; continuing without it (see $DASHBOARD_LOG)"
         DASHBOARD_PID=""
+        rm -f "$HEALTH_STATE_DIR/dashboard.port"
     fi
 }
 
@@ -763,12 +771,14 @@ stop_dashboard() {
     for _ in 1 2 3 4 5; do
         if ! kill -0 "$DASHBOARD_PID" 2>/dev/null; then
             DASHBOARD_PID=""
+            rm -f "$HEALTH_STATE_DIR/dashboard.port"
             return 0
         fi
         sleep 0.3
     done
     kill -9 "$DASHBOARD_PID" 2>/dev/null || true
     DASHBOARD_PID=""
+    rm -f "$HEALTH_STATE_DIR/dashboard.port"
 }
 
 # --------------------------------------------------------------------- #

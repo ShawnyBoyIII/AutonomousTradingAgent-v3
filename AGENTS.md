@@ -207,6 +207,16 @@ older `runtime/dashboard.py` legacy dashboard and the static HTML
 generator have been removed. The CLI `dashboard` command remains as
 a deprecation no-op alias that points operators at `serve`.
 
+**Doctor port discovery.** `doctor --burn-in` resolves the dashboard
+port via `trading_bot/cli/app.py::resolve_dashboard_port` with this
+precedence: `DASHBOARD_PORT` env var → `state/burn_in/dashboard.port`
+(written by the burner when the sidecar starts) → `settings.app.dashboard_port`
+→ 8000. The port file is the bridge that lets a manual operator run
+`./tradebot-local doctor --burn-in` from outside the burner and
+discover the burner's actual sidecar port without exporting env vars.
+The file is removed on `stop_dashboard` so a stale file from a dead
+burner is overwritten on the next launch.
+
 Dashboard endpoints:
 
 - `GET /api/portfolio` — ledger + risk snapshot

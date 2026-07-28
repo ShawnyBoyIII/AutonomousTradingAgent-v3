@@ -103,6 +103,65 @@ def main(
     configure_from_settings(ctx.obj)
 
 
+def resolve_dashboard_port(settings) -> int:
+    """Return the dashboard port to probe for health checks.
+
+    Precedence:
+      1. ``DASHBOARD_PORT`` env var (if set and parseable as int) — the
+         burn-in sidecar exports this so subprocesses it spawns (including
+         its own ``doctor --burn-in`` self-check) hit the right port.
+      2. ``state/burn_in/dashboard.port`` — the burner writes this when
+         the sidecar starts so a manual operator running ``doctor
+         --burn-in`` from outside the burner can discover the actual
+         sidecar port without exporting env vars.
+      3. ``settings.app.dashboard_port`` — the loader's value, which is
+         already env-overridden at load time. This also catches the
+         ``--port`` CLI override from ``serve``.
+      4. ``8000`` — the historical default documented in AGENTS.md.
+    """
+    import os
+
+    env_value = os.getenv("DASHBOARD_PORT")
+    if env_value:
+        try:
+            return int(env_value.strip())
+        except ValueError:
+            pass
+
+    state_dir = _doctor_state_dir(settings)
+    if state_dir is not None:
+        port_file = state_dir / "burn_in" / "dashboard.port"
+        try:
+            text = port_file.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            text = ""
+        if text:
+            try:
+                return int(text)
+            except ValueError:
+                pass
+
+    configured = getattr(getattr(settings, "app", None), "dashboard_port", None)
+    if isinstance(configured, int):
+        return configured
+    return 8000
+
+
+def _doctor_state_dir(settings):
+    from pathlib import Path
+
+    app = getattr(settings, "app", None)
+    if app is None:
+        return None
+    explicit = getattr(app, "state_dir", None)
+    if explicit:
+        return Path(str(explicit))
+    db_path = getattr(app, "state_db_path", None)
+    if db_path:
+        return Path(str(db_path)).parent
+    return None
+
+
 @app.command()
 def doctor(
     ctx: typer.Context,
@@ -127,7 +186,7 @@ def doctor(
 
     state_dir_setting = Path(getattr(ctx.obj.app, "state_dir", None) or Path(ctx.obj.app.state_db_path).parent)
     db_path = Path(ctx.obj.app.state_db_path)
-    dashboard_port = int(getattr(ctx.obj.app, "dashboard_port", 8000))
+    dashboard_port = resolve_dashboard_port(ctx.obj)
     eod_watchdog_pid_file = state_dir_setting / "burn_in" / "eod_watchdog.pid"
     scan_results_path = Path(ctx.obj.app.scan_results_path)
 
