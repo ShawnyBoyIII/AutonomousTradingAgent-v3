@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
 from datetime import datetime, timezone
@@ -8,6 +9,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+cli_module = importlib.import_module("trading_bot.cli.app")
 from trading_bot.cli.app import app
 
 
@@ -25,6 +27,64 @@ def state_dir(tmp_path: Path, monkeypatch):
     (sd / "burn_in.pid").write_text(str(os.getpid()))
     monkeypatch.setenv("TRADING_BOT_STATE_DIR", str(sd))
     return sd
+
+
+def test_doctor_burn_in_uses_burn_in_config_by_default(monkeypatch, tmp_path):
+    """`doctor --burn-in` must probe burn-in-config.yaml's paths when no
+    --config-path is given, because the burner always uses burn-in-config
+    and writes its scan_results/heartbeat/etc. there. config.yaml's legacy
+    `state/scan_results.json` is no longer touched by anyone and would
+    produce false-positive FAILs.
+
+    Regression for the 2026-07-28 divergence where the default-config doctor
+    reported scan_freshness FAIL while the burner was perfectly healthy.
+    """
+    from trading_bot.config import loader as loader_module
+    from trading_bot.health.types import CheckResult, HealthReport
+
+    captured = {}
+
+    sdir = tmp_path / "state"
+    sdir.mkdir()
+
+    def fake_load_settings(path):
+        captured["config_path"] = path
+        class _A:
+            state_db_path = str(sdir / "burn_in.db")
+            state_dir = str(sdir)
+            scan_results_path = str(sdir / "burn_in/scan.json")
+            dashboard_port = 9999
+        class _S:
+            app = _A()
+            market_data = type("M", (), {"cache_db_path": str(sdir / "market_cache.db")})()
+        return _S()
+
+    monkeypatch.setattr(loader_module, "load_settings", fake_load_settings)
+    # Also patch the binding inside cli.app so the doctor command's
+    # `_reload = load_settings as ...` import resolves to our fake.
+    monkeypatch.setattr(cli_module, "load_settings", fake_load_settings)
+
+    fake = HealthReport(
+        checks=[
+            CheckResult(name="pid_alive", status="PASS", detail="ok", observed=None),
+            CheckResult(name="scan_freshness", status="PASS", detail="ok", observed=None),
+        ],
+        generated_at="2026-07-28T13:00:00+00:00",
+    )
+    from trading_bot.health import runner as runner_module
+    monkeypatch.setattr(runner_module, "run_health_checks", lambda **kw: fake)
+
+    bim = tmp_path / "burn-in-config.yaml"
+    bim.write_text("app:\n  state_db_path: state/burn_in.db\n")
+    monkeypatch.chdir(tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["doctor", "--burn-in"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert captured.get("config_path") is not None
+    assert str(captured["config_path"]).endswith("burn-in-config.yaml"), (
+        f"expected burn-in-config.yaml fallback, got {captured['config_path']!r}"
+    )
 
 
 def test_doctor_default_unchanged(state_dir: Path):

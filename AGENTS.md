@@ -217,6 +217,16 @@ discover the burner's actual sidecar port without exporting env vars.
 The file is removed on `stop_dashboard` so a stale file from a dead
 burner is overwritten on the next launch.
 
+**Doctor `--burn-in` config routing.** `./tradebot-local doctor --burn-in`
+(no `--config-path`) re-loads settings from `burn-in-config.yaml`
+instead of `config.yaml`. The burner itself always uses
+`burn-in-config.yaml`, and `config.yaml`'s legacy
+`state/scan_results.json` is no longer written by anything. Earlier
+operators had to pass `--config-path burn-in-config.yaml` to get
+accurate scan-freshness results; now the doctor self-routes when
+`--burn-in` is the entry point (and respects an explicit
+`--config-path` override as a higher precedence).
+
 **Doctor market-data freshness.** `check_market_data_freshness` reads
 `state/market_data_cache.db` (`MarketDataCache`, the canonical store)
 first, falling back to the legacy `market_data` table in

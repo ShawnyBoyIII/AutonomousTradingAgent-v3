@@ -196,6 +196,18 @@ def doctor(
         typer.echo(_format_doctor(ctx.obj))
         return
 
+    # `doctor --burn-in` is the burner's self-check entrypoint. The
+    # burner itself always uses burn-in-config.yaml, so when --burn-in
+    # is requested without an explicit --config-path override, re-load
+    # settings from burn-in-config.yaml regardless of what the global
+    # callback loaded. This avoids the divergence where
+    # `./tradebot-local doctor --burn-in` (no --config-path) reads
+    # config.yaml's legacy `state/scan_results.json` and reports false-
+    # positive FAILs. (Regression: 2026-07-28.)
+    if burn_in:
+        from trading_bot.config.loader import load_settings as _reload
+        ctx.obj = _reload(Path("burn-in-config.yaml"))
+
     from trading_bot.health.runner import run_health_checks
     from trading_bot.health.types import HealthReport
 
