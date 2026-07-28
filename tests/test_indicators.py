@@ -241,25 +241,6 @@ def test_add_stochastic_bounded() -> None:
     assert (k_values <= 100).all()
 
 
-def test_add_cci_creates_expected_column() -> None:
-    frame = pd.DataFrame(
-        {
-            "high": [10.0 + i * 0.5 for i in range(30)],
-            "low": [8.0 + i * 0.5 for i in range(30)],
-            "close": [9.0 + i * 0.5 for i in range(30)],
-        }
-    )
-
-    from trading_bot.data.indicators import add_cci
-
-    result = add_cci(frame, period=20)
-
-    assert "cci" in result.columns
-    # First valid CCI at index 19 (period - 1)
-    assert result["cci"].iloc[:19].isna().all()
-    assert result["cci"].iloc[19] is not None
-
-
 def test_add_williams_r_creates_expected_column() -> None:
     frame = pd.DataFrame(
         {

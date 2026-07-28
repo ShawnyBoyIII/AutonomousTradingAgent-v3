@@ -442,46 +442,6 @@ def add_adx(
     return result
 
 
-def add_cci(
-    frame: "pd.DataFrame",
-    period: int = 20,
-) -> "pd.DataFrame":
-    """Add Commodity Channel Index (CCI).
-
-    Measures deviation from average price.
-    CCI > 100 = overbought, < -100 = oversold.
-
-    Returns frame with column:
-    - cci: Commodity Channel Index
-    """
-    required_columns = {"high", "low", "close"}
-    if not required_columns.issubset(frame.columns):
-        raise KeyError("missing required columns: high, low, close")
-
-    highs = [float(value) for value in frame["high"].tolist()]
-    lows = [float(value) for value in frame["low"].tolist()]
-    closes = [float(value) for value in frame["close"].tolist()]
-
-    n = len(closes)
-    cci_values: list[float | None] = [None] * n
-
-    # Calculate Typical Price
-    typical_prices = [(highs[i] + lows[i] + closes[i]) / 3.0 for i in range(n)]
-
-    for i in range(period - 1, n):
-        window = typical_prices[i - period + 1 : i + 1]
-        if len(window) == period:
-            sma = sum(window) / period
-            mean_deviation = sum(abs(p - sma) for p in window) / period
-
-            if mean_deviation > 0:
-                cci_values[i] = (typical_prices[i] - sma) / (0.015 * mean_deviation)
-            else:
-                cci_values[i] = 0.0
-
-    return _with_column(frame, "cci", cci_values)
-
-
 def add_williams_r(
     frame: "pd.DataFrame",
     period: int = 14,
