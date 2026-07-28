@@ -24,7 +24,6 @@ from trading_bot.config.settings import ScoutSettings
 from trading_bot.strategy.news_filter import NewsFilter, RiskAssessment
 from trading_bot.strategy.sector_rotation import (
     SectorRotationAnalysis,
-    filter_symbols_by_sector_strength,
     get_best_sectors_for_trading,
 )
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import struct
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
