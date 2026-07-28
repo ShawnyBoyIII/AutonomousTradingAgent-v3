@@ -10,8 +10,12 @@ from trading_bot.db.models import MarketData
 
 
 def upsert_market_bars(session: Session, ticker: str, timeframe: str, bars: pd.DataFrame) -> int:
-    count = 0
-    # Optimization: use to_dict('records') which is much faster than iterrows
+    if bars.empty:
+        return 0
+
+    # Pre-process timestamps
+    processed_bars = []
+    timestamps = []
     for row in bars.to_dict('records'):
         ts = row["timestamp"]
         if isinstance(ts, (int, float)):
@@ -21,15 +25,42 @@ def upsert_market_bars(session: Session, ticker: str, timeframe: str, bars: pd.D
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
 
-        existing = session.execute(
-            select(MarketData).where(
-                and_(
-                    MarketData.ticker == ticker,
-                    MarketData.timeframe == timeframe,
-                    MarketData.timestamp == ts,
-                )
+        row["timestamp_obj"] = ts
+        timestamps.append(ts)
+        processed_bars.append(row)
+
+    # In SQLite timezone-aware datetimes might be stored as naive UTC
+    # To reliably match, we should do our mapped lookup ensuring we
+    # compare them the same way they come out of the DB.
+
+    # Bulk fetch existing market data to avoid N+1 queries
+    existing_records = session.execute(
+        select(MarketData).where(
+            and_(
+                MarketData.ticker == ticker,
+                MarketData.timeframe == timeframe,
+                MarketData.timestamp.in_(timestamps),
             )
-        ).scalar_one_or_none()
+        )
+    ).scalars().all()
+
+    existing_map = {}
+    for record in existing_records:
+        ts = record.timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        existing_map[ts] = record
+
+    count = 0
+    now = datetime.now(timezone.utc)
+    for row in processed_bars:
+        ts = row["timestamp_obj"]
+
+        # Ensure our lookup key is also tz-aware
+        if ts.tzinfo is None:
+             ts = ts.replace(tzinfo=timezone.utc)
+
+        existing = existing_map.get(ts)
 
         if existing:
             existing.open = float(row["open"])
@@ -48,10 +79,11 @@ def upsert_market_bars(session: Session, ticker: str, timeframe: str, bars: pd.D
                     low=float(row["low"]),
                     close=float(row["close"]),
                     volume=int(row["volume"]),
-                    fetched_at=datetime.now(timezone.utc),
+                    fetched_at=now,
                 )
             )
         count += 1
+
     session.commit()
     return count
 

@@ -243,12 +243,18 @@ class ResearchStore:
             total = conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone()[0]
             stats["total_hypotheses"] = total
 
+            # Initialize all status counts to 0
             for status in HypothesisStatus:
-                count = conn.execute(
-                    "SELECT COUNT(*) FROM hypotheses WHERE status = ?",
-                    (status.value,),
-                ).fetchone()[0]
-                stats[f"{status.value}_count"] = count
+                stats[f"{status.value}_count"] = 0
+
+            # Get counts for all statuses in a single query
+            status_counts = conn.execute(
+                "SELECT status, COUNT(*) FROM hypotheses GROUP BY status"
+            ).fetchall()
+            for row in status_counts:
+                status_val = row[0]
+                count = row[1]
+                stats[f"{status_val}_count"] = count
 
             stats["total_experiments"] = (
                 conn.execute("SELECT COUNT(*) FROM experiment_results")
