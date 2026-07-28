@@ -217,6 +217,23 @@ discover the burner's actual sidecar port without exporting env vars.
 The file is removed on `stop_dashboard` so a stale file from a dead
 burner is overwritten on the next launch.
 
+**Doctor market-data freshness.** `check_market_data_freshness` reads
+`state/market_data_cache.db` (`MarketDataCache`, the canonical store)
+first, falling back to the legacy `market_data` table in
+`state/burn_in.db` only if the cache is missing. Earlier the check
+queried the vestigial `market_data` table that no production code
+populates, so a busy burner with fresh intraday bars still reported
+`market_data_freshness: WARN  no market data yet`. The runner wires
+the cache path via `cache_db_path` (defaults to
+`<state_db_path parent>/market_data_cache.db`).
+
+**EOD fetch target date.** `eod-fetch` defaults to the previous
+**trading** day in America/New_York (`_previous_trading_day` helper),
+so Monday-evening fetches skip Sunday and don't 404 on the empty S3
+partition. The burner no longer passes `--date "$(date -v -1d ...)"`;
+it relies on the CLI default so weekend and DST transitions don't
+slip a calendar-yesterday target into the S3 request.
+
 Dashboard endpoints:
 
 - `GET /api/portfolio` — ledger + risk snapshot

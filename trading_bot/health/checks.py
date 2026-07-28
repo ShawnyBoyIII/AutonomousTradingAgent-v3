@@ -381,24 +381,71 @@ def check_scan_freshness(
     )
 
 
-def check_market_data_freshness(db_path: Path, *, now_utc: datetime) -> CheckResult:
-    """Verify recent market data matches market-hours expectations."""
-    if not db_path.exists():
-        return CheckResult(
-            name="market_data_freshness",
-            status="PASS",
-            detail=f"market DB missing: {db_path}",
-            observed={},
-        )
-    conn = sqlite3.connect(db_path)
-    try:
-        cursor = conn.execute(
-            "SELECT MAX(timestamp) FROM market_data WHERE timeframe IN ('5m','1m','1d')"
-        )
-        row = cursor.fetchone()
-        latest = row[0] if row else None
-    finally:
-        conn.close()
+def _latest_market_data_timestamp(cache_db_path: Path, legacy_db_path: Path) -> str | None:
+    """Return the ISO timestamp of the freshest market-data row.
+
+    Prefers ``cache_db_path`` (MarketDataCache, ``cache`` table); falls back
+    to ``legacy_db_path`` (``market_data`` table) only if the cache table is
+    absent. Returns ``None`` when neither store has any rows.
+    """
+    if cache_db_path.exists():
+        try:
+            conn = sqlite3.connect(cache_db_path)
+            try:
+                row = conn.execute(
+                    "SELECT MAX(created_at) FROM cache"
+                ).fetchone()
+            finally:
+                conn.close()
+            cached = row[0] if row else None
+            if cached:
+                return cached
+        except sqlite3.DatabaseError:
+            pass
+
+    if legacy_db_path.exists():
+        try:
+            conn = sqlite3.connect(legacy_db_path)
+            try:
+                row = conn.execute(
+                    "SELECT MAX(timestamp) FROM market_data "
+                    "WHERE timeframe IN ('5m','1m','1d')"
+                ).fetchone()
+            finally:
+                conn.close()
+            legacy = row[0] if row else None
+            if legacy:
+                return legacy
+        except sqlite3.DatabaseError:
+            pass
+
+    return None
+
+
+def check_market_data_freshness(
+    db_path: Path,
+    *,
+    now_utc: datetime,
+    cache_db_path: Path | None = None,
+) -> CheckResult:
+    """Verify recent market data matches market-hours expectations.
+
+    Reads from ``MarketDataCache`` (state/market_data_cache.db by default),
+    which is the actual store production code populates. Falls back to the
+    legacy ``market_data`` table in ``db_path`` for back-compat with older
+    installations that still write to it.
+
+    Returns PASS/WARN/FAIL based on the age of the latest cache entry:
+    - no cache entries during weekday market hours → WARN
+    - outside market hours → PASS regardless
+    - data ≤ 10 minutes old → PASS
+    - data ≤ 30 minutes old → WARN
+    - data > 30 minutes old → FAIL
+    """
+    if cache_db_path is None:
+        cache_db_path = db_path.parent / "market_data_cache.db"
+
+    latest = _latest_market_data_timestamp(cache_db_path, db_path)
 
     if not latest:
         weekday = now_utc.weekday()

@@ -162,6 +162,21 @@ def _doctor_state_dir(settings):
     return None
 
 
+def _previous_trading_day(today: "date") -> "date":
+    """Return the most recent weekday strictly before ``today``.
+
+    Saturday -> Friday, Sunday -> Friday, Monday -> Friday, etc. Used by
+    ``eod-fetch`` so the CLI default never asks massive.com for a Sunday
+    or holiday-eve date (which returns 404 from S3).
+    """
+    from datetime import timedelta
+
+    candidate = today - timedelta(days=1)
+    while candidate.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+        candidate -= timedelta(days=1)
+    return candidate
+
+
 @app.command()
 def doctor(
     ctx: typer.Context,
@@ -2471,6 +2486,9 @@ def eod_fetch(
     from trading_bot.data.data_store import DataStoreManifest
     from trading_bot.data.eod_runner import run_eod_fetch
 
+    if as_of_date is None:
+        as_of_date = _previous_trading_day(_date.today()).isoformat()
+
     settings = ctx.obj
     cfg = settings.eod_data_store
     if not cfg.enabled:
@@ -2478,7 +2496,11 @@ def eod_fetch(
         return
 
     if as_of_date is None:
-        as_of_date = (_date.today() - timedelta(days=1)).isoformat()
+        from zoneinfo import ZoneInfo
+
+        as_of_date = _previous_trading_day(
+            datetime.now(ZoneInfo("America/New_York")).date()
+        ).isoformat()
     target = _date.fromisoformat(as_of_date)
 
     universe_path = Path(settings.app.universe_path)

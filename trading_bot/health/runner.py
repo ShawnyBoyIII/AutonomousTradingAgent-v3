@@ -23,6 +23,7 @@ def run_health_checks(
     dashboard_port: int,
     eod_watchdog_pid_file: Path,
     scan_results_path: Path | None = None,
+    cache_db_path: Path | None = None,
     now_utc: datetime | None = None,
 ) -> HealthReport:
     """Run all burn-in checks; never raises. Failures degrade to FAIL."""
@@ -31,13 +32,20 @@ def run_health_checks(
     pid_file = health_state_dir / "burn_in.pid"
     heartbeat = health_state_dir / "heartbeat.json"
 
+    if cache_db_path is None:
+        cache_db_path = db_path.parent / "market_data_cache.db"
+
     results: list[CheckResult] = []
     results.append(check_pid_alive(pid_file))
     results.append(check_heartbeat_fresh(heartbeat, max_age_seconds=90))
     results.append(check_dashboard_health(port=dashboard_port))
     results.append(check_eod_watchdog(pid_file=eod_watchdog_pid_file, now_utc=now))
     results.append(check_open_positions_consistent(db_path=db_path, heartbeat_path=heartbeat))
-    results.append(check_market_data_freshness(db_path=db_path, now_utc=now))
+    results.append(
+        check_market_data_freshness(
+            db_path=db_path, cache_db_path=cache_db_path, now_utc=now
+        )
+    )
     results.append(check_tuning_experiment(state_dir=state_dir, now_utc=now))
     if scan_results_path is not None:
         results.append(check_scan_freshness(scan_results_path, now_utc=now))

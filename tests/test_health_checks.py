@@ -312,3 +312,104 @@ def test_market_data_no_data_after_hours_is_passing(tmp_path: Path):
         now_utc=datetime(2026, 7, 11, 17, 0, tzinfo=timezone.utc),
     )
     assert result.status == "PASS"
+
+
+def _seed_market_data_cache(db: Path, *, last_created_at: str | None = None) -> None:
+    """Seed a market_data_cache.db with a fresh (or absent) cache entry.
+
+    Mirrors the schema created by trading_bot.data.cache.MarketDataCache.
+    """
+    conn = sqlite3.connect(db)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE cache (
+                key TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                period TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                ttl_seconds INTEGER NOT NULL,
+                expires_at TEXT NOT NULL,
+                data TEXT NOT NULL
+            );
+            """
+        )
+        if last_created_at is not None:
+            conn.execute(
+                "INSERT INTO cache(key, symbol, period, interval, created_at, ttl_seconds, expires_at, data) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "providers=polygon,alpaca,yfinance:NOK:3mo:1d::",
+                    "NOK",
+                    "3mo",
+                    "1d",
+                    last_created_at,
+                    43200,
+                    "2026-07-29T13:42:57+00:00",
+                    "[]",
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_market_data_fresh_uses_cache_db_not_legacy_market_data_table(tmp_path: Path):
+    """The check must read from the MarketDataCache (state/market_data_cache.db),
+    not the vestigial market_data table in state/burn_in.db. Production code
+    populates only the cache, so a legacy-table-only check reports a permanent
+    WARN even when fresh bars are flowing.
+    """
+    burn_in_db = tmp_path / "burn_in.db"
+    _seed_db(burn_in_db, last_market_ts=None)  # legacy market_data table empty
+
+    cache_db = tmp_path / "market_data_cache.db"
+    fresh_ts = datetime.now(timezone.utc).isoformat()
+    _seed_market_data_cache(cache_db, last_created_at=fresh_ts)
+
+    # 13:00 ET on a weekday, fresh cache entry
+    result = check_market_data_freshness(
+        db_path=burn_in_db,
+        cache_db_path=cache_db,
+        now_utc=datetime(2026, 7, 6, 17, 0, tzinfo=timezone.utc),
+    )
+    assert result.status == "PASS", result.detail
+
+
+def test_market_data_warn_when_cache_db_missing(tmp_path: Path):
+    """When the MarketDataCache DB doesn't exist (cold cache), the check
+    reports WARN, matching the prior behavior for a brand-new install
+    before any fetcher has populated the cache.
+    """
+    burn_in_db = tmp_path / "burn_in.db"
+    _seed_db(burn_in_db, last_market_ts=None)
+    cache_db = tmp_path / "does_not_exist_cache.db"
+
+    result = check_market_data_freshness(
+        db_path=burn_in_db,
+        cache_db_path=cache_db,
+        now_utc=datetime(2026, 7, 6, 17, 0, tzinfo=timezone.utc),
+    )
+    assert result.status == "WARN", result.detail
+
+
+def test_market_data_fail_when_cache_entry_stale(tmp_path: Path):
+    """A cache entry older than the freshness threshold (during market
+    hours) must report FAIL so the operator notices a stale fetcher.
+    """
+    burn_in_db = tmp_path / "burn_in.db"
+    _seed_db(burn_in_db, last_market_ts=None)
+    cache_db = tmp_path / "market_data_cache.db"
+    # 4 hours ago: stale beyond the 30-minute warn threshold during market hours
+    stale_ts = datetime.fromtimestamp(
+        datetime.now(timezone.utc).timestamp() - 4 * 3600, tz=timezone.utc
+    ).isoformat()
+    _seed_market_data_cache(cache_db, last_created_at=stale_ts)
+
+    result = check_market_data_freshness(
+        db_path=burn_in_db,
+        cache_db_path=cache_db,
+        now_utc=datetime(2026, 7, 6, 17, 0, tzinfo=timezone.utc),
+    )
+    assert result.status == "FAIL", result.detail

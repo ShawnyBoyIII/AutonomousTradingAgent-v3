@@ -201,3 +201,29 @@ class TestRunEodFetch:
             "us_stocks_sip/quotes_v1/{year}/{date}.csv.gz",
             "us_stocks_sip/trades_v1/{year}/{date}.csv.gz",
         ]
+
+
+def test_previous_trading_day_weekday():
+    """A weekday target's previous trading day is the prior weekday."""
+    from datetime import date
+
+    from trading_bot.cli.app import _previous_trading_day
+
+    # Mon 2026-07-27 -> Fri 2026-07-24
+    assert _previous_trading_day(date(2026, 7, 27)) == date(2026, 7, 24)
+    # Tue 2026-07-28 -> Mon 2026-07-27
+    assert _previous_trading_day(date(2026, 7, 28)) == date(2026, 7, 27)
+    # Wed 2026-07-29 -> Tue 2026-07-28
+    assert _previous_trading_day(date(2026, 7, 29)) == date(2026, 7, 28)
+
+
+def test_previous_trading_day_weekend():
+    """Saturday/Sunday target's previous trading day is the prior Friday."""
+    from datetime import date
+
+    from trading_bot.cli.app import _previous_trading_day
+
+    # Sat 2026-07-25 -> Fri 2026-07-24
+    assert _previous_trading_day(date(2026, 7, 25)) == date(2026, 7, 24)
+    # Sun 2026-07-26 -> Fri 2026-07-24
+    assert _previous_trading_day(date(2026, 7, 26)) == date(2026, 7, 24)
