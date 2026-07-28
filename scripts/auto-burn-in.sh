@@ -535,6 +535,22 @@ echo "To stop: Press Ctrl-C"
 echo "=========================================="
 echo ""
 
+# Function to run the pattern miner pass
+run_pattern_miner() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] 🔎 Running pattern miner..."
+
+    local output
+    if ! output=$(sh ./tradebot-local --config-path "$CONFIG_FILE" pattern-mine 2>&1); then
+        echo "[$timestamp] ⚠️  Pattern miner failed:"
+        echo "$output"
+        return 0  # Do not kill burn-in on miner failure
+    fi
+
+    echo "[$timestamp] ✅ Pattern miner complete"
+    return 0
+}
+
 # Function to refresh tuning overrides from recent paper results
 run_nightly_tuning() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
@@ -1178,6 +1194,7 @@ while true; do
         else
             run_discovery "daily"
             # nightly tuning runs after discovery; EOD fetch already ran above
+            run_pattern_miner
             run_nightly_tuning
         fi
         load_symbols
