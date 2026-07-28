@@ -4,3 +4,6 @@
 ## 2026-07-01 - Semantic Landmarks and Screen Reader Table Navigation
 **Learning:** The dashboard previously lacked semantic HTML landmarks (like `<header>` and `<main>`) and used basic `<th>` tags for tables, which made it harder for assistive technologies to map page layout and data relationships.
 **Action:** Implemented semantic landmark wrapping in dashboard templates and added `scope="col"` to table headers for consistent screen reader accessibility.
+## 2024-07-28 - Async Loading State for Kill Switch
+**Learning:** Found that the "Kill Switch" button on the dashboard lacked an accessible async loading state. When pulled, it did not provide visual feedback to users that the action was in progress, nor did it announce its busy state to screen readers.
+**Action:** Implemented `aria-busy="true"` and changed the visual label to "Halting..." on click. Reverted these states properly both on successful update and error catch block.

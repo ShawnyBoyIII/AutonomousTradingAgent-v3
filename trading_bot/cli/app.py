@@ -2447,6 +2447,47 @@ def tune_experiment(
     raise typer.BadParameter(f"unknown action {action!r}")
 
 
+@app.command(name="pattern-mine")
+def pattern_mine(
+    ctx: typer.Context,
+    lookback_days: int = typer.Option(
+        90,
+        "--lookback-days",
+        help="Number of days to look back for pattern mining.",
+    ),
+) -> None:
+    """Run the pattern mining pass over historical EOD data."""
+    import logging
+    from trading_bot.patterns.miner import mine_patterns
+    from trading_bot.patterns.digest import generate_digest
+
+    settings = ctx.obj
+    cfg = settings.eod_data_store
+
+    if not cfg.enabled:
+        typer.echo("eod_data_store disabled in config, cannot mine patterns.")
+        raise typer.Exit(code=1)
+
+    store_root = Path(cfg.store_root)
+    manifest_db = Path(cfg.manifest_db)
+
+    typer.echo(f"Mining patterns over last {lookback_days} days...")
+
+    patterns = mine_patterns(
+        store_root=store_root,
+        manifest_db=manifest_db,
+        lookback_days=lookback_days
+    )
+
+    if not patterns:
+        typer.echo("No patterns found. Check if EOD data exists.")
+        raise typer.Exit(code=1)
+
+    output_dir = Path("state/patterns")
+    generate_digest(patterns=patterns, output_dir=output_dir)
+
+    typer.echo(f"Found {len(patterns)} patterns. Digests written to {output_dir}")
+
 @app.command(name="eod-fetch")
 def eod_fetch(
     ctx: typer.Context,
