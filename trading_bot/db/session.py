@@ -17,16 +17,31 @@ def _resolve_db_path(settings: Settings) -> Path:
 
 def _make_engine(db_path: Path) -> any:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    return create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    import os
+    try:
+        if db_path.exists():
+            os.chmod(db_path, 0o600)
+    except OSError:
+        pass
+    return engine
 
 
 def init_db(settings: Settings) -> any:
     from trading_bot.db.models import Base
     from sqlalchemy import text
+    import os
 
     db_path = _resolve_db_path(settings)
     engine = _make_engine(db_path)
     Base.metadata.create_all(engine)
+
+    try:
+        if db_path.exists():
+            os.chmod(db_path, 0o600)
+    except OSError:
+        pass
+
     with engine.begin() as conn:
         for ddl in (
             "ALTER TABLE trades ADD COLUMN signal_quality VARCHAR(20)",

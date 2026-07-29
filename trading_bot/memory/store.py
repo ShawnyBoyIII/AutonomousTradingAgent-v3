@@ -74,6 +74,12 @@ class MemoryStore:
                 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
                 CREATE INDEX IF NOT EXISTS idx_memories_relevance ON memories(relevance_score);
             """)
+        import os
+        try:
+            if Path(self.db_path).exists():
+                os.chmod(self.db_path, 0o600)
+        except OSError:
+            pass
 
     # --- CRUD ---
 

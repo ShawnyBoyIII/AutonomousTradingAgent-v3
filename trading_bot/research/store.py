@@ -84,6 +84,12 @@ class ResearchStore:
                 CREATE INDEX IF NOT EXISTS idx_hypotheses_category ON hypotheses(category);
                 CREATE INDEX IF NOT EXISTS idx_experiment_hypothesis ON experiment_results(hypothesis_id);
             """)
+        import os
+        try:
+            if Path(self.db_path).exists():
+                os.chmod(self.db_path, 0o600)
+        except OSError:
+            pass
 
     # --- Hypothesis CRUD ---
 

@@ -98,6 +98,12 @@ class MarketDataCache:
             conn.execute("PRAGMA busy_timeout=5000")
             conn.commit()
             conn.close()
+            import os
+            try:
+                if self._db_path.exists():
+                    os.chmod(self._db_path, 0o600)
+            except OSError:
+                pass
 
     def _connect(self) -> Any:
         import sqlite3

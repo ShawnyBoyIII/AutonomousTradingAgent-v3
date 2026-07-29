@@ -74,6 +74,12 @@ class DataStoreManifest:
                 conn.commit()
             finally:
                 conn.close()
+            import os
+            try:
+                if self._db_path.exists():
+                    os.chmod(self._db_path, 0o600)
+            except OSError:
+                pass
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self._db_path))
