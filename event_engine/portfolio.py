@@ -419,12 +419,13 @@ class Portfolio:
         if self._last_timestamp_ns is not None and timestamp_ns > self._last_timestamp_ns:
             elapsed_ns = timestamp_ns - self._last_timestamp_ns
             elapsed_days = elapsed_ns / 86_400_000_000_000.0
+            borrow_rate = self._policy.borrow_rate_per_day
             for sym, pos in self._positions.items():
-                if pos.is_short:
+                if pos.quantity < 0:
                     mark = prices.get(sym, pos.last_mark)
                     fee = (
-                        self._policy.borrow_rate_per_day
-                        * abs(pos.quantity)
+                        borrow_rate
+                        * (-pos.quantity)
                         * mark
                         * elapsed_days
                     )
@@ -434,20 +435,18 @@ class Portfolio:
 
         for symbol, price in prices.items():
             pos = self._positions.get(symbol)
-            if pos is None or pos.is_flat:
+            if pos is None or pos.quantity == 0:
                 continue
             pos.last_mark = float(price)
         self._last_timestamp_ns = timestamp_ns
 
     def used_margin(self, prices: dict[str, float]) -> float:
         """Used margin = sum of ``|qty| × mark`` for shorts."""
-        return _round_money(
-            sum(
-                abs(pos.quantity) * prices.get(symbol, pos.last_mark)
-                for symbol, pos in self._positions.items()
-                if pos.is_short
-            )
-        )
+        total = 0.0
+        for symbol, pos in self._positions.items():
+            if pos.quantity < 0:
+                total += (-pos.quantity) * prices.get(symbol, pos.last_mark)
+        return _round_money(total)
 
     def free_margin(self, prices: dict[str, float]) -> float:
         """Free margin = cash - used margin."""
@@ -457,26 +456,23 @@ class Portfolio:
         """Total equity = cash + sum of marked positions + accrued borrow fees."""
         marked = 0.0
         for symbol, pos in self._positions.items():
-            if pos.is_flat:
+            if pos.quantity == 0:
                 continue
             mark = prices.get(symbol, pos.last_mark)
-            if pos.is_long:
-                marked += pos.quantity * mark
-            else:
-                marked += pos.quantity * mark  # negative quantity times mark
+            marked += pos.quantity * mark
         return _round_money(self._cash + marked)
 
     def unrealised_pnl(self, prices: dict[str, float]) -> float:
         """Unrealised P&L across all open positions at the given marks."""
         out = 0.0
         for symbol, pos in self._positions.items():
-            if pos.is_flat:
+            if pos.quantity == 0:
                 continue
             mark = prices.get(symbol, pos.last_mark)
-            if pos.is_long:
+            if pos.quantity > 0:
                 out += (mark - pos.average_cost) * pos.quantity
             else:
-                out += (pos.average_short_cost - mark) * abs(pos.quantity)
+                out += (pos.average_short_cost - mark) * (-pos.quantity)
         return _round_money(out)
 
     def summary(self, prices: dict[str, float]) -> dict[str, float]:
