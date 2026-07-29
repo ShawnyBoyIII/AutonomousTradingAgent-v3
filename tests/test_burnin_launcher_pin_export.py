@@ -36,8 +36,6 @@ import re
 import subprocess
 from pathlib import Path
 
-import pytest
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = REPO_ROOT / "scripts" / "burnin-launcher.sh"

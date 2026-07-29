@@ -21,7 +21,6 @@ import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 from typer.testing import CliRunner
@@ -91,7 +90,7 @@ def test_load_settings_falls_back_to_config_yaml_when_no_env(
     """With neither arg nor env, the loader falls back to ``config.yaml`` in
     CWD — preserved so existing manual workflows keep working.
     """
-    default_config = _write_config(tmp_path / "config.yaml", db_filename="default.db")
+    _write_config(tmp_path / "config.yaml", db_filename="default.db")
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("CONFIG_PATH", raising=False)
 
