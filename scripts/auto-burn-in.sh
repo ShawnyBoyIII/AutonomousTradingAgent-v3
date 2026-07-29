@@ -200,7 +200,7 @@ run_discovery() {
     # Preserve manually added watchlist symbols
     local watchlist_symbols=()
     if [ -f "$WATCHLIST_FILE" ]; then
-        while IFS= read -r line; do
+        while IFS= read -r line || [ -n "$line" ]; do
             line=$(echo "$line" | tr -d '[:space:]')
             if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
                 watchlist_symbols+=("$line")
@@ -249,7 +249,7 @@ run_discovery() {
         
         # Merge discovered symbols with watchlist symbols (preserve manual additions)
         local all_symbols=()
-        while IFS= read -r line; do
+        while IFS= read -r line || [ -n "$line" ]; do
             line=$(echo "$line" | tr -d '[:space:]')
             if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
                 all_symbols+=("$line")
@@ -438,7 +438,7 @@ load_symbols() {
     
     # Read universe file (ranked symbols from build-universe)
     if [ -f "$UNIVERSE_FILE" ]; then
-        while IFS= read -r line; do
+        while IFS= read -r line || [ -n "$line" ]; do
             line=$(echo "$line" | tr -d '[:space:]')
             if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
                 all_symbols+=("$line")
@@ -448,7 +448,7 @@ load_symbols() {
     
     # Read watchlist file (manually added symbols)
     if [ -f "$WATCHLIST_FILE" ]; then
-        while IFS= read -r line; do
+        while IFS= read -r line || [ -n "$line" ]; do
             line=$(echo "$line" | tr -d '[:space:]')
             if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
                 # Add if not already in universe

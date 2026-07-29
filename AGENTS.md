@@ -584,6 +584,7 @@ Fail-fast: stops on first validation error.
 - `./tradebot-local tune` writes `state/tuning_overrides.yaml`; loader applies only allowlisted supermodel + strategy-tracker fields and still forces `live_trading_enabled=false`
 - Swarm worker votes (when running the manual `./tradebot-local swarm` command) are logged to `logs/worker_votes.jsonl`; use this file for per-worker weight tuning
 - Decision-log and paper-trade rows preserve compact supermodel evidence even on rejects and `NO_SIGNAL`; use `paper-report`, `trade-attribution`, and `db-features` for paper review before adding new logging.
+- Burner universe/watchlist readers preserve a final symbol even when the file has no trailing newline; Python discovery exports intentionally use that valid text-file form.
 
 ---
 
