@@ -164,7 +164,51 @@ def resolve_dashboard_port(settings) -> int:
     return 8000
 
 
+def _pin_snapshot_state_dir(env=None) -> Path | None:
+    """Return ``$PIN_DIR/state`` when the burner is pinned to an active
+    snapshot, otherwise ``None``.
+
+    The burn-in launcher captures ``HEAD`` into ``$PIN_DIR`` and runs
+    ``auto-burn-in.sh`` with cwd ``$PIN_DIR``; the resident burner
+    writes its heartbeat / pid / port / scan files under
+    ``$PIN_DIR/state/...``, not the live worktree. ``doctor --burn-in``
+    and ``resolve_dashboard_port`` must read from that location so
+    manual operators (and the burner's own self-check) see the
+    burner's actual health state.
+
+    "Active" means both canonical marker files exist:
+
+      - ``$PIN_DIR/scripts/auto-burn-in.sh`` — distinguishes a real
+        snapshot from a stray directory the operator may have pointed
+        ``PIN_DIR`` at by accident.
+      - ``$PIN_DIR/state/burn_in/burn_in.pid`` — the burner writes
+        this on every loop iteration (see
+        ``scripts/auto-burn-in.sh``). Missing ⇒ the burner has been
+        stopped; we must not silently read stale state from a dead
+        snapshot.
+
+    Returns ``None`` when ``PIN_DIR`` is unset or the snapshot is
+    missing its markers so the caller falls back to the live worktree.
+    """
+    import os
+
+    source = env if env is not None else os.environ
+    raw = source.get("PIN_DIR")
+    if not raw:
+        return None
+    pin_dir = Path(raw)
+    if not (pin_dir / "scripts" / "auto-burn-in.sh").exists():
+        return None
+    if not (pin_dir / "state" / "burn_in" / "burn_in.pid").exists():
+        return None
+    return pin_dir / "state"
+
+
 def _doctor_state_dir(settings):
+    pin_state = _pin_snapshot_state_dir()
+    if pin_state is not None:
+        return pin_state
+
     from pathlib import Path
 
     app = getattr(settings, "app", None)
@@ -234,11 +278,19 @@ def doctor(
     from trading_bot.health.runner import run_health_checks
     from trading_bot.health.types import HealthReport
 
-    state_dir_setting = Path(getattr(ctx.obj.app, "state_dir", None) or Path(ctx.obj.app.state_db_path).parent)
+    pin_state = _pin_snapshot_state_dir()
+    state_dir_setting = pin_state or Path(
+        getattr(ctx.obj.app, "state_dir", None)
+        or Path(ctx.obj.app.state_db_path).parent
+    )
     db_path = Path(ctx.obj.app.state_db_path)
     dashboard_port = resolve_dashboard_port(ctx.obj)
     eod_watchdog_pid_file = state_dir_setting / "burn_in" / "eod_watchdog.pid"
-    scan_results_path = Path(ctx.obj.app.scan_results_path)
+    scan_results_path = (
+        pin_state / "burn_in" / "scan_results.json"
+        if pin_state is not None
+        else Path(ctx.obj.app.scan_results_path)
+    )
 
     report: HealthReport = run_health_checks(
         state_dir=state_dir_setting,
