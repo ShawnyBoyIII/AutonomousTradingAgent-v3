@@ -174,6 +174,25 @@ def test_run_health_check_function_present():
     assert "doctor --burn-in --json" in contents
 
 
+def test_run_health_check_forwards_pin_dir_to_doctor():
+    """run_health_check must export PIN_DIR so the doctor subprocess
+    resolves burn_in.pid / heartbeat / dashboard.port against the
+    burner's pinned snapshot root, not the stale live tree.
+
+    Regression: a manual `./tradebot-local doctor --burn-in` from outside
+    the burner returned PID 68295 / heartbeat stale / scan stale because
+    the burner's subprocess did not propagate PIN_DIR. After the fix the
+    subprocess sees the snapshot and reports the live PID/heartbeat/scan.
+    """
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "auto-burn-in.sh"
+    contents = script_path.read_text()
+    health_block = contents.split("run_health_check()", 1)[1].split("\n}\n", 1)[0]
+    assert "PIN_DIR=\"$PIN_DIR\"" in health_block, (
+        "run_health_check must forward PIN_DIR to its doctor subprocess so "
+        "the snapshot's health artifacts are read instead of the live tree"
+    )
+
+
 def test_no_local_outside_functions_in_burn_in_script() -> None:
     """Regression: 'local' is only valid inside bash functions.
 

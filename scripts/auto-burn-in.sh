@@ -603,7 +603,11 @@ run_health_check() {
     local rc=0
     local output
     # canonical: sh ./tradebot-local --config-path "$CONFIG_FILE" doctor --burn-in
-    output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" doctor --burn-in --json 2>&1) || rc=$?
+    # Forward PIN_DIR explicitly so the subprocess's loader sees the
+    # snapshot root for burn_in.pid / heartbeat / scan_results /
+    # dashboard.port lookups, even if a future refactor drops the
+    # top-level ``export PIN_DIR`` from this script.
+    output=$(PIN_DIR="$PIN_DIR" sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" doctor --burn-in --json 2>&1) || rc=$?
     echo "$output" >> "$HEALTH_LOG" 2>/dev/null || true
     if [ "$rc" -ne 0 ]; then
         echo "[$timestamp] ⚠️  Health check exit=$rc (see $HEALTH_LOG)"
