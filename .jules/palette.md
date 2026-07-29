@@ -7,3 +7,6 @@
 ## 2024-07-28 - Async Loading State for Kill Switch
 **Learning:** Found that the "Kill Switch" button on the dashboard lacked an accessible async loading state. When pulled, it did not provide visual feedback to users that the action was in progress, nor did it announce its busy state to screen readers.
 **Action:** Implemented `aria-busy="true"` and changed the visual label to "Halting..." on click. Reverted these states properly both on successful update and error catch block.
+## 2024-05-18 - Tabindex and Title Accessibility in Dashboard
+**Learning:** Found that the "skip to main content" link pointed to `<main id="main">` which lacked a `tabindex="-1"`, meaning keyboard focus was not properly managed by the browser upon skip link activation. Also found that the "Kill Switch" lever lacked descriptive tooltips (`title` attribute) communicating its disabled or ready states.
+**Action:** When creating skip links, always ensure the target container (e.g. `<main>`) has `tabindex="-1"`. When a button's disabled state changes, dynamically update its `title` attribute so hover and screen readers provide actionable feedback on *why* it is disabled.

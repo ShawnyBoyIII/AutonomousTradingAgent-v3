@@ -90,7 +90,7 @@ def test_tab_switcher_logic():
     ;return { initialTab: (typeof getActiveBookTab === 'function') ? getActiveBookTab() : null };
     """
     out = subprocess.run(
-        [".venv/bin/python", "-c", f"import subprocess, json; print(subprocess.run(['node', '-e', '''{harness}'''], capture_output=True, text=True, cwd='/Users/shawndlima/Documents/AutonomousTradingAgentcopy').stdout)"],
+        ["python", "-c", f"import subprocess, json; print(subprocess.run(['node', '-e', '''{harness}'''], capture_output=True, text=True, cwd='/app').stdout)"],
         capture_output=True, text=True,
     )
 
