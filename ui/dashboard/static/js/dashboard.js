@@ -656,6 +656,7 @@
       lever.removeAttribute("aria-busy");
       lever.disabled = halted;
       setValue(leverLbl, halted ? "Halted" : "Pull to halt");
+      lever.setAttribute("title", halted ? "Halted. Resume via CLI to re-arm" : "Pull to instantly halt all trading");
     }
 
     if (badge) {
@@ -1231,6 +1232,7 @@
       try {
         lever.disabled = true;
         lever.setAttribute("aria-busy", "true");
+        lever.setAttribute("title", "Halting...");
         if (leverLbl) setValue(leverLbl, "Halting...");
         const r = await fetch("/api/kill-switch/halt", {
           method: "POST",
@@ -1245,6 +1247,7 @@
         console.error("halt failed", e);
         lever.disabled = false;
         lever.removeAttribute("aria-busy");
+        lever.setAttribute("title", "Pull to instantly halt all trading");
         if (leverLbl) setValue(leverLbl, "Pull to halt");
         window.alert("Failed to halt. Check the console for details.");
       }
