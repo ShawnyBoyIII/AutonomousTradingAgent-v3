@@ -191,7 +191,7 @@ silently enable canary activation.
 
 ## Testing
 
-- 2,162 tests pass (network-free, monkeypatch `fetch_bars`).
+- 2,174 tests pass (network-free, monkeypatch `fetch_bars`; new additive regressions cover continuous CLI wiring, dashboard config routing, and burn-in PIN_DIR handoff).
 - Run: `.venv/bin/python -m pytest -q`
 
 ## Configuration

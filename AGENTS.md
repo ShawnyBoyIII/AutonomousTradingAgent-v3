@@ -28,11 +28,12 @@ AGENTS.md is a snapshot of the project's current operational reality, not a hist
 
 Never use bare `tradebot` on PATH — it may resolve to a stale global install.
 
-**Config file selection:**
+**Config file selection (precedence: CLI `--config-path` > `CONFIG_PATH` env > `config.yaml`):**
 - `config.yaml` — default config for manual commands (`scan`, `paper-trade`, `portfolio`, etc.)
 - `burn-in-config.yaml` — config for automated burn-in (`./scripts/auto-burn-in.sh`); enables V3 signals, different risk params
 - `config.alpaca.yaml` — alternative config using Alpaca as market data provider
 - Pass via `--config-path` to override: `./tradebot-local --config-path burn-in-config.yaml scan`
+- Export `CONFIG_PATH=burn-in-config.yaml` to switch the default for any child process; `load_settings()` honors it only when no explicit path is supplied, and the CLI `serve` command re-exports the resolved absolute path before launching Uvicorn so the dashboard's module-level `DashboardState` reads the same config
 
 ---
 
@@ -123,6 +124,7 @@ prints a notice and exits non-zero while an experiment is active.
 - Tests are deterministic: monkeypatch market data, use `tmp_path` fixtures
 - No real network calls
 - Config: `pytest -ra --strict-markers` (pyproject.toml)
+- When fixing a defect, add new regression tests that capture the bug at the broken boundary. Do not weaken or rewrite existing test expectations; new tests live alongside the originals and prove the previous failure mode is now impossible.
 
 ---
 
@@ -228,6 +230,15 @@ precedence: `DASHBOARD_PORT` env var → `state/burn_in/dashboard.port`
 discover the burner's actual sidecar port without exporting env vars.
 The file is removed on `stop_dashboard` so a stale file from a dead
 burner is overwritten on the next launch.
+
+**Dashboard config routing.** `trading_bot/config/loader.py::load_settings`
+selects the config file with this precedence: explicit argument >
+`CONFIG_PATH` env > `config.yaml`. The CLI `serve` command re-exports
+the resolved absolute path via `CONFIG_PATH` before invoking Uvicorn so
+the dashboard's module-level `DashboardState()` reads the same config
+as the CLI. `scripts/start-dashboard.sh` already sets `CONFIG_PATH`
+when the operator passes `--config`; the loader honors it for any
+caller that does not pass an explicit path.
 
 **Doctor `--burn-in` config routing.** `./tradebot-local doctor --burn-in`
 (no `--config-path`) re-loads settings from `burn-in-config.yaml`
@@ -476,18 +487,22 @@ exact 44.9296% drawdown — while a fresh CLI on the same ledger reported
 1.78%.
 
 **The boundary:** `scripts/burnin-launcher.sh` captures an immutable
-snapshot of `HEAD` via `git archive HEAD | tar -x -C
-.burnin_pin/<head_sha>/` and `exec`s `scripts/auto-burn-in.sh` from the
-snapshot root with `PIN_DIR` exported. Every Python subprocess then
-resolves through the snapshot's wrapper, not the live mutable worktree.
+snapshot of `HEAD` into `$PIN_PARENT_DIR/<head_sha>/` and then exports
+`PIN_DIR` pointing at the snapshot root before `exec`ing
+`scripts/auto-burn-in.sh`. Every Python subprocess resolves through
+the snapshot's wrapper, not the live mutable worktree.
 
 - **Always use `./scripts/burnin-launcher.sh` for unattended runs.**
   `./scripts/auto-burn-in.sh` is still callable for ad-hoc / debugging
   scenarios where the worktree is stable, but the launcher is the
   pinned contract.
-- The snapshot lives under `.burnin_pin/<head_sha>/`. SHA is recorded
-  in `state/burn_in_health/burn_in.pin` so the doctor can confirm the
-  burner is operating from the expected snapshot.
+- `PIN_PARENT_DIR` (default `$REPO/.burnin_pin`) is where snapshot
+  subdirectories are created. After capture the launcher exports
+  `PIN_DIR=<pin_parent>/<head_sha>/` so `$PIN_DIR/tradebot-local` and
+  `$PIN_DIR/.venv/bin/python` resolve against the immutable snapshot.
+- The snapshot fingerprint is written to
+  `$PIN_PARENT_DIR/last_fingerprint`. Doctor reads this file and
+  reports it as the pin's SHA256 prefix.
 - Doctor `--burn-in` reports the pin SHA and the fingerprint of pinned
   paths. A fingerprint mismatch means the live worktree edited
   `tradebot-local`, `scripts/auto-burn-in.sh`, `trading_bot/runtime/burnin_pin.py`,
