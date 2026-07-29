@@ -225,11 +225,14 @@ a deprecation no-op alias that points operators at `serve`.
 port via `trading_bot/cli/app.py::resolve_dashboard_port` with this
 precedence: `DASHBOARD_PORT` env var → `state/burn_in/dashboard.port`
 (written by the burner when the sidecar starts) → `settings.app.dashboard_port`
-→ 8000. The port file is the bridge that lets a manual operator run
-`./tradebot-local doctor --burn-in` from outside the burner and
-discover the burner's actual sidecar port without exporting env vars.
-The file is removed on `stop_dashboard` so a stale file from a dead
-burner is overwritten on the next launch.
+→ 8000. When the burner is running under the pinned launcher, these
+files live under `$PIN_DIR/state/burn_in/`, so the doctor also
+consults the active snapshot before the live `state/`. The port file
+is the bridge that lets a manual operator run `./tradebot-local doctor
+--burn-in` from outside the burner and discover the burner's actual
+sidecar port without exporting env vars. The file is removed on
+`stop_dashboard` so a stale file from a dead burner is overwritten on
+the next launch.
 
 **Dashboard config routing.** `trading_bot/config/loader.py::load_settings`
 selects the config file with this precedence: explicit argument >
