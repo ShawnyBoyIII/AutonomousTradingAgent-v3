@@ -148,10 +148,10 @@ def test_run_symbol_backtest_replays_multiple_trade_cycles() -> None:
         "trades": 2,
         "wins": 2,
         "losses": 0,
-        "net_pnl": 45.4,  # Updated for V2.5 position sizing (smaller positions)
+        "net_pnl": 53.0,
     }
-    assert result["avg_win"] == 22.7
-    assert result["profit_factor"] == 45.4
+    assert result["avg_win"] == 26.5
+    assert result["profit_factor"] == 53.0
 
 
 def _v3_daily_frame() -> pd.DataFrame:

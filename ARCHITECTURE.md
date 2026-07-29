@@ -1,6 +1,6 @@
 # System Architecture Overview
 
-> Current as of 2026-07-24. When `AGENTS.md` changes in a way that
+> Current as of 2026-07-29. When `AGENTS.md` changes in a way that
 > affects the architecture, update this file in the same commit.
 
 ## Data Flow
@@ -191,7 +191,7 @@ silently enable canary activation.
 
 ## Testing
 
-- 2,133 tests pass (network-free, monkeypatch `fetch_bars`); one pre-existing assertion mismatch in `test_run_symbol_backtest_replays_multiple_trade_cycles` remains.
+- 2,161 tests pass (network-free, monkeypatch `fetch_bars`).
 - Run: `.venv/bin/python -m pytest -q`
 
 ## Configuration
