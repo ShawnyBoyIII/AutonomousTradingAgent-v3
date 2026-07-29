@@ -122,14 +122,22 @@ def _load_tuning_overrides(settings: Settings, base_dir: Path) -> None:
 def load_settings(config_path: Path | None = None) -> Settings:
     """
     Load settings from YAML config file.
-    
+
     Process:
-    1. Load YAML config
-    2. Validate no credentials in config file
-    3. Override with environment variables
-    4. Check for live trading enablement (env only)
-    5. Resolve relative paths
+    1. Resolve which config file to load:
+       - Explicit ``config_path`` argument (highest priority)
+       - ``CONFIG_PATH`` environment variable
+       - ``config.yaml`` in the current working directory (default)
+    2. Load YAML config
+    3. Validate no credentials in config file
+    4. Override with environment variables
+    5. Check for live trading enablement (env only)
+    6. Resolve relative paths
     """
+    if config_path is None:
+        env_path = os.environ.get("CONFIG_PATH")
+        if env_path:
+            config_path = Path(env_path)
     path = config_path or Path("config.yaml")
     raw: dict[str, Any] = {}
 
