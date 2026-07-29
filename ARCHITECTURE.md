@@ -3,6 +3,16 @@
 > Current as of 2026-07-29. When `AGENTS.md` changes in a way that
 > affects the architecture, update this file in the same commit.
 
+## Operational Atlas
+
+A companion set of per-subsystem maps covers every operational file
+with callers, side effects, tests, and status. See
+[`docs/architecture/operational-atlas/`](docs/architecture/operational-atlas/)
+for the entrypoint, runtime, data/signals/execution, persistence/
+analytics/dashboard, burner/safety/monitoring, and learning/research/
+integrations maps, plus the file-coverage index, verification matrix,
+and remediation backlog.
+
 ## Data Flow
 
 ```
