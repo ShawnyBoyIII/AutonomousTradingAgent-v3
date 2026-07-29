@@ -4,8 +4,8 @@ app:
   log_dir: "logs"
   portfolio_summary_path: "state/burn_in/portfolio_summary.json"
   scan_results_path: "state/burn_in/scan_results.json"
-  allow_yellow_mean_reversion: true
-  min_entry_confluence_score: 0.0  # TEMP FIRE MODE 2026-07-09 (user said "loosen the guardrails"); permits any signal the V3 selector produces; see AGENTS.md.
+  allow_yellow_mean_reversion: false
+  min_entry_confluence_score: 4.0
   signal_mode: "parallel"
   min_timeframe_alignment: 1
   dashboard_port: 8080
@@ -24,24 +24,26 @@ market_data:
 risk:
   max_risk_per_trade_pct: 0.01
   max_daily_risk_pct: 0.03
-  max_daily_orders: 60
-  max_ticker_allocation_pct: 0.25
-  min_reward_risk_ratio: 1.0  # TEMP lowered 2026-07-09 (today's low-vol market produces ATR-based R/R ~1.3 — below 1.5 default); user instructed "Leave the temp override in please"; see AGENTS.md.
+  max_daily_orders: 3
+  max_ticker_allocation_pct: 0.20
+  min_reward_risk_ratio: 2.0
   use_atr_sizing: true
   atr_period: 14
-  atr_multiplier: 2.5
+  atr_multiplier: 2.0
   atr_stop_multiplier: 3.0
-  min_stop_distance_pct: 2.0
-  max_portfolio_heat_pct: 0.10
-  max_consecutive_losses: 999  # TEMP disabled 2026-07-08 5-loss streak; user instructed "Leave the temp override in please" on 2026-07-09 — see AGENTS.md.
-  enable_drawdown_circuit_breaker: false  # TEMP DISABLED 2026-07-08 (5-loss streak unbroken since yesterday's close); user instructed "Leave the temp override in please" on 2026-07-09 — see AGENTS.md.
-  ticker_reentry_cooldown_minutes: 5
+  min_stop_distance_pct: 3.0
+  max_portfolio_heat_pct: 0.03
+  max_sector_concentration_pct: 0.20
+  max_shares_per_position: 50
+  max_consecutive_losses: 5
+  enable_drawdown_circuit_breaker: true
+  ticker_reentry_cooldown_minutes: 30
   yellow_allocation_pct: 0.5
 
 strategy:
   use_v3_signals: true
-  risk_tolerance: "high"
-  min_confidence: "low"
+  risk_tolerance: "medium"
+  min_confidence: "medium"
 
 counter_thesis:
   enabled: false
@@ -71,18 +73,13 @@ session:
 paper:
   fee_per_order: 1.0
   slippage_bps: 5
-  graduation_since: "2026-07-11T00:00:00+00:00"
-  equity_evaluation_since: "2026-07-15T22:29:45.354846-04:00"
+  graduation_since: "2026-07-28T23:28:04.494941-04:00"
+  equity_evaluation_since: "2026-07-28T23:28:04.494941-04:00"
 
-# TEMP strategy_tracker override 2026-07-09 (loosened per user "loosen the guardrails")
-# Yesterday's 7-loss streak put the rolling win rate just below the 20% min_win_rate
-# threshold, so every v3-mean_reversion / v3-trend_following signal was getting
-# allocation=0. Loosening to 0% lets the strategies take trades; min_reward_risk_ratio
-# still gates quality. Revert at user's direction. See AGENTS.md.
 strategy_tracker:
   window: 20
-  min_win_rate: 0.0
-  full_allocation_rate: 0.20
+  min_win_rate: 0.20
+  full_allocation_rate: 0.50
 
 alerts:
   slack_webhook_url: ""

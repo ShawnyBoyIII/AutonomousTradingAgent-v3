@@ -111,9 +111,12 @@ scripts/
 
 ### Risk Controls
 
-- Position cap: `risk.max_ticker_allocation_pct` (default `0.20`, fire-mode burn-in `0.25`)
-- Portfolio heat: `risk.max_portfolio_heat_pct` (default `0.03`, fire-mode burn-in `0.10`)
-- Hard per-ticker share cap: `risk.max_shares_per_position` (`50` in fire-mode)
+- Position cap: `risk.max_ticker_allocation_pct` (`0.20` in code and burn-in)
+- Portfolio heat: `risk.max_portfolio_heat_pct` (`0.03` in code and burn-in)
+- Hard per-ticker share cap: `risk.max_shares_per_position` (`50`)
+- Burn-in entry guards: three daily orders, 2.0 minimum reward/risk,
+  3% minimum stop distance, and a 30-minute ticker re-entry cooldown
+- Burn-in circuit breakers: five consecutive losses or 10% cohort drawdown
 - Daily-loss guard (resets by configured trading date)
 - Paper-only by hardcode — `live_trading_enabled` forced `false` in `config/loader.py`
 

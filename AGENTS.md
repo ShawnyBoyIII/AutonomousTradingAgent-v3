@@ -54,19 +54,20 @@ Never use bare `tradebot` on PATH — it may resolve to a stale global install.
 
 **Target**: Profit factor > 1.3 over 100 closed trades on paper with $100K starting capital.
 Graduation evidence starts at `paper.graduation_since`; the burn-in cohort is
-currently `2026-07-11T00:00:00+00:00`, after the 50-share cap was introduced.
+currently `2026-07-28T23:28:04.494941-04:00`, when the paper ledger and
+learned runtime state were reset to a fresh $100K cohort.
 
 Equity-risk evidence (drawdown, peak, return) starts at the dedicated
 `paper.equity_evaluation_since` boundary. The current value is
-`2026-07-15T22:29:45.354846-04:00`, the moment the live burn-in database
-was reset to the $100K paper cohort. Pre-cohort equity rows (including
-the legacy $1.27M peak) are excluded from cohort drawdown so a stale
-peak cannot trip the circuit breaker.
+`2026-07-28T23:28:04.494941-04:00`, the same full-reset boundary. Pre-cohort
+equity rows are excluded from cohort drawdown so stale peaks cannot trip the
+circuit breaker.
 
-- Burn-in runs daily via `./scripts/auto-burn-in.sh`
+- Unattended burn-in runs via `./scripts/burnin-launcher.sh`
 - Parallel signal mode is V3 + V2.5 consensus. The swarm engine is no longer in the automated scan/vote path — it remains as a manual/advisory tool (`./tradebot-local swarm`) only.
-- 5% minimum stop distance on 5-minute bars (intraday noise protection)
-- Fire-mode burn-in keeps a 25% ticker-allocation ceiling and a hard 50-share cap; default config uses 20%
+- 3% minimum stop distance on 5-minute bars (intraday noise protection)
+- Strict burn-in guards use a 20% ticker-allocation ceiling, 3% portfolio-heat ceiling, three daily orders, and a hard 50-share cap
+- Circuit breakers halt after five consecutive losses or a 10% cohort drawdown; ticker re-entry cooldown is 30 minutes
 - Confidence gates are advisory at PF < 0.8 after 50+ trades (logs alert, does not halt)
 - The daily loss guard resets by configured trading date and sums that day's realized SELL P&L; cumulative historical P&L does not block a new session when dated SELL history is available
 - Strategy tags recorded on all buys and sells for attribution
@@ -146,7 +147,7 @@ screening, the event driver, and Stage 5 quantitative validation.
 
 ## Configuration
 
-**Critical defaults (config.yaml):**
+**Critical burn-in defaults (`burn-in-config.yaml`):**
 ```yaml
 app:
   live_trading_enabled: false  # Always false, enforced in code
@@ -154,19 +155,30 @@ app:
 
 risk:
   max_risk_per_trade_pct: 0.01
-  max_ticker_allocation_pct: 0.25  # Fire-mode burn-in; default config uses 20%
-  max_portfolio_heat_pct: 0.10     # Fire-mode burn-in; default config uses 3%
+  max_daily_orders: 3
+  max_ticker_allocation_pct: 0.20
+  max_portfolio_heat_pct: 0.03
   max_shares_per_position: 50      # Hard per-ticker share cap
+  min_reward_risk_ratio: 2.0
+  min_stop_distance_pct: 3.0
+  max_consecutive_losses: 5
+  enable_drawdown_circuit_breaker: true
+  ticker_reentry_cooldown_minutes: 30
 
 market_data:
   validate_data: true  # V2.5: fail-fast
 
 paper:
-  graduation_since: "2026-07-11T00:00:00+00:00"  # trade-quality cohort
-  equity_evaluation_since: "2026-07-15T22:29:45.354846-04:00"  # equity-risk cohort
+  graduation_since: "2026-07-28T23:28:04.494941-04:00"  # trade-quality cohort
+  equity_evaluation_since: "2026-07-28T23:28:04.494941-04:00"  # equity-risk cohort
+
+strategy_tracker:
+  window: 20
+  min_win_rate: 0.20
+  full_allocation_rate: 0.50
 
 app:
-  dashboard_port: 8000  # overridden by DASHBOARD_PORT env var
+  dashboard_port: 8080  # overridden by DASHBOARD_PORT env var
 ```
 
 **Quirks:**
@@ -293,8 +305,9 @@ Cross-table reporting reads both `orders` and `trades` tables separately.
 Position cost basis uses the actual slipped BUY fill. New SELL `pnl` values are
 net of BUY and SELL fees, with BUY fees allocated proportionally across partial
 exits; cumulative portfolio P&L does not double-count the BUY fee charged when
-the position opened. The `2026-07-11` paper cohort's persisted SELL rows were
-reconciled to this fill-to-fill net convention; older legacy rows were not.
+the position opened. The archived `2026-07-11` paper cohort's persisted SELL
+rows were reconciled to this fill-to-fill net convention; older legacy rows
+were not.
 
 ---
 
@@ -565,7 +578,7 @@ Fail-fast: stops on first validation error.
 
 - When calling `trading_bot.runtime.position_exit` helpers outside CLI entrypoints, pass the active `settings` object explicitly so exit persistence uses the intended DB/log paths.
 - Intraday backtests are causal: signals receive only completed prior-day context, approved setups fill at the next observed bar open, next opens at or beyond the original stop/target cancel the setup, exits are evaluated one bar at a time, same-bar stop/target collisions choose the stop, and configured paper fees/slippage apply. When `app.signal_mode=parallel`, replay and paper mode share the V3 + V2.5 consensus, counter-thesis, supermodel veto, and one-source half-sizing path. Portfolio-wide correlation, sector exposure, cooldown, and adaptive strategy-tracker state remain paper-runtime concerns; only the configured paper cohort counts toward graduation.
-- New paper fills are persisted as timezone-aware UTC timestamps. Legacy order rows before the `2026-07-11` cohort may contain naive America/New_York wall time and must not be mixed into UTC-window conclusions.
+- New paper fills are persisted as timezone-aware UTC timestamps. Legacy order rows in archived pre-reset cohorts may contain naive America/New_York wall time and must not be mixed into UTC-window conclusions.
 - `list_equity_history()` retains legacy oldest-first semantics; monitoring and audits must use `list_recent_equity_history()` when requesting a bounded recent window.
 - `trading_bot.data.providers.registry` is the source of truth for market-data capabilities, network-free credential readiness, and intraday fallback priority. Add or change a provider there in the same commit as its adapter; unsupported intervals are skipped before provider construction.
 - `./tradebot-local tune` writes `state/tuning_overrides.yaml`; loader applies only allowlisted supermodel + strategy-tracker fields and still forces `live_trading_enabled=false`
@@ -601,6 +614,6 @@ Fail-fast: stops on first validation error.
 ```
 
 **Position sizes too small:**
-- Verify `max_ticker_allocation_pct` (burn-in: 0.15, default: 0.20)
+- Verify `max_ticker_allocation_pct` (burn-in and code default: 0.20)
 - Check `max_portfolio_heat_pct` (blocks at 3% unrealized loss)
 - Review ATR multiplier settings
