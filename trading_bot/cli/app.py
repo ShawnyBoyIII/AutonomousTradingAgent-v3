@@ -113,6 +113,10 @@ def main(
             config_path = Path(env_path)
     ctx.obj = load_settings(config_path)
     ctx.obj._explicit_config_path = explicit_config_path
+    # Stash the resolved config path so subcommands (notably ``serve``)
+    # can re-export it before launching subprocesses whose module-level
+    # state re-loads settings from CONFIG_PATH.
+    ctx.obj._config_path = config_path
     configure_from_settings(ctx.obj)
 
 
@@ -671,9 +675,22 @@ def serve(
 
     Press Ctrl-C to stop.
     """
+    import os
+
     import uvicorn
 
     effective_port = port if port is not None else ctx.obj.app.dashboard_port
+    # Re-export the resolved config path via CONFIG_PATH so the Uvicorn
+    # string-imported ``ui.dashboard.main`` module reads the same config
+    # the CLI just loaded. Without this, the dashboard's eager
+    # ``DashboardState()`` re-runs against config.yaml regardless of
+    # --config-path or CONFIG_PATH (root cause: uvicorn spawns a fresh
+    # module import without receiving the loader's selection).
+    config_path = getattr(ctx.obj, "_config_path", None)
+    if config_path is not None:
+        resolved = Path(config_path).resolve()
+        os.environ["CONFIG_PATH"] = str(resolved)
+
     typer.echo(
         f"Serving rich dashboard at http://{host}:{effective_port} (Ctrl-C to stop)"
     )
@@ -775,11 +792,6 @@ def continuous(
         "--max-failures",
         help="Consecutive failures before circuit breaker opens.",
     ),
-    event_system: bool = typer.Option(
-        False,
-        "--event-system",
-        help="Wire loop events through the event bus.",
-    ),
 ) -> None:
     """Run the full paper-trading loop continuously.
 
@@ -808,7 +820,6 @@ def continuous(
             build_universe=build_universe,
             dry_run=dry_run,
             max_failures=max_failures,
-            use_event_system=event_system,
         )
         typer.echo(f"loop_stopped stats={json.dumps(stats.summary(), default=str)}")
     except KeyboardInterrupt:
