@@ -191,7 +191,7 @@ silently enable canary activation.
 
 ## Testing
 
-- 2,161 tests pass (network-free, monkeypatch `fetch_bars`).
+- 2,162 tests pass (network-free, monkeypatch `fetch_bars`).
 - Run: `.venv/bin/python -m pytest -q`
 
 ## Configuration

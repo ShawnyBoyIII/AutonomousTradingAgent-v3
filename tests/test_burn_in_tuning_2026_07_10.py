@@ -11,9 +11,12 @@ from pathlib import Path
 
 
 def _settings_from_burn_in_config():
-    from trading_bot.config.loader import load_settings
+    import yaml
 
-    return load_settings(Path("burn-in-config.yaml"))
+    from trading_bot.config.settings import Settings
+
+    raw = yaml.safe_load(Path("burn-in-config.yaml").read_text(encoding="utf-8"))
+    return Settings.model_validate(raw)
 
 
 def test_risk_min_reward_risk_ratio_matches_strict_default() -> None:
@@ -56,3 +59,16 @@ def test_remaining_risk_guards_match_strict_defaults() -> None:
     assert settings.risk.max_consecutive_losses == 5
     assert settings.risk.enable_drawdown_circuit_breaker is True
     assert settings.risk.ticker_reentry_cooldown_minutes == 30
+
+
+def test_config_tripwire_ignores_runtime_tuning_overrides(monkeypatch) -> None:
+    from trading_bot.config import loader
+
+    def inject_runtime_override(settings, _base_dir) -> None:
+        settings.strategy_tracker.full_allocation_rate = 0.99
+
+    monkeypatch.setattr(loader, "_load_tuning_overrides", inject_runtime_override)
+
+    settings = _settings_from_burn_in_config()
+
+    assert settings.strategy_tracker.full_allocation_rate == 0.50
