@@ -97,17 +97,21 @@ def test_auto_burn_in_integrates_eod_data_download() -> None:
     # CLI invocation mirrors the burn-in config path.
     assert "./tradebot-local --config-path \"$CONFIG_FILE\" eod-fetch" in script
 
-    # CRITICAL: must pass YESTERDAY's date (massive.com publishes day-T's
-    # bars at 11:00 ET on day T+1). Using today's date yields a 404 every
-    # single day. Either omit the flag (let CLI default to yesterday) or
-    # pass an explicit "yesterday" computation.
+    # CRITICAL: must NOT pass today's date (massive.com publishes day-T's
+    # bars at 11:00 ET on day T+1). The CLI's `--date` default uses the
+    # previous trading day in America/New_York, so the burner relies on
+    # the CLI default rather than computing a host-calendar date. A
+    # shell-side date override mis-targets the S3 partition around DST
+    # transitions or weekend rollover. Operators can still pass --date
+    # explicitly to override.
     # NOTE: use the function's closing "}" via "    return 0" followed by
     # the brace — naive first-"}" splitting breaks when the function uses
     # ${VAR} parameter expansion.
     fetch_block = script.split("run_eod_data_download()", 1)[1].split("\n}\n", 1)[0]
-    assert "yesterday" in fetch_block or "v-1d" in fetch_block, (
-        "EOD fetch must target YESTERDAY (massive.com publishes day-T's bars "
-        "at ~11:00 ET on day T+1), not today"
+    assert "today_ymd" in fetch_block or "date '+%Y-%m-%d'" in fetch_block, (
+        "EOD fetch function should retain at least one date reference for "
+        "logging (e.g. target=YYYY-MM-DD); the CLI computes the actual "
+        "fetch target from the previous trading day."
     )
 
     # CRITICAL: must not mark the day complete if every fetch failed.
@@ -190,6 +194,57 @@ def test_run_health_check_forwards_pin_dir_to_doctor():
     assert "PIN_DIR=\"$PIN_DIR\"" in health_block, (
         "run_health_check must forward PIN_DIR to its doctor subprocess so "
         "the snapshot's health artifacts are read instead of the live tree"
+    )
+
+
+def test_run_eod_data_download_omits_calendar_date_flag():
+    """run_eod_data_download must NOT pass --date computed from the host
+    calendar. The CLI already defaults to the previous trading day in
+    America/New_York (so a Monday-evening fetch lands on Friday). A
+    shell-side calendar override mis-targets the S3 partition around
+    DST transitions or weekend rollover and yields a 404.
+
+    Regression: AGENTS.md "EOD fetch target date" claims the burner
+    relies on the CLI default, but ``scripts/auto-burn-in.sh:653-655``
+    still passed ``--date "$(date -v -1d ... || date -d 'yesterday' ...)"``.
+    The fix removes that override and lets the CLI default drive the
+    fetch target.
+    """
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "auto-burn-in.sh"
+    contents = script_path.read_text()
+    eod_block = contents.split("run_eod_data_download()", 1)[1].split("\n}\n", 1)[0]
+
+    # The shell must not compute a host-calendar date for the CLI.
+    assert "date -v -1d" not in eod_block and "date -d 'yesterday'" not in eod_block, (
+        "run_eod_data_download must not compute a calendar date; the CLI "
+        "already defaults to the previous trading day in America/New_York. "
+        "Passing --date with a shell-side date breaks weekend and DST rollover."
+    )
+    # The actual fetch invocation must omit --date. The eod-fetch line
+    # that calls $PINNED_TRADEBOT is the anchor; backfill-days may live
+    # on the next line of the same command substitution. Look at the
+    # joined text from the anchor to the closing "2>&1".
+    anchor_idx = next(
+        (i for i, line in enumerate(eod_block.splitlines())
+         if "eod-fetch" in line and "$PINNED_TRADEBOT" in line),
+        None,
+    )
+    assert anchor_idx is not None, (
+        "run_eod_data_download must invoke eod-fetch via PINNED_TRADEBOT"
+    )
+    invocation_lines: list[str] = []
+    for line in eod_block.splitlines()[anchor_idx:]:
+        invocation_lines.append(line)
+        if "2>&1" in line:
+            break
+    invocation = "\n".join(invocation_lines)
+    assert "--date" not in invocation, (
+        f"run_eod_data_download must omit --date and rely on the CLI default; "
+        f"found invocation:\n{invocation}"
+    )
+    assert "--backfill-days" in invocation, (
+        f"run_eod_data_download must forward --backfill-days; "
+        f"found invocation:\n{invocation}"
     )
 
 

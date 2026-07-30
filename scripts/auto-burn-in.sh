@@ -646,12 +646,14 @@ run_eod_data_download() {
     echo "[$timestamp] 📥 Fetching EOD data (target=$today_ymd, intervals=$EOD_INTERVALS_SLUG, backfill=$EOD_FETCH_BACKFILL_DAYS days)..."
 
     local fetch_output
-    # Default to yesterday's date — the CLI uses the previous trading day
-    # because massive.com publishes day-T's bars at 11:00 AM ET on day T+1.
-    # Operator can override with --date if they want a different target.
+    # Rely on the CLI default (previous trading day in America/New_York):
+    # the CLI's `_previous_trading_day` helper skips weekends and honors
+    # ET, so a Monday-evening fetch lands on Friday. A shell-side host
+    # calendar override mis-targets the S3 partition around DST
+    # transitions or weekend rollover and yields a 404. Operators can
+    # still pass --date explicitly to override.
     # canonical: ./tradebot-local --config-path "$CONFIG_FILE" eod-fetch
     fetch_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" eod-fetch \
-        --date "$(date -v -1d '+%Y-%m-%d' 2>/dev/null || date -d 'yesterday' '+%Y-%m-%d')" \
         --backfill-days "$EOD_FETCH_BACKFILL_DAYS" 2>&1)
     local status=$?
 
