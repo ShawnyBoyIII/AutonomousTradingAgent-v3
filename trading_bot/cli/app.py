@@ -4984,6 +4984,7 @@ def cache_data(
     typer.echo(f"Data saved to: {output_path}")
 
 
+@app.command(name="reset-portfolio")
 def reset_portfolio(
     ctx: typer.Context,
     confirm: bool = typer.Option(
