@@ -1164,7 +1164,15 @@ echo ""
 # Track cycle count
 CYCLE_COUNT=0
 
-trap on_shutdown EXIT INT TERM
+# 2026-07-30 fix: SIGTERM/SIGINT must actually exit the script. The
+# on_shutdown handler cleans up the dashboard + EOD watchdog but the
+# trap doesn't `exit`, so the loop kept cycling in `sleep 60` after
+# SIGTERM and required SIGKILL. Split the trap so signal-triggered
+# shutdown calls `exit 0` (after cleanup) while the EXIT trap (normal
+# completion via `set -e`) just runs cleanup without overriding the
+# exit status. See `kill -TERM` behavior in scripts/burn-in-monitor.sh.
+trap 'on_shutdown; exit 0' INT TERM
+trap on_shutdown EXIT
 
 # Confidence gate thresholds (advisory: alert but don't block on PF/windows)
 MIN_TRADES=50
