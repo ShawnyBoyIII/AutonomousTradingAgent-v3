@@ -34,6 +34,19 @@ runtime-critical files (``tradebot-local``, ``scripts/auto-burn-in.sh``,
 own ``trading_bot`` package tree). Legitimate ``state/tuning_overrides.yaml``
 mutations from a validated experiment do not change the fingerprint
 because that file is excluded.
+
+The 2026-07-30 cohort divergence: ``git archive HEAD`` excludes the
+gitignored ``state/`` directory, so the snapshot's ``state/burn_in.db``
+was freshly initialized to the generic $10K default on first cycle.
+The pinned burner then operated against the wrong cohort while the
+live worktree still held the $100K reset. ``capture_snapshot`` now
+inherits the live ``state/burn_in.db`` and ``state/market_data_cache.db``
+(via SQLite's online backup) plus ``state/tuning_experiments/`` so the
+snapshot is a code + cohort capture. Runtime ephemera under
+``state/burn_in/`` (heartbeat, PID files, scan results, portfolio
+summary) are NOT inherited — the burner writes fresh ones on first
+cycle. Disable inheritance with ``BURNIN_PIN_INHERIT_STATE=0`` for
+ad-hoc debugging.
 """
 from __future__ import annotations
 
@@ -41,7 +54,9 @@ import dataclasses
 import hashlib
 import os
 import shutil
+import sqlite3
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -57,6 +72,29 @@ _DEFAULT_FINGERPRINT_GLOBS = (
     "burn-in-config.yaml",
     "config.yaml",
 )
+
+# State files copied from the live worktree into the snapshot at
+# capture time so the pinned burner inherits the live cohort (2026-07-30).
+# SQLite databases are copied via ``sqlite3.Connection.backup`` so the
+# snapshot is a consistent point-in-time capture even when the live
+# writer is mid-transaction. Non-DB files are copied via ``shutil.copy2``.
+_INHERITED_STATE_FILES = (
+    "state/burn_in.db",
+    "state/market_data_cache.db",
+)
+
+# State directories copied recursively. ``state/tuning_experiments``
+# carries the persisted experiment controller state and must travel
+# with the cohort so a canary doesn't appear "new" on every snapshot.
+_INHERITED_STATE_DIRS = (
+    "state/tuning_experiments",
+)
+
+# WAL/SHM/JOURNAL sidecars that may travel with a SQLite file. The
+# helper removes them from the snapshot after backup because the
+# backup is already self-consistent — carrying a stale WAL would
+# reapply pre-snapshot writes when the snapshot DB is first opened.
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -75,6 +113,86 @@ class SnapshotInfo:
 
 def _git(*args: str, cwd: Path) -> str:
     return subprocess.check_output(("git",) + args, cwd=cwd, text=True)
+
+
+def _inherit_runtime_state(
+    snapshot_root: Path,
+    repo_root: Path,
+    *,
+    enabled: bool = True,
+) -> tuple[int, int]:
+    """Copy the live worktree's runtime state into the snapshot so
+    the pinned burner inherits the cohort at capture time.
+
+    Returns ``(copied, skipped)``. The caller emits a single
+    ``inherit_state`` log line so the operator can see the effect.
+
+    The helper honors ``BURNIN_PIN_INHERIT_STATE=0`` to disable
+    inheritance for ad-hoc debugging — the legacy code-only snapshot
+    is still available when the operator suspects the inherited data
+    is the cause of an anomaly.
+
+    SQLite files travel via ``sqlite3.Connection.backup``, which
+    produces a consistent point-in-time copy even when the live
+    writer is mid-transaction. WAL/SHM/JOURNAL sidecars are removed
+    from the snapshot after the backup completes — the backup is
+    already self-consistent, and carrying a stale WAL would reapply
+    pre-snapshot writes when the snapshot DB is first opened.
+    """
+    if not enabled or os.environ.get("BURNIN_PIN_INHERIT_STATE") == "0":
+        return (0, 0)
+
+    copied = 0
+    skipped = 0
+
+    for relpath in _INHERITED_STATE_FILES:
+        src = repo_root / relpath
+        dst = snapshot_root / relpath
+        if not src.exists():
+            skipped += 1
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        # Remove any pre-existing destination (refresh on recapture).
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        for suffix in _SQLITE_SIDECAR_SUFFIXES:
+            sidecar = dst.with_name(dst.name + suffix)
+            if sidecar.exists():
+                sidecar.unlink()
+        # SQLite online backup acquires a SHARED lock on the source,
+        # so it waits for any active writer to commit/rollback before
+        # producing a consistent image. This is the canonical safe
+        # way to copy a live SQLite DB. ``src.backup(dst)`` reads from
+        # ``src`` and writes to ``dst``.
+        src_conn = sqlite3.connect(str(src), timeout=30)
+        try:
+            dst_conn = sqlite3.connect(str(dst), timeout=30)
+            try:
+                src_conn.backup(dst_conn)
+            finally:
+                dst_conn.close()
+        finally:
+            src_conn.close()
+        # The backup is self-consistent; remove any WAL sidecars that
+        # may have been carried alongside the source.
+        for suffix in _SQLITE_SIDECAR_SUFFIXES:
+            sidecar = dst.with_name(dst.name + suffix)
+            if sidecar.exists():
+                sidecar.unlink()
+        copied += 1
+
+    for relpath in _INHERITED_STATE_DIRS:
+        src = repo_root / relpath
+        dst = snapshot_root / relpath
+        if not src.is_dir():
+            skipped += 1
+            continue
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst, symlinks=False, ignore_dangling_symlinks=True)
+        copied += 1
+
+    return (copied, skipped)
 
 
 def _fingerprint(snapshot_root: Path, head_sha: str) -> str:
@@ -114,8 +232,9 @@ def capture_snapshot(
     pin_dir: Path,
     *,
     fingerprint_globs: tuple[str, ...] = _DEFAULT_FINGERPRINT_GLOBS,
+    inherit_state: bool = True,
 ) -> SnapshotInfo:
-    """Extract ``HEAD`` of ``repo_root`` into ``pin_dir/<head_sha>``.
+    """Extract ``HEAD`` of ``repo_root`` into ``pin_dir/<head_sha>/``.
 
     The extraction is byte-identical to ``git archive HEAD | tar -x`` and
     reuses the existing tarball smoke-test machinery. Subsequent
@@ -123,11 +242,23 @@ def capture_snapshot(
     environment variable; see ``tradebot-local`` and
     ``scripts/auto-burn-in.sh``.
 
+    After the tracked-tree extraction, the runtime state
+    (``state/burn_in.db``, ``state/market_data_cache.db``, and
+    ``state/tuning_experiments/`` if present) is copied from the live
+    worktree into the snapshot so the pinned burner inherits the live
+    cohort. Pass ``inherit_state=False`` (or set
+    ``BURNIN_PIN_INHERIT_STATE=0``) to disable inheritance for ad-hoc
+    debugging.
+
     Args:
         repo_root: Absolute path to the working tree.
         pin_dir: Parent directory that holds ``<pin_dir>/<sha>/``.
         fingerprint_globs: Tracked paths whose content is folded into
             the fingerprint.
+        inherit_state: When ``True`` (the default), copy the live
+            worktree's runtime state into the snapshot. Explicit
+            ``False`` overrides the ``BURNIN_PIN_INHERIT_STATE`` env
+            var.
 
     Returns:
         :class:`SnapshotInfo` with the resolved paths.
@@ -162,7 +293,7 @@ def capture_snapshot(
 
     # Always create the .venv directory layout so the wrapper can
     # resolve ``$ROOT_DIR/.venv/bin/python``. By default we symlink
-    # the live .venv into the snapshot — the snapshot's source files
+    # the live venv into the snapshot — the snapshot's source files
     # are the security boundary, not the interpreter. Tests opt out
     # of the symlink by clearing ``BURNIN_PIN_USE_LIVE_VENV``.
     src_venv = repo_root / ".venv"
@@ -184,6 +315,19 @@ def capture_snapshot(
             if dst_venv.exists():
                 shutil.rmtree(dst_venv)
             shutil.copytree(src_venv, dst_venv, symlinks=True)
+
+    # Inherit the live runtime state so the pinned burner sees the
+    # cohort at capture time (2026-07-30 divergence fix). Disabled
+    # via ``inherit_state=False`` or ``BURNIN_PIN_INHERIT_STATE=0``.
+    copied, skipped = _inherit_runtime_state(
+        snapshot_root, repo_root, enabled=inherit_state
+    )
+    # Emit to stderr so the launcher's stdout capture (which holds the
+    # JSON payload for downstream parsing) is not polluted.
+    print(
+        f"inherit_state copied={copied} skipped={skipped}",
+        file=sys.stderr,
+    )
 
     # Recompute the fingerprint with the operator-provided globs so the
     # caller can extend it. The base implementation hashes a small set
