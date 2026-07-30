@@ -10,3 +10,6 @@
 ## 2024-05-18 - Tabindex and Title Accessibility in Dashboard
 **Learning:** Found that the "skip to main content" link pointed to `<main id="main">` which lacked a `tabindex="-1"`, meaning keyboard focus was not properly managed by the browser upon skip link activation. Also found that the "Kill Switch" lever lacked descriptive tooltips (`title` attribute) communicating its disabled or ready states.
 **Action:** When creating skip links, always ensure the target container (e.g. `<main>`) has `tabindex="-1"`. When a button's disabled state changes, dynamically update its `title` attribute so hover and screen readers provide actionable feedback on *why* it is disabled.
+## 2024-05-24 - Timestamp Clarity
+**Learning:** In trading dashboards, relative time displays (e.g., "5s ago") are great for quick parsing, but users frequently need exact execution times to cross-reference with market data.
+**Action:** Always pair relative times with absolute timestamp tooltips (`title` attributes) so exact context is available on hover without cluttering the UI.
