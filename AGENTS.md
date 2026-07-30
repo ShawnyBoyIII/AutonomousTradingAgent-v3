@@ -515,6 +515,30 @@ the snapshot's wrapper, not the live mutable worktree.
   live worktree when `PIN_DIR` is unset, so the operator's CLI workflow
   is unaffected.
 
+**Snapshot state inheritance (2026-07-30).** `capture_snapshot` copies
+the live `state/burn_in.db` and `state/market_data_cache.db` (plus
+`state/tuning_experiments/` if it exists) into the snapshot via
+SQLite's online backup. The snapshot is therefore a frozen **code +
+cohort** capture — the pinned burner inherits the live cohort at
+startup and never re-initializes the ledger to the generic $10K
+default. Runtime ephemera (`state/burn_in/heartbeat.json`,
+`burn_in.pid`, `dashboard.port`, `portfolio_summary.json`,
+`scan_results.json`, and `.last_eod_watchdog_*.marker`) are NOT
+inherited; the burner writes fresh ones on first cycle. Override
+with `BURNIN_PIN_INHERIT_STATE=0` (or `inherit_state=False` from
+Python) to revert to the legacy code-only snapshot for ad-hoc
+debugging.
+
+**Burner-vs-live DB divergence (2026-07-30).** After the snapshot
+captures the live cohort, fills written by the pinned burner land in
+the snapshot DB, not the live worktree DB. Manual `./tradebot-local`
+invocations from the live worktree (without `PIN_DIR`) still read the
+live DB. The two ledgers will diverge for the duration of the running
+burner. To reconcile after a session, compare both DBs directly via
+`sqlite3`; do not assume they agree. The next `./scripts/burnin-launcher.sh`
+restart re-snapshots the live DB and the snapshot's cohort is
+refreshed.
+
 ---
 
 ## V3 Strategy Layer (Feature Flag)
@@ -603,6 +627,7 @@ Fail-fast: stops on first validation error.
 - Swarm worker votes (when running the manual `./tradebot-local swarm` command) are logged to `logs/worker_votes.jsonl`; use this file for per-worker weight tuning
 - Decision-log and paper-trade rows preserve compact supermodel evidence even on rejects and `NO_SIGNAL`; use `paper-report`, `trade-attribution`, and `db-features` for paper review before adding new logging.
 - Burner universe/watchlist readers preserve a final symbol even when the file has no trailing newline; Python discovery exports intentionally use that valid text-file form.
+- `capture_snapshot` (2026-07-30) copies `state/burn_in.db` and `state/market_data_cache.db` into the snapshot at capture time. The pinned burner writes fills to the snapshot DB; manual `./tradebot-local` (no `PIN_DIR`) reads the live DB. The two will diverge until the next launcher restart — reconcile via `sqlite3` directly.
 
 ---
 

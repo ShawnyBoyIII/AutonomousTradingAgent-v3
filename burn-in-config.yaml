@@ -73,8 +73,8 @@ session:
 paper:
   fee_per_order: 1.0
   slippage_bps: 5
-  graduation_since: "2026-07-28T23:28:04.494941-04:00"
-  equity_evaluation_since: "2026-07-28T23:28:04.494941-04:00"
+  graduation_since: "2026-07-30T11:13:07.227545-04:00"
+  equity_evaluation_since: "2026-07-30T11:13:07.227545-04:00"
 
 strategy_tracker:
   window: 20

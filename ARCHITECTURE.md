@@ -13,6 +13,15 @@ analytics/dashboard, burner/safety/monitoring, and learning/research/
 integrations maps, plus the file-coverage index, verification matrix,
 and remediation backlog.
 
+> **Snapshot is a code + cohort capture (2026-07-30).** The
+> `burnin-launcher.sh` snapshot at `$PIN_DIR/<HEAD>/` inherits the
+> live `state/burn_in.db`, `state/market_data_cache.db`, and (if
+> present) `state/tuning_experiments/` via SQLite online backup at
+> capture time. Runtime writes from the pinned burner land in the
+> snapshot DB, not the live worktree DB. Manual CLI invocations from
+> the live worktree (without `PIN_DIR`) still read the live DB;
+> reconcile via `sqlite3` directly.
+
 ## Data Flow
 
 ```
