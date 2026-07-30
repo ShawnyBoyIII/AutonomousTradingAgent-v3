@@ -7,3 +7,6 @@
 ## 2024-07-28 - Async Loading State for Kill Switch
 **Learning:** Found that the "Kill Switch" button on the dashboard lacked an accessible async loading state. When pulled, it did not provide visual feedback to users that the action was in progress, nor did it announce its busy state to screen readers.
 **Action:** Implemented `aria-busy="true"` and changed the visual label to "Halting..." on click. Reverted these states properly both on successful update and error catch block.
+## 2024-05-24 - Timestamp Clarity
+**Learning:** In trading dashboards, relative time displays (e.g., "5s ago") are great for quick parsing, but users frequently need exact execution times to cross-reference with market data.
+**Action:** Always pair relative times with absolute timestamp tooltips (`title` attributes) so exact context is available on hover without cluttering the UI.

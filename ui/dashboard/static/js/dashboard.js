@@ -67,6 +67,16 @@
   const FMT_FULL_DATE = (d) =>
     d.toLocaleDateString([], { weekday: "short", year: "numeric", month: "short", day: "2-digit" });
 
+  const FMT_EXACT = (ts) => {
+    if (!ts) return "—";
+    const d = ts instanceof Date ? ts : new Date(ts);
+    if (isNaN(d.getTime())) return "—";
+    return d.toLocaleString([], {
+      year: "numeric", month: "short", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+    });
+  };
+
   const FMT_RELATIVE = (ts) => {
     if (!ts) return "—";
     const d = ts instanceof Date ? ts : new Date(ts);
@@ -391,13 +401,13 @@
         <table class="positions-table">
           <thead>
             <tr>
-              <th>Symbol</th>
-              <th class="num">Qty</th>
-              <th class="num">Avg Cost</th>
-              <th class="num">Mark</th>
-              <th class="num">Market Value</th>
-              <th class="num">Unrealized P&L</th>
-              <th class="num">Unrealized %</th>
+              <th scope="col">Symbol</th>
+              <th scope="col" class="num">Qty</th>
+              <th scope="col" class="num">Avg Cost</th>
+              <th scope="col" class="num">Mark</th>
+              <th scope="col" class="num">Market Value</th>
+              <th scope="col" class="num">Unrealized P&L</th>
+              <th scope="col" class="num">Unrealized %</th>
             </tr>
           </thead>
           <tbody>${rows}</tbody>
@@ -592,7 +602,7 @@
             <span class="alert__level">${escapeHTML(lvl)} · ${escapeHTML(a.category || "system")}</span>
             <span class="alert__message">${escapeHTML(a.message)}</span>
           </div>
-          <span class="alert__time">${escapeHTML(FMT_RELATIVE(a.timestamp))}</span>
+          <span class="alert__time" title="${escapeHTML(FMT_EXACT(a.timestamp))}" style="cursor: help;">${escapeHTML(FMT_RELATIVE(a.timestamp))}</span>
         </div>
       `;
     }).join("");
@@ -728,11 +738,13 @@
     if (trades.length) {
       const last = trades[0];
       const when = FMT_RELATIVE(last.timestamp);
-      const side = last.side || "?";
-      const sym  = last.symbol || "—";
+      const exactTime = FMT_EXACT(last.timestamp);
+      const whenHtml = `<span title="${escapeHTML(exactTime)}" style="cursor: help;">${escapeHTML(when)}</span>`;
+      const side = escapeHTML(last.side || "?");
+      const sym  = escapeHTML(last.symbol || "—");
       const qty  = fmtInt(last.quantity);
       const px   = fmtUSD(last.price);
-      setValue($("telemetryLastFill"), `${side} ${sym} ${qty}@${px} · ${when}`);
+      setValue($("telemetryLastFill"), `${side} ${sym} ${qty}@${px} · ${whenHtml}`, { html: true });
     }
 
     if (!trades.length) {
@@ -752,7 +764,7 @@
                 <span class="trade__symbol">${escapeHTML(t.symbol || "—")}</span>
                 <span class="trade__detail">${fmtInt(t.quantity)} @ ${fmtUSD(t.price)}</span>
               </div>
-              <span class="trade__time">${escapeHTML(FMT_TIME(t.timestamp))}</span>
+              <span class="trade__time" title="${escapeHTML(FMT_EXACT(t.timestamp))}" style="cursor: help;">${escapeHTML(FMT_TIME(t.timestamp))}</span>
             </div>
           `;
         }).join("")}
