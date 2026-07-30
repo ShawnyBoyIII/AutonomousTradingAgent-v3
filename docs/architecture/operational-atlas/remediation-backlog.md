@@ -26,13 +26,14 @@
 | `26c6ec7` | Launcher exported `PIN_DIR` to the snapshot parent, not the snapshot root; auto-burn-in resolved `$PIN_DIR/tradebot-local` from the wrong directory and silently fell back to the live wrapper. | Critical | `tests/test_burnin_launcher_pin_export.py` |
 | `85631c7` | Manual `./tradebot-local doctor --burn-in` from outside the burner read stale `state/burn_in/...` because the burner wrote to `$PIN_DIR/state/burn_in/...`. | Important | `tests/test_doctor_burn_in_pin_state_dir.py` |
 | `62d178b` | `run_health_check` invoked the doctor subprocess without forwarding `PIN_DIR`; the subprocess lost the snapshot's health-state contract. | Important | `tests/test_auto_burn_in_script.py::test_run_health_check_forwards_pin_dir_to_doctor` |
+| `4c1c278` | `run_eod_data_download` passed `--date "$(date -v -1d ...)"` from the host calendar while the CLI already defaults to the previous trading day in America/New_York. The shell-side override mis-targets the S3 partition around DST transitions and weekend rollover. | Important | `tests/test_auto_burn_in_script.py::test_run_eod_data_download_omits_calendar_date_flag` |
 
-All five commits are merged into `main` and pushed to `v3/main`. The
+All six commits are merged into `main` and pushed to `v3/main`. The
 burner is currently pinned at HEAD `62d178b` with PID 89523.
 
 ## Important (planned)
 
-None at HEAD 62d178b. Phase 2 through 5 of the atlas may surface new
+None at HEAD `4c1c278`. Phase 2 through 5 of the atlas may surface new
 items; they will be appended here in the same commit that introduces
 the corresponding test.
 
@@ -49,6 +50,9 @@ into either confirmed defects (added here) or documented invariants
    updates P&L fields. If the process crashes between the two writes,
    the `orders` row exists without a paired `trades` row. Cross-table
    reporting reads both tables; reconciliation should be observable.
+   Note: `tests/test_fill_persistence_fail_closed.py` already covers the
+   "exception swallowed silently" variant; the open hypothesis is
+   specifically about the *crash mid-write* gap.
 2. **`validate_bars()` keyword mismatch (Phase 2).** Earlier hypothesis
    that the function may be called with unsupported keywords from a
    code path that hasn't yet been wired to the V2.5 fail-fast contract.
@@ -61,6 +65,14 @@ into either confirmed defects (added here) or documented invariants
 5. **Configured research integrations (Phase 5).** Several configurations
    appear manual-only or unwired. These need explicit status tags once
    the phase 5 audit completes.
+
+## Recently closed hypotheses
+
+- **EOD fetch target date (Phase 4).** Burner shell was passing a
+  host-calendar `--date` while the CLI already defaulted to the
+  previous trading day in America/New_York. Closed by commit
+  `4c1c278`; regression added to
+  `tests/test_auto_burn_in_script.py::test_run_eod_data_download_omits_calendar_date_flag`.
 
 ## Cosmetic (deferred)
 
