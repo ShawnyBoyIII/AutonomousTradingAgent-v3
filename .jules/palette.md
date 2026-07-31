@@ -7,3 +7,6 @@
 ## 2024-07-28 - Async Loading State for Kill Switch
 **Learning:** Found that the "Kill Switch" button on the dashboard lacked an accessible async loading state. When pulled, it did not provide visual feedback to users that the action was in progress, nor did it announce its busy state to screen readers.
 **Action:** Implemented `aria-busy="true"` and changed the visual label to "Halting..." on click. Reverted these states properly both on successful update and error catch block.
+## 2024-07-28 - Dynamic Page Titles for Background Monitoring
+**Learning:** For a dashboard like this, users often have it open in a background tab while doing other work. They shouldn't have to switch tabs just to see if the system is halted or to check their P&L.
+**Action:** When working on dashboards with critical live states (like P&L or system health), dynamically update the `<title>` tag with a high-level summary (e.g. "🚨 HALTED" or "+$1.2K"). This provides ambient awareness and reduces context switching.

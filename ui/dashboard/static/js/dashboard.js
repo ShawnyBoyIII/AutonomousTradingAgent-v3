@@ -17,7 +17,25 @@
     reconnectTimer: null,
     reconnectDelay: 2500,
     clockTimer: null,
+    halted: false,
+    lastPnlStr: null,
   };
+
+  // -------------------------------------------------------------
+  // Dynamic Page Title
+  // -------------------------------------------------------------
+  function updateDocumentTitle() {
+    if (STATE.halted) {
+      document.title = "🚨 HALTED · Trading Bot";
+      return;
+    }
+
+    if (STATE.lastPnlStr) {
+      document.title = `${STATE.lastPnlStr} · Trading Bot`;
+    } else {
+      document.title = "Trading Bot — Desk 01";
+    }
+  }
 
   // -------------------------------------------------------------
   // DOM helpers
@@ -261,6 +279,10 @@
     const pctEl = $("pnlPct");
     setValue(pctEl, FMT_PCT(pct, 2));
     setAttr(pctEl, "data-trend", trend);
+
+    const sign = pnl >= 0 ? "+" : "−";
+    STATE.lastPnlStr = `${sign}${fmtShort(Math.abs(pnl))}`;
+    updateDocumentTitle();
   }
 
   // -------------------------------------------------------------
@@ -644,6 +666,9 @@
     const badge   = $("killBadge");
 
     const halted = !!ks.active;
+    STATE.halted = halted;
+    updateDocumentTitle();
+
     setAttr(panel, "data-state", halted ? "halted" : "armed");
     setAttr(stateEl, "data-state", halted ? "halted" : "armed");
     setValue(stateEl, halted ? "Halted" : "Armed");
