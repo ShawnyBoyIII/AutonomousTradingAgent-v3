@@ -55,12 +55,12 @@ Never use bare `tradebot` on PATH — it may resolve to a stale global install.
 
 **Target**: Profit factor > 1.3 over 100 closed trades on paper with $100K starting capital.
 Graduation evidence starts at `paper.graduation_since`; the burn-in cohort is
-currently `2026-07-28T23:28:04.494941-04:00`, when the paper ledger and
+currently `2026-07-30T11:13:07.227545-04:00`, when the paper ledger and
 learned runtime state were reset to a fresh $100K cohort.
 
 Equity-risk evidence (drawdown, peak, return) starts at the dedicated
 `paper.equity_evaluation_since` boundary. The current value is
-`2026-07-28T23:28:04.494941-04:00`, the same full-reset boundary. Pre-cohort
+`2026-07-30T11:13:07.227545-04:00`, the same full-reset boundary. Pre-cohort
 equity rows are excluded from cohort drawdown so stale peaks cannot trip the
 circuit breaker.
 
@@ -161,7 +161,7 @@ risk:
   max_ticker_allocation_pct: 0.20
   max_portfolio_heat_pct: 0.03
   max_shares_per_position: 50      # Hard per-ticker share cap
-  min_reward_risk_ratio: 2.0
+  min_reward_risk_ratio: 1.0
   min_stop_distance_pct: 3.0
   max_consecutive_losses: 5
   enable_drawdown_circuit_breaker: true
@@ -171,8 +171,8 @@ market_data:
   validate_data: true  # V2.5: fail-fast
 
 paper:
-  graduation_since: "2026-07-28T23:28:04.494941-04:00"  # trade-quality cohort
-  equity_evaluation_since: "2026-07-28T23:28:04.494941-04:00"  # equity-risk cohort
+  graduation_since: "2026-07-30T11:13:07.227545-04:00"  # trade-quality cohort
+  equity_evaluation_since: "2026-07-30T11:13:07.227545-04:00"  # equity-risk cohort
 
 strategy_tracker:
   window: 20
