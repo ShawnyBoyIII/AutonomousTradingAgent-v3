@@ -13,3 +13,6 @@
 ## 2024-05-24 - Timestamp Clarity
 **Learning:** In trading dashboards, relative time displays (e.g., "5s ago") are great for quick parsing, but users frequently need exact execution times to cross-reference with market data.
 **Action:** Always pair relative times with absolute timestamp tooltips (`title` attributes) so exact context is available on hover without cluttering the UI.
+## 2024-07-28 - Dynamic Page Titles for Background Monitoring
+**Learning:** For a dashboard like this, users often have it open in a background tab while doing other work. They shouldn't have to switch tabs just to see if the system is halted or to check their P&L.
+**Action:** When working on dashboards with critical live states (like P&L or system health), dynamically update the `<title>` tag with a high-level summary (e.g. "🚨 HALTED" or "+$1.2K"). This provides ambient awareness and reduces context switching.

@@ -90,8 +90,10 @@ def test_tab_switcher_logic():
     ;return { initialTab: (typeof getActiveBookTab === 'function') ? getActiveBookTab() : null };
     """
     out = subprocess.run(
-        ["python", "-c", f"import subprocess, json; print(subprocess.run(['node', '-e', '''{harness}'''], capture_output=True, text=True, cwd='/app').stdout)"],
-        capture_output=True, text=True,
+        ["node", "-e", harness],
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parents[1],
     )
 
     # Robust assertion: verify the source contains the expected helpers.
