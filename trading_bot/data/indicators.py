@@ -29,9 +29,9 @@ def add_atr(frame: "pd.DataFrame", period: int = 14, column_name: str | None = N
     if not required_columns.issubset(frame.columns):
         raise KeyError("missing required price columns: high, low, close")
     _validate_period(period)
-    highs = [float(value) for value in frame["high"].tolist()]
-    lows = [float(value) for value in frame["low"].tolist()]
-    closes = [float(value) for value in frame["close"].tolist()]
+    highs = frame["high"].to_numpy(dtype=float).tolist()
+    lows = frame["low"].to_numpy(dtype=float).tolist()
+    closes = frame["close"].to_numpy(dtype=float).tolist()
     values = _atr_values(highs, lows, closes, period)
     return _with_column(frame, column_name or f"atr_{period}", values)
 
@@ -39,7 +39,7 @@ def add_atr(frame: "pd.DataFrame", period: int = 14, column_name: str | None = N
 def _close_prices(frame: "pd.DataFrame") -> list[float]:
     if "close" not in frame.columns:
         raise KeyError("missing required price column: close")
-    return [float(value) for value in frame["close"].tolist()]
+    return frame["close"].to_numpy(dtype=float).tolist()
 
 
 def _with_column(frame: "pd.DataFrame", column_name: str, values: list[float | None]) -> "pd.DataFrame":
@@ -272,10 +272,10 @@ def add_vwap(frame: "pd.DataFrame") -> "pd.DataFrame":
     if not required_columns.issubset(frame.columns):
         raise KeyError("missing required columns: high, low, close, volume")
 
-    highs = [float(value) for value in frame["high"].tolist()]
-    lows = [float(value) for value in frame["low"].tolist()]
-    closes = [float(value) for value in frame["close"].tolist()]
-    volumes = [float(value) for value in frame["volume"].tolist()]
+    highs = frame["high"].to_numpy(dtype=float).tolist()
+    lows = frame["low"].to_numpy(dtype=float).tolist()
+    closes = frame["close"].to_numpy(dtype=float).tolist()
+    volumes = frame["volume"].to_numpy(dtype=float).tolist()
 
     n = len(closes)
     vwap: list[float | None] = [None] * n
@@ -312,9 +312,9 @@ def add_stochastic(
     if not required_columns.issubset(frame.columns):
         raise KeyError("missing required columns: high, low, close")
 
-    highs = [float(value) for value in frame["high"].tolist()]
-    lows = [float(value) for value in frame["low"].tolist()]
-    closes = [float(value) for value in frame["close"].tolist()]
+    highs = frame["high"].to_numpy(dtype=float).tolist()
+    lows = frame["low"].to_numpy(dtype=float).tolist()
+    closes = frame["close"].to_numpy(dtype=float).tolist()
 
     n = len(closes)
     k_values: list[float | None] = [None] * n
@@ -362,9 +362,9 @@ def add_adx(
     if not required_columns.issubset(frame.columns):
         raise KeyError("missing required columns: high, low, close")
 
-    highs = [float(value) for value in frame["high"].tolist()]
-    lows = [float(value) for value in frame["low"].tolist()]
-    closes = [float(value) for value in frame["close"].tolist()]
+    highs = frame["high"].to_numpy(dtype=float).tolist()
+    lows = frame["low"].to_numpy(dtype=float).tolist()
+    closes = frame["close"].to_numpy(dtype=float).tolist()
 
     n = len(closes)
     if n < period + 1:
@@ -458,9 +458,9 @@ def add_williams_r(
     if not required_columns.issubset(frame.columns):
         raise KeyError("missing required columns: high, low, close")
 
-    highs = [float(value) for value in frame["high"].tolist()]
-    lows = [float(value) for value in frame["low"].tolist()]
-    closes = [float(value) for value in frame["close"].tolist()]
+    highs = frame["high"].to_numpy(dtype=float).tolist()
+    lows = frame["low"].to_numpy(dtype=float).tolist()
+    closes = frame["close"].to_numpy(dtype=float).tolist()
 
     n = len(closes)
     wr_values: list[float | None] = [None] * n
@@ -491,8 +491,8 @@ def add_obv(frame: "pd.DataFrame") -> "pd.DataFrame":
     if not required_columns.issubset(frame.columns):
         raise KeyError("missing required columns: close, volume")
 
-    closes = [float(value) for value in frame["close"].tolist()]
-    volumes = [float(value) for value in frame["volume"].tolist()]
+    closes = frame["close"].to_numpy(dtype=float).tolist()
+    volumes = frame["volume"].to_numpy(dtype=float).tolist()
 
     n = len(closes)
     obv_values: list[float | None] = [None] * n
@@ -534,7 +534,7 @@ def add_atr_percent(
     # First add regular ATR
     result = add_atr(frame, period)
 
-    closes = [float(value) for value in frame["close"].tolist()]
+    closes = frame["close"].to_numpy(dtype=float).tolist()
     atr_col = f"atr_{period}"
     atr_values = result[atr_col].tolist()
 
