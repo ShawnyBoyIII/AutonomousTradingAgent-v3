@@ -26,7 +26,7 @@ risk:
   max_daily_risk_pct: 0.03
   max_daily_orders: 3
   max_ticker_allocation_pct: 0.20
-  min_reward_risk_ratio: 2.0
+  min_reward_risk_ratio: 1.0
   use_atr_sizing: true
   atr_period: 14
   atr_multiplier: 2.0
@@ -44,6 +44,12 @@ strategy:
   use_v3_signals: true
   risk_tolerance: "medium"
   min_confidence: "medium"
+
+scout:
+  static_core_path: "config/burn-in-core-symbols.txt"
+  max_universe_size: 50
+  min_universe_size: 10
+  preserve_previous_on_underflow: true
 
 counter_thesis:
   enabled: false
@@ -73,8 +79,8 @@ session:
 paper:
   fee_per_order: 1.0
   slippage_bps: 5
-  graduation_since: "2026-07-28T23:28:04.494941-04:00"
-  equity_evaluation_since: "2026-07-28T23:28:04.494941-04:00"
+  graduation_since: "2026-07-30T11:13:07.227545-04:00"
+  equity_evaluation_since: "2026-07-30T11:13:07.227545-04:00"
 
 strategy_tracker:
   window: 20

@@ -205,7 +205,8 @@ echo "HEARTBEAT_COUNT=$HEARTBEAT_COUNT"
         pytest.skip("bash not available")
 
     proc = subprocess.run(
-        ["bash", "-c", bash],
+        ["bash"],
+        input=bash,
         capture_output=True,
         text=True,
         env=env,

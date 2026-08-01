@@ -55,12 +55,12 @@ Never use bare `tradebot` on PATH — it may resolve to a stale global install.
 
 **Target**: Profit factor > 1.3 over 100 closed trades on paper with $100K starting capital.
 Graduation evidence starts at `paper.graduation_since`; the burn-in cohort is
-currently `2026-07-28T23:28:04.494941-04:00`, when the paper ledger and
+currently `2026-07-30T11:13:07.227545-04:00`, when the paper ledger and
 learned runtime state were reset to a fresh $100K cohort.
 
 Equity-risk evidence (drawdown, peak, return) starts at the dedicated
 `paper.equity_evaluation_since` boundary. The current value is
-`2026-07-28T23:28:04.494941-04:00`, the same full-reset boundary. Pre-cohort
+`2026-07-30T11:13:07.227545-04:00`, the same full-reset boundary. Pre-cohort
 equity rows are excluded from cohort drawdown so stale peaks cannot trip the
 circuit breaker.
 
@@ -125,6 +125,7 @@ prints a notice and exits non-zero while an experiment is active.
 - No real network calls
 - Config: `pytest -ra --strict-markers` (pyproject.toml)
 - When fixing a defect, add new regression tests that capture the bug at the broken boundary. Do not weaken or rewrite existing test expectations; new tests live alongside the originals and prove the previous failure mode is now impossible.
+- GitHub Actions runs the same network-free suite through `.github/workflows/ci.yml` on pull requests and pushes to `main`; the required check name is `test`.
 
 ---
 
@@ -161,7 +162,7 @@ risk:
   max_ticker_allocation_pct: 0.20
   max_portfolio_heat_pct: 0.03
   max_shares_per_position: 50      # Hard per-ticker share cap
-  min_reward_risk_ratio: 2.0
+  min_reward_risk_ratio: 1.0
   min_stop_distance_pct: 3.0
   max_consecutive_losses: 5
   enable_drawdown_circuit_breaker: true
@@ -171,8 +172,8 @@ market_data:
   validate_data: true  # V2.5: fail-fast
 
 paper:
-  graduation_since: "2026-07-28T23:28:04.494941-04:00"  # trade-quality cohort
-  equity_evaluation_since: "2026-07-28T23:28:04.494941-04:00"  # equity-risk cohort
+  graduation_since: "2026-07-30T11:13:07.227545-04:00"  # trade-quality cohort
+  equity_evaluation_since: "2026-07-30T11:13:07.227545-04:00"  # equity-risk cohort
 
 strategy_tracker:
   window: 20
@@ -515,6 +516,30 @@ the snapshot's wrapper, not the live mutable worktree.
   live worktree when `PIN_DIR` is unset, so the operator's CLI workflow
   is unaffected.
 
+**Snapshot state inheritance (2026-07-30).** `capture_snapshot` copies
+the live `state/burn_in.db` and `state/market_data_cache.db` (plus
+`state/tuning_experiments/` if it exists) into the snapshot via
+SQLite's online backup. The snapshot is therefore a frozen **code +
+cohort** capture — the pinned burner inherits the live cohort at
+startup and never re-initializes the ledger to the generic $10K
+default. Runtime ephemera (`state/burn_in/heartbeat.json`,
+`burn_in.pid`, `dashboard.port`, `portfolio_summary.json`,
+`scan_results.json`, and `.last_eod_watchdog_*.marker`) are NOT
+inherited; the burner writes fresh ones on first cycle. Override
+with `BURNIN_PIN_INHERIT_STATE=0` (or `inherit_state=False` from
+Python) to revert to the legacy code-only snapshot for ad-hoc
+debugging.
+
+**Burner-vs-live DB divergence (2026-07-30).** After the snapshot
+captures the live cohort, fills written by the pinned burner land in
+the snapshot DB, not the live worktree DB. Manual `./tradebot-local`
+invocations from the live worktree (without `PIN_DIR`) still read the
+live DB. The two ledgers will diverge for the duration of the running
+burner. To reconcile after a session, compare both DBs directly via
+`sqlite3`; do not assume they agree. The next `./scripts/burnin-launcher.sh`
+restart re-snapshots the live DB and the snapshot's cohort is
+refreshed.
+
 ---
 
 ## V3 Strategy Layer (Feature Flag)
@@ -602,7 +627,9 @@ Fail-fast: stops on first validation error.
 - `./tradebot-local tune` writes `state/tuning_overrides.yaml`; loader applies only allowlisted supermodel + strategy-tracker fields and still forces `live_trading_enabled=false`
 - Swarm worker votes (when running the manual `./tradebot-local swarm` command) are logged to `logs/worker_votes.jsonl`; use this file for per-worker weight tuning
 - Decision-log and paper-trade rows preserve compact supermodel evidence even on rejects and `NO_SIGNAL`; use `paper-report`, `trade-attribution`, and `db-features` for paper review before adding new logging.
+- The pinned burner refreshes a hybrid universe once per discovery day: the tracked diversified ETF core (`config/burn-in-core-symbols.txt`), operator watchlist, scout candidates, and the previous healthy universe. A refresh below `scout.min_universe_size` preserves prior coverage instead of replacing it.
 - Burner universe/watchlist readers preserve a final symbol even when the file has no trailing newline; Python discovery exports intentionally use that valid text-file form.
+- `capture_snapshot` (2026-07-30) copies `state/burn_in.db` and `state/market_data_cache.db` into the snapshot at capture time. The pinned burner writes fills to the snapshot DB; manual `./tradebot-local` (no `PIN_DIR`) reads the live DB. The two will diverge until the next launcher restart — reconcile via `sqlite3` directly.
 
 ---
 

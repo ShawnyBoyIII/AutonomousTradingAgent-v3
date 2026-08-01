@@ -7,10 +7,35 @@ from pathlib import Path
 def test_auto_burn_in_runs_nightly_tune_after_daily_discovery() -> None:
     script = Path("scripts/auto-burn-in.sh").read_text(encoding="utf-8")
 
+    assert "run_universe_refresh()" in script
     assert "run_nightly_tuning()" in script
     assert 'sh ./tradebot-local --config-path "$CONFIG_FILE" tune' in script
     assert 'run_discovery "daily"' in script
     assert 'run_nightly_tuning' in script
+
+    refresh_idx = script.index("run_universe_refresh")
+    discovery_idx = script.index('run_discovery "daily"')
+    assert refresh_idx < discovery_idx
+
+
+def test_auto_burn_in_requests_scan_summary_for_pipeline_observability() -> None:
+    script = Path("scripts/auto-burn-in.sh").read_text(encoding="utf-8")
+
+    scan_line = next(
+        line
+        for line in script.splitlines()
+        if "scan --symbols" in line and "scan_output" in line
+    )
+    assert "--why" in scan_line
+    assert "--summary" in scan_line
+
+
+def test_auto_burn_in_discovery_does_not_overwrite_hybrid_universe() -> None:
+    script = Path("scripts/auto-burn-in.sh").read_text(encoding="utf-8")
+    start = script.index("discover_output=$(")
+    end = script.index("discover_rc=", start)
+
+    assert "--export" not in script[start:end]
 
 
 def test_auto_burn_in_runs_tune_experiment_evaluate_in_nightly() -> None:

@@ -13,6 +13,15 @@ analytics/dashboard, burner/safety/monitoring, and learning/research/
 integrations maps, plus the file-coverage index, verification matrix,
 and remediation backlog.
 
+> **Snapshot is a code + cohort capture (2026-07-30).** The
+> `burnin-launcher.sh` snapshot at `$PIN_DIR/<HEAD>/` inherits the
+> live `state/burn_in.db`, `state/market_data_cache.db`, and (if
+> present) `state/tuning_experiments/` via SQLite online backup at
+> capture time. Runtime writes from the pinned burner land in the
+> snapshot DB, not the live worktree DB. Manual CLI invocations from
+> the live worktree (without `PIN_DIR`) still read the live DB;
+> reconcile via `sqlite3` directly.
+
 ## Data Flow
 
 ```
@@ -124,11 +133,18 @@ scripts/
 - Position cap: `risk.max_ticker_allocation_pct` (`0.20` in code and burn-in)
 - Portfolio heat: `risk.max_portfolio_heat_pct` (`0.03` in code and burn-in)
 - Hard per-ticker share cap: `risk.max_shares_per_position` (`50`)
-- Burn-in entry guards: three daily orders, 2.0 minimum reward/risk,
+- Burn-in entry guards: three daily orders, 1.0 minimum reward/risk,
   3% minimum stop distance, and a 30-minute ticker re-entry cooldown
 - Burn-in circuit breakers: five consecutive losses or 10% cohort drawdown
 - Daily-loss guard (resets by configured trading date)
 - Paper-only by hardcode — `live_trading_enabled` forced `false` in `config/loader.py`
+
+### Burner Universe
+
+- Daily universe refresh merges the tracked diversified ETF core,
+  operator watchlist, scout candidates, and the previous healthy universe.
+- Undersized or failed scout refreshes preserve the previous universe;
+  breakout discovery remains a second-stage filter over that merged set.
 
 ### Monitoring
 

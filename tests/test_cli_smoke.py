@@ -307,6 +307,36 @@ def test_build_universe_writes_ranked_symbols_and_snapshot(monkeypatch, tmp_path
     assert snapshot["summary"]["included"] == 2
 
 
+def test_build_universe_merges_static_core_and_preserves_previous_underflow(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import trading_bot.data.market_data as market_data
+
+    monkeypatch.setattr(market_data, "fetch_small_cap_candidates", lambda **kwargs: [])
+    static_core = tmp_path / "core.txt"
+    static_core.write_text("SPY\nQQQ\n", encoding="utf-8")
+    universe_path = tmp_path / "state" / "universe.txt"
+    universe_path.parent.mkdir(parents=True)
+    universe_path.write_text("IWM\nDIA\n", encoding="utf-8")
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "app:\n"
+        f"  state_db_path: {tmp_path / 'state' / 'trading_bot.db'}\n"
+        f"  universe_path: {universe_path}\n"
+        "scout:\n"
+        f"  static_core_path: {static_core}\n"
+        "  min_universe_size: 4\n"
+        "  preserve_previous_on_underflow: true\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["--config-path", str(config_file), "build-universe"])
+
+    assert result.exit_code == 0
+    assert universe_path.read_text(encoding="utf-8") == "SPY\nQQQ\nIWM\nDIA\n"
+    assert "preserved_previous=True" in result.stdout
+
+
 def test_discover_export_writes_configured_universe_path(monkeypatch, tmp_path: Path) -> None:
     import trading_bot.data.market_data as market_data
     import trading_bot.strategy.dynamic_watchlist as dynamic_watchlist
@@ -4612,4 +4642,3 @@ def test_cache_data_command_from_watchlist(monkeypatch, tmp_path: Path) -> None:
     assert (output_dir / "AAPL.csv").exists()
     assert (output_dir / "GOOGL.csv").exists()
     assert captured_provider_stacks == [["alpaca", "polygon"], ["alpaca", "polygon"]]
-

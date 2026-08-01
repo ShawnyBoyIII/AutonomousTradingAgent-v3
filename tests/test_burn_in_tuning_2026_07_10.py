@@ -1,8 +1,9 @@
-"""Tripwire regression tests for the strict burn-in guard posture.
+"""Tripwire regression tests for the burn-in guard posture.
 
-The 2026-07-28 full paper reset retired the loose July 9 fire-mode
-overrides. These tests keep ``burn-in-config.yaml`` aligned with the
-strict baseline documented in AGENTS.md.
+The burn-in keeps strict portfolio and loss controls while using the
+operator-approved 1.0 reward/risk floor for this paper experiment. These
+tests keep ``burn-in-config.yaml`` aligned with the baseline documented in
+AGENTS.md.
 """
 
 from __future__ import annotations
@@ -19,9 +20,9 @@ def _settings_from_burn_in_config():
     return Settings.model_validate(raw)
 
 
-def test_risk_min_reward_risk_ratio_matches_strict_default() -> None:
+def test_risk_min_reward_risk_ratio_matches_burn_in_baseline() -> None:
     settings = _settings_from_burn_in_config()
-    assert settings.risk.min_reward_risk_ratio == 2.0
+    assert settings.risk.min_reward_risk_ratio == 1.0
 
 
 def test_risk_max_daily_orders_matches_strict_default() -> None:
