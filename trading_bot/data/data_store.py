@@ -19,6 +19,7 @@ Configuration via :class:`EodDataStoreSettings` in
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 from datetime import date
@@ -57,6 +58,10 @@ class DataStoreManifest:
     def _init_db(self) -> None:
         with self._lock:
             conn = sqlite3.connect(str(self._db_path))
+            try:
+                os.chmod(self._db_path, 0o600)
+            except OSError:
+                pass
             try:
                 conn.execute(
                     """

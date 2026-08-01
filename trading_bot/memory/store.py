@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -30,6 +31,10 @@ class MemoryStore:
     def _init_db(self) -> None:
         """Initialize memory database with FTS5."""
         with self._get_conn() as conn:
+            try:
+                os.chmod(self.db_path, 0o600)
+            except OSError:
+                pass
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS memories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,

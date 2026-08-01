@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,7 +18,18 @@ def _resolve_db_path(settings: Settings) -> Path:
 
 def _make_engine(db_path: Path) -> any:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    return create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+
+    # We must try to connect once to ensure the file is actually created by SQLAlchemy
+    with engine.connect() as conn:
+        pass
+
+    try:
+        os.chmod(db_path, 0o600)
+    except OSError:
+        pass
+
+    return engine
 
 
 def init_db(settings: Settings) -> any:

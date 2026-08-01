@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import struct
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -75,6 +76,10 @@ class MarketDataCache:
     def _init_db(self) -> None:
         with self._lock:
             conn = self._connect()
+            try:
+                os.chmod(self._db_path, 0o600)
+            except OSError:
+                pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS cache (
                     key TEXT PRIMARY KEY,

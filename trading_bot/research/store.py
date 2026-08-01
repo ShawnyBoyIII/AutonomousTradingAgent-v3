@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,10 @@ class ResearchStore:
     def _init_db(self) -> None:
         """Initialize research database tables."""
         with self._get_conn() as conn:
+            try:
+                os.chmod(self.db_path, 0o600)
+            except OSError:
+                pass
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS hypotheses (
                     id TEXT PRIMARY KEY,
