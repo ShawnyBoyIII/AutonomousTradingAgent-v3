@@ -188,7 +188,7 @@ class MarketEvent(Event):
     bar_type: BarType = BarType.BAR_1M
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        Event.__post_init__(self)
         if not self.symbol:
             raise EventValidationError("MarketEvent.symbol must be non-empty")
         _require_finite_finite(self.open, "open")
@@ -224,7 +224,7 @@ class SignalEvent(Event):
     suggested_take_profit: float | None = None
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        Event.__post_init__(self)
         if not self.symbol:
             raise EventValidationError("SignalEvent.symbol must be non-empty")
         if not isinstance(self.signal_type, SignalDirection):
@@ -271,7 +271,7 @@ class OrderEvent(Event):
     time_in_force: TimeInForce = TimeInForce.GTC
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        Event.__post_init__(self)
         if not self.symbol:
             raise EventValidationError("OrderEvent.symbol must be non-empty")
         if not self.order_id:
@@ -329,7 +329,7 @@ class FillEvent(Event):
     order_id: str = field()
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        Event.__post_init__(self)
         if not self.symbol:
             raise EventValidationError("FillEvent.symbol must be non-empty")
         if not self.exchange:
