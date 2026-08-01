@@ -19,14 +19,13 @@
 | `trading_bot/cli/__init__.py` | entry |
 | `trading_bot/cli/app.py` | entry |
 
-## Configuration (6)
+## Configuration (5)
 
 | Path | Layer |
 | --- | --- |
 | `burn-in-config.yaml` | config |
 | `config.alpaca.yaml` | config |
 | `config.yaml` | config |
-| `rl-config-example.yaml` | config |
 | `trading_bot/config/loader.py` | config |
 | `trading_bot/config/settings.py` | config |
 

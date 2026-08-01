@@ -3872,7 +3872,8 @@ def db_portfolio(
     from datetime import datetime
 
     from trading_bot.db.session import get_session, make_session_factory
-    from trading_bot.db.repositories import get_open_positions, get_snapshots
+    from trading_bot.db.repositories import get_open_positions
+    from trading_bot.db.repositories.portfolio_snapshots import get_snapshots
 
     engine = None
     try:
