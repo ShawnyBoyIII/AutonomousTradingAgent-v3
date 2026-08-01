@@ -387,6 +387,14 @@ tail -f logs/burn_in/decision-log.jsonl
 # canary appends fills/equity lines to <artifacts_dir>/shadow-fills.jsonl and
 # shadow-equity.jsonl (JSONL, one record per line).
 
+## SQLite Artifact Permissions
+
+All writable SQLite stores secure the primary database and any existing
+`-wal`, `-shm`, or `-journal` sidecars to mode `0600` through
+`trading_bot.db.permissions.secure_sqlite_artifacts`. Permission failures
+raise instead of being ignored. Burn-in snapshot copies are re-secured after
+SQLite online backup; do not replace this with a best-effort `chmod`.
+
 ## Runtime Canary Contract
 
 Live paper trading during an experiment's `CANARY` phase mirrors every
