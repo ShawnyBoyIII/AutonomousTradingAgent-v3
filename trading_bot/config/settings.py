@@ -98,6 +98,9 @@ class ScoutSettings(BaseModel):
     min_avg_dollar_volume: float = Field(default=5_000_000.0, ge=0.0)
     max_universe_size: int = Field(default=50, ge=1)
     max_snapshot_candidates: int = Field(default=100, ge=1)
+    static_core_path: str | None = None
+    min_universe_size: int = Field(default=10, ge=1)
+    preserve_previous_on_underflow: bool = True
 
 
 class AdvisorySettings(BaseModel):

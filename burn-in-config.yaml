@@ -45,6 +45,12 @@ strategy:
   risk_tolerance: "medium"
   min_confidence: "medium"
 
+scout:
+  static_core_path: "config/burn-in-core-symbols.txt"
+  max_universe_size: 50
+  min_universe_size: 10
+  preserve_previous_on_underflow: true
+
 counter_thesis:
   enabled: false
 

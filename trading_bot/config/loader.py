@@ -194,6 +194,10 @@ def load_settings(config_path: Path | None = None) -> Settings:
     settings.app.advisory_dir = _resolve_relative_value(
         settings.app.advisory_dir, base_dir
     )
+    if settings.scout.static_core_path:
+        settings.scout.static_core_path = _resolve_relative_value(
+            settings.scout.static_core_path, base_dir
+        )
     settings.sentiment.context_path = _resolve_relative_value(
         settings.sentiment.context_path, base_dir
     )

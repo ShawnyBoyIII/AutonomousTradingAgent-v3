@@ -1,5 +1,5 @@
 #!/bin/bash
-# V3 FULLY AUTOMATED Burn-In with Dynamic Watchlist + Swarm Overlay
+# V3 FULLY AUTOMATED Burn-In with a hybrid universe refresh
 # This runs discover → scan → trade → manage loop continuously
 #
 # Scan interval: 300 seconds (5 minutes) during market hours
@@ -22,9 +22,9 @@ if [[ -z "${_BURN_IN_CAFFEINATED:-}" ]]; then
 fi
 
 echo "=========================================="
-echo "FULLY AUTOMATED Paper Burn-In (V3 + Swarm)"
+echo "FULLY AUTOMATED Paper Burn-In (V3 + hybrid universe)"
 echo "Date: $(date)"
-echo "Dynamic Watchlist: ENABLED"
+echo "Hybrid Universe: ENABLED"
 echo "=========================================="
 echo ""
 
@@ -188,6 +188,26 @@ rotate_logs() {
             fi
         fi
     done
+}
+
+# Refresh the broad candidate universe once per discovery day. The CLI
+# preserves the previous universe when the scout result is too small, so a
+# transient provider failure cannot erase the burner's coverage.
+run_universe_refresh() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local refresh_output=""
+    local refresh_rc=0
+
+    echo "[$timestamp] 🌐 Refreshing hybrid universe..."
+    refresh_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" build-universe 2>&1) || refresh_rc=$?
+    printf '%s\n' "$refresh_output" | head -100 | sed "s/^/[$timestamp]    /"
+
+    if [ "$refresh_rc" -eq 0 ]; then
+        echo "[$timestamp] ✅ Hybrid universe refresh complete"
+    else
+        echo "[$timestamp] ⚠️  Hybrid universe refresh failed (rc=$refresh_rc); preserving existing universe"
+    fi
+    return 0
 }
 
 # Function to run discovery
@@ -479,7 +499,7 @@ echo "Configuration:"
 echo "  Config: $CONFIG_FILE"
 echo "  Symbols File: $UNIVERSE_FILE"
 echo "  Database: $DB_PATH"
-echo "  Mode: Dynamic discovery + V3 signals + Swarm overlay"
+echo "  Mode: Hybrid universe + V3/V2.5 consensus"
 echo ""
 
 # Pre-flight checks
@@ -521,7 +541,7 @@ echo ""
 echo "This will:"
 echo "  1. Discover new candidates on first cycle of each day"
 echo "  2. Scan universe every 60 seconds during market hours"
-echo "  3. Auto-trade GREEN signals (V3 + Swarm overlay; RL disabled in burn-in)"
+echo "  3. Auto-trade GREEN signals (V3 + V2.5 consensus; RL disabled in burn-in)"
 echo "  4. Manage positions (stops, targets, EOD)"
 echo "  5. Log everything to $LOG_DIR"
 echo ""
@@ -947,7 +967,11 @@ scan_and_trade() {
     
     # Run scan and capture output
     # canonical: sh ./tradebot-local --config-path "$CONFIG_FILE" scan --symbols "$SYMBOLS"
-    local scan_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" scan --symbols "$SYMBOLS" --why 2>&1)
+    local scan_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" scan --symbols "$SYMBOLS" --why --summary 2>&1)
+    local scan_summary=$(echo "$scan_output" | grep '^summary ' | tail -1)
+    if [ -n "$scan_summary" ]; then
+        echo "[$timestamp] 📋 Scan summary: $scan_summary"
+    fi
     
     # Check if kill switch is active
     if echo "$scan_output" | grep -q "KILL_SWITCH"; then
@@ -1206,6 +1230,7 @@ while true; do
         if is_midday; then
             run_discovery "midday"
         else
+            run_universe_refresh
             run_discovery "daily"
             # nightly tuning runs after discovery; EOD fetch already ran above
             run_pattern_miner

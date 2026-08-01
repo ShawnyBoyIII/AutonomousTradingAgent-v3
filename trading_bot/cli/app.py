@@ -63,6 +63,7 @@ from trading_bot.runtime.position_exit import (
 )
 from trading_bot.runtime.position_management import evaluate_exit_priority
 from trading_bot.runtime.snapshots import read_recent_decision_rows, write_snapshot
+from trading_bot.runtime.universe import merge_universe_symbols
 from trading_bot.scout import build_scout_candidates
 from trading_bot.strategy.trailing_stop import next_trailing_stop
 
@@ -1891,7 +1892,22 @@ def _build_universe_file(settings) -> dict[str, object]:
         screeners=settings.scout.screeners,
     )
     scout_result = build_scout_candidates(rows, settings.scout, advisory_override=load_scout_override(settings))
-    included_symbols = scout_result.included_symbols
+    path = Path(settings.app.universe_path)
+    previous_symbols = _read_universe_symbols(path)
+    static_symbols: list[str] = []
+    if settings.scout.static_core_path:
+        static_path = Path(settings.scout.static_core_path)
+        if static_path.exists():
+            static_symbols = _read_universe_symbols(static_path)
+    watchlist_symbols = _read_universe_symbols(Path(settings.app.watchlist_path))
+    included_symbols, preserved_previous = merge_universe_symbols(
+        static_symbols,
+        watchlist_symbols,
+        scout_result.included_symbols,
+        previous_symbols if settings.scout.preserve_previous_on_underflow else [],
+        max_size=settings.scout.max_universe_size,
+        min_size=settings.scout.min_universe_size,
+    )
     lines = [
         " ".join(
             [
@@ -1909,7 +1925,6 @@ def _build_universe_file(settings) -> dict[str, object]:
         if candidate.included
     ]
 
-    path = Path(settings.app.universe_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(".tmp")
     tmp_path.write_text("".join(f"{symbol}\n" for symbol in included_symbols), encoding="utf-8")
@@ -1930,6 +1945,11 @@ def _build_universe_file(settings) -> dict[str, object]:
         f"included={scout_result.summary.included} "
         f"excluded={scout_result.summary.excluded} "
         f"errors={scout_result.summary.errors} path={path}"
+    )
+    lines.append(
+        f"universe merged={len(included_symbols)} "
+        f"static={len(static_symbols)} watchlist={len(watchlist_symbols)} "
+        f"previous={len(previous_symbols)} preserved_previous={preserved_previous}"
     )
     return {"lines": lines, "symbols": included_symbols}
 

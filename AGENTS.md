@@ -626,6 +626,7 @@ Fail-fast: stops on first validation error.
 - `./tradebot-local tune` writes `state/tuning_overrides.yaml`; loader applies only allowlisted supermodel + strategy-tracker fields and still forces `live_trading_enabled=false`
 - Swarm worker votes (when running the manual `./tradebot-local swarm` command) are logged to `logs/worker_votes.jsonl`; use this file for per-worker weight tuning
 - Decision-log and paper-trade rows preserve compact supermodel evidence even on rejects and `NO_SIGNAL`; use `paper-report`, `trade-attribution`, and `db-features` for paper review before adding new logging.
+- The pinned burner refreshes a hybrid universe once per discovery day: the tracked diversified ETF core (`config/burn-in-core-symbols.txt`), operator watchlist, scout candidates, and the previous healthy universe. A refresh below `scout.min_universe_size` preserves prior coverage instead of replacing it.
 - Burner universe/watchlist readers preserve a final symbol even when the file has no trailing newline; Python discovery exports intentionally use that valid text-file form.
 - `capture_snapshot` (2026-07-30) copies `state/burn_in.db` and `state/market_data_cache.db` into the snapshot at capture time. The pinned burner writes fills to the snapshot DB; manual `./tradebot-local` (no `PIN_DIR`) reads the live DB. The two will diverge until the next launcher restart — reconcile via `sqlite3` directly.
 
