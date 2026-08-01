@@ -44,6 +44,8 @@ Order Submission (paper-only by default; Robinhood MCP-only via operator snapsho
 Fill Persistence
    - PortfolioLedger (canonical, SQLite, `orders` table)
    - SQLAlchemy (`trades`, `positions` — separate, reconcilable projection)
+   - Writable SQLite databases and existing WAL/SHM/journal sidecars are
+     secured to `0600`; permission failures are surfaced
     ↓
 Dashboard / Reports / Alerts / Attribution
 ```
