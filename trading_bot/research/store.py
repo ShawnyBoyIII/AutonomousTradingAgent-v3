@@ -15,6 +15,7 @@ from trading_bot.research.models import (
     HypothesisStatus,
     ResearchCycle,
 )
+from trading_bot.db.permissions import secure_sqlite_artifacts
 
 
 class ResearchStore:
@@ -82,8 +83,9 @@ class ResearchStore:
 
                 CREATE INDEX IF NOT EXISTS idx_hypotheses_status ON hypotheses(status);
                 CREATE INDEX IF NOT EXISTS idx_hypotheses_category ON hypotheses(category);
-                CREATE INDEX IF NOT EXISTS idx_experiment_hypothesis ON experiment_results(hypothesis_id);
-            """)
+                 CREATE INDEX IF NOT EXISTS idx_experiment_hypothesis ON experiment_results(hypothesis_id);
+             """)
+        secure_sqlite_artifacts(self.db_path)
 
     # --- Hypothesis CRUD ---
 

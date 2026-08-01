@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 from trading_bot.config.settings import (  # noqa: E402  (import after logger)
     EodDataStoreSettings as DataStoreSettings,
 )
+from trading_bot.db.permissions import secure_sqlite_artifacts
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +75,7 @@ class DataStoreManifest:
                 conn.commit()
             finally:
                 conn.close()
+            secure_sqlite_artifacts(self._db_path)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self._db_path))

@@ -60,6 +60,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from trading_bot.db.permissions import secure_sqlite_artifacts
+
 # Files whose content must be byte-stable for the pinned execution to
 # mean what the operator thinks it means. Tracked Python under
 # ``trading_bot/``, ``event_engine/``, ``scripts/``, ``ui/``, the
@@ -179,6 +181,7 @@ def _inherit_runtime_state(
             sidecar = dst.with_name(dst.name + suffix)
             if sidecar.exists():
                 sidecar.unlink()
+        secure_sqlite_artifacts(dst)
         copied += 1
 
     for relpath in _INHERITED_STATE_DIRS:

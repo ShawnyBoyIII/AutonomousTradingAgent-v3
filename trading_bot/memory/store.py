@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from trading_bot.memory.models import MemoryEntry, MemoryQuery, MemoryStats, MemoryType
+from trading_bot.db.permissions import secure_sqlite_artifacts
 
 
 class MemoryStore:
@@ -72,8 +73,9 @@ class MemoryStore:
                 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
                 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
                 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
-                CREATE INDEX IF NOT EXISTS idx_memories_relevance ON memories(relevance_score);
-            """)
+                 CREATE INDEX IF NOT EXISTS idx_memories_relevance ON memories(relevance_score);
+             """)
+        secure_sqlite_artifacts(self.db_path)
 
     # --- CRUD ---
 

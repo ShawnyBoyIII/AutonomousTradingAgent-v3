@@ -8,6 +8,7 @@ from datetime import datetime
 
 from trading_bot.models.order import FillResult
 from trading_bot.models.portfolio import PortfolioState
+from trading_bot.db.permissions import secure_sqlite_artifacts
 
 
 class PortfolioLedger:
@@ -134,14 +135,7 @@ class PortfolioLedger:
                 """
             )
         
-        # Set restrictive permissions on database file (user read/write only)
-        import os
-        try:
-            if self.db_path.exists():
-                os.chmod(self.db_path, 0o600)
-        except OSError:
-            # File may not exist yet or permissions cannot be changed
-            pass
+        secure_sqlite_artifacts(self.db_path)
 
     def load_portfolio_state(self) -> PortfolioState | None:
         self.initialize()

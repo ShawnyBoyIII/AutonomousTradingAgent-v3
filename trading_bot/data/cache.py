@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+import struct
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+from trading_bot.db.permissions import secure_sqlite_artifacts
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +100,7 @@ class MarketDataCache:
             conn.execute("PRAGMA busy_timeout=5000")
             conn.commit()
             conn.close()
+            secure_sqlite_artifacts(self._db_path)
 
     def _connect(self) -> Any:
         import sqlite3
