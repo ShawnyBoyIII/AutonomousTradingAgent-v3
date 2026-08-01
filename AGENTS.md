@@ -125,6 +125,7 @@ prints a notice and exits non-zero while an experiment is active.
 - No real network calls
 - Config: `pytest -ra --strict-markers` (pyproject.toml)
 - When fixing a defect, add new regression tests that capture the bug at the broken boundary. Do not weaken or rewrite existing test expectations; new tests live alongside the originals and prove the previous failure mode is now impossible.
+- GitHub Actions runs the same network-free suite through `.github/workflows/ci.yml` on pull requests and pushes to `main`; the required check name is `test`.
 
 ---
 
