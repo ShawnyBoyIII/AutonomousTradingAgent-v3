@@ -58,4 +58,8 @@ jobs:
           PY
 
       - name: Run test suite
-        run: .venv/bin/python -m pytest -q
+        run: |
+          # The pre-market shell harness passes a generated script through
+          # bash -c; Linux derives ARG_MAX from the process stack limit.
+          ulimit -s 8192
+          .venv/bin/python -m pytest -q

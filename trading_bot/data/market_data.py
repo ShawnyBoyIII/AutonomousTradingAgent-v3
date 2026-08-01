@@ -152,7 +152,11 @@ def fetch_bars(
     end: str | None = None,
     settings: MarketDataSettings | None = None,
 ) -> pd.DataFrame:
-    cache = _get_cache()
+    cache = (
+        MarketDataCache(settings.cache_db_path)
+        if settings is not None and settings.cache_db_path
+        else _get_cache()
+    )
     namespace = _cache_namespace(settings, interval)
     cached = cache.get(symbol, period, interval, start, end, namespace=namespace)
     if cached is not None:

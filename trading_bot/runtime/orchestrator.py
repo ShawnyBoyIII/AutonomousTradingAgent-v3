@@ -559,6 +559,10 @@ def run_paper_trade(
     *,
     runtime_canary: Any = None,
 ) -> list[str]:
+    if settings.market_data.cache_db_path is None:
+        settings.market_data.cache_db_path = str(
+            Path(settings.app.state_db_path).parent / "market_data_cache.db"
+        )
     ledger = PortfolioLedger(Path(settings.app.state_db_path))
     state = ledger.ensure_portfolio_state()
     broker = PaperBroker(

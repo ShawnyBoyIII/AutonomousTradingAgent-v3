@@ -47,6 +47,7 @@ class AppSettings(BaseModel):
 class MarketDataSettings(BaseModel):
     provider: str = "yfinance"
     providers: list[str] = Field(default_factory=list)
+    cache_db_path: str | None = None
 
     @field_validator("provider", mode="before")
     @classmethod
