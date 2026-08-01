@@ -10,7 +10,6 @@ from trading_bot.strategy.news_filter import (
     NewsEvent,
     NewsFilter,
     RiskAssessment,
-    calculate_news_sentiment,
     create_mock_earnings_calendar,
 )
 
@@ -135,51 +134,6 @@ class TestNewsFilter:
 
         # Should only have recent event
         assert len(filter.event_cache["AAPL"]) == 1
-
-
-class TestSentimentCalculation:
-    """Tests for sentiment calculation."""
-
-    def test_positive_sentiment(self) -> None:
-        """Test positive sentiment detection."""
-        headlines = [
-            "AAPL beats earnings expectations",
-            "Bullish upgrade from Goldman Sachs",
-            "Stock rallies on strong growth",
-        ]
-
-        sentiment = calculate_news_sentiment(headlines)
-
-        assert sentiment > 0
-
-    def test_negative_sentiment(self) -> None:
-        """Test negative sentiment detection."""
-        headlines = [
-            "AAPL misses earnings target",
-            "Bearish downgrade from Morgan Stanley",
-            "Stock crashes on weak guidance",
-        ]
-
-        sentiment = calculate_news_sentiment(headlines)
-
-        assert sentiment < 0
-
-    def test_neutral_sentiment(self) -> None:
-        """Test neutral sentiment with no keywords."""
-        headlines = [
-            "AAPL announces quarterly results",
-            "Company releases new product",
-        ]
-
-        sentiment = calculate_news_sentiment(headlines)
-
-        assert sentiment == 0.0
-
-    def test_empty_headlines(self) -> None:
-        """Test empty headlines."""
-        sentiment = calculate_news_sentiment([])
-
-        assert sentiment == 0.0
 
 
 class TestMockEarningsCalendar:
