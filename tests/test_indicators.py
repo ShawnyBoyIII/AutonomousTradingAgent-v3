@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import numpy as np
 import pandas as pd
 
 from trading_bot.data.indicators import (
@@ -11,6 +12,10 @@ from trading_bot.data.indicators import (
     add_macd,
     add_bollinger_bands,
     add_vwap,
+    add_stochastic,
+    add_adx,
+    add_williams_r,
+    add_obv,
 )
 from trading_bot.data.market_data import normalize_ohlcv_frame
 
@@ -197,6 +202,39 @@ def test_add_vwap_requires_ohlcv() -> None:
 
     with pytest.raises(KeyError):
         add_vwap(frame)
+
+
+def test_optimized_indicator_casts_preserve_object_and_nullable_inputs() -> None:
+    numeric = pd.DataFrame(
+        {
+            "high": [10.0, 11.0, 12.0, 11.5, 13.0, 14.0, 13.5, 15.0],
+            "low": [8.0, 9.0, 10.0, 9.5, 11.0, 12.0, 11.5, 13.0],
+            "close": [9.0, 10.5, 11.5, 10.5, 12.5, 13.5, 12.5, 14.5],
+            "volume": [1000.0, 1200.0, 1100.0, 1400.0, 1600.0, 1500.0, 1800.0, 2000.0],
+        }
+    )
+    object_frame = numeric.astype(str)
+    nullable_frame = numeric.astype("Float64")
+    builders = (
+        lambda frame: add_atr(frame, period=3),
+        add_vwap,
+        lambda frame: add_stochastic(frame, k_period=3, d_period=2),
+        lambda frame: add_adx(frame, period=3),
+        lambda frame: add_williams_r(frame, period=3),
+        add_obv,
+    )
+
+    for build in builders:
+        expected = build(numeric.copy())
+        for variant in (object_frame, nullable_frame):
+            actual = build(variant.copy())
+            assert list(actual.columns) == list(expected.columns)
+            for column in expected.columns:
+                np.testing.assert_allclose(
+                    actual[column].to_numpy(dtype=float),
+                    expected[column].to_numpy(dtype=float),
+                    equal_nan=True,
+                )
 
 
 def test_add_stochastic_creates_expected_columns() -> None:
