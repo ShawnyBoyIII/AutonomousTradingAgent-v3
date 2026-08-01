@@ -189,37 +189,6 @@ def fetch_news_for_symbol(symbol: str) -> list[NewsEvent]:
     return []
 
 
-def calculate_news_sentiment(headlines: list[str]) -> float:
-    """Calculate sentiment score from headlines.
-
-    Returns:
-        Sentiment score: -1.0 (very negative) to 1.0 (very positive)
-    """
-    if not headlines:
-        return 0.0
-
-    # Simple keyword-based sentiment (would use NLP in production)
-    positive_words = ["beat", "surge", "rally", "upgrade", "growth", "bullish", "outperform"]
-    negative_words = ["miss", "crash", "plunge", "downgrade", "loss", "bearish", "underperform"]
-
-    score = 0
-    for headline in headlines:
-        headline_lower = headline.lower()
-        for word in positive_words:
-            if word in headline_lower:
-                score += 1
-        for word in negative_words:
-            if word in headline_lower:
-                score -= 1
-
-    # Normalize
-    max_possible = len(headlines) * max(len(positive_words), len(negative_words))
-    if max_possible == 0:
-        return 0.0
-
-    return max(-1.0, min(1.0, score / max_possible * 5))
-
-
 class EarningsCalendar:
     """Manages earnings calendar for risk filtering."""
 
