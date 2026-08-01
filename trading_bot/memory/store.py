@@ -207,11 +207,6 @@ class MemoryStore:
             ).fetchall()
             return [self._row_to_entry(dict(r)) for r in rows]
 
-    def get_memories_by_tags(self, tags: list[str], limit: int = 50) -> list[MemoryEntry]:
-        """Get memories matching any of the given tags."""
-        query = MemoryQuery(tags=tags, limit=limit, sort_by="relevance")
-        return self.query_memories(query)
-
     # --- Stats ---
 
     def get_stats(self) -> MemoryStats:

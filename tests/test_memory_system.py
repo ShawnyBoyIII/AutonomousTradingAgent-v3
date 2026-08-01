@@ -114,19 +114,6 @@ class TestMemoryStore:
         results = store.query_memories(query)
         assert len(results) == 3
 
-    def test_get_memories_by_tags(self, store):
-        for i in range(3):
-            entry = MemoryEntry(
-                memory_type=MemoryType.CUSTOM,
-                title=f"Memory {i}",
-                content=f"Content {i}",
-                tags=["test", "memory"],
-            )
-            store.save_memory(entry)
-
-        results = store.get_memories_by_tags(["test"])
-        assert len(results) == 3
-
     def test_get_stats(self, store):
         for i in range(5):
             entry = MemoryEntry(
