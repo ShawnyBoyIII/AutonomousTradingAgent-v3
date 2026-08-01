@@ -98,11 +98,3 @@ counter_thesis:
   volatility_percentile_threshold: 0.85
   check_extension: true
   extension_pct: 5.0
-
-# RL-based trading (disabled by default)
-rl:
-  enabled: false
-  agent_type: PPO
-  feature_set: standard
-  reward_function: sharpe
-  model_path: state/rl_logs/PPO_final.zip

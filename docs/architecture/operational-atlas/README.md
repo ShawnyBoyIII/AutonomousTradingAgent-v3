@@ -53,7 +53,7 @@ For every operational file the atlas records:
 
 ## Build sequence
 
-1. Inventory: `git ls-files` over operational roots; 185 files indexed.
+1. Inventory: `git ls-files` over operational roots; 184 files indexed.
 2. Phase maps: traced via static analysis + targeted test/smoke runs.
 3. Verification matrix: each subsystem row mapped to passing tests or explicit static attestations.
 4. Remediation backlog: confirmed defects separated from architectural risks.
