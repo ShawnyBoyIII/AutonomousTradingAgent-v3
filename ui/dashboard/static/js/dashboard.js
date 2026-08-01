@@ -17,7 +17,25 @@
     reconnectTimer: null,
     reconnectDelay: 2500,
     clockTimer: null,
+    halted: false,
+    lastPnlStr: null,
   };
+
+  // -------------------------------------------------------------
+  // Dynamic Page Title
+  // -------------------------------------------------------------
+  function updateDocumentTitle() {
+    if (STATE.halted) {
+      document.title = "🚨 HALTED · Trading Bot";
+      return;
+    }
+
+    if (STATE.lastPnlStr) {
+      document.title = `${STATE.lastPnlStr} · Trading Bot`;
+    } else {
+      document.title = "Trading Bot — Desk 01";
+    }
+  }
 
   // -------------------------------------------------------------
   // DOM helpers
@@ -66,6 +84,16 @@
 
   const FMT_FULL_DATE = (d) =>
     d.toLocaleDateString([], { weekday: "short", year: "numeric", month: "short", day: "2-digit" });
+
+  const FMT_EXACT = (ts) => {
+    if (!ts) return "—";
+    const d = ts instanceof Date ? ts : new Date(ts);
+    if (isNaN(d.getTime())) return "—";
+    return d.toLocaleString([], {
+      year: "numeric", month: "short", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+    });
+  };
 
   const FMT_RELATIVE = (ts) => {
     if (!ts) return "—";
@@ -261,6 +289,10 @@
     const pctEl = $("pnlPct");
     setValue(pctEl, FMT_PCT(pct, 2));
     setAttr(pctEl, "data-trend", trend);
+
+    const sign = pnl >= 0 ? "+" : "−";
+    STATE.lastPnlStr = `${sign}${fmtShort(Math.abs(pnl))}`;
+    updateDocumentTitle();
   }
 
   // -------------------------------------------------------------
@@ -391,13 +423,13 @@
         <table class="positions-table">
           <thead>
             <tr>
-              <th>Symbol</th>
-              <th class="num">Qty</th>
-              <th class="num">Avg Cost</th>
-              <th class="num">Mark</th>
-              <th class="num">Market Value</th>
-              <th class="num">Unrealized P&L</th>
-              <th class="num">Unrealized %</th>
+              <th scope="col">Symbol</th>
+              <th scope="col" class="num">Qty</th>
+              <th scope="col" class="num">Avg Cost</th>
+              <th scope="col" class="num">Mark</th>
+              <th scope="col" class="num">Market Value</th>
+              <th scope="col" class="num">Unrealized P&L</th>
+              <th scope="col" class="num">Unrealized %</th>
             </tr>
           </thead>
           <tbody>${rows}</tbody>
@@ -592,7 +624,7 @@
             <span class="alert__level">${escapeHTML(lvl)} · ${escapeHTML(a.category || "system")}</span>
             <span class="alert__message">${escapeHTML(a.message)}</span>
           </div>
-          <span class="alert__time">${escapeHTML(FMT_RELATIVE(a.timestamp))}</span>
+          <span class="alert__time" title="${escapeHTML(FMT_EXACT(a.timestamp))}" style="cursor: help;">${escapeHTML(FMT_RELATIVE(a.timestamp))}</span>
         </div>
       `;
     }).join("");
@@ -644,6 +676,9 @@
     const badge   = $("killBadge");
 
     const halted = !!ks.active;
+    STATE.halted = halted;
+    updateDocumentTitle();
+
     setAttr(panel, "data-state", halted ? "halted" : "armed");
     setAttr(stateEl, "data-state", halted ? "halted" : "armed");
     setValue(stateEl, halted ? "Halted" : "Armed");
@@ -656,6 +691,7 @@
       lever.removeAttribute("aria-busy");
       lever.disabled = halted;
       setValue(leverLbl, halted ? "Halted" : "Pull to halt");
+      lever.setAttribute("title", halted ? "Halted. Resume via CLI to re-arm" : "Pull to instantly halt all trading");
     }
 
     if (badge) {
@@ -728,11 +764,13 @@
     if (trades.length) {
       const last = trades[0];
       const when = FMT_RELATIVE(last.timestamp);
-      const side = last.side || "?";
-      const sym  = last.symbol || "—";
+      const exactTime = FMT_EXACT(last.timestamp);
+      const whenHtml = `<span title="${escapeHTML(exactTime)}" style="cursor: help;">${escapeHTML(when)}</span>`;
+      const side = escapeHTML(last.side || "?");
+      const sym  = escapeHTML(last.symbol || "—");
       const qty  = fmtInt(last.quantity);
       const px   = fmtUSD(last.price);
-      setValue($("telemetryLastFill"), `${side} ${sym} ${qty}@${px} · ${when}`);
+      setValue($("telemetryLastFill"), `${side} ${sym} ${qty}@${px} · ${whenHtml}`, { html: true });
     }
 
     if (!trades.length) {
@@ -752,7 +790,7 @@
                 <span class="trade__symbol">${escapeHTML(t.symbol || "—")}</span>
                 <span class="trade__detail">${fmtInt(t.quantity)} @ ${fmtUSD(t.price)}</span>
               </div>
-              <span class="trade__time">${escapeHTML(FMT_TIME(t.timestamp))}</span>
+              <span class="trade__time" title="${escapeHTML(FMT_EXACT(t.timestamp))}" style="cursor: help;">${escapeHTML(FMT_TIME(t.timestamp))}</span>
             </div>
           `;
         }).join("")}
@@ -1231,6 +1269,7 @@
       try {
         lever.disabled = true;
         lever.setAttribute("aria-busy", "true");
+        lever.setAttribute("title", "Halting...");
         if (leverLbl) setValue(leverLbl, "Halting...");
         const r = await fetch("/api/kill-switch/halt", {
           method: "POST",
@@ -1245,6 +1284,7 @@
         console.error("halt failed", e);
         lever.disabled = false;
         lever.removeAttribute("aria-busy");
+        lever.setAttribute("title", "Pull to instantly halt all trading");
         if (leverLbl) setValue(leverLbl, "Pull to halt");
         window.alert("Failed to halt. Check the console for details.");
       }

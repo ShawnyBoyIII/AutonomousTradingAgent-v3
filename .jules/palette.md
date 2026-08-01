@@ -7,3 +7,12 @@
 ## 2024-07-28 - Async Loading State for Kill Switch
 **Learning:** Found that the "Kill Switch" button on the dashboard lacked an accessible async loading state. When pulled, it did not provide visual feedback to users that the action was in progress, nor did it announce its busy state to screen readers.
 **Action:** Implemented `aria-busy="true"` and changed the visual label to "Halting..." on click. Reverted these states properly both on successful update and error catch block.
+## 2024-05-18 - Tabindex and Title Accessibility in Dashboard
+**Learning:** Found that the "skip to main content" link pointed to `<main id="main">` which lacked a `tabindex="-1"`, meaning keyboard focus was not properly managed by the browser upon skip link activation. Also found that the "Kill Switch" lever lacked descriptive tooltips (`title` attribute) communicating its disabled or ready states.
+**Action:** When creating skip links, always ensure the target container (e.g. `<main>`) has `tabindex="-1"`. When a button's disabled state changes, dynamically update its `title` attribute so hover and screen readers provide actionable feedback on *why* it is disabled.
+## 2024-05-24 - Timestamp Clarity
+**Learning:** In trading dashboards, relative time displays (e.g., "5s ago") are great for quick parsing, but users frequently need exact execution times to cross-reference with market data.
+**Action:** Always pair relative times with absolute timestamp tooltips (`title` attributes) so exact context is available on hover without cluttering the UI.
+## 2024-07-28 - Dynamic Page Titles for Background Monitoring
+**Learning:** For a dashboard like this, users often have it open in a background tab while doing other work. They shouldn't have to switch tabs just to see if the system is halted or to check their P&L.
+**Action:** When working on dashboards with critical live states (like P&L or system health), dynamically update the `<title>` tag with a high-level summary (e.g. "🚨 HALTED" or "+$1.2K"). This provides ambient awareness and reduces context switching.

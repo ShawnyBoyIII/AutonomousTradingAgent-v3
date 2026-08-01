@@ -863,6 +863,12 @@ header, main, footer, .mode-rail, .skip-link { position: relative; z-index: 1; }
     0 8px 24px rgba(0, 0, 0, 0.5);
 }
 
+.kill__lever[aria-busy="true"] {
+  cursor: wait;
+  opacity: 0.7;
+  animation: pulse-soft 1.2s var(--ease-in-out) infinite;
+}
+
 .kill__meta {
   text-align: right;
   display: flex;
