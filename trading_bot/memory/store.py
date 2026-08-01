@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
 from trading_bot.memory.models import MemoryEntry, MemoryQuery, MemoryStats, MemoryType
+from trading_bot.db.permissions import secure_sqlite_artifacts
 
 
 class MemoryStore:
@@ -31,10 +31,6 @@ class MemoryStore:
     def _init_db(self) -> None:
         """Initialize memory database with FTS5."""
         with self._get_conn() as conn:
-            try:
-                os.chmod(self.db_path, 0o600)
-            except OSError:
-                pass
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS memories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,8 +73,9 @@ class MemoryStore:
                 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
                 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
                 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
-                CREATE INDEX IF NOT EXISTS idx_memories_relevance ON memories(relevance_score);
-            """)
+                 CREATE INDEX IF NOT EXISTS idx_memories_relevance ON memories(relevance_score);
+             """)
+        secure_sqlite_artifacts(self.db_path)
 
     # --- CRUD ---
 

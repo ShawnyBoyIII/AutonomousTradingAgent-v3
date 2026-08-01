@@ -10,6 +10,8 @@ from typing import Any
 
 import pandas as pd
 
+from trading_bot.db.permissions import secure_sqlite_artifacts
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,10 +78,6 @@ class MarketDataCache:
     def _init_db(self) -> None:
         with self._lock:
             conn = self._connect()
-            try:
-                os.chmod(self._db_path, 0o600)
-            except OSError:
-                pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS cache (
                     key TEXT PRIMARY KEY,
@@ -102,6 +100,7 @@ class MarketDataCache:
             conn.execute("PRAGMA busy_timeout=5000")
             conn.commit()
             conn.close()
+            secure_sqlite_artifacts(self._db_path)
 
     def _connect(self) -> Any:
         import sqlite3

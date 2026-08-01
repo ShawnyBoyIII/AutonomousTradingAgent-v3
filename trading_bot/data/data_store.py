@@ -19,7 +19,6 @@ Configuration via :class:`EodDataStoreSettings` in
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
 import threading
 from datetime import date
@@ -34,6 +33,7 @@ logger = logging.getLogger(__name__)
 from trading_bot.config.settings import (  # noqa: E402  (import after logger)
     EodDataStoreSettings as DataStoreSettings,
 )
+from trading_bot.db.permissions import secure_sqlite_artifacts
 
 
 # ---------------------------------------------------------------------------
@@ -59,10 +59,6 @@ class DataStoreManifest:
         with self._lock:
             conn = sqlite3.connect(str(self._db_path))
             try:
-                os.chmod(self._db_path, 0o600)
-            except OSError:
-                pass
-            try:
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS fetched (
@@ -79,6 +75,7 @@ class DataStoreManifest:
                 conn.commit()
             finally:
                 conn.close()
+            secure_sqlite_artifacts(self._db_path)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self._db_path))

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +15,7 @@ from trading_bot.research.models import (
     HypothesisStatus,
     ResearchCycle,
 )
+from trading_bot.db.permissions import secure_sqlite_artifacts
 
 
 class ResearchStore:
@@ -37,10 +37,6 @@ class ResearchStore:
     def _init_db(self) -> None:
         """Initialize research database tables."""
         with self._get_conn() as conn:
-            try:
-                os.chmod(self.db_path, 0o600)
-            except OSError:
-                pass
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS hypotheses (
                     id TEXT PRIMARY KEY,
@@ -87,8 +83,9 @@ class ResearchStore:
 
                 CREATE INDEX IF NOT EXISTS idx_hypotheses_status ON hypotheses(status);
                 CREATE INDEX IF NOT EXISTS idx_hypotheses_category ON hypotheses(category);
-                CREATE INDEX IF NOT EXISTS idx_experiment_hypothesis ON experiment_results(hypothesis_id);
-            """)
+                 CREATE INDEX IF NOT EXISTS idx_experiment_hypothesis ON experiment_results(hypothesis_id);
+             """)
+        secure_sqlite_artifacts(self.db_path)
 
     # --- Hypothesis CRUD ---
 

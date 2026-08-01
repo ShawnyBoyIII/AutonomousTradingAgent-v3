@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sqlalchemy import create_engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
+
+from trading_bot.db.permissions import secure_sqlite_artifacts
 
 if TYPE_CHECKING:
     from trading_bot.config import Settings
@@ -23,11 +24,7 @@ def _make_engine(db_path: Path) -> any:
     # We must try to connect once to ensure the file is actually created by SQLAlchemy
     with engine.connect() as conn:
         pass
-
-    try:
-        os.chmod(db_path, 0o600)
-    except OSError:
-        pass
+    secure_sqlite_artifacts(db_path)
 
     return engine
 
