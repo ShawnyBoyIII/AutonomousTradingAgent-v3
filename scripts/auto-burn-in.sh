@@ -239,9 +239,13 @@ run_discovery() {
     # case when EOD data hasn't been published yet). Confirmed via
     # `bash -x` trace on 2026-07-27.
     local discover_output discover_rc
+    # Discovery is advisory after the hybrid refresh. Do not pass --export:
+    # exporting would replace the broad merged universe with only the
+    # breakout winners and defeat the static-core/scout coverage floor.
     # canonical: sh ./tradebot-local --config-path "$CONFIG_FILE" discover --mode breakout
-    discover_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" discover --mode breakout --max 50 --export 2>&1) || true
-    discover_rc=$?
+    discover_output=""
+    discover_rc=0
+    discover_output=$(sh "$PINNED_TRADEBOT" --config-path "$CONFIG_FILE" discover --mode breakout --max 50 2>&1) || discover_rc=$?
 
     # The "0 candidates" warning is the new failure marker (audit
     # follow-up 2026-07-24). When the screener returns 0 results the
@@ -254,8 +258,8 @@ run_discovery() {
         return 0
     fi
 
-    if [ "$discover_rc" -eq 0 ] && echo "$discover_output" | grep -q "Exported"; then
-        local count=$(echo "$discover_output" | grep "Exported" | sed 's/.*Exported \([0-9]*\).*/\1/')
+    if [ "$discover_rc" -eq 0 ] && echo "$discover_output" | grep -q "Added:"; then
+        local count=$(echo "$discover_output" | grep "Added:" | tail -1 | sed 's/.*Added: \([0-9]*\).*/\1/')
         echo "[$timestamp] ✅ Discovered $count symbols"
         
         # Show top candidates
@@ -295,6 +299,9 @@ run_discovery() {
         
         # Log discovery event
         echo "{\"event\":\"discovery\",\"timestamp\":\"$timestamp\",\"trigger\":\"$trigger_reason\",\"count\":$count,\"watchlist_preserved\":${#watchlist_symbols[@]}}" >> "$LOG_DIR/discovery.log"
+    elif [ "$discover_rc" -ne 0 ]; then
+        echo "[$timestamp] ⚠️  Discovery command failed (rc=$discover_rc), preserving hybrid universe"
+        echo "[$timestamp]    $discover_output" | head -20
     else
         echo "[$timestamp] ⚠️  Discovery returned no symbols, preserving existing list"
         # Log failed discovery
