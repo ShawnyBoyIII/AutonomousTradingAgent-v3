@@ -131,12 +131,6 @@ class MemoryStore:
             ).fetchone()
             return self._row_to_entry(dict(row)) if row else None
 
-    def delete_memory(self, memory_id: int) -> bool:
-        """Delete a memory by ID."""
-        with self._get_conn() as conn:
-            cursor = conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-            return cursor.rowcount > 0
-
     # --- Query ---
 
     def query_memories(self, query: MemoryQuery) -> list[MemoryEntry]:

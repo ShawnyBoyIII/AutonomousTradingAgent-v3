@@ -55,16 +55,6 @@ class TestMemoryStore:
         assert retrieved.title == "Updated"
         assert retrieved.content == "Updated content"
 
-    def test_delete_memory(self, store):
-        entry = MemoryEntry(
-            memory_type=MemoryType.CUSTOM,
-            title="To delete",
-            content="Content",
-        )
-        row_id = store.save_memory(entry)
-        assert store.delete_memory(row_id) is True
-        assert store.get_memory(row_id) is None
-
     def test_fts5_search(self, store):
         for i in range(5):
             entry = MemoryEntry(
