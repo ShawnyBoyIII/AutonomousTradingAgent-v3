@@ -102,17 +102,6 @@ class _Position:
     last_mark: float = 0.0
     borrow_fee_accrued: float = 0.0
 
-    @property
-    def is_flat(self) -> bool:
-        return self.quantity == 0
-
-    @property
-    def is_long(self) -> bool:
-        return self.quantity > 0
-
-    @property
-    def is_short(self) -> bool:
-        return self.quantity < 0
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +195,7 @@ class Portfolio:
         symbol = signal.symbol
         if signal.signal_type == SignalDirection.EXIT:
             pos = self._positions.get(symbol)
-            if pos is None or pos.is_flat:
+            if pos is None or pos.quantity == 0:
                 return None
             return self._build_exit_order(signal, symbol, pos, last_price)
 
@@ -273,7 +262,7 @@ class Portfolio:
         last_price: float,
     ) -> OrderEvent:
         direction = (
-            OrderDirection.SELL if position.is_long else OrderDirection.BUY
+            OrderDirection.SELL if position.quantity > 0 else OrderDirection.BUY
         )
         order_id = f"X-{symbol}-{signal.timestamp_ns}-{abs(position.quantity)}"
         return OrderEvent(
@@ -494,7 +483,7 @@ class Portfolio:
                     "borrow_fee_accrued": pos.borrow_fee_accrued,
                 }
                 for sym, pos in self._positions.items()
-                if not pos.is_flat
+                if pos.quantity != 0
             },
         }
 
