@@ -5068,7 +5068,15 @@ def reset_portfolio(
         counts = {}
         for t in tables_to_clear:
             try:
-                cur.execute(f"SELECT COUNT(*) FROM {t}")
+                # Use explicit if/elif blocks to appease static security analysis (Bandit)
+                if t == "orders":
+                    cur.execute("SELECT COUNT(*) FROM orders")
+                elif t == "trades":
+                    cur.execute("SELECT COUNT(*) FROM trades")
+                elif t == "equity_history":
+                    cur.execute("SELECT COUNT(*) FROM equity_history")
+                else:
+                    raise ValueError(f"Invalid table name: {t}")
                 counts[t] = cur.fetchone()[0]
             except sqlite3.OperationalError:
                 counts[t] = 0
@@ -5076,7 +5084,14 @@ def reset_portfolio(
         # Clear trade history
         for t in tables_to_clear:
             if counts[t] > 0:
-                cur.execute(f"DELETE FROM {t}")
+                if t == "orders":
+                    cur.execute("DELETE FROM orders")
+                elif t == "trades":
+                    cur.execute("DELETE FROM trades")
+                elif t == "equity_history":
+                    cur.execute("DELETE FROM equity_history")
+                else:
+                    raise ValueError(f"Invalid table name: {t}")
                 typer.echo(f"  Cleared {t}: {counts[t]} rows")
 
         # Reset portfolio state to starting cash
