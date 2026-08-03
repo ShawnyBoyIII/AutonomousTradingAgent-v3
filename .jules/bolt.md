@@ -12,3 +12,6 @@
 ## 2026-07-29 - [Property Access Overhead in Tight Loops]
 **Learning:** In the backtester's hottest paths (`Portfolio` accounting loops executing millions of times), Python's `@property` access (like `pos.is_short` or `pos.is_long`) introduces severe function-call overhead that dominates execution time. Similarly, `super().__post_init__()` inside tightly instantiated `@dataclass` events scales poorly.
 **Action:** When optimizing loop bottlenecks, read base attributes directly (e.g., `pos.quantity < 0` instead of `pos.is_short`) and unroll simple generator expressions into `for` loops. For highly volatile event classes without complex inheritance, replace `super()` with direct parent class method calls.
+## 2026-08-03 - [Pandas .iloc inside Nested Backtest Loops]
+**Learning:** Using `.iloc` inside nested loops over dataframes (like the daily simulation loop in backtest runners) introduces severe overhead because it forces pandas to instantiate Series objects repeatedly. Moving data access to pre-extracted numpy arrays drops loop execution time by over 98% (from ~0.50s to ~0.007s).
+**Action:** When writing or optimizing nested loops over dataframes in python, extract columns into numpy arrays via `.to_numpy(dtype=float)` before the outer loop and use simple list/array indexing.
