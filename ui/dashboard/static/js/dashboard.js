@@ -19,6 +19,7 @@
     clockTimer: null,
     halted: false,
     lastPnlStr: null,
+    closedExpanded: false,
   };
 
   // -------------------------------------------------------------
@@ -497,7 +498,7 @@
 
     // Cap initial render to keep the leaf readable; allow expansion via "show all".
     const INITIAL_LIMIT = 6;
-    const visible = trades.slice(0, INITIAL_LIMIT);
+    const visible = STATE.closedExpanded ? trades : trades.slice(0, INITIAL_LIMIT);
     const overflow = Math.max(0, trades.length - visible.length);
 
     const rows = visible.map(buildClosedTradesRow).join("");
@@ -539,15 +540,17 @@
     const expandBtn = $("closedExpandBtn");
     if (expandBtn) {
       expandBtn.addEventListener("click", () => {
-        const allRows = trades.map(buildClosedTradesRow).join("");
-        const tbody = container.querySelector("tbody");
-        tbody.innerHTML = allRows;
-        expandBtn.remove();
-        requestAnimationFrame(() => {
-          container.querySelectorAll(".hold__bar > i").forEach((el) =>
-            el.parentElement.classList.add("on")
-          );
-        });
+        const wasFocused = document.activeElement === expandBtn;
+        STATE.closedExpanded = true;
+        renderClosedTrades(payload);
+
+        if (wasFocused) {
+          const table = container.querySelector(".closed-table");
+          if (table) {
+            table.setAttribute("tabindex", "-1");
+            table.focus();
+          }
+        }
       });
     }
   }
