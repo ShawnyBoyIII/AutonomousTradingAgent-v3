@@ -478,7 +478,16 @@
     if (!container) return;
 
     const focusExpanded = options.focusExpanded === true;
-    const focusWasInside = container.contains(document.activeElement);
+    const activeEl = document.activeElement;
+    const focusWasInside = container.contains(activeEl);
+    let activeId = null;
+    let activeClass = null;
+    if (focusWasInside && activeEl) {
+      activeId = activeEl.id;
+      if (!activeId && activeEl.className) {
+        activeClass = activeEl.className.split(' ')[0];
+      }
+    }
     const trades = (payload && payload.trades) || [];
     if (badgeNum) badgeNum.textContent = String(trades.length);
     const tabCount  = $("closedTabCount");
@@ -536,7 +545,25 @@
     `;
 
     const table = container.querySelector(".closed-table");
-    if (table && (focusExpanded || focusWasInside)) table.focus();
+    if (focusExpanded && table) {
+      table.focus();
+    } else if (focusWasInside) {
+      let restored = false;
+      if (activeId) {
+        const el = document.getElementById(activeId);
+        if (el && container.contains(el)) {
+          el.focus();
+          restored = true;
+        }
+      } else if (activeClass) {
+        const el = container.querySelector(`.${activeClass}`);
+        if (el) {
+          el.focus();
+          restored = true;
+        }
+      }
+      // Only fallback to table if we explicitly wanted it focused, not forcefully on random polling.
+    }
 
     requestAnimationFrame(() => {
       container.querySelectorAll(".hold__bar > i").forEach((el) =>
