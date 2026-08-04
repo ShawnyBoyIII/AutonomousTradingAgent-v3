@@ -188,3 +188,13 @@ def test_closed_trades_endpoint_handles_unreadable_db(tmp_path: Path, monkeypatc
             assert data["count"] == 0
             assert data["trades"] == []
             assert data.get("error") == "forced"
+
+
+def test_closed_trade_expansion_preserves_state_and_focus():
+    """Expansion is explicit, focusable, and not reset by background updates."""
+    js = Path("ui/dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    assert "closedTradesExpanded" in js
+    assert "focusExpanded" in js
+    assert "document.activeElement" in js
+    assert ".focus()" in js
+    assert 'tabindex="-1"' in js

@@ -19,6 +19,7 @@
     clockTimer: null,
     halted: false,
     lastPnlStr: null,
+    closedTradesExpanded: false,
   };
 
   // -------------------------------------------------------------
@@ -470,12 +471,14 @@
     return `<span class="regime regime--${escapeHTML(r)}">${escapeHTML(label)}</span>`;
   }
 
-  function renderClosedTrades(payload) {
+  function renderClosedTrades(payload, options = {}) {
     const container = $("closedTradesList");
     const badge     = $("closedBadge");
     const badgeNum  = $("closedBadgeNum");
     if (!container) return;
 
+    const focusExpanded = options.focusExpanded === true;
+    const focusWasInside = container.contains(document.activeElement);
     const trades = (payload && payload.trades) || [];
     if (badgeNum) badgeNum.textContent = String(trades.length);
     const tabCount  = $("closedTabCount");
@@ -490,6 +493,7 @@
     }
 
     if (!trades.length) {
+      STATE.closedTradesExpanded = false;
       container.innerHTML =
         '<div class="empty">No closed trades yet</div>';
       return;
@@ -497,7 +501,9 @@
 
     // Cap initial render to keep the leaf readable; allow expansion via "show all".
     const INITIAL_LIMIT = 6;
-    const visible = trades.slice(0, INITIAL_LIMIT);
+    const visible = STATE.closedTradesExpanded
+      ? trades
+      : trades.slice(0, INITIAL_LIMIT);
     const overflow = Math.max(0, trades.length - visible.length);
 
     const rows = visible.map(buildClosedTradesRow).join("");
@@ -511,7 +517,7 @@
 
     container.innerHTML = `
       <div class="closed-wrap">
-        <table class="closed-table">
+        <table class="closed-table" tabindex="-1">
           <caption>Lifecycle of closed round-trip trades, ordered by exit time, newest first</caption>
           <thead>
             <tr>
@@ -529,6 +535,9 @@
       </div>
     `;
 
+    const table = container.querySelector(".closed-table");
+    if (table && (focusExpanded || focusWasInside)) table.focus();
+
     requestAnimationFrame(() => {
       container.querySelectorAll(".hold__bar > i").forEach((el) =>
         el.parentElement.classList.add("on")
@@ -539,15 +548,8 @@
     const expandBtn = $("closedExpandBtn");
     if (expandBtn) {
       expandBtn.addEventListener("click", () => {
-        const allRows = trades.map(buildClosedTradesRow).join("");
-        const tbody = container.querySelector("tbody");
-        tbody.innerHTML = allRows;
-        expandBtn.remove();
-        requestAnimationFrame(() => {
-          container.querySelectorAll(".hold__bar > i").forEach((el) =>
-            el.parentElement.classList.add("on")
-          );
-        });
+        STATE.closedTradesExpanded = true;
+        renderClosedTrades({ trades }, { focusExpanded: true });
       });
     }
   }
@@ -624,7 +626,7 @@
             <span class="alert__level">${escapeHTML(lvl)} · ${escapeHTML(a.category || "system")}</span>
             <span class="alert__message">${escapeHTML(a.message)}</span>
           </div>
-          <span class="alert__time" title="${escapeHTML(FMT_EXACT(a.timestamp))}" style="cursor: help;">${escapeHTML(FMT_RELATIVE(a.timestamp))}</span>
+          <span class="alert__time" tabindex="0" aria-label="Exact time: ${escapeHTML(FMT_EXACT(a.timestamp))}" title="${escapeHTML(FMT_EXACT(a.timestamp))}" style="cursor: help;">${escapeHTML(FMT_RELATIVE(a.timestamp))}</span>
         </div>
       `;
     }).join("");
@@ -765,7 +767,7 @@
       const last = trades[0];
       const when = FMT_RELATIVE(last.timestamp);
       const exactTime = FMT_EXACT(last.timestamp);
-      const whenHtml = `<span title="${escapeHTML(exactTime)}" style="cursor: help;">${escapeHTML(when)}</span>`;
+      const whenHtml = `<span tabindex="0" aria-label="Exact time: ${escapeHTML(exactTime)}" title="${escapeHTML(exactTime)}" style="cursor: help;">${escapeHTML(when)}</span>`;
       const side = escapeHTML(last.side || "?");
       const sym  = escapeHTML(last.symbol || "—");
       const qty  = fmtInt(last.quantity);
@@ -790,7 +792,7 @@
                 <span class="trade__symbol">${escapeHTML(t.symbol || "—")}</span>
                 <span class="trade__detail">${fmtInt(t.quantity)} @ ${fmtUSD(t.price)}</span>
               </div>
-              <span class="trade__time" title="${escapeHTML(FMT_EXACT(t.timestamp))}" style="cursor: help;">${escapeHTML(FMT_TIME(t.timestamp))}</span>
+              <span class="trade__time" tabindex="0" aria-label="Exact time: ${escapeHTML(FMT_EXACT(t.timestamp))}" title="${escapeHTML(FMT_EXACT(t.timestamp))}" style="cursor: help;">${escapeHTML(FMT_TIME(t.timestamp))}</span>
             </div>
           `;
         }).join("")}

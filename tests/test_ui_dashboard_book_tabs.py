@@ -68,6 +68,16 @@ def test_open_tab_is_default_active():
     assert 'class="tab-pane is-active"' not in closed_pane_tag
 
 
+def test_tabpanels_are_keyboard_focus_targets():
+    """Every dashboard tabpanel can receive focus when activated."""
+    html = Path("ui/dashboard/templates/dashboard.html").read_text(encoding="utf-8")
+    for pane_id in ("openPane", "closedPane", "todayPane", "tradeCohortPane", "equityCohortPane"):
+        pane_match = re.search(rf'<div[^>]*id="{pane_id}"[^>]*>', html)
+        assert pane_match, f"Missing tabpanel {pane_id}"
+        assert 'role="tabpanel"' in pane_match.group(0)
+        assert 'tabindex="0"' in pane_match.group(0), f"{pane_id} is not focusable"
+
+
 def test_tab_switcher_logic():
     """The tab switcher (selected via monkeypatched localStorage) flips ARIA + .is-active."""
     import subprocess
