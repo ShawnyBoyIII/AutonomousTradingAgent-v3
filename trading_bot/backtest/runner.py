@@ -707,6 +707,11 @@ def _run_symbol_backtest_daily(
         selector.atr_stop_multiplier = settings.risk.atr_stop_multiplier
         selector.min_stop_distance_pct = settings.risk.min_stop_distance_pct
 
+    # Optimize tight inner loops by converting to numpy arrays for much faster indexing vs .iloc
+    closes = daily_frame["close"].to_numpy(dtype=float)
+    lows = daily_frame["low"].to_numpy(dtype=float)
+    highs = daily_frame["high"].to_numpy(dtype=float)
+
     for index in range(50, len(daily_frame)):
         if index <= entry_blocked_until:
             continue
@@ -733,7 +738,7 @@ def _run_symbol_backtest_daily(
             signal=signal,
             broker=broker,
             account_equity=broker.cash + sum(
-                quantity * daily_frame.iloc[index]["close"]
+                quantity * closes[index]
                 for quantity in broker.positions.values()
             ),
             open_tickers=set(broker.positions),
@@ -750,18 +755,17 @@ def _run_symbol_backtest_daily(
         
         # Check if stop/target hit during hold period
         for check_idx in range(index + 1, exit_index + 1):
-            bar = daily_frame.iloc[check_idx]
-            if bar["low"] <= signal.stop_loss:
+            if lows[check_idx] <= signal.stop_loss:
                 exit_price = signal.stop_loss
                 exit_index = check_idx
                 break
-            if bar["high"] >= signal.profit_target:
+            if highs[check_idx] >= signal.profit_target:
                 exit_price = signal.profit_target
                 exit_index = check_idx
                 break
         else:
             # No stop/target hit, exit at close
-            exit_price = daily_frame.iloc[exit_index]["close"]
+            exit_price = closes[exit_index]
 
         quantity = broker.positions.get(symbol, 0)
         trade_records.append({
