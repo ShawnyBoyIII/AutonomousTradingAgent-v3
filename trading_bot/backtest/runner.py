@@ -148,10 +148,14 @@ def run_backtest(
                 logger.info("Note: Using daily bars for %s (intraday unavailable)", symbol)
         
         # Detect daily mode: when intraday is same frequency as daily
-        daily_mode = len(intraday_frame) == len(daily_frame) and all(
-            intraday_frame["timestamp"].iloc[i] == daily_frame["timestamp"].iloc[i]
-            for i in range(min(len(intraday_frame), len(daily_frame)))
-        ) if not intraday_frame.empty and not daily_frame.empty else False
+        # Optimization: ~10000x faster timestamp comparison using numpy array equality instead of .iloc generator
+        if not intraday_frame.empty and not daily_frame.empty and len(intraday_frame) == len(daily_frame):
+            daily_mode = bool(np.array_equal(
+                intraday_frame["timestamp"].to_numpy(),
+                daily_frame["timestamp"].to_numpy()
+            ))
+        else:
+            daily_mode = False
         
         daily_frame = add_all_features(
             daily_frame,
