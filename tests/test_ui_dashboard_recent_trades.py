@@ -156,6 +156,15 @@ def test_trades_payload_returns_empty_for_fresh_ledger(monkeypatch, tmp_path: Pa
     assert payload["count"] == 0
 
 
+def test_timestamp_tooltips_are_keyboard_accessible():
+    """Exact timestamps are reachable and named for keyboard users."""
+    js = Path("ui/dashboard/static/js/dashboard.js").read_text(encoding="utf-8")
+    assert 'class="alert__time"' in js
+    assert 'class="trade__time"' in js
+    assert 'tabindex="0"' in js
+    assert 'aria-label="Exact time:' in js
+
+
 def test_trades_payload_logs_and_isolates_ledger_read_failure(
     monkeypatch,
     caplog,
