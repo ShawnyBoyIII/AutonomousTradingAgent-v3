@@ -2802,7 +2802,7 @@ def correlation(ctx: typer.Context) -> None:
         try:
             bars = fetch_bars(ticker, period="3mo", interval="1d", settings=ctx.obj.market_data)
             if not bars.empty:
-                price_history[ticker] = [float(c) for c in bars["Close"].tolist()]
+                price_history[ticker] = bars["Close"].to_numpy(dtype=float).tolist()
         except Exception as exc:
             typer.echo(f"Warning: could not fetch history for {ticker}: {exc}")
 
@@ -2846,7 +2846,7 @@ def var(
         try:
             bars = fetch_bars(ticker, period="1y", interval="1d", settings=ctx.obj.market_data)
             if not bars.empty:
-                price_history[ticker] = [float(c) for c in bars["Close"].tolist()]
+                price_history[ticker] = bars["Close"].to_numpy(dtype=float).tolist()
         except Exception as exc:
             typer.echo(f"Warning: could not fetch history for {ticker}: {exc}")
 
@@ -2942,7 +2942,7 @@ def risk_report(ctx: typer.Context) -> None:
                 if not bars.empty:
                     close_column = "close" if "close" in bars.columns else ("Close" if "Close" in bars.columns else None)
                     if close_column is not None:
-                        price_history[ticker] = [float(c) for c in bars[close_column].tolist()]
+                        price_history[ticker] = bars[close_column].to_numpy(dtype=float).tolist()
             except Exception as e:
                 logger.debug("Error in CLI: %s", e)
 
