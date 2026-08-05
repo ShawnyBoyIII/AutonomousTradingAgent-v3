@@ -5052,11 +5052,14 @@ def reset_portfolio(
     import sqlite3
     from datetime import datetime
 
+    from trading_bot.db.permissions import secure_sqlite_artifacts
+
     # Backup before doing anything
     if backup:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = db_path.with_name(f"{db_path.name}.reset_{ts}.bak")
         shutil.copy2(db_path, backup_path)
+        secure_sqlite_artifacts(backup_path)
         typer.echo(f"  Backup created: {backup_path}")
 
     conn = sqlite3.connect(str(db_path), timeout=5)
