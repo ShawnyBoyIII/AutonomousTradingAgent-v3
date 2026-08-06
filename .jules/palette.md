@@ -16,3 +16,6 @@
 ## 2024-07-28 - Dynamic Page Titles for Background Monitoring
 **Learning:** For a dashboard like this, users often have it open in a background tab while doing other work. They shouldn't have to switch tabs just to see if the system is halted or to check their P&L.
 **Action:** When working on dashboards with critical live states (like P&L or system health), dynamically update the `<title>` tag with a high-level summary (e.g. "🚨 HALTED" or "+$1.2K"). This provides ambient awareness and reduces context switching.
+## 2024-08-06 - Managing keyboard focus during dynamic UI polling updates
+**Learning:** Found that when dynamically replacing DOM components containing interactive elements (like the "Show more" button in the closed trades list) using `innerHTML`, keyboard focus resets to the body or container element if not carefully preserved, which severely degrades navigation for keyboard and screen reader users.
+**Action:** Before destroying DOM elements via `innerHTML` replacements on polled data, explicitly capture `document.activeElement.id` and/or `className`, and attempt to call `.focus()` on the corresponding recreated element immediately afterward to prevent focus-stealing regressions.

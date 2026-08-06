@@ -479,6 +479,15 @@
 
     const focusExpanded = options.focusExpanded === true;
     const focusWasInside = container.contains(document.activeElement);
+
+    // Capture the active element before re-rendering
+    let activeId = null;
+    let activeClass = null;
+    if (focusWasInside && document.activeElement) {
+      activeId = document.activeElement.id;
+      activeClass = document.activeElement.className;
+    }
+
     const trades = (payload && payload.trades) || [];
     if (badgeNum) badgeNum.textContent = String(trades.length);
     const tabCount  = $("closedTabCount");
@@ -535,8 +544,28 @@
       </div>
     `;
 
+    // Attempt to explicitly restore focus to the previously focused element
+    let restoredFocus = false;
+    if (focusWasInside) {
+      if (activeId) {
+        const el = document.getElementById(activeId);
+        if (el) {
+          el.focus();
+          restoredFocus = true;
+        }
+      } else if (activeClass) {
+        // If it lacked an ID, try matching on class string (useful for buttons/links)
+        // Ensure it is still within the container
+        const el = container.querySelector(`[class="${activeClass}"]`);
+        if (el) {
+          el.focus();
+          restoredFocus = true;
+        }
+      }
+    }
+
     const table = container.querySelector(".closed-table");
-    if (table && (focusExpanded || focusWasInside)) table.focus();
+    if (table && (focusExpanded || (focusWasInside && !restoredFocus))) table.focus();
 
     requestAnimationFrame(() => {
       container.querySelectorAll(".hold__bar > i").forEach((el) =>
