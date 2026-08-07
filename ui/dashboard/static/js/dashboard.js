@@ -51,6 +51,39 @@
       .replace(/"/g, "&quot;")
       .replace(/'/g, "&#39;");
 
+  function setInnerHTMLAndRestoreFocus(container, htmlContent) {
+    if (!container) return;
+
+    // Capture currently focused element if it's inside the container
+    const active = document.activeElement;
+    let activeId = null;
+    let activeClass = null;
+
+    if (active && container.contains(active)) {
+      if (active.id) {
+        activeId = active.id;
+      } else if (active.className && typeof active.className === 'string') {
+        activeClass = active.className;
+      }
+    }
+
+    // Perform the DOM replacement
+    container.innerHTML = htmlContent;
+
+    // Restore focus
+    if (activeId) {
+      const elToFocus = document.getElementById(activeId);
+      if (elToFocus) {
+        elToFocus.focus();
+      }
+    } else if (activeClass) {
+      const els = container.getElementsByClassName(activeClass);
+      if (els.length > 0) {
+        els[0].focus();
+      }
+    }
+  }
+
   // -------------------------------------------------------------
   // Formatters
   // -------------------------------------------------------------
@@ -382,7 +415,7 @@
     if (tabCount) tabCount.textContent = String(positions.length);
 
     if (!positions.length) {
-      container.innerHTML = '<div class="empty">No open positions</div>';
+      setInnerHTMLAndRestoreFocus(container, '<div class="empty">No open positions</div>');
       return;
     }
 
@@ -419,7 +452,7 @@
       `;
     }).join("");
 
-    container.innerHTML = `
+    setInnerHTMLAndRestoreFocus(container, `
       <div class="positions-wrap">
         <table class="positions-table">
           <thead>
@@ -436,7 +469,7 @@
           <tbody>${rows}</tbody>
         </table>
       </div>
-    `;
+    `);
 
     // Animate pnl bars in after the DOM settles
     requestAnimationFrame(() => {
@@ -478,7 +511,6 @@
     if (!container) return;
 
     const focusExpanded = options.focusExpanded === true;
-    const focusWasInside = container.contains(document.activeElement);
     const trades = (payload && payload.trades) || [];
     if (badgeNum) badgeNum.textContent = String(trades.length);
     const tabCount  = $("closedTabCount");
@@ -494,8 +526,7 @@
 
     if (!trades.length) {
       STATE.closedTradesExpanded = false;
-      container.innerHTML =
-        '<div class="empty">No closed trades yet</div>';
+      setInnerHTMLAndRestoreFocus(container, '<div class="empty">No closed trades yet</div>');
       return;
     }
 
@@ -515,7 +546,7 @@
          </button>`
       : "";
 
-    container.innerHTML = `
+    setInnerHTMLAndRestoreFocus(container, `
       <div class="closed-wrap">
         <table class="closed-table" tabindex="-1">
           <caption>Lifecycle of closed round-trip trades, ordered by exit time, newest first</caption>
@@ -533,10 +564,10 @@
         </table>
         ${overflowFooter}
       </div>
-    `;
+    `);
 
     const table = container.querySelector(".closed-table");
-    if (table && (focusExpanded || focusWasInside)) table.focus();
+    if (table && focusExpanded) table.focus();
 
     requestAnimationFrame(() => {
       container.querySelectorAll(".hold__bar > i").forEach((el) =>
@@ -614,11 +645,11 @@
     setAttr(badge, "data-state", state);
 
     if (!alerts.length) {
-      container.innerHTML = '<div class="empty">All systems nominal</div>';
+      setInnerHTMLAndRestoreFocus(container, '<div class="empty">All systems nominal</div>');
       return;
     }
 
-    container.innerHTML = alerts.map((a) => {
+    setInnerHTMLAndRestoreFocus(container, alerts.map((a) => {
       const lvl = a.level === "critical" ? "critical" : "warning";
       return `
         <div class="alert alert--${lvl}" role="status">
@@ -629,7 +660,7 @@
           <span class="alert__time" tabindex="0" aria-label="Exact time: ${escapeHTML(FMT_EXACT(a.timestamp))}" title="${escapeHTML(FMT_EXACT(a.timestamp))}" style="cursor: help;">${escapeHTML(FMT_RELATIVE(a.timestamp))}</span>
         </div>
       `;
-    }).join("");
+    }).join(""));
   }
 
   // -------------------------------------------------------------
@@ -646,11 +677,11 @@
     setAttr(badge, "data-state", status);
 
     if (!checks.length) {
-      container.innerHTML = '<div class="empty">No checks reported</div>';
+      setInnerHTMLAndRestoreFocus(container, '<div class="empty">No checks reported</div>');
       return;
     }
 
-    container.innerHTML = checks.map((c) => {
+    setInnerHTMLAndRestoreFocus(container, checks.map((c) => {
       const st = c.status || "ok";
       return `
         <div class="health-row">
@@ -659,7 +690,7 @@
           ${c.message ? `<span class="health-row__msg">${escapeHTML(c.message)}</span>` : ""}
         </div>
       `;
-    }).join("");
+    }).join(""));
 
     renderKillSwitch(data && data.kill_switch);
     renderTelemetry({ health: data });
@@ -776,11 +807,11 @@
     }
 
     if (!trades.length) {
-      container.innerHTML = '<div class="empty">No recent trades</div>';
+      setInnerHTMLAndRestoreFocus(container, '<div class="empty">No recent trades</div>');
       return;
     }
 
-    container.innerHTML = `
+    setInnerHTMLAndRestoreFocus(container, `
       <div class="trades-grid">
         ${trades.map((t) => {
           const side = (t.side || "?").toLowerCase();
@@ -797,7 +828,7 @@
           `;
         }).join("")}
       </div>
-    `;
+    `);
   }
 
   // -------------------------------------------------------------

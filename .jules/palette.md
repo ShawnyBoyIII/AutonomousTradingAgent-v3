@@ -16,3 +16,6 @@
 ## 2024-07-28 - Dynamic Page Titles for Background Monitoring
 **Learning:** For a dashboard like this, users often have it open in a background tab while doing other work. They shouldn't have to switch tabs just to see if the system is halted or to check their P&L.
 **Action:** When working on dashboards with critical live states (like P&L or system health), dynamically update the `<title>` tag with a high-level summary (e.g. "🚨 HALTED" or "+$1.2K"). This provides ambient awareness and reduces context switching.
+## 2024-08-07 - Preventing Focus-Stealing Regressions in Live Dashboards
+**Learning:** In dynamically updated/polled interfaces (like dashboards), directly assigning to `innerHTML` destroys and re-creates DOM elements, forcing the browser to drop focus to the `<body>`. This breaks keyboard accessibility, especially for expanded panels or action buttons within live tables.
+**Action:** When updating live DOM nodes, first capture `document.activeElement`'s ID or `className` (if it falls within the updating container), apply the `innerHTML` change, and then explicitly restore focus using `.focus()` on the re-created element.
