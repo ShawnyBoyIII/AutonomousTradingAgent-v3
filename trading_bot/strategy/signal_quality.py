@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, time, timezone
 import math
+import numpy as np
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
@@ -427,7 +428,7 @@ def _latest_range_ratio(frame: "pd.DataFrame") -> float | None:
 def _has_two_bar_confirmation(frame: "pd.DataFrame") -> bool:
     if len(frame) < 3:
         return False
-    closes = [_finite_float(value) for value in frame["close"].tail(3).tolist()]
+    closes = [v if math.isfinite(v) else None for v in frame["close"].tail(3).to_numpy(dtype=float, na_value=np.nan).tolist()]
     if any(value is None for value in closes):
         return False
     first, second, third = [value for value in closes if value is not None]

@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 import json
 import math
+import numpy as np
 from pathlib import Path
 from typing import Any
 
@@ -1575,7 +1576,7 @@ def _scan_details(daily_frame, intraday_frame) -> dict[str, float | int]:
         _set_detail(details, "intraday_close", latest_intraday.get("close"))
         if "high" in intraday_frame.columns and len(intraday_frame) > 1:
             recent_highs = intraday_frame.tail(5).iloc[:-1]["high"]
-            high_values = [_finite_float(value) for value in recent_highs.tolist()]
+            high_values = [v if math.isfinite(v) else None for v in recent_highs.to_numpy(dtype=float, na_value=np.nan).tolist()]
             valid_highs = [value for value in high_values if value is not None]
             if valid_highs:
                 details["range_high"] = round(max(valid_highs), 2)

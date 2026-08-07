@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import numpy as np
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -133,8 +134,8 @@ def detect_range_bound_reversal(frame: "pd.DataFrame", lookback: int = 10) -> bo
     rsi = _to_finite_float(latest["rsi_14"])
 
     # Get lookback highs and lows
-    lookback_highs = [_to_finite_float(h) for h in lookback_period["high"].tolist()]
-    lookback_lows = [_to_finite_float(l) for l in lookback_period["low"].tolist()]
+    lookback_highs = [h if math.isfinite(h) else None for h in lookback_period["high"].to_numpy(dtype=float, na_value=np.nan).tolist()]
+    lookback_lows = [l if math.isfinite(l) else None for l in lookback_period["low"].to_numpy(dtype=float, na_value=np.nan).tolist()]
 
     if any(v is None for v in [latest_close, latest_open, prev_close, prev_open,
                                latest_volume, avg_volume, rsi]):

@@ -21,6 +21,7 @@ stay network-free):
 from __future__ import annotations
 
 import math
+import numpy as np
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -203,18 +204,18 @@ def build_counter_thesis_context(
     regime, regime_metrics = detect_market_regime(daily)
     volatility_percentile = regime_metrics.volatility_percentile
 
-    closes = [_to_finite_float(v) for v in intraday["close"].tolist()]
+    closes = [v if math.isfinite(v) else None for v in intraday["close"].to_numpy(dtype=float, na_value=np.nan).tolist()]
     closes = [c for c in closes if c is not None]
     rsi_series: list[float | None] = []
     if "rsi_14" in intraday.columns:
-        rsi_series = [_to_finite_float(v) for v in intraday["rsi_14"].tolist()]
+        rsi_series = [v if math.isfinite(v) else None for v in intraday["rsi_14"].to_numpy(dtype=float, na_value=np.nan).tolist()]
     latest_rsi = _last_finite(rsi_series)
 
     volumes: list[float] = []
     latest_volume = None
     avg_volume = None
     if "volume" in intraday.columns:
-        volumes = [_to_finite_float(v) for v in intraday["volume"].tolist()]
+        volumes = [v if math.isfinite(v) else None for v in intraday["volume"].to_numpy(dtype=float, na_value=np.nan).tolist()]
         volumes = [v for v in volumes if v is not None]
         latest_volume = volumes[-1] if volumes else None
         avg_series = intraday.get("volume_avg_5")
