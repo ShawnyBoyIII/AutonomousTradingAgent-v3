@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import numpy as np
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -14,7 +15,7 @@ def detect_intraday_breakout(frame: "pd.DataFrame", lookback: int = 4) -> bool:
 
     latest = frame.iloc[-1]
     prior = frame.iloc[-(lookback + 1) : -1]
-    prior_highs_raw = [_to_finite_float(high) for high in prior["high"].tolist()]
+    prior_highs_raw = [h if math.isfinite(h) else None for h in prior["high"].to_numpy(dtype=float, na_value=np.nan).tolist()]
     latest_close = _to_finite_float(latest["close"])
     latest_volume = _to_finite_float(latest["volume"])
     average_volume = _to_finite_float(latest["volume_avg_5"])
@@ -46,7 +47,7 @@ def detect_intraday_momentum_continuation(frame: "pd.DataFrame") -> bool:
     previous_close = _to_finite_float(previous["close"])
     latest_volume = _to_finite_float(latest["volume"])
     average_volume = _to_finite_float(latest["volume_avg_5"])
-    recent_closes = [_to_finite_float(close) for close in recent["close"].tolist()]
+    recent_closes = [c if math.isfinite(c) else None for c in recent["close"].to_numpy(dtype=float, na_value=np.nan).tolist()]
 
     if (
         latest_close is None
